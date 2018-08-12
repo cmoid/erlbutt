@@ -1,0 +1,16 @@
+.eunit
+*.o
+*.beam
+*.plt
+erl_crash.dump
+*~
+ebin
+.rebar
+log
+Mnesia*
+_build
+*#*#
+.DS_Store
+foo
+foobar
+log.offset

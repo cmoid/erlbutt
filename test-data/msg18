@@ -1,0 +1,12 @@
+{
+  "previous": "%HYxFSKE+UAs+I8BNHQv6nJks82qtEDDilI3Q1H6XaI0=.sha256",
+  "sequence": 120,
+  "author": "@e84qV/tx9w1ZiOIxU3+fOpirrT8rP3YqDydRgfk076c=.ed25519",
+  "timestamp": 1534673917278,
+  "hash": "sha256",
+  "content": {
+    "type": "about",
+    "about": "\u001B[200~@e84qV/tx9w1ZiOIxU3+fOpirrT8rP3YqDydRgfk076c=.ed25519",
+    "publicWebHosting": true
+  }
+}

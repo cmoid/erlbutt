@@ -1,0 +1,20 @@
+{
+  "previous": "%v8MJYKo43Nd4VMyuNAY553ge9grdngbM9vOLwh4Ij1g=.sha256",
+  "author": "@uOReuhnb9+mPi5RnTbKMKRr3r87cK+aOg8lFXV/SBPU=.ed25519",
+  "sequence": 78,
+  "timestamp": 1520857987601,
+  "hash": "sha256",
+  "content": {
+    "type": "post",
+    "text": "keks started [his diary](%WS8k0+hN1fvu3pLfAMJdj5k6X9ySrFtvRWAZYctg0bY=.sha256)!",
+    "mentions": [
+      {
+        "link": "%WS8k0+hN1fvu3pLfAMJdj5k6X9ySrFtvRWAZYctg0bY=.sha256",
+        "name": "his diary"
+      }
+    ],
+    "root": "%LaHB+jJqYD5KbYU0Rnx7/PdXL2ic0XWgc2qOyLXrnls=.sha256",
+    "branch": "%k4uUaTdrRGFpKpkrTeGAYkpwOQ3cLvvtjPT8waIEGGU=.sha256",
+    "channel": "golang"
+  }
+}

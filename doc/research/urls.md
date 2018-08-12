@@ -1,0 +1,8 @@
+%f9pa8FparL/zQNwo+6qG9IBH4nxBfjeGgAAuIqdjtHg=.sha256 - Cryptic comments on EBT
+%HqvC29wmrW64/mbsL+6Je4mNwMNazxW9iSBb3Wya70c=.sha256 - Andre's ngi-pointer diary
+%+fBXl12aV1wpAdD62RMl1WRhwthDMuAuHH4iNWgB7jA=.sha256 - Mix fork/nested threads
+%L3qSfcRwZ1nJliIlzSOfVKf8d1X4guIjCsvrrDi1N3Q=.sha256 - Cel on forks
+%/aqqVCh//RuwapyeGHbUOE7OUlCrXF/BoVQUSCGzrrk=.sha256 - list of links on forks from Mikey
+https://github.com/ssb-ngi-pointer - NGI pointer repo for project work
+https://github.com/AljoschaMeyer/bamboo - Bamboo (partial replication)
+https://github.com/ssb-ngi-pointer/rooms2 - Andre's rooms 2.0

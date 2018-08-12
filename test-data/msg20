@@ -1,0 +1,16 @@
+{
+  "previous": "%pCpzlZGRZQhUabTBuhbHNX1iQJzjud8kp/KIDDkZ3Uk=.sha256",
+  "author": "@nti4TWBH/WNZnfwEoSleF3bgagd63Z5yeEnmFIyq0KA=.ed25519",
+  "sequence": 93,
+  "timestamp": 1496906958860,
+  "hash": "sha256",
+  "content": {
+    "type": "post",
+    "root": "%k7PZ3U8ALfUQeUk8BreIR29yahNgvEhgCJMQMQ5frV4=.sha256",
+    "branch": "%JjF5x0YveKKyGwwDWf+p3tJAkGoTgrv3Qm00/0mgRY8=.sha256",
+    "channel": "anarchitecture",
+    "recps": null,
+    "text": "The cool thing about this: You can very easily create UNIX binaries that run in the browser:\n\n```\n#!/bin/sh\ncat $0 | tail -n+2; exit 0\nESC\u001B_HTMSHELL/1.0\nAPPENDCHILD\ncontent-type:text/html\ncontent-encoding:gzip\ncontent-transfer-encoding:base64\n\nH4sICD9mo1gAA2luZGV ...\n(lots more gzipped html containing js and css)\nESC\\\n```\n\nIf I run this, a music player UI shows up inside my terminal emulator :)\n\nSo, I can set up all my widgets in my `.zshrc`.",
+    "mentions": []
+  }
+}

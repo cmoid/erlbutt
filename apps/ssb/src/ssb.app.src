@@ -1,0 +1,21 @@
+%% SPDX-License-Identifier: GPL-2.0-only
+%%
+%% Copyright (C) 2018 Dionne Associates, LLC.
+{application, ssb,
+ [{description, "ssb"},
+  {vsn, {cmd, "echo 0.1-`git describe --always --tags`"}},
+  {registered, []},
+  {applications, [kernel,
+                  stdlib,
+                  crypto,
+                  observer,
+                  wx,
+                  mnesia,
+                  ranch,
+                  enacl,
+                  jiffy,
+                  compiler,
+                  debugger,
+                  syntax_tools,
+                  tools]},
+  {mod, {ssb_app, [{ssb_log_level, notice}]}}]}.

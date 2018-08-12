@@ -1,0 +1,15 @@
+{
+  "previous": "%HYxFSKE+UAs%mLiOAXYseh1jeb6M51D6loze9fFeImoaH5BXDIcnnd8=.sha256",
+  "author": "@Sur8RwcDh6kBjub8pLZpHNWDfuuRpYVyCHrVo+TdA/4=.ed25519",
+  "sequence": 2,
+  "timestamp": 1491735433137,
+  "hash": "sha256",
+  "content": {
+    "type": "pub",
+    "address": {
+      "host": "ssb.rootsystems.nz",
+      "port": 8008,
+      "key": "@L+nPFTMUHWXuchOwuzT6Z8Ea8wD/Rtd7leVRxGaknVk=.ed25519"
+    }
+  }
+}

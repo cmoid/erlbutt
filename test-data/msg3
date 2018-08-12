@@ -1,0 +1,22 @@
+{
+  "previous": "%Wjp2rclMyKwmnzSTtza71cX7MqCwVPebzZeGc0ubJZY=.sha256",
+  "author": "@Sur8RwcDh6kBjub8pLZpHNWDfuuRpYVyCHrVo+TdA/4=.ed25519",
+  "sequence": 165,
+  "timestamp": 1516796405753,
+  "hash": "sha256",
+  "content": {
+    "type": "post",
+    "root": "%KqUf79k1cIRsVCVntGQyNKsg3qi4rE4Ote6NHnkIVS0=.sha256",
+    "branch": [
+      "%5y6Z2SkYStc7ZIbhSBcZl7q7Y2hWB+agFzBmAiujpe0=.sha256",
+      "%Wjp2rclMyKwmnzSTtza71cX7MqCwVPebzZeGc0ubJZY=.sha256"
+    ],
+    "reply": {
+      "%KqUf79k1cIRsVCVntGQyNKsg3qi4rE4Ote6NHnkIVS0=.sha256": "@0uuaW1PsyU04iS2VBDlRbiQh8OqxEH+n2vV0BkrtXLU=.ed25519"
+    },
+    "channel": "patchwork",
+    "recps": null,
+    "text": "All good questions, reminds me of Thoreau - \"What could a man in Massachusetts possibly have to say to a man in Texas\"",
+    "mentions": []
+  }
+}

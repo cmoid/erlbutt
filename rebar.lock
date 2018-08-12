@@ -1,0 +1,12 @@
+[{<<"enacl">>,
+  {git,"https://github.com/jlouis/enacl.git",
+       {ref,"220ac6640a1b78160345256d76d18bcff744f536"}},
+  0},
+ {<<"jiffy">>,
+  {git,"https://git.sr.ht/~cmoid/jiffy",
+       {ref,"cec4f97422e033140588f7588c4c59d7fe4c3940"}},
+  0},
+ {<<"ranch">>,
+  {git,"https://github.com/ninenines/ranch.git",
+       {ref,"cbfed2c3c70f7ef4bef3479e65acc10d08903304"}},
+  0}].

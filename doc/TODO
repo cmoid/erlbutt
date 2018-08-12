@@ -1,0 +1,8 @@
+
+Need to pass the mnesia dir into the eunit command to keep all the artifacts in `_build`
+
+ERL_FLAGS='-mnesia dir \"./_build/test/mnesia\"' ./rebar3 eunit
+
+Make directory for secret and databases configurable
+
+Make network identifier configurable

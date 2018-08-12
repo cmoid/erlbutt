@@ -1,0 +1,46 @@
+\input texinfo
+@setfilename erlbutt.info
+@settitle Erlbutt 
+
+@copying
+This is a simple info explaining how to configure and run erlbutt
+
+Copyright @copyright{} 2019 Dionne Associates, LLC.
+@end copying
+
+@titlepage
+@title Erlbutt
+@page
+@vskip 0pt plus 1filll
+@insertcopying
+@end titlepage
+
+@c Output the table of the contents at the beginning.
+@contents
+
+@ifnottex
+@node Top
+@top Erlbutt User Manual
+
+This manual is for using erlbutt
+(version @value{VERSION}, @value{UPDATED}).
+@end ifnottex
+
+@menu
+* Introduction::    Some comments on motivation for the work
+* Index::            Complete index.
+@end menu
+
+
+@node Introduction
+@chapter Introduction
+
+
+@cindex introduction
+
+@node Index
+@unnumbered Index
+
+@printindex cp
+
+@bye

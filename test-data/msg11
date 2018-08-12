@@ -1,0 +1,21 @@
+{
+  "previous": "%9Tyz4cNvHQJt5uHgHj7ibJkCabycf6L6jXwMuT92mZo=.sha256",
+  "author": "@Sur8RwcDh6kBjub8pLZpHNWDfuuRpYVyCHrVo+TdA/4=.ed25519",
+  "sequence": 65,
+  "timestamp": 1514670451697,
+  "hash": "sha256",
+  "content": {
+    "type": "post",
+    "text": "Does it fix [#1](%wC57/ST1GrFi+5Qoq/HNJtrUjHC/KWE+JRKIdVVtA6k=.sha256)",
+    "root": "%9Tyz4cNvHQJt5uHgHj7ibJkCabycf6L6jXwMuT92mZo=.sha256",
+    "branch": "%9Tyz4cNvHQJt5uHgHj7ibJkCabycf6L6jXwMuT92mZo=.sha256",
+    "issue": "%9Tyz4cNvHQJt5uHgHj7ibJkCabycf6L6jXwMuT92mZo=.sha256",
+    "repo": "%OvQ799sU4l87saa/lrk+rWVQI9HolXYc5POJmJthU6Q=.sha256",
+    "mentions": [
+      {
+        "link": "%wC57/ST1GrFi+5Qoq/HNJtrUjHC/KWE+JRKIdVVtA6k=.sha256",
+        "name": "#1"
+      }
+    ]
+  }
+}
