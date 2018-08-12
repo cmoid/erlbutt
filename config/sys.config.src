@@ -1,0 +1,17 @@
+[{kernel,
+  [{logger,
+    [{handler, default, logger_std_h,
+      #{level => error,
+        config => #{type => {file, "log/error.log"}}}},
+     {handler, term, logger_std_h,
+      #{formatter => {logger_formatter, #{single_line => true}}}},
+     {handler, info, logger_std_h,
+      #{level => info,
+        config => #{type => {file, "log/info.log"}}}},
+     {handler, debug, logger_std_h,
+      #{level => debug,
+        config => #{type => {file, "log/debug.log"}}}}
+    ]}]},
+ {ssb, [{ssb_log_level, ${SSB_LOG_LEVEL:-error}},
+        {ssb_home, "${SSB_HOME:-.}"}]}].
+

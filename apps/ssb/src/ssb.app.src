@@ -1,0 +1,21 @@
+%% SPDX-License-Identifier: GPL-2.0-only
+%%
+%% Copyright (C) 2023 Charles Moid
+{application, ssb,
+ [{description, "ssb"},
+  {vsn, {cmd, "echo 0.1-`git describe --always --tags`"}},
+  {registered, []},
+  {applications, [kernel,
+                  sasl,
+                  stdlib,
+                  crypto,
+                  observer,
+                  wx,
+                  ranch,
+                  enacl,
+                  compiler,
+                  debugger,
+                  syntax_tools,
+                  tools]},
+  {env, []},
+  {mod, {ssb_app, [{ssb_log_level, notice}]}}]}.
