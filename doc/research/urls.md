@@ -6,3 +6,4 @@
 https://github.com/ssb-ngi-pointer - NGI pointer repo for project work
 https://github.com/AljoschaMeyer/bamboo - Bamboo (partial replication)
 https://github.com/ssb-ngi-pointer/rooms2 - Andre's rooms 2.0
+%eVPRoYaDZCH/cz4WVYIFeCHzaNFOSEUS5uIv2gNVBW8=.sha256 - Links on URIs from Cel

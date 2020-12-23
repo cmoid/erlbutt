@@ -22,7 +22,7 @@ In much of the discussion the community has, one item that seems to be missing i
 
 I spend far too much time in Patchwork pointlessly scrolling.
 
-So I'm wondering about keeping the same log.offset file format, but having a separate file for each feed. Maybe a separate directory for each feed that includes a meta-level file of information about the feed. This meta-level file would capture things like the latest state of the user's follow graph, perhaps lists of ids that are roots of tangles[3]. In the running peer each feed current in use could map to a `gen_server`, allowing Erlang's awesomeness to add value.
+So I'm wondering about keeping the same log.offset file format, but having a separate file for each feed. Maybe a separate directory for each feed that includes a meta-level file of information about the feed. This meta-level file would capture things like the latest state of the user's follow graph, perhaps lists of ids that are roots of [tangles][3]. In the running peer each feed current in use could map to a `gen_server`, allowing Erlang's awesomeness to add value.
 
 ----
 [0]: https://github.com/rebar/rebar3
