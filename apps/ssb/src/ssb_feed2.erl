@@ -12,10 +12,9 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/0,
-         start_link/1]).
+-export([start_link/2]).
 
--export([post_msg/1]).
+-export([process_msg/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -23,36 +22,36 @@
 
 -define(SERVER, ?MODULE).
 
--record(state, {feed_id}).
+-record(state, {feed,
+                meta}).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 
-start_link() ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [keys:pub_key()], []).
-
-start_link(FeedId) ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [FeedId], []).
+start_link(FeedId, Location) ->
+    gen_server:start_link(?MODULE, [FeedId, Location], []).
 
 %% Msg is the content field of a message, the assumption being that
 %% last_msg has all the other fields needed
-post_msg(Msg) ->
-    gen_server:cast(?MODULE, {post, Msg}).
+process_msg(FeedPid, Msg) ->
+    gen_server:cast(FeedPid, {process, Msg}).
 
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
-init([FeedId]) ->
+init([FeedId, Location]) ->
     process_flag(trap_exit, true),
-    {ok, #state{feed_id = FeedId}}.
+    DecodeId = integer_to_binary(binary:decode_unsigned(base64:decode(FeedId)),16),
+    {Feed, Meta} = init_directories(DecodeId, Location),
+    {ok, #state{feed = Feed, meta = Meta}}.
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
-handle_cast({post, Msg}, State) ->
-    store(Msg),
+handle_cast({process, Msg}, #state{feed = Feed} = State) ->
+    store(Msg, Feed),
     {noreply, State}.
 
 %% info
@@ -71,8 +70,29 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
-store(_Msg) ->
-    ok.
+store(Msg, Feed) ->
+    {ok, Out} = file:open(Feed, [append]),
+    DataSiz = size(Msg),
+    file:write(Out,
+               <<DataSiz:32, Msg/binary, DataSiz:32>>),
+    FileSize = filelib:file_size(Feed),
+    file:write(Out, <<FileSize:32>>),
+    file:close(Out).
+
+init_directories(AuthDir, Location) ->
+    %% Author is already decoded as hex, use first two chars for directory
+    <<Dir:2/binary,RestAuth/binary>> = AuthDir,
+    file:make_dir(<<Location/binary,Dir/binary>>),
+    FeedDir = <<Location/binary,Dir/binary,<<"/">>/binary,RestAuth/binary>>,
+    file:make_dir(FeedDir),
+    %% write msg to feed
+    Feed = <<FeedDir/binary,<<"/">>/binary,<<"log.offset">>/binary>>,
+    Meta = <<FeedDir/binary,<<"/">>/binary,<<"meta">>/binary>>,
+    {ok, Out} = file:open(Feed, [append]),
+    {ok, Out2} = file:open(Meta, [append]),
+    ok = file:close(Out),
+    ok = file:close(Out2),
+    {Feed, Meta}.
 
 -ifdef(TEST).
 

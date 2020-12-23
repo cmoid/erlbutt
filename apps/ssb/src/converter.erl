@@ -27,11 +27,11 @@ convert(OffsetLog)->
             ?info("There are ~p ids in this log ~n",[length(get())]),
             {BiggestId, NoMsgs} =
                 lists:foldl(fun(Elem, Acc) ->
-                                    case element(2, Elem) > element(2, Acc) of
+                                    case count(Elem) > count(Acc) of
                                         true -> Elem;
                                         _Else -> Acc
                                     end
-                            end,{<<"FFF">>, 0},get()),
+                            end,{<<"FFF">>, {0, 0}},get()),
             ?info("The largest feed belongs to: ~p ~n",
                   [{BiggestId, NoMsgs}]);
         {error, enoent} ->
@@ -43,6 +43,13 @@ convert_terms(IoDev, Found, DataStore) ->
     case load_term(IoDev) of
         {ok, Data} ->
             store(Data, DataStore),
+            SleepCnt = Found rem 500 == 0,
+            if SleepCnt ->
+                    timer:sleep(200),
+                    ?info("Sleeping... ~n", []);
+               true ->
+                    true
+            end,
             %% read spacer in file, at end this will cause eof but that will be picked
             %% up in the next iteration
             {ok, <<_PosInt:32/integer>>} = file:read(IoDev, 4),
@@ -85,46 +92,40 @@ check_data(IoDev, Data, Len) ->
             {error, Reason}
     end.
 
+count(Element)->
+    element(2, element(2, Element)).
+
 extract_author(DataProps) ->
     {Value} = ?pgv(<<"value">>, DataProps),
     <<"@",Id/binary>> = ?pgv(<<"author">>, Value),
-    Author = hd(string:replace(Id,".ed25519","")),
-    integer_to_binary(binary:decode_unsigned(base64:decode(Author)),16).
+    hd(string:replace(Id,".ed25519","")).
 
-count(Author) ->
-    Count = get(Author),
-    case Count of
+get_feed(Author, Location) ->
+    Val = get(Author),
+    case Val of
         undefined ->
-            put(Author, 1);
-        _Else ->
-            put(Author, Count + 1),
+            {ok, Pid} = ssb_feed2:start_link(Author, Location),
+            put(Author, {Pid, 1}),
+            Pid;
+        {Pid, Count} ->
+            put(Author, {Pid, Count + 1}),
             PrintCount = Count rem 10000 == 0,
             if PrintCount ->
+                    timer:sleep(500),
                     ?info("This author ~p has ~p records ~n", [Author, Count]);
                true ->
                     true
-            end
+            end,
+            Pid;
+        _Else ->
+            bad
 
     end.
 
 store(Msg, Location) ->
 
     {DecProps} = jiffy:decode(Msg),
-    AuthDir = extract_author(DecProps),
+    AuthId = extract_author(DecProps),
 
-    count(AuthDir),
-
-    %% Author is already decoded as hex, use first two chars for directory
-    <<Dir:2/binary,RestAuth/binary>> = AuthDir,
-    file:make_dir(<<Location/binary,Dir/binary>>),
-    FeedDir = <<Location/binary,Dir/binary,<<"/">>/binary,RestAuth/binary>>,
-    file:make_dir(FeedDir),
-    %% write msg to feed
-    Feed = <<FeedDir/binary,<<"/">>/binary,<<"log.offset">>/binary>>,
-    {ok, Out} = file:open(Feed, [append]),
-    DataSiz = size(Msg),
-    file:write(Out,
-               <<DataSiz:32, Msg/binary, DataSiz:32>>),
-    FileSize = filelib:file_size(Feed),
-    file:write(Out, <<FileSize:32>>),
-    file:close(Out).
+    FeedPid = get_feed(AuthId, Location),
+    ssb_feed2:process_msg(FeedPid, Msg).
