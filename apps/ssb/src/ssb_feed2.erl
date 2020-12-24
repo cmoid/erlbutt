@@ -88,10 +88,6 @@ init_directories(AuthDir, Location) ->
     %% write msg to feed
     Feed = <<FeedDir/binary,<<"/">>/binary,<<"log.offset">>/binary>>,
     Meta = <<FeedDir/binary,<<"/">>/binary,<<"meta">>/binary>>,
-    {ok, Out} = file:open(Feed, [append]),
-    {ok, Out2} = file:open(Meta, [append]),
-    ok = file:close(Out),
-    ok = file:close(Out2),
     {Feed, Meta}.
 
 -ifdef(TEST).
