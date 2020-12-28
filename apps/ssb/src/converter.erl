@@ -45,7 +45,7 @@ convert_terms(IoDev, Found, DataStore) ->
             store(Data, DataStore),
             SleepCnt = Found rem 500 == 0,
             if SleepCnt ->
-                    timer:sleep(200),
+                    timer:sleep(1000),
                     ?info("Sleeping... ~n", []);
                true ->
                     true

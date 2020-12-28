@@ -50,8 +50,14 @@ init([FeedId, Location]) ->
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
-handle_cast({process, Msg}, #state{feed = Feed} = State) ->
+handle_cast({process, Msg}, #state{feed = Feed, meta = Meta} = State) ->
     store(Msg, Feed),
+    IsAbout = is_about(Msg),
+    if IsAbout ->
+            store_meta(Msg, Meta);
+       true ->
+            true
+    end,
     {noreply, State}.
 
 %% info
@@ -78,6 +84,34 @@ store(Msg, Feed) ->
     FileSize = filelib:file_size(Feed),
     file:write(Out, <<FileSize:32>>),
     file:close(Out).
+
+is_about(Msg) ->
+    {DecProps} = jiffy:decode(Msg),
+    {Value} = ?pgv(<<"value">>, DecProps),
+    Content = ?pgv(<<"content">>, Value),
+    case is_binary(Content) of
+        true ->
+            false;
+        _Else ->
+            {ContentProps} = Content,
+            Type = ?pgv(<<"type">>, ContentProps),
+            case Type of
+                undefined ->
+                    false;
+                Type ->
+                    Type == <<"about">>
+            end
+    end.
+
+store_meta(Msg, Meta) ->
+    {ok, Out} = file:open(Meta, [append]),
+    DataSiz = size(Msg),
+    file:write(Out,
+               <<DataSiz:32, Msg/binary, DataSiz:32>>),
+    FileSize = filelib:file_size(Meta),
+    file:write(Out, <<FileSize:32>>),
+    file:close(Out).
+
 
 init_directories(AuthDir, Location) ->
     %% Author is already decoded as hex, use first two chars for directory
