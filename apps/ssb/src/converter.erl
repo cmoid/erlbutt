@@ -45,7 +45,7 @@ convert_terms(IoDev, Found, DataStore) ->
             store(Data, DataStore),
             SleepCnt = Found rem 500 == 0,
             if SleepCnt ->
-                    timer:sleep(1000),
+                    timer:sleep(500),
                     ?info("Sleeping... ~n", []);
                true ->
                     true
@@ -109,7 +109,7 @@ get_feed(Author, Location) ->
             Pid;
         {Pid, Count} ->
             put(Author, {Pid, Count + 1}),
-            PrintCount = Count rem 10000 == 0,
+            PrintCount = Count rem 1000 == 0,
             if PrintCount ->
                     timer:sleep(500),
                     ?info("This author ~p has ~p records ~n", [Author, Count]);

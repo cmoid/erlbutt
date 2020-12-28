@@ -35,7 +35,7 @@ start_link(FeedId, Location) ->
 %% Msg is the content field of a message, the assumption being that
 %% last_msg has all the other fields needed
 process_msg(FeedPid, Msg) ->
-    gen_server:cast(FeedPid, {process, Msg}).
+    gen_server:call(FeedPid, {process, Msg}).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -47,18 +47,19 @@ init([FeedId, Location]) ->
     {Feed, Meta} = init_directories(DecodeId, Location),
     {ok, #state{feed = Feed, meta = Meta}}.
 
-handle_call(_Request, _From, State) ->
-    {reply, ok, State}.
-
-handle_cast({process, Msg}, #state{feed = Feed, meta = Meta} = State) ->
+handle_call({process, Msg}, _From, #state{feed = Feed, meta = Meta} = State) ->
     store(Msg, Feed),
     IsAbout = is_about(Msg),
     if IsAbout ->
-            store_meta(Msg, Meta);
+            store(Msg, Meta);
        true ->
             true
     end,
+    {reply, ok, State}.
+
+handle_cast(_Request, State) ->
     {noreply, State}.
+
 
 %% info
 
@@ -102,16 +103,6 @@ is_about(Msg) ->
                     Type == <<"about">>
             end
     end.
-
-store_meta(Msg, Meta) ->
-    {ok, Out} = file:open(Meta, [append]),
-    DataSiz = size(Msg),
-    file:write(Out,
-               <<DataSiz:32, Msg/binary, DataSiz:32>>),
-    FileSize = filelib:file_size(Meta),
-    file:write(Out, <<FileSize:32>>),
-    file:close(Out).
-
 
 init_directories(AuthDir, Location) ->
     %% Author is already decoded as hex, use first two chars for directory
