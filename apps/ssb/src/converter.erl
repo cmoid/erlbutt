@@ -1,6 +1,7 @@
 %% SPDX-License-Identifier: GPL-2.0-only
 %%
 %% Copyright (C) 2020 Dionne Associates, LLC.
+
 -module(converter).
 
 %% converter is a utility that takes an existing log.offset file from the
@@ -119,7 +120,6 @@ get_feed(Author, Location) ->
             Pid;
         _Else ->
             bad
-
     end.
 
 store(Msg, Location) ->

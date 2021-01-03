@@ -40,14 +40,11 @@ init([Ip, PubKey]) ->
         {ok, {Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce}} =
             shs:client_shake_hands(connect(Ip, 8008), PubKey),
         ranch_tcp:setopts(Socket, [{active, once}]),
-        {ok, RpcPid} = rpc_processor:start_link(),
-        ?debug("processor for this client ~p is ~p ~n",[self(), RpcPid]),
         {ok, #sbox_state{socket = Socket,
                     dec_sbox_key = DecBoxKey,
                     enc_sbox_key = EncBoxKey,
                     dec_nonce = DecNonce,
-                    enc_nonce = EncNonce,
-                    rpc_proc = RpcPid}}
+                    enc_nonce = EncNonce}}
     catch
         error:Reason ->
             ?debug("Handshake failed, perhaps server is afraid of Corona beer ~p ~n",

@@ -26,12 +26,9 @@ init([Ref, Socket, Transport, _Opts = []]) ->
     %% note the return of a 0 timeout, this is required to notify
     %% ranch that it owns the socket, and start_link doesn't return
     %% until init does.
-    {ok, RpcProc} = rpc_processor:start_link(),
-    ?debug("processor for this peer ~p is ~p ~n",[self(), RpcProc]),
     {ok, #sbox_state{ref = Ref,
                 socket = Socket,
-                transport = Transport,
-                rpc_proc = RpcProc}, 0}.
+                transport = Transport}, 0}.
 
 handle_info({tcp, Socket, Data},
             #sbox_state{socket=Socket,

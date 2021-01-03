@@ -77,8 +77,7 @@ unbox_and_parse(BoxData, #sbox_state{socket=Socket,
                                 enc_sbox_key = EncBoxKey,
                                 dec_nonce = DecNonce,
                                 enc_nonce = EncNonce,
-                                rpc_rem_bytes = RpcLeftOver,
-                                rpc_proc = RpcPid} = State) ->
+                                rpc_rem_bytes = RpcLeftOver} = State) ->
     {Done, Msg, NewDecNonce, NewBoxLeftOver} =
         unbox(DecBoxKey, DecNonce,
                         BoxData),
@@ -97,9 +96,8 @@ unbox_and_parse(BoxData, #sbox_state{socket=Socket,
                        [Rest]),
                 {RpcLeftOver, EncNonce};
             {complete, {Header, Body}, Rest} ->
-                ?debug("Calling rpc with pid ~p ~n",[RpcPid]),
                 ProcEncNonce =
-                    rpc_processor:process(RpcPid, {Header, Body},
+                    rpc_processor:process({Header, Body},
                                           #ssb_conn{
                                              socket = Socket,
                                              nonce = EncNonce,

@@ -7,49 +7,18 @@
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
--behaviour(gen_server).
-
 -include("ssb.hrl").
 
 %% API
--export([start_link/0,
-         process/3,
+-export([process/2,
          create_flags/3,
          create_header/3,
          parse_flags/1]).
 
-%% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2,
-         terminate/2, code_change/3]).
-
--define(SERVER, ?MODULE).
-
--record(state, {}).
-%%%===================================================================
-%%% API
-%%%===================================================================
-process( RpcPid, {_Header, _Body} = Msg, SsbConn ) ->
-    gen_server:call(RpcPid, {process, Msg, SsbConn}).
-
-start_link() ->
-    gen_server:start_link(?MODULE, [], []).
-
-
-%%%===================================================================
-%%% gen_server boilerplate
-%%%===================================================================
-
-init([]) ->
-    process_flag(trap_exit, true),
-    {ok, #state{}}.
-
-handle_call({process, {Header, Body}, #ssb_conn{
-                                        socket = Socket,
-                                        nonce = Nonce,
-                                        secret_box = SecretBoxKey}},
-            _From,
-            #state{} = State) ->
-
+process({Header, Body}, #ssb_conn{
+                           socket = Socket,
+                           nonce = Nonce,
+                           secret_box = SecretBoxKey}) ->
     ReqNo = req_no(Header),
 
     ?debug("Please process ~p ~n from pid: ~p ~n",[{ReqNo, Body}, self()]),
@@ -57,39 +26,12 @@ handle_call({process, {Header, Body}, #ssb_conn{
     case ReqNo < 0 of
         true ->
             proc_response(ReqNo, Body),
-            {reply, Nonce, State#state{}};
+            Nonce;
         _Else ->
             ReqBod = create_req(Body),
             NewNonce = proc_request(ReqNo, ReqBod, Socket, Nonce, SecretBoxKey),
-            {reply, NewNonce, State#state{}}
-    end;
-
-handle_call(_Request, _From, State) ->
-    Reply = ok,
-    {reply, Reply, State}.
-
-handle_cast(_Msg, State) ->
-    {noreply, State}.
-
-handle_info(_Info, State) ->
-    {noreply, State}.
-
-terminate(_Reason, _State) ->
-    ok.
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
-
-%%%===================================================================
-%%% Internal functions
-%%%===================================================================
-
-req_no(Header) ->
-    <<_Flags:1/binary,
-      _BodySize:4/binary,
-      Req:4/big-signed-integer-unit:8>> = Header,
-    Req.
-
+            NewNonce
+    end.
 parse_flags(Header) ->
     <<Flags:1/binary, _Rest/binary>> = Header,
     <<_Unused:4, Stream:1, EndOrError:1, Type:2>> = Flags,
@@ -102,6 +44,17 @@ create_header(Flags, BodySize, ReqNo) ->
     <<Flags:1/binary,
       BodySize:4/big-unsigned-integer-unit:8,
       ReqNo:4/big-signed-integer-unit:8>>.
+
+
+%%%===================================================================
+%%% Internal functions
+%%%===================================================================
+
+req_no(Header) ->
+    <<_Flags:1/binary,
+      _BodySize:4/binary,
+      Req:4/big-signed-integer-unit:8>> = Header,
+    Req.
 
 create_req(Body) ->
     DecBody = jiffy:decode(Body),
