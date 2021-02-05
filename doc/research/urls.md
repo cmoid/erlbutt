@@ -10,3 +10,4 @@ https://github.com/ssb-ngi-pointer/rooms2 - Andre's rooms 2.0
 %1ts45jTyl1H+paGP9iUBa4D1/QX6UqDC+DJfpZ7Fc2U=.sha256 - Cryptix on EBT for NGI work
 %LKqAORPSwWHNrEzQGgXRVGzmy8xOej71685p26a6PSg=.sha256 - Andre's comments on moderation/blocks
 https://cblgh.org/articles/trustnet.html - Trustnet article by Cblgh
+%hW8m7+X5AmRkTDbMPgrnz8GE5BSdvOf6CA498iZENXM=.sha256 - Daan on re-sync
