@@ -48,7 +48,6 @@ cc: #erlang, #erlbutt
  * added function to fetch feed history from mnesia, and unit test
 
 ## 08-26-2020
-
  * resume project work, after missed deadline.
  * reviewed code, wondered who wrote it.
  
@@ -58,3 +57,6 @@ cc: #erlang, #erlbutt
 ## 12-18-2020
  * squash history, move files around, project notes
  * read ngi-pointer dev diaries, new info on rooms2
+
+## 02-12-2021
+ * resume project work.

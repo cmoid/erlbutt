@@ -60,7 +60,6 @@ handle_call({process, Msg}, _From, #state{feed = Feed, meta = Meta} = State) ->
 handle_cast(_Request, State) ->
     {noreply, State}.
 
-
 %% info
 
 handle_info(_Info, State) ->
