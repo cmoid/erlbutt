@@ -96,8 +96,9 @@ check_data(IoDev, Data, Len) ->
 count(Element)->
     element(2, element(2, Element)).
 
-extract_author(DataProps) ->
-    {Value} = ?pgv(<<"value">>, DataProps),
+extract_author(Msg) ->
+    {DecProps} = jiffy:decode(Msg),
+    {Value} = ?pgv(<<"value">>, DecProps),
     <<"@",Id/binary>> = ?pgv(<<"author">>, Value),
     hd(string:replace(Id,".ed25519","")).
 
@@ -124,8 +125,7 @@ get_feed(Author, Location) ->
 
 store(Msg, Location) ->
 
-    {DecProps} = jiffy:decode(Msg),
-    AuthId = extract_author(DecProps),
+    AuthId = extract_author(Msg),
 
     FeedPid = get_feed(AuthId, Location),
     ssb_feed2:process_msg(FeedPid, Msg).

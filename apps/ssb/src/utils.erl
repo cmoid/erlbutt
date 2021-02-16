@@ -20,14 +20,12 @@ concat(ListOfBins) ->
 incr(Nonce) ->
     binary:encode_unsigned(binary:decode_unsigned(Nonce) + 1).
 
+combine(nil, Bin) ->
+    Bin;
+
 combine(Bin1, Bin2) ->
-    case Bin1 of
-        nil ->
-            Bin2;
-        _ ->
-            Bin1Len = size(Bin1),
-            <<Bin1:Bin1Len/binary, Bin2/binary>>
-    end.
+    Bin1Len = size(Bin1),
+    <<Bin1:Bin1Len/binary, Bin2/binary>>.
 
 send_data(Data, Socket, Nonce, SecretBoxKey) ->
 
@@ -47,5 +45,9 @@ log(Info) ->
            [Info]).
 
 -ifdef(TEST).
+
+combine_test() ->
+    <<"foo">> = combine(nil, <<"foo">>),
+    <<"foobar">> = combine(<<"foo">>,<<"bar">>).
 
 -endif.

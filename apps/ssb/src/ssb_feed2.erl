@@ -91,6 +91,7 @@ is_about(Msg) ->
     Content = ?pgv(<<"content">>, Value),
     case is_binary(Content) of
         true ->
+            %% this is encrypted
             false;
         _Else ->
             {ContentProps} = Content,
@@ -106,12 +107,11 @@ is_about(Msg) ->
 init_directories(AuthDir, Location) ->
     %% Author is already decoded as hex, use first two chars for directory
     <<Dir:2/binary,RestAuth/binary>> = AuthDir,
-    file:make_dir(<<Location/binary,Dir/binary>>),
     FeedDir = <<Location/binary,Dir/binary,<<"/">>/binary,RestAuth/binary>>,
-    file:make_dir(FeedDir),
-    %% write msg to feed
     Feed = <<FeedDir/binary,<<"/">>/binary,<<"log.offset">>/binary>>,
     Meta = <<FeedDir/binary,<<"/">>/binary,<<"meta">>/binary>>,
+    filelib:ensure_dir(Feed),
+    filelib:ensure_dir(Meta),
     {Feed, Meta}.
 
 -ifdef(TEST).
