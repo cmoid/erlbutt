@@ -60,3 +60,10 @@ cc: #erlang, #erlbutt
 
 ## 02-12-2021
  * resume project work.
+ 
+## 02-15-2021
+ * ssb_feed2
+ * triaged and responded to planetary issues
+ 
+## 02-16-2021
+ * minor refactoring
