@@ -10,7 +10,6 @@
                   crypto,
                   observer,
                   wx,
-                  mnesia,
                   ranch,
                   enacl,
                   jiffy,
@@ -18,4 +17,5 @@
                   debugger,
                   syntax_tools,
                   tools]},
+  {env, []},
   {mod, {ssb_app, [{ssb_log_level, notice}]}}]}.

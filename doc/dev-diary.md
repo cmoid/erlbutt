@@ -67,3 +67,12 @@ cc: #erlang, #erlbutt
  
 ## 02-16-2021
  * minor refactoring
+
+## 02-23-2021
+ * fixed log offset file
+ 
+## 02-24-2021
+ * start new shard-feed branch
+ * refactor converter to run under 2 mins.
+ * rewrote `ssb_feed` to handle feed
+ * abbou profile messages stored in separate offset file

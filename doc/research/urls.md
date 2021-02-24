@@ -12,3 +12,6 @@ https://github.com/ssb-ngi-pointer/rooms2 - Andre's rooms 2.0
 https://cblgh.org/articles/trustnet.html - Trustnet article by Cblgh
 %hW8m7+X5AmRkTDbMPgrnz8GE5BSdvOf6CA498iZENXM=.sha256 - Daan on re-sync
 https://github.com/ssb-ngi-pointer/ssb-meta-feed - arj03 meta feeds
+https://xlfoundation.com - Mitchell cross licensing foundtion
+%vb0PiP6hwU6GCXT0QWlHJAoZ/Al4Vzeo23mS4NHjYpM=.sha256 - Cel on cross licensing
+%3E++5IPsLer5UbYCLKkEzPIgp0nAh7AD952XCJ7TlDs=.sha256 - Cryptix development thread

@@ -3,11 +3,6 @@
 %% Copyright (C) 2018 Dionne Associates, LLC.
 -module(ssb_feed).
 
-%% ssb_feed is a gen_server that represents a single feed. When it
-%% is initialized with an id, it retrieves the latest message for the feed
-%% and stores it in the state of the gen_server. As new messages are posted
-%% they are appended to the feed as per the protocol and persisted in
-%% the mnesia table.
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 -endif.
@@ -16,24 +11,13 @@
 
 -behaviour(gen_server).
 
--import(msg_store,
-        [persist/1,
-         fetch_latest_msg/1,
-         fetch_msg/1,
-         fetch_msgs_author/1,
-         fetch_history_feed/2]
-       ).
-
--import(message,
-        [encn_store/3]
-       ).
-
 %% API
--export([start_link/0,
-         start_link/1]).
+-export([start_link/2]).
 
--export([post_msg/1,
-         reinit/0]).
+-export([open/1,
+         close/1,
+         process_msg/2,
+         fetch_msg/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -41,48 +25,84 @@
 
 -define(SERVER, ?MODULE).
 
--record(state, {last_msg}).
+-record(state, {id,
+                feed_open = false,
+                feed,
+                feed_file = nil,
+                meta,
+                meta_file = nil,
+                msg_cache}).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 
-start_link() ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [keys:pub_key()], []).
-
-start_link(Id) ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [Id], []).
-
+start_link(FeedId, Location) ->
+    gen_server:start_link(?MODULE, [FeedId, Location], []).
 
 %% Msg is the content field of a message, the assumption being that
 %% last_msg has all the other fields needed
-post_msg(Msg) ->
-    gen_server:cast(?MODULE, {post, Msg}).
+process_msg(FeedPid, Msg) ->
+    gen_server:call(FeedPid, {process, Msg}).
+
+fetch_msg(FeedPid, Key) ->
+    gen_server:call(FeedPid, {fetch, Key}).
+
+open(Pid) ->
+    gen_server:call(Pid, {open}).
+
+close(Pid) ->
+    gen_server:call(Pid, {close}).
 
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
-init([Id]) ->
+init([FeedId, Location]) ->
     process_flag(trap_exit, true),
-    %% initialize state with last_msg from database
-    {ok, #state{last_msg = fetch_latest_msg(Id)}}.
+    <<"@",Id/binary>> = FeedId,
+    RawId = hd(string:replace(Id,".ed25519","")),
+    DecodeId = integer_to_binary(binary:decode_unsigned(base64:decode(RawId)),16),
+    {Feed, Meta} = init_directories(DecodeId, Location),
+    {ok, #state{id = FeedId,
+                feed = Feed,
+                meta = Meta,
+                msg_cache = ets:new(messages, [])}}.
 
-reinit() ->
-    ok == gen_server:call(?MODULE, {reinit}).
+handle_call({open}, _From, #state{feed_open = false} = State) ->
+    NewState = open_feed(State),
+    {reply, ok, NewState};
 
-handle_call({reinit}, _From, State) ->
-    LatestMsg = fetch_latest_msg(keys:pub_key()),
-    {reply, ok, State#state{last_msg = LatestMsg}}.
+handle_call({close}, _From, #state{feed_open = true} = State) ->
+    NewState = close_feed(State),
+    {reply, ok, NewState};
 
-%% casts
+handle_call({close}, _From, #state{feed_open = false} = State) ->
+    {reply, ok, State};
 
-handle_cast({post, Msg}, #state{last_msg = LastMsg} = State) ->
-    %% create and persist new msg appended to feed
-    NewMsg = postn_store(Msg, LastMsg),
-    {noreply, State#state{last_msg = NewMsg}};
+handle_call({process, Msg}, _From, #state{feed_open = true} = State) ->
+    NewState = store(Msg, State),
+    {reply, ok, NewState};
 
-handle_cast(_OtherMsg, State) ->
+handle_call({process, Msg}, _From, #state{feed_open = false} = State) ->
+    OpenState = open_feed(State),
+    NewState = store(Msg, OpenState),
+    ClosedState = close_feed(NewState),
+    {reply, ok, ClosedState};
+
+handle_call({fetch, Key}, _From, #state{feed = Feed,
+                                       msg_cache = Messages} = State) ->
+    Val = ets:lookup(Messages, Key),
+    {Pos, Msg} = feed_get(Feed, Val, Key),
+    case Val of
+        [] ->
+            ets:insert(Messages, {Key, Pos});
+        _Else ->
+            nop
+    end,
+    {reply, Msg, State}.
+
+handle_cast(_Request, State) ->
     {noreply, State}.
 
 %% info
@@ -101,76 +121,159 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+store(Msg, #state{id = Id,
+                feed_open = true,
+                feed = Feed,
+                feed_file = F,
+                meta = Meta,
+                meta_file = M} = State) ->
+    write_msg(Msg, F, Feed),
+    IsAbout = is_about(Msg, Id),
+    if IsAbout ->
+            write_msg(Msg, M, Meta);
+       true ->
+            nop
+    end,
+    State;
 
-postn_store(Msg, nil) ->
-    %% First time there is no last msg
-    Previous = nil,
-    Sequence = 1,
-    encn_store(Previous, Sequence, Msg);
+store(_Msg, #state{feed_open = false} = State) ->
+    State.
 
-postn_store(Msg, LastMsg) ->
-    %% create a new msg pointing back to the last msg
-    Previous = LastMsg#message.id,
-    Sequence = LastMsg#message.sequence + 1,
-    encn_store(Previous, Sequence, Msg).
+
+write_msg(Msg, O, Store) ->
+    DataSiz = size(Msg),
+    file:write(O,
+               <<DataSiz:32, Msg/binary, DataSiz:32>>),
+    FileSize = filelib:file_size(Store) + 4,
+    file:write(O, <<FileSize:32>>).
+
+is_about(Msg, Id) ->
+    {DecProps} = jiffy:decode(Msg),
+    {Value} = ?pgv(<<"value">>, DecProps),
+    Content = ?pgv(<<"content">>, Value),
+    case is_binary(Content) of
+        true ->
+            %% this is encrypted
+            false;
+        _Else ->
+            {ContentProps} = Content,
+            Type = ?pgv(<<"type">>, ContentProps),
+            About = ?pgv(<<"about">>, ContentProps),
+            case Type of
+                undefined ->
+                    false;
+                Type ->
+                    (Type == <<"about">>) andalso
+                        (About == Id)
+            end
+    end.
+
+init_directories(AuthDir, Location) ->
+    %% Author is already decoded as hex, use first two chars for directory
+    <<Dir:2/binary,RestAuth/binary>> = AuthDir,
+    FeedDir = <<Location/binary,Dir/binary,<<"/">>/binary,RestAuth/binary>>,
+    Feed = <<FeedDir/binary,<<"/">>/binary,<<"log.offset">>/binary>>,
+    Meta = <<FeedDir/binary,<<"/">>/binary,<<"meta">>/binary>>,
+    filelib:ensure_dir(Feed),
+    filelib:ensure_dir(Meta),
+    {Feed, Meta}.
+
+feed_get(Feed, [], Key) ->
+    ?info("opening ~p ~n",[Feed]),
+    case file:open(Feed, [read, binary]) of
+        {ok, IoDev} ->
+            scan(IoDev, 0, Key);
+        {error, enoent} ->
+            ?info("Probably bad input ~n",[]),
+            done
+    end;
+
+feed_get(Feed, [{Key, Pos}], Key) ->
+    case file:open(Feed, [read, binary]) of
+        {ok, IoDev} ->
+            file:position(IoDev, Pos),
+            scan(IoDev, Pos, Key);
+        {error, enoent} ->
+            ?info("Probably bad input ~n",[]),
+            done
+    end.
+
+scan(IoDev, Pos, Key) ->
+    case load_term(IoDev) of
+        {ok, Data} ->
+            {DataProps} = jiffy:decode(Data),
+            KeyVal = ?pgv(<<"key">>, DataProps),
+            if KeyVal == Key ->
+                    {Pos, Data};
+               true ->
+                    {ok, <<NextPos:32/integer>>} = file:read(IoDev, 4),
+                    scan(IoDev, NextPos, Key)
+            end;
+        {error, eof} ->
+            ?info("Key not found: ~p ~n",[Key]),
+            not_found;
+        {error, Error} ->
+            ?info("Error ~p scanning for key: ~p ~n",[Error, Key])
+    end.
+
+
+load_term(IoDev) ->
+    case file:read(IoDev, 4) of
+        {ok, <<TermLenInt:32/integer>>} ->
+            case file:read(IoDev, TermLenInt) of
+                {ok, TermData} ->
+                    check_data(IoDev, TermData, TermLenInt);
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        eof ->
+            {error, eof};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+
+check_data(IoDev, Data, Len) ->
+    case file:read(IoDev, 4) of
+        {ok, TermLen} ->
+            <<TermLenInt:32/integer>> = TermLen,
+            %% the length of the term is also stored at the end of the term
+            %% and can be used to check
+            if TermLenInt == Len ->
+                    {ok, Data};
+               true ->
+                    {error, data_size_no_match}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+open_feed(#state{feed_open = false,
+                 feed = Feed,
+                 meta = Meta} = State) ->
+    FileOpen = file:open(Feed, [append]),
+    MetaOpen = file:open(Meta, [append]),
+    case {FileOpen, MetaOpen} of
+        {{ok, F}, {ok, M}} ->
+            State#state{feed_open = true,
+                feed_file = F,
+                meta_file = M};
+        _Else ->
+            State
+    end.
+
+close_feed(#state{feed_open = true,
+                  feed_file = F,
+                  meta_file = M} = State) ->
+    file:close(F),
+    file:close(M),
+    State#state{feed_open = false,
+                feed_file = nil,
+                meta_file = nil};
+close_feed(#state{feed_open = false} = State) ->
+    State.
+
 
 -ifdef(TEST).
-
-simple_test() ->
-    init_apps(),
-    post_msg(<<"foo">>),
-    post_msg(<<"bar">>),
-    timer:sleep(500),
-    ?assert(true),
-    clear().
-
-retrieve_test() ->
-    reinit(),
-    Msg = postn_store(<<"retrieve">>, nil),
-    timer:sleep(500),
-    RetMsg = fetch_msg(Msg#message.id),
-    ?assert(RetMsg#message.id == Msg#message.id),
-    clear().
-
-retrieve_index_test() ->
-    reinit(),
-    Msg = postn_store(<<"index">>, nil),
-    timer:sleep(500),
-    [RetMsg] = fetch_msgs_author(Msg#message.author),
-    ?assert(RetMsg#message.id == Msg#message.id),
-    clear().
-
-create_feed_test() ->
-    reinit(),
-    post_msg(<<"foo">>),
-    post_msg(<<"bar">>),
-    post_msg(<<"baz">>),
-    timer:sleep(500),
-    Msgs = fetch_msgs_author(keys:pub_key()),
-    ?assert(length(Msgs) == 3),
-    LastMsg = msg_store:fetch_latest_msg(keys:pub_key()),
-    ?assert(LastMsg#message.content == <<"baz">>),
-    clear().
-
-create_history_test() ->
-    reinit(),
-    post_msg(<<"foo">>),
-    post_msg(<<"bar">>),
-    post_msg(<<"baz">>),
-    timer:sleep(500),
-    Msgs = fetch_history_feed(keys:pub_key(), 0),
-    ?assert(length(Msgs) == 3),
-    Msgs2 = fetch_history_feed(keys:pub_key(), 1),
-    ?assert(length(Msgs2) == 2),
-    clear().
-
-init_apps() ->
-    application:ensure_all_started(ssb),
-    keys:start_link(),
-    start_link().
-
-clear() ->
-    mnesia:clear_table(message).
-
 
 -endif.

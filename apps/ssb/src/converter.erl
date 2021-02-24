@@ -11,9 +11,9 @@
 
 -include("ssb.hrl").
 
--export([convert/1]).
+-export([convert/2]).
 
-convert(OffsetLog)->
+convert(OffsetLog, Sleep)->
     %% create initial store if needed, this info will come from config or
     %% environment at build time
     {ok, [[Home]]} = init:get_argument(home),
@@ -23,11 +23,12 @@ convert(OffsetLog)->
 
     case file:open(File, [read, binary]) of
         {ok, IoDev} ->
-            convert_terms(IoDev, 0, DataStore),
+            convert_terms(IoDev, 0, DataStore, Sleep),
             file:close(IoDev),
             ?info("There are ~p ids in this log ~n",[length(get())]),
             {BiggestId, NoMsgs} =
                 lists:foldl(fun(Elem, Acc) ->
+                                    close(Elem),
                                     case count(Elem) > count(Acc) of
                                         true -> Elem;
                                         _Else -> Acc
@@ -40,13 +41,13 @@ convert(OffsetLog)->
             done
     end.
 
-convert_terms(IoDev, Found, DataStore) ->
+convert_terms(IoDev, Found, DataStore, Sleep) ->
     case load_term(IoDev) of
         {ok, Data} ->
-            store(Data, DataStore),
-            SleepCnt = Found rem 500 == 0,
+            store(Data, DataStore, Sleep),
+            SleepCnt = Found rem 20000 == 0,
             if SleepCnt ->
-                    timer:sleep(500),
+                    timer:sleep(Sleep),
                     ?info("Sleeping... ~n", []);
                true ->
                     true
@@ -55,7 +56,7 @@ convert_terms(IoDev, Found, DataStore) ->
             %% up in the next iteration
             {ok, <<_PosInt:32/integer>>} = file:read(IoDev, 4),
             %%?info("The pos is ~p ~n",[PosInt]),
-            convert_terms(IoDev, Found + 1, DataStore);
+            convert_terms(IoDev, Found + 1, DataStore, Sleep);
         {error, eof} ->
             ?info("Found ~p messages ~n",[Found]),
             done;
@@ -96,24 +97,33 @@ check_data(IoDev, Data, Len) ->
 count(Element)->
     element(2, element(2, Element)).
 
+close(Element) ->
+    Pid = element(1, element(2, Element)),
+    ssb_feed:close(Pid).
+
 extract_author(Msg) ->
     {DecProps} = jiffy:decode(Msg),
     {Value} = ?pgv(<<"value">>, DecProps),
-    <<"@",Id/binary>> = ?pgv(<<"author">>, Value),
-    hd(string:replace(Id,".ed25519","")).
+    ?pgv(<<"author">>, Value).
 
-get_feed(Author, Location) ->
+get_feed(Author, Location, Sleep) ->
     Val = get(Author),
     case Val of
         undefined ->
-            {ok, Pid} = ssb_feed2:start_link(Author, Location),
+            {ok, Pid} = ssb_feed:start_link(Author, Location),
+            TooMany = length(get()) > 8000,
+            if not TooMany ->
+                    ssb_feed:open(Pid);
+               true ->
+                    nop
+            end,
             put(Author, {Pid, 1}),
             Pid;
         {Pid, Count} ->
             put(Author, {Pid, Count + 1}),
-            PrintCount = Count rem 1000 == 0,
+            PrintCount = Count rem 10000 == 0,
             if PrintCount ->
-                    timer:sleep(500),
+                    timer:sleep(Sleep),
                     ?info("This author ~p has ~p records ~n", [Author, Count]);
                true ->
                     true
@@ -123,9 +133,9 @@ get_feed(Author, Location) ->
             bad
     end.
 
-store(Msg, Location) ->
+store(Msg, Location, Sleep) ->
 
     AuthId = extract_author(Msg),
 
-    FeedPid = get_feed(AuthId, Location),
-    ssb_feed2:process_msg(FeedPid, Msg).
+    FeedPid = get_feed(AuthId, Location, Sleep),
+    ssb_feed:process_msg(FeedPid, Msg).

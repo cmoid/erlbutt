@@ -8,10 +8,6 @@
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
--import(msg_store,
-        [persist/1]
-       ).
-
 %% API
 -export([build_msg/1,
         encn_store/3]).
@@ -36,7 +32,6 @@ encn_store(Previous, Sequence, Msg) ->
     EncSig = ?l2b(base_64(Sig) ++ ".sig.ed25519"),
     %% Now add the sig to original msg
     NewMsgSig = add_sig(NewMsg, EncSig),
-    store_post(NewMsgSig),
     NewMsgSig.
 
 % Build a message record, checking that it's valid based on
@@ -135,13 +130,3 @@ base_64(Binary) ->
 
 current_time() ->
     erlang:system_time(millisecond).
-
--ifdef(TEST).
-store_post(Msg) ->
-    ?debugFmt("The post in test mode is ~p ~n",[Msg]),
-    ok = persist(Msg).
--else.
-store_post(Msg) ->
-    ?info("The post is ~p ~n",[Msg]),
-    ok = persist(Msg).
--endif.

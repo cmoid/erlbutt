@@ -25,28 +25,11 @@ start(_StartType, _StartArgs) ->
     logger:set_primary_config(level, LogLevel),
     logger:set_module_level(supervisor, error),
 
-    application:stop(mnesia),
-    case mnesia:create_schema([node()]) of
-        ok ->
-            %% this is first time
-            ?info("Schema was just initialized, so build tables ~n",[]),
-            application:start(mnesia, permanent),
-            build_tables();
-        {error, {_, {already_exists, _}}} ->
-            ?info("Schema already exists so just start up mnesia ~n",[]),
-            application:start(mnesia, permanent)
-    end,
     ssb_sup:start_link().
 
 stop(_State) ->
     ok.
 
-build_tables() ->
-    mnesia:create_table(message, [{disc_copies, [node()]},
-                                  {attributes, record_info(fields, message)}]),
-    mnesia:add_table_copy(message, node(), ram_copies),
-    mnesia:add_table_index(message, #message.author),
-    mnesia:add_table_index(message, #message.sequence).
 
 -ifdef(TEST).
 
