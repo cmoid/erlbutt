@@ -111,7 +111,8 @@ get_feed(Author, Location, Sleep) ->
     case Val of
         undefined ->
             {ok, Pid} = ssb_feed:start_link(Author, Location),
-            TooMany = length(get()) > 8000,
+
+            TooMany = length(get()) > 1000,
             if not TooMany ->
                     ssb_feed:open(Pid);
                true ->

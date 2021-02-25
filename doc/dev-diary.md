@@ -74,5 +74,8 @@ cc: #erlang, #erlbutt
 ## 02-24-2021
  * start new shard-feed branch
  * refactor converter to run under 2 mins.
- * rewrote `ssb_feed` to handle feed
- * abbou profile messages stored in separate offset file
+ * rewrote `ssb_feed` to handle feeds
+ * about profile messages stored in separate offset file
+
+## 02-25-2021
+ * make sure files sync when `gen_servers` close

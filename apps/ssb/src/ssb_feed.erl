@@ -112,7 +112,13 @@ handle_info(_Info, State) ->
 
 %%
 
-terminate(_Reason, _State) ->
+terminate(Reason, #state{feed_open = IsOpen} = State) ->
+    ?info("Closed gen_server: ~p ~n",[Reason]),
+    if IsOpen ->
+            close_feed(State);
+       true ->
+            nop
+    end,
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -142,10 +148,10 @@ store(_Msg, #state{feed_open = false} = State) ->
 
 write_msg(Msg, O, Store) ->
     DataSiz = size(Msg),
-    file:write(O,
+    ok = file:write(O,
                <<DataSiz:32, Msg/binary, DataSiz:32>>),
     FileSize = filelib:file_size(Store) + 4,
-    file:write(O, <<FileSize:32>>).
+    ok = file:write(O, <<FileSize:32>>).
 
 is_about(Msg, Id) ->
     {DecProps} = jiffy:decode(Msg),
@@ -265,8 +271,10 @@ open_feed(#state{feed_open = false,
 close_feed(#state{feed_open = true,
                   feed_file = F,
                   meta_file = M} = State) ->
-    file:close(F),
-    file:close(M),
+    ok = file:sync(F),
+    ok = file:sync(M),
+    ok = file:close(F),
+    ok = file:close(M),
     State#state{feed_open = false,
                 feed_file = nil,
                 meta_file = nil};
