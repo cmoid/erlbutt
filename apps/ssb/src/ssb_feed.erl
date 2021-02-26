@@ -73,11 +73,16 @@ handle_call({open}, _From, #state{feed_open = false} = State) ->
     NewState = open_feed(State),
     {reply, ok, NewState};
 
+handle_call({open}, _From, #state{feed_open = true} = State) ->
+    %% already open, do nothing
+    {reply, ok, State};
+
 handle_call({close}, _From, #state{feed_open = true} = State) ->
     NewState = close_feed(State),
     {reply, ok, NewState};
 
 handle_call({close}, _From, #state{feed_open = false} = State) ->
+    %% already closed, do nothing
     {reply, ok, State};
 
 handle_call({process, Msg}, _From, #state{feed_open = true} = State) ->
