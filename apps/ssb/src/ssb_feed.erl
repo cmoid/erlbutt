@@ -15,6 +15,7 @@
 -export([start_link/2]).
 
 -export([open/1,
+         is_open/1,
          close/1,
          process_msg/2,
          fetch_msg/2]).
@@ -32,7 +33,6 @@
                 meta,
                 meta_file = nil,
                 msg_cache}).
-
 %%%===================================================================
 %%% API
 %%%===================================================================
@@ -50,6 +50,9 @@ fetch_msg(FeedPid, Key) ->
 
 open(Pid) ->
     gen_server:call(Pid, {open}).
+
+is_open(Pid) ->
+    gen_server:call(Pid, {is_open}).
 
 close(Pid) ->
     gen_server:call(Pid, {close}).
@@ -76,6 +79,13 @@ handle_call({open}, _From, #state{feed_open = false} = State) ->
 handle_call({open}, _From, #state{feed_open = true} = State) ->
     %% already open, do nothing
     {reply, ok, State};
+
+handle_call({is_open}, _From, #state{feed_open = false} = State) ->
+    {reply, false, State};
+
+handle_call({is_open}, _From, #state{feed_open = true} = State) ->
+    {reply, true, State};
+
 
 handle_call({close}, _From, #state{feed_open = true} = State) ->
     NewState = close_feed(State),
@@ -112,7 +122,8 @@ handle_cast(_Request, State) ->
 
 %% info
 
-handle_info(_Info, State) ->
+handle_info(Info, State) ->
+    ?info("WTF: ~p ~n",[Info]),
     {noreply, State}.
 
 %%
@@ -262,22 +273,21 @@ check_data(IoDev, Data, Len) ->
 open_feed(#state{feed_open = false,
                  feed = Feed,
                  meta = Meta} = State) ->
-    FileOpen = file:open(Feed, [append]),
-    MetaOpen = file:open(Meta, [append]),
+    FileOpen = file:open(Feed, [append, sync]),
+    MetaOpen = file:open(Meta, [append, sync]),
     case {FileOpen, MetaOpen} of
         {{ok, F}, {ok, M}} ->
             State#state{feed_open = true,
                 feed_file = F,
                 meta_file = M};
-        _Else ->
+        Else ->
+            ?info("Tried to open failed: ~p ~n",[Else]),
             State
     end.
 
 close_feed(#state{feed_open = true,
                   feed_file = F,
                   meta_file = M} = State) ->
-    ok = file:sync(F),
-    ok = file:sync(M),
     ok = file:close(F),
     ok = file:close(M),
     State#state{feed_open = false,

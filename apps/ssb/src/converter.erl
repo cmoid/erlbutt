@@ -21,6 +21,8 @@ convert(OffsetLog, Sleep)->
     DataStore = ?l2b(Home ++ "/.ssberl/feeds/"),
     file:make_dir(DataStore),
 
+    put(<<"feed_cnt">>,0),
+
     case file:open(File, [read, binary]) of
         {ok, IoDev} ->
             convert_terms(IoDev, 0, DataStore, Sleep),
@@ -94,12 +96,17 @@ check_data(IoDev, Data, Len) ->
             {error, Reason}
     end.
 
-count(Element)->
-    element(2, element(2, Element)).
+close({<<"feed_cnt">>, _Rest}) ->
+    nop;
 
-close(Element) ->
-    Pid = element(1, element(2, Element)),
+close({_key, {Pid, _Count}}) ->
     ssb_feed:close(Pid).
+
+count({<<"feed_cnt">>, _Rest}) ->
+    0;
+
+count({_key, {_Pid, Count}}) ->
+    Count.
 
 extract_author(Msg) ->
     {DecProps} = jiffy:decode(Msg),
@@ -107,20 +114,18 @@ extract_author(Msg) ->
     ?pgv(<<"author">>, Value).
 
 get_feed(Author, Location, Sleep) ->
+    check_open_feeds(),
     Val = get(Author),
     case Val of
         undefined ->
             {ok, Pid} = ssb_feed:start_link(Author, Location),
+            ssb_feed:open(Pid),
+            put(<<"feed_cnt">>,get(<<"feed_cnt">>) + 1),
 
-            TooMany = length(get()) > 1000,
-            if not TooMany ->
-                    ssb_feed:open(Pid);
-               true ->
-                    nop
-            end,
             put(Author, {Pid, 1}),
             Pid;
         {Pid, Count} ->
+            check_is_open(Pid),
             put(Author, {Pid, Count + 1}),
             PrintCount = Count rem 10000 == 0,
             if PrintCount ->
@@ -140,3 +145,25 @@ store(Msg, Location, Sleep) ->
 
     FeedPid = get_feed(AuthId, Location, Sleep),
     ssb_feed:process_msg(FeedPid, Msg).
+
+check_open_feeds() ->
+    TooMany = get(<<"feed_cnt">>) > 1200,
+    if TooMany ->
+            ?info("Seen how many uniue feeds: ~p ~n",[length(get())]),
+            lists:map(fun(Elem) ->
+                              close(Elem),
+                              Elem
+                      end, get()),
+            put(<<"feed_cnt">>,0);
+       true ->
+            nop
+    end.
+
+check_is_open(Pid) ->
+    IsOpen = ssb_feed:is_open(Pid),
+    if IsOpen ->
+            nop;
+       true ->
+            ssb_feed:open(Pid),
+            put(<<"feed_cnt">>, get(<<"feed_cnt">>) + 1)
+    end.

@@ -13,4 +13,4 @@ _build
 .DS_Store
 foo
 foobar
-log.offset
+*.offset
