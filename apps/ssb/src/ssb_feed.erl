@@ -18,7 +18,8 @@
          is_open/1,
          close/1,
          process_msg/2,
-         fetch_msg/2]).
+         fetch_msg/2,
+         foldl/3]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -47,6 +48,9 @@ process_msg(FeedPid, Msg) ->
 
 fetch_msg(FeedPid, Key) ->
     gen_server:call(FeedPid, {fetch, Key}).
+
+foldl(FeedPid, Fun, Acc) ->
+    gen_server:call(FeedPid, {foldl, Fun, Acc}).
 
 open(Pid) ->
     gen_server:call(Pid, {open}).
@@ -115,7 +119,20 @@ handle_call({fetch, Key}, _From, #state{feed = Feed,
         _Else ->
             nop
     end,
-    {reply, Msg, State}.
+    {reply, Msg, State};
+
+handle_call({foldl, Fun, Acc}, _From, #state{feed = Feed} = State) ->
+    Result =
+        case file:open(Feed, [read, binary]) of
+            {ok, IoDev} ->
+                int_foldr(Fun, Acc, IoDev);
+            {error, enoent} ->
+                ?info("Ill formed feed ~n",[]),
+                done
+        end,
+
+    {reply, Result, State}.
+
 
 handle_cast(_Request, State) ->
     {noreply, State}.
@@ -236,6 +253,16 @@ scan(IoDev, Pos, Key) ->
             not_found;
         {error, Error} ->
             ?info("Error ~p scanning for key: ~p ~n",[Error, Key])
+    end.
+
+int_foldr(Fun, Acc, IoDev) ->
+    case load_term(IoDev) of
+        {ok, Data} ->
+            file:read(IoDev, 4),
+            int_foldr(Fun, Fun(Data, Acc), IoDev);
+        {error, _Error} ->
+            file:close(IoDev),
+            Acc
     end.
 
 
