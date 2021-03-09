@@ -19,7 +19,8 @@
          close/1,
          process_msg/2,
          fetch_msg/2,
-         foldl/3]).
+         foldl/3,
+         direct_follows/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -51,6 +52,17 @@ fetch_msg(FeedPid, Key) ->
 
 foldl(FeedPid, Fun, Acc) ->
     gen_server:call(FeedPid, {foldl, Fun, Acc}).
+
+direct_follows(FeedPid) ->
+    Fun = fun(Data, Acc) ->
+                  Follow = utils:is_follow(Data),
+                  case Follow of
+                      nope -> Acc;
+                      {Id, true} -> [Id | Acc];
+                      {Id, false} -> lists:delete(Id, Acc)
+                  end
+          end,
+    gen_server:call(FeedPid, {foldl, Fun, []}).
 
 open(Pid) ->
     gen_server:call(Pid, {open}).

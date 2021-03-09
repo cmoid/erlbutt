@@ -12,7 +12,8 @@
          incr/1,
          combine/2,
          send_data/4,
-         log/1]).
+         log/1,
+         is_follow/1]).
 
 concat(ListOfBins) ->
     iolist_to_binary(ListOfBins).
@@ -43,6 +44,32 @@ log({Socket, Data}) ->
 log(Info) ->
     ?debug("received random info message ~p ~n",
            [Info]).
+
+is_follow(Msg) ->
+    {DecProps} = jiffy:decode(Msg),
+    {Value} = ?pgv(<<"value">>, DecProps),
+    Val = ?pgv(<<"content">>, Value),
+    if is_binary(Val) ->
+            nope;
+       true ->
+            {Content} = Val,
+            Type = ?pgv(<<"type">>, Content),
+            case Type of
+                <<"contact">> ->
+                    Contact = ?pgv(<<"contact">>, Content),
+                    Following = ?pgv(<<"following">>, Content),
+                    case Following of
+                        true ->
+                            {Contact, true};
+                        false ->
+                            {Contact, false};
+                        _Else ->
+                            nope
+                    end;
+                _Else ->
+                    nope
+            end
+    end.
 
 -ifdef(TEST).
 
