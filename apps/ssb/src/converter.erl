@@ -11,9 +11,9 @@
 
 -include("ssb.hrl").
 
--export([convert/2]).
+-export([convert/3]).
 
-convert(OffsetLog, Sleep)->
+convert(OffsetLog, Sleep, Feeds)->
     %% create initial store if needed, this info will come from config or
     %% environment at build time
     {ok, [[Home]]} = init:get_argument(home),
@@ -25,9 +25,9 @@ convert(OffsetLog, Sleep)->
 
     case file:open(File, [read, binary]) of
         {ok, IoDev} ->
-            convert_terms(IoDev, 0, DataStore, Sleep),
+            convert_terms(IoDev, 0, DataStore, Sleep, Feeds),
             file:close(IoDev),
-            ?info("There are ~p ids in this log ~n",[length(get())]),
+            ?info("There are ~p ids in this log ~n",[length(get()) - 1]),
             {BiggestId, NoMsgs} =
                 lists:foldl(fun(Elem, Acc) ->
                                     close(Elem),
@@ -43,10 +43,10 @@ convert(OffsetLog, Sleep)->
             done
     end.
 
-convert_terms(IoDev, Found, DataStore, Sleep) ->
+convert_terms(IoDev, Found, DataStore, Sleep, Feeds) ->
     case load_term(IoDev) of
         {ok, Data} ->
-            store(Data, DataStore, Sleep),
+            store(Data, DataStore, Sleep, Feeds),
             SleepCnt = Found rem 20000 == 0,
             if SleepCnt ->
                     timer:sleep(Sleep),
@@ -58,7 +58,7 @@ convert_terms(IoDev, Found, DataStore, Sleep) ->
             %% up in the next iteration
             {ok, <<_PosInt:32/integer>>} = file:read(IoDev, 4),
             %%?info("The pos is ~p ~n",[PosInt]),
-            convert_terms(IoDev, Found + 1, DataStore, Sleep);
+            convert_terms(IoDev, Found + 1, DataStore, Sleep, Feeds);
         {error, eof} ->
             ?info("Found ~p messages ~n",[Found]),
             done;
@@ -139,12 +139,18 @@ get_feed(Author, Location, Sleep) ->
             bad
     end.
 
-store(Msg, Location, Sleep) ->
+store(Msg, Location, Sleep, Feeds) ->
 
     AuthId = extract_author(Msg),
 
-    FeedPid = get_feed(AuthId, Location, Sleep),
-    ssb_feed:process_msg(FeedPid, Msg).
+    Belongs = lists:member(AuthId, Feeds),
+
+    if Belongs ->
+            FeedPid = get_feed(AuthId, Location, Sleep),
+            ssb_feed:process_msg(FeedPid, Msg);
+       true ->
+            nop
+    end.
 
 check_open_feeds() ->
     TooMany = get(<<"feed_cnt">>) > 1200,
