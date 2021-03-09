@@ -10,7 +10,36 @@
 
 %% API
 -export([build_msg/1,
-        encn_store/3]).
+         is_follow/1,
+         validate_msg/1,
+         encn_store/3]).
+
+is_follow(Msg) ->
+    {DecProps} = jiffy:decode(Msg),
+    {Value} = ?pgv(<<"value">>, DecProps),
+    Val = ?pgv(<<"content">>, Value),
+    if is_binary(Val) ->
+            nope;
+       true ->
+            {Content} = Val,
+            Type = ?pgv(<<"type">>, Content),
+            case Type of
+                <<"contact">> ->
+                    Contact = ?pgv(<<"contact">>, Content),
+                    Following = ?pgv(<<"following">>, Content),
+                    case Following of
+                        true ->
+                            {Contact, true};
+                        false ->
+                            {Contact, false};
+                        _Else ->
+                            nope
+                    end;
+                _Else ->
+                    nope
+            end
+    end.
+
 
 encn_store(Previous, Sequence, Msg) ->
     Author = keys:pub_key(),
@@ -40,7 +69,7 @@ build_msg(DecDataProps) ->
     Key = ?pgv(<<"key">>, DecDataProps),
     {Value} = ?pgv(<<"value">>, DecDataProps),
 
-    validate(Key, Value),
+    validate(Value),
 
     #message{id = Key,
              previous = ?pgv(<<"previous">>, Value),
@@ -51,9 +80,17 @@ build_msg(DecDataProps) ->
              content = ?pgv(<<"content">>, Value),
              signature = ?pgv(<<"signature">>, Value)}.
 
+validate_msg(Msg) ->
+
+    {DecDataProps} = jiffy:decode(Msg),
+    {Value} = ?pgv(<<"value">>, DecDataProps),
+
+    validate(Value).
+
+
 %% Internal functions
 
-validate(Key, MsgProps) ->
+validate(MsgProps) ->
     Author = ?pgv(<<"author">>, MsgProps),
 
     %% remove signature from message and encode as json
@@ -67,19 +104,7 @@ validate(Key, MsgProps) ->
     SigDec = base64:decode(hd(string:replace(Sig,".sig.ed25519",""))),
 
     %% verify
-    Result = enacl:sign_verify_detached(SigDec, EncMsg, AuthorPk),
-
-    case Result of
-        true ->
-            ?info("This is a valid msg ~p ~n",[Key]);
-        false ->
-            %% assuming we only want to store valid messages, currently
-            %% we have 11 out of 1.2M messages that are invalid. The culprit
-            %% is most likely UTF-8 issues from JS land. Will revisit later
-            %% and if need be store a validity boolean in the message mnesia
-            %% records.
-            ?info("This failed to validate ~p ~n",[{Key, DelSigProps, EncMsg}])
-    end.
+    enacl:sign_verify_detached(SigDec, EncMsg, AuthorPk).
 
 % scuttlebutt protocol requires json keys be in a specific order for
 % message signing, this order is based on the javascript implementation

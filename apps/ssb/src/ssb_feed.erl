@@ -17,7 +17,7 @@
 -export([open/1,
          is_open/1,
          close/1,
-         process_msg/2,
+         store_msg/2,
          fetch_msg/2,
          foldl/3,
          direct_follows/1]).
@@ -44,8 +44,8 @@ start_link(FeedId, Location) ->
 
 %% Msg is the content field of a message, the assumption being that
 %% last_msg has all the other fields needed
-process_msg(FeedPid, Msg) ->
-    gen_server:call(FeedPid, {process, Msg}).
+store_msg(FeedPid, Msg) ->
+    gen_server:call(FeedPid, {store, Msg}).
 
 fetch_msg(FeedPid, Key) ->
     gen_server:call(FeedPid, {fetch, Key}).
@@ -55,7 +55,7 @@ foldl(FeedPid, Fun, Acc) ->
 
 direct_follows(FeedPid) ->
     Fun = fun(Data, Acc) ->
-                  Follow = utils:is_follow(Data),
+                  Follow = message:is_follow(Data),
                   case Follow of
                       nope -> Acc;
                       {Id, true} -> [Id | Acc];
@@ -111,11 +111,11 @@ handle_call({close}, _From, #state{feed_open = false} = State) ->
     %% already closed, do nothing
     {reply, ok, State};
 
-handle_call({process, Msg}, _From, #state{feed_open = true} = State) ->
+handle_call({store, Msg}, _From, #state{feed_open = true} = State) ->
     NewState = store(Msg, State),
     {reply, ok, NewState};
 
-handle_call({process, Msg}, _From, #state{feed_open = false} = State) ->
+handle_call({store, Msg}, _From, #state{feed_open = false} = State) ->
     OpenState = open_feed(State),
     NewState = store(Msg, OpenState),
     ClosedState = close_feed(NewState),

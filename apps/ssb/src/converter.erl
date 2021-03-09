@@ -50,7 +50,7 @@ convert_terms(IoDev, Found, DataStore, Sleep, Feeds) ->
             SleepCnt = Found rem 20000 == 0,
             if SleepCnt ->
                     timer:sleep(Sleep),
-                    ?info("Sleeping... ~n", []);
+                    io:format(".", []);
                true ->
                     true
             end,
@@ -147,7 +147,12 @@ store(Msg, Location, Sleep, Feeds) ->
 
     if Belongs ->
             FeedPid = get_feed(AuthId, Location, Sleep),
-            ssb_feed:process_msg(FeedPid, Msg);
+            Valid = message:validate_msg(Msg),
+            if Valid ->
+                    ssb_feed:store_msg(FeedPid, Msg);
+               true ->
+                    ?info("Bad message, cannot validate ~p ~n",[Msg])
+            end;
        true ->
             nop
     end.
