@@ -14,6 +14,7 @@
          validate_msg/1,
          encn_store/3]).
 
+
 is_follow(Msg) ->
     {DecProps} = jiffy:decode(Msg),
     {Value} = ?pgv(<<"value">>, DecProps),
