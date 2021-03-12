@@ -18,3 +18,4 @@ https://xlfoundation.com - Mitchell cross licensing foundtion
 %vb0PiP6hwU6GCXT0QWlHJAoZ/Al4Vzeo23mS4NHjYpM=.sha256 - Licensing thread with Cel
 %YttiL9bGNlkqfkqykYZB6kOOGBN+V+Hrc9CqZd6xTPo=.sha256 - ERE thread from Andre
 https://github.com/timjrobinson/ssb-db2-examples - ssb-db2 query examples
+https://github.com/cn-uofbasel/ssbdrv/blob/master/doc/tangle.md - CFT Tangles

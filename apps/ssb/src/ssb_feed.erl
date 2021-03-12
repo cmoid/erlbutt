@@ -14,13 +14,15 @@
 %% API
 -export([start_link/2]).
 
--export([open/1,
+-export([location/1,
+         open/1,
          is_open/1,
          close/1,
          store_msg/2,
          fetch_msg/2,
          foldl/3,
-         direct_follows/1]).
+         direct_follows/1,
+         follows/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -29,6 +31,7 @@
 -define(SERVER, ?MODULE).
 
 -record(state, {id,
+                location = nil,
                 feed_open = false,
                 feed,
                 feed_file = nil,
@@ -44,6 +47,9 @@ start_link(FeedId, Location) ->
 
 %% Msg is the content field of a message, the assumption being that
 %% last_msg has all the other fields needed
+location(FeedPid) ->
+    gen_server:call(FeedPid, location).
+
 store_msg(FeedPid, Msg) ->
     gen_server:call(FeedPid, {store, Msg}).
 
@@ -64,6 +70,15 @@ direct_follows(FeedPid) ->
           end,
     gen_server:call(FeedPid, {foldl, Fun, []}).
 
+follows(FeedPid, _HopCount) ->
+    DirectFollow = direct_follows(FeedPid),
+    Location = ssb_feed:location(FeedPid),
+    FollowPids = lists:map(fun(Id) ->
+                                   find_or_create_pid(Id, Location)
+                           end, DirectFollow),
+    FollowPids.
+
+
 open(Pid) ->
     gen_server:call(Pid, {open}).
 
@@ -79,14 +94,16 @@ close(Pid) ->
 
 init([FeedId, Location]) ->
     process_flag(trap_exit, true),
-    <<"@",Id/binary>> = FeedId,
-    RawId = hd(string:replace(Id,".ed25519","")),
-    DecodeId = integer_to_binary(binary:decode_unsigned(base64:decode(RawId)),16),
+    DecodeId = decode_id(FeedId),
     {Feed, Meta} = init_directories(DecodeId, Location),
     {ok, #state{id = FeedId,
+                location = Location,
                 feed = Feed,
                 meta = Meta,
                 msg_cache = ets:new(messages, [])}}.
+
+handle_call(location, _From, #state{location = Location} = State) ->
+    {reply, Location, State};
 
 handle_call({open}, _From, #state{feed_open = false} = State) ->
     NewState = open_feed(State),
@@ -334,6 +351,33 @@ close_feed(#state{feed_open = true,
                 meta_file = nil};
 close_feed(#state{feed_open = false} = State) ->
     State.
+
+decode_id(FeedId) ->
+    <<"@",Id/binary>> = FeedId,
+    RawId = hd(string:replace(Id,".ed25519","")),
+    integer_to_binary(binary:decode_unsigned(base64:decode(RawId)),16).
+
+find_or_create_pid(Id, Location) ->
+    Val = get(Id),
+    case Val of
+        undefined ->
+            {ok, Pid} = ssb_feed:start_link(Id, Location),
+            ssb_feed:open(Pid),
+            put(Id, Pid),
+            Pid;
+        Pid when is_pid(Pid) ->
+            Alive = is_process_alive(Pid),
+            if Alive ->
+                    Pid;
+               true ->
+                    erase(Id),
+                    find_or_create_pid(Id, Location)
+            end;
+        _Else ->
+            erase(Id),
+            find_or_create_pid(Id, Location)
+    end.
+
 
 
 -ifdef(TEST).
