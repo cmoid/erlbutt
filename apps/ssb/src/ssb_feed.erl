@@ -74,14 +74,40 @@ direct_follows(FeedPid) ->
           end,
     gen_server:call(FeedPid, {foldl, Fun, []}).
 
-follows(FeedPid, _HopCount) ->
-    DirectFollow = direct_follows(FeedPid),
-    Location = ssb_feed:location(FeedPid),
-    FollowPids = lists:map(fun(Id) ->
-                                   find_or_create_pid(Id, Location)
-                           end, DirectFollow),
-    FollowPids.
+follows(FeedPid, HopCount) ->
+    put(visited, [whoami(FeedPid)]),
+    follows2(FeedPid, HopCount).
 
+follows2(_FeedPid, 0) ->
+    [];
+
+follows2(FeedPid, HopCount) ->
+    Location = ssb_feed:location(FeedPid),
+    DirectFollow = direct_follows(FeedPid),
+    NewDirectFollow = lists:filter(fun(E) ->
+                                           not lists:member(E, get(visited))
+                                   end, DirectFollow),
+
+    lists:append(lists:foldl(recurse_follow(Location, HopCount),
+                             [], NewDirectFollow),
+                 NewDirectFollow).
+
+recurse_follow(Location, HopCount) ->
+    fun(Id, Acc) ->
+            AlreadySeen = lists:member(Id, get(visited)),
+            if AlreadySeen ->
+                    Acc;
+               true ->
+                    Pid = find_or_create_pid(Id, Location),
+                    Visited = get(visited),
+                    put(visited, [Id | Visited]),
+                    DF = follows2(Pid, HopCount - 1),
+                    lists:append(lists:filter(fun(Nid) ->
+                                                      not lists:member(Nid, Acc)
+                                              end, DF),
+                                 Acc)
+            end
+    end.
 
 open(Pid) ->
     gen_server:call(Pid, {open}).
