@@ -26,21 +26,23 @@ is_follow(Msg) ->
             Type = ?pgv(<<"type">>, Content),
             case Type of
                 <<"contact">> ->
-                    Contact = ?pgv(<<"contact">>, Content),
-                    Following = ?pgv(<<"following">>, Content),
-                    case Following of
-                        true ->
-                            {Contact, true};
-                        false ->
-                            {Contact, false};
-                        _Else ->
-                            nope
-                    end;
+                    check_contact(?pgv(<<"contact">>,Content),
+                                  ?pgv(<<"following">>, Content));
                 _Else ->
                     nope
             end
     end.
 
+check_contact(undefined, _Following) ->
+    nope;
+check_contact(<<>>, _Following) ->
+    nope;
+check_contact(Contact, true) ->
+    {Contact, true};
+check_contact(Contact, false) ->
+    {Contact, false};
+check_contact(_Contact, _Following) ->
+    nope.
 
 encn_store(Previous, Sequence, Msg) ->
     Author = keys:pub_key(),
