@@ -15,6 +15,7 @@
 -export([start_link/2]).
 
 -export([location/1,
+         whoami/1,
          open/1,
          is_open/1,
          close/1,
@@ -49,6 +50,9 @@ start_link(FeedId, Location) ->
 %% last_msg has all the other fields needed
 location(FeedPid) ->
     gen_server:call(FeedPid, location).
+
+whoami(FeedPid) ->
+    gen_server:call(FeedPid, whoami).
 
 store_msg(FeedPid, Msg) ->
     gen_server:call(FeedPid, {store, Msg}).
@@ -104,6 +108,9 @@ init([FeedId, Location]) ->
 
 handle_call(location, _From, #state{location = Location} = State) ->
     {reply, Location, State};
+
+handle_call(whoami, _From, #state{id = Id} = State) ->
+    {reply, Id, State};
 
 handle_call({open}, _From, #state{feed_open = false} = State) ->
     NewState = open_feed(State),
