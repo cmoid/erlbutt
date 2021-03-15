@@ -280,14 +280,7 @@ init_directories(AuthDir, Location) ->
     {Feed, Meta}.
 
 feed_get(Feed, [], Key) ->
-    ?info("opening ~p ~n",[Feed]),
-    case file:open(Feed, [read, binary]) of
-        {ok, IoDev} ->
-            scan(IoDev, 0, Key);
-        {error, enoent} ->
-            ?info("Probably bad input ~n",[]),
-            done
-    end;
+    feed_get(Feed, [{Key, 0}], Key);
 
 feed_get(Feed, [{Key, Pos}], Key) ->
     case file:open(Feed, [read, binary]) of
