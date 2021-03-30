@@ -108,10 +108,11 @@ count({<<"feed_cnt">>, _Rest}) ->
 count({_key, {_Pid, Count}}) ->
     Count.
 
-extract_author(Msg) ->
+extract_key_author(Msg) ->
     {DecProps} = jiffy:decode(Msg),
+    Key = ?pgv(<<"key">>, DecProps),
     {Value} = ?pgv(<<"value">>, DecProps),
-    ?pgv(<<"author">>, Value).
+    {Key, ?pgv(<<"author">>, Value)}.
 
 get_feed(Author, Location, Sleep) ->
     check_open_feeds(),
@@ -141,7 +142,7 @@ get_feed(Author, Location, Sleep) ->
 
 store(Msg, Location, Sleep, Feeds) ->
 
-    AuthId = extract_author(Msg),
+    {MsgId, AuthId} = extract_key_author(Msg),
 
     Belongs = lists:member(AuthId, Feeds),
 
@@ -149,7 +150,8 @@ store(Msg, Location, Sleep, Feeds) ->
             FeedPid = get_feed(AuthId, Location, Sleep),
             Valid = message:validate_msg(Msg),
             if Valid ->
-                    ssb_feed:store_msg(FeedPid, Msg);
+                    ssb_feed:store_msg(FeedPid, Msg),
+                    mess_auth:put(MsgId, AuthId);
                true ->
                     ?info("Bad message, cannot validate ~p ~n",[Msg])
             end;

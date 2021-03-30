@@ -19,3 +19,5 @@ https://xlfoundation.com - Mitchell cross licensing foundtion
 %YttiL9bGNlkqfkqykYZB6kOOGBN+V+Hrc9CqZd6xTPo=.sha256 - ERE thread from Andre
 https://github.com/timjrobinson/ssb-db2-examples - ssb-db2 query examples
 https://github.com/cn-uofbasel/ssbdrv/blob/master/doc/tangle.md - CFT Tangles
+%bbNqd5Zziop6A8m6ibLCrs21qRTUJ7uvfl3E6w0SDDA=.sha256 - cblgh's vision thread
+%PeGW29P0olzpQWwhZ7cizuXfrKhRUUv5LlFITeu0ZDs=.sha256 - Andre why stay on SSB
