@@ -149,13 +149,13 @@ store(Msg, Location, Sleep, Feeds) ->
 
     if Belongs ->
             FeedPid = get_feed(AuthId, Location, Sleep),
-            %%Valid = message:validate_msg(Msg),
-            %%if Valid ->
+            Valid = message:validate_msg(Msg),
+            if Valid ->
                     ssb_feed:store_msg(FeedPid, Msg),
                     mess_auth:put(MsgId, AuthId);
-               %%true ->
-                 %%   ?info("Bad message, cannot validate ~p ~n",[Msg])
-            %%end;
+               true ->
+                    ?info("Bad message, cannot validate ~p ~n",[Msg])
+            end;
        true ->
             nop
     end.

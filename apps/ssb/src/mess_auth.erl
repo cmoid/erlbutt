@@ -15,7 +15,9 @@
 %% API
 -export([start_link/0,
          put/2,
-         get/1]).
+         get/1,
+         close/0,
+         sync/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -46,6 +48,12 @@ put(Key, Val) ->
 
 get(Key) ->
     gen_server:call(?MODULE, {get, Key}).
+
+close() ->
+    gen_server:call(?MODULE, {close}).
+
+sync() ->
+    gen_server:call(?MODULE, {sync}).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -95,7 +103,17 @@ handle_call({get, Key}, _From, #state{mess_auth = BitHand} = State) ->
             {reply, Value, State};
         not_found ->
             {reply, not_found, State}
-    end.
+    end;
+
+handle_call({sync}, _From, #state{mess_auth = BitHand} = State) ->
+    ok = bitcask:sync(BitHand),
+    {reply, ok, State};
+
+handle_call({close}, _From, #state{mess_auth = BitHand} = State) ->
+    ok = bitcask:close(BitHand),
+    {stop, ok, State}.
+
+
 
 %%--------------------------------------------------------------------
 %% @private
@@ -136,7 +154,8 @@ handle_info(_Info, State) ->
 %%--------------------------------------------------------------------
 -spec terminate(Reason :: normal | shutdown | {shutdown, term()} | term(),
                 State :: term()) -> any().
-terminate(_Reason, _State) ->
+terminate(Reason, _State) ->
+    ?info("terminate called ~p ~n",[Reason]),
     ok.
 
 %%--------------------------------------------------------------------
@@ -168,3 +187,7 @@ format_status(_Opt, Status) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+-ifdef(TEST).
+
+-endif.
