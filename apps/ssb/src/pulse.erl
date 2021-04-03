@@ -114,10 +114,15 @@ new_sbot_client(Ip, Data) ->
                     [{_Ip, NSClient}] = ets:lookup(sbot_clients, Ip),
                     sbot_client:send(NSClient, ping());
                 _Else ->
-                    {ok, NewSbotClient} = sbot_client:start_link(Ip, extract_key(Data)),
-                    ?debug("Connected to client ~p ~n",[extract_key(Data)]),
-                    ets:insert(sbot_clients, {Ip, NewSbotClient}),
-                    sbot_client:send(NewSbotClient, ping())
+                    PubKey = extract_key(Data),
+                    if PubKey == nokey ->
+                            ?debug("No public key in data ~p ~n",[Data]);
+                       true ->
+                            {ok, NewSbotClient} =
+                                sbot_client:start_link(Ip, PubKey),
+                            ets:insert(sbot_clients, {Ip, NewSbotClient}),
+                            sbot_client:send(NewSbotClient, ping())
+                    end
             end;
         _else ->
             %%?debug("This is looking like self ~p ~n",[local_ip_v4()]),
@@ -143,17 +148,22 @@ blob_wants() ->
 extract_key(Data) ->
     %% may be more that one connection string here, look for semicolon
     %% and truncate
-    {Pos, Len} = binary:match(Data, <<":8008~shs:">>),
-    CheckSemicolon = binary:match(Data, <<";">>),
-    End = case CheckSemicolon of
-              nomatch ->
-                  size(Data);
-              {Pos1, _} ->
-                  Pos1
-          end,
-    base64:decode(binary_to_list(binary:part(Data,
-                                             (Pos + Len),
-                                             End - (Pos + Len)))).
+    CheckMatch = binary:match(Data, <<":8008~shs:">>),
+    if CheckMatch == nomatch ->
+            nokey;
+       true ->
+            {Pos, Len} = CheckMatch,
+            CheckSemicolon = binary:match(Data, <<";">>),
+            End = case CheckSemicolon of
+                      nomatch ->
+                          size(Data);
+                      {Pos1, _} ->
+                          Pos1
+                  end,
+            base64:decode(binary_to_list(binary:part(Data,
+                                                     (Pos + Len),
+                                                     End - (Pos + Len))))
+    end.
 whoami_req() ->
     Flags = rpc_processor:create_flags(0,0,2),
     Body = jiffy:encode({[{<<"name">>,[?whoami]},
