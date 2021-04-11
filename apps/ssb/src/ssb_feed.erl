@@ -77,7 +77,8 @@ direct_follows(FeedPid) ->
 follows(FeedPid, HopCount) ->
     put(visited, [whoami(FeedPid)]),
     FinalFeeds = follows2(FeedPid, HopCount),
-    put(visited, nil),
+    put(visited, []),
+    ?debug("visited is ~p ~n",[length(get(visited))]),
     lists:foldl(fun(E, Acc) ->
                         Cf = lists:member(E, Acc),
                         if Cf ->

@@ -94,20 +94,27 @@ validate_msg(Msg) ->
 %% Internal functions
 
 validate(MsgProps) ->
-    Author = ?pgv(<<"author">>, MsgProps),
+    try
+        Author = ?pgv(<<"author">>, MsgProps),
 
-    %% remove signature from message and encode as json
-    DelSigProps = proplists:delete(<<"signature">>, MsgProps),
-    EncMsg = jiffy:encode(js_order(DelSigProps), [pretty, force_utf8]),
+        %% remove signature from message and encode as json
+        DelSigProps = proplists:delete(<<"signature">>, MsgProps),
+        EncMsg = jiffy:encode(js_order(DelSigProps), [pretty, force_utf8]),
 
-    %% extract and decode the keys for the signature and the author
-    Sig = ?pgv(<<"signature">>, MsgProps),
-    <<"@",KeySuf/binary>> = Author,
-    AuthorPk = base64:decode(hd(string:replace(KeySuf,".ed25519",""))),
-    SigDec = base64:decode(hd(string:replace(Sig,".sig.ed25519",""))),
+        %% extract and decode the keys for the signature and the author
+        Sig = ?pgv(<<"signature">>, MsgProps),
+        <<"@",KeySuf/binary>> = Author,
+        AuthorPk = base64:decode(hd(string:replace(KeySuf,".ed25519",""))),
+        SigDec = base64:decode(hd(string:replace(Sig,".sig.ed25519",""))),
 
-    %% verify
-    enacl:sign_verify_detached(SigDec, EncMsg, AuthorPk).
+        %% verify
+        enacl:sign_verify_detached(SigDec, EncMsg, AuthorPk)
+    catch
+        error:Reason ->
+            ?info("Unable to validate due to: ~p ~n",
+                  [Reason]),
+            false
+    end.
 
 % scuttlebutt protocol requires json keys be in a specific order for
 % message signing, this order is based on the javascript implementation
