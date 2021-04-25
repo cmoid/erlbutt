@@ -103,7 +103,6 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
-
 connect(Host, Port) ->
     {ok, Socket} =
         gen_tcp:connect(Host, Port,

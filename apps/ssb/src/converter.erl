@@ -126,7 +126,7 @@ get_feed(Author, Location, Sleep) ->
             put(Author, {Pid, 1}),
             Pid;
         {Pid, Count} ->
-            check_is_open(Pid),
+            ensure_is_open(Pid),
             put(Author, {Pid, Count + 1}),
             PrintCount = Count rem 10000 == 0,
             if PrintCount ->
@@ -173,7 +173,7 @@ check_open_feeds() ->
             nop
     end.
 
-check_is_open(Pid) ->
+ensure_is_open(Pid) ->
     IsOpen = ssb_feed:is_open(Pid),
     if IsOpen ->
             nop;
