@@ -74,7 +74,7 @@ handle_call({sync}, _From, #state{mess_auth = BitHand} = State) ->
 
 handle_call({close}, _From, #state{mess_auth = BitHand} = State) ->
     ok = bitcask:close(BitHand),
-    {stop, ok, State}.
+    {reply, ok, State}.
 
 handle_cast(_Request, State) ->
     {noreply, State}.
@@ -82,9 +82,9 @@ handle_cast(_Request, State) ->
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(Reason, _State) ->
+terminate(Reason, #state{mess_auth = BitHand}) ->
     ?info("terminate called ~p ~n",[Reason]),
-    ok.
+    bitcask:close(BitHand).
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
