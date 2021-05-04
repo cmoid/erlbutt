@@ -1,7 +1,7 @@
 -name erlbutt@localhost
 -setcookie erlbutt
--pa /usr/local/lib/erlang/lib/syntax_tools-2.5/ebin
--pa /usr/local/lib/erlang/lib/tools-3.4.4/ebin
+-pa /usr/local/lib/erlang/lib/syntax_tools-2.2.1/ebin
+-pa /usr/local/lib/erlang/lib/tools-3.3.1/ebin
 -pa ${HOME}/emacs/erlbutt/_build/default/lib/ssb/ebin
 -pa ${HOME}/emacs/erlbutt/_build/test/extras/test
 -pa ${HOME}/emacs/distel/ebin
