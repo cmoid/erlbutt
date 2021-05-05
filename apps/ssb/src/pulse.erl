@@ -118,10 +118,15 @@ new_sbot_client(Ip, Data) ->
                     if PubKey == nokey ->
                             ?debug("No public key in data ~p ~n",[Data]);
                        true ->
-                            {ok, NewSbotClient} =
+                            Result =
                                 sbot_client:start_link(Ip, PubKey),
-                            ets:insert(sbot_clients, {Ip, NewSbotClient}),
-                            sbot_client:send(NewSbotClient, ping())
+                            case Result of
+                                {ok, NewSbotClient} ->
+                                    ets:insert(sbot_clients, {Ip, NewSbotClient}),
+                                    sbot_client:send(NewSbotClient, ping());
+                                Else ->
+                                    ?debug("Issue connecting to client ~p ~n",[Else])
+                            end
                     end
             end;
         _else ->
