@@ -1,4 +1,4 @@
-1%% SPDX-License-Identifier: GPL-2.0-only
+%% SPDX-License-Identifier: GPL-2.0-only
 %%
 %% Copyright (C) 2023 Charles Moid
 -module(ssb_client).
