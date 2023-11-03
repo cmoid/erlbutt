@@ -144,14 +144,6 @@ ping() ->
     Header = rpc_processor:create_header(Flags, size(Body), 1),
     utils:combine(Header, Body).
 
-%% blob_wants() ->
-%%     Flags = rpc_processor:create_flags(1,0,2),
-%%     Body = jiffy:encode({[{<<"name">>,[<<"blobs">>,<<"createWants">>]},
-%%                           {<<"args">>,[]},
-%%                           {<<"type">>,<<"source">>}]}),
-%%     Header = rpc_processor:create_header(Flags, size(Body), 1),
-%%     utils:combine(Header, Body).
-
 extract_key(Data) ->
     %% may be more that one connection string here, look for semicolon
     %% and truncate
@@ -171,10 +163,3 @@ extract_key(Data) ->
                                                      (Pos + Len),
                                                      End - (Pos + Len))))
     end.
-%% whoami_req() ->
-%%     Flags = rpc_processor:create_flags(0,0,2),
-%%     Body = jiffy:encode({[{<<"name">>,[?whoami]},
-%%                           {<<"args">>,[]},
-%%                           {<<"type">>,<<"async">>}]}),
-%%     Header = rpc_processor:create_header(Flags, size(Body), 1),
-%%     utils:combine(Header, Body).
