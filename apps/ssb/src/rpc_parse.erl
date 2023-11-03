@@ -20,28 +20,30 @@
 %%%===================================================================
 parse(Data) ->
     ?debug("The data to parse ~p ~n",[Data]),
-    EnoughForHeader = size(Data) >= 9,
-    case EnoughForHeader of
-        true ->
-            <<Header:9/binary,
-              Rest/binary>> = Data,
-            %% may also have enough data for the body
-            parseBody(Header, Rest, Data);
-        _Else ->
-            {partial, nil, Data}
-    end.
+    parse_header(Data).
+
+%% private funs
+
+parse_header(Data) when size(Data) >= 9 ->
+    <<Header:9/binary,
+      Rest/binary>> = Data,
+    %% may also have enough data for the body
+    parseBody(Header, Rest, Data);
+
+parse_header(Data) ->
+    {partial, nil, Data}.
 
 parseBody(Header, Rest, OrigData) ->
     BodySize = body_size(Header),
-    HaveBodySize = BodySize =< size(Rest),
-    case HaveBodySize of
-        true ->
-            <<Body:BodySize/binary,
-              RestRest/binary>> = Rest,
-            {complete, {Header, Body}, RestRest};
-        _ ->
-            {partial, nil, OrigData}
-    end.
+    extract_body(BodySize, Header, Rest, OrigData).
+
+extract_body(BodySize, Header, Rest, _OrigData) when BodySize =< size(Rest) ->
+    <<Body:BodySize/binary,
+      RestRest/binary>> = Rest,
+    {complete, {Header, Body}, RestRest};
+
+extract_body(_BodySize, _Header, _Rest, OrigData) ->
+    {partial, nil, OrigData}.
 
 body_size(Header) ->
     <<_Flags:1/binary,
