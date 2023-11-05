@@ -36,8 +36,7 @@ box(Data, Nonce, SecretBoxKey) ->
     {combine(EncHeader, Body),
      incr(incr(Nonce))}.
 
-unbox(_SecretBoxKey, Nonce,
-      DataProc) when size(DataProc) < 34 ->
+unbox(_SecretBoxKey, Nonce, DataProc) when size(DataProc) < 34 ->
     {partial, <<>>, Nonce, DataProc};
 
 unbox(SecretBoxKey, Nonce, DataProc) ->
