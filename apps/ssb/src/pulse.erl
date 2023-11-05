@@ -63,7 +63,9 @@ handle_cast(_Msg, State) ->
 
 handle_info({udp, _ClientSocket, Ip, _Port, Data},
             #state{socket =_Socket}=State) ->
-    new_ssb_client(Ip, Data),
+    %% don't talk to yourself, unless you want complete agreement
+    IsSelf = local_ip_v4() == Ip,
+    new_ssb_client(Ip, Data, IsSelf),
     {noreply, State};
 
 handle_info(advertise, #state{socket=Socket}=State) ->
@@ -106,34 +108,34 @@ local_ip_v4() ->
             hd(Ips)
     end.
 
-new_ssb_client(Ip, Data) ->
-    case local_ip_v4() == Ip of
-        false ->
-            case ets:member(ssb_clients, Ip) of
-                true ->
-                    [{_Ip, NSClient}] = ets:lookup(ssb_clients, Ip),
-                    ?debug("Sending new link a ping ~p ~n",[NSClient]),
-                    ssb_client:send(NSClient, ping());
-                _Else ->
-                    PubKey = extract_key(Data),
-                    if PubKey == nokey ->
-                            ?debug("No public key in data ~p ~n",[Data]);
-                       true ->
-                            Result =
-                                ssb_client:start_link(Ip, PubKey),
-                            case Result of
-                                {ok, NewSbotClient} ->
-                                    ?debug("Started new link with ~p ~n",[{Ip, PubKey}]),
-                                    ets:insert(ssb_clients, {Ip, NewSbotClient}),
-                                    ssb_client:send(NewSbotClient, ping());
-                                Else ->
-                                    ?debug("Issue connecting to client ~p ~n",[Else])
-                            end
-                    end
-            end;
-        _else ->
-            %%?debug("This is looking like self ~p ~n",[local_ip_v4()]),
-            ok
+new_ssb_client(_Ip, _Data, true) ->
+    %%?debug("This is looking like self ~p ~n",[local_ip_v4()]),
+    ok;
+
+new_ssb_client(Ip, Data, _) ->
+    ClientExists = ets:member(ssb_clients, Ip),
+    reuse_or_create(Ip, Data, ClientExists).
+
+reuse_or_create(Ip, _Data, true) ->
+    [{_Ip, NSClient}] = ets:lookup(ssb_clients, Ip),
+    ?debug("Sending new link a ping ~p ~n",[NSClient]),
+    ssb_client:send(NSClient, ping());
+
+reuse_or_create(Ip, Data, false) ->
+    PubKey = extract_key(Data),
+    if PubKey == nokey ->
+            ?debug("No public key in data ~p ~n",[Data]);
+       true ->
+            Result =
+                ssb_client:start_link(Ip, PubKey),
+            case Result of
+                {ok, NewSbotClient} ->
+                    ?debug("Started new link with ~p ~n",[{Ip, PubKey}]),
+                    ets:insert(ssb_clients, {Ip, NewSbotClient}),
+                    ssb_client:send(NewSbotClient, ping());
+                Else ->
+                    ?debug("Issue connecting to client ~p ~n",[Else])
+            end
     end.
 
 ping() ->
