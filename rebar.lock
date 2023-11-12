@@ -4,7 +4,7 @@
   0},
  {<<"enacl">>,
   {git,"https://git.sr.ht/~cmoid/enacl",
-       {ref,"df926eefd159a3d328662c00cbb3b219ea03d5ff"}},
+       {ref,"db5df4fcf0c6e8ca9c1e69f0a013331d00e4ba41"}},
   0},
  {<<"jiffy">>,
   {git,"https://git.sr.ht/~cmoid/jiffy",
