@@ -45,7 +45,7 @@ init([]) ->
             {ok, #state{socket = Socket,
                         timer = TRef}};
         {error, Reason} ->
-            ?debug("Why can't I broadcast a heartbeat? ~p ~n",
+            ?LOG_DEBUG("Why can't I broadcast a heartbeat? ~p ~n",
                    [Reason]),
             {ok, #state{}}
     end.
@@ -109,7 +109,7 @@ local_ip_v4() ->
     end.
 
 new_ssb_client(_Ip, _Data, true) ->
-    %%?debug("This is looking like self ~p ~n",[local_ip_v4()]),
+    %%?LOG_DEBUG("This is looking like self ~p ~n",[local_ip_v4()]),
     ok;
 
 new_ssb_client(Ip, Data, _) ->
@@ -118,23 +118,23 @@ new_ssb_client(Ip, Data, _) ->
 
 reuse_or_create(Ip, _Data, true) ->
     [{_Ip, NSClient}] = ets:lookup(ssb_clients, Ip),
-    ?debug("Sending new link a ping ~p ~n",[NSClient]),
+    ?LOG_DEBUG("Sending new link a ping ~p ~n",[NSClient]),
     ssb_client:send(NSClient, ping());
 
 reuse_or_create(Ip, Data, false) ->
     PubKey = extract_key(Data),
     if PubKey == nokey ->
-            ?debug("No public key in data ~p ~n",[Data]);
+            ?LOG_DEBUG("No public key in data ~p ~n",[Data]);
        true ->
             Result =
                 ssb_client:start_link(Ip, PubKey),
             case Result of
                 {ok, NewSbotClient} ->
-                    ?debug("Started new link with ~p ~n",[{Ip, PubKey}]),
+                    ?LOG_DEBUG("Started new link with ~p ~n",[{Ip, PubKey}]),
                     ets:insert(ssb_clients, {Ip, NewSbotClient}),
                     ssb_client:send(NewSbotClient, ping());
                 Else ->
-                    ?debug("Issue connecting to client ~p ~n",[Else])
+                    ?LOG_DEBUG("Issue connecting to client ~p ~n",[Else])
             end
     end.
 

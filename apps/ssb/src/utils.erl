@@ -54,7 +54,7 @@ combine(Bin1, Bin2) ->
 
 send_data(Data, Socket, Nonce, SecretBoxKey) ->
 
-    ?debug("Sending data ~p ~n",[Data]),
+    ?LOG_DEBUG("Sending data ~p ~n",[Data]),
 
     {EncBox, NewNonce} =
         boxstream:box(Data, Nonce, SecretBoxKey),
@@ -165,7 +165,7 @@ check_id(<<"@",Id/binary>>) ->
         end
     catch
         error:Reason ->
-            ?debug("Bad Id ~p ~n",[{Id, Reason}]),
+            ?LOG_DEBUG("Bad Id ~p ~n",[{Id, Reason}]),
             bad
     end;
 check_id(_Else) ->
@@ -191,11 +191,11 @@ whoami_req() ->
 
 
 log({Socket, Data}) ->
-    ?debug("received a tcp packet of size: ~p ~n on socket ~p ~n",
+    ?LOG_DEBUG("received a tcp packet of size: ~p ~n on socket ~p ~n",
            [size(Data), Socket]);
 
 log(Info) ->
-    ?debug("received random info message ~p ~n",
+    ?LOG_DEBUG("received random info message ~p ~n",
            [Info]).
 
 -ifdef(TEST).

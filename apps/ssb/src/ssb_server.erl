@@ -47,7 +47,7 @@ handle_info({tcp, Socket, Data},
                                shook_hands = 1}}
     catch
         error:Reason ->
-            ?debug("Unable to shake hands with stranger ~p ~n",
+            ?LOG_DEBUG("Unable to shake hands with stranger ~p ~n",
                    [Reason]),
             {stop, Reason}
     end;
@@ -88,7 +88,7 @@ handle_info(timeout, #sbox_state{ref = Ref,
     {noreply, State};
 
 handle_info(Info, State) ->
-    ?info("Stopped presumably for normal reason: ~p ~n",[Info]),
+    ?LOG_INFO("Stopped presumably for normal reason: ~p ~n",[Info]),
     {stop, normal, State}.
 
 handle_call(_Request, _From, State) ->
@@ -108,7 +108,7 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 
 network_error(Reason, State) ->
-    ?debug("Network error ~p ~n",[Reason]),
+    ?LOG_DEBUG("Network error ~p ~n",[Reason]),
     stop({shutdown, conn_closed}, State).
 
 stop(Reason, State) ->

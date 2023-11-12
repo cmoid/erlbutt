@@ -19,10 +19,10 @@ process({Header, Body}, #ssb_conn{
                            socket = Socket,
                            nonce = Nonce,
                            secret_box = SecretBoxKey}) ->
-    ?debug("Please parse header ~p ~n from pid: ~p ~n",[Header, self()]),
+    ?LOG_DEBUG("Please parse header ~p ~n from pid: ~p ~n",[Header, self()]),
     ReqNo = req_no(Header),
 
-    ?debug("Please process ~p ~n from pid: ~p ~n",[{ReqNo, Body}, self()]),
+    ?LOG_DEBUG("Please process ~p ~n from pid: ~p ~n",[{ReqNo, Body}, self()]),
 
     case ReqNo < 0 of
         %% negative request numbers indicate responses
@@ -74,7 +74,7 @@ create_req(Body) ->
     end.
 
 proc_response(ReqNo, RespBody) ->
-    ?debug("Please process response ~p ~n", [{ReqNo, RespBody}]),
+    ?LOG_DEBUG("Please process response ~p ~n", [{ReqNo, RespBody}]),
     RespBody.
 
 proc_request(ReqNo, #ssb_rpc{name = [?createhistorystream],
@@ -94,7 +94,7 @@ proc_request(ReqNo, #ssb_rpc{name = [?gossip, ?ping],
     TimeStamp = jiffy:encode(integer_to_binary(current_time()), [pretty]),
     Header = create_header(Flags,size(TimeStamp), -ReqNo),
     NewNonce = utils:send_data(utils:combine(Header, TimeStamp), Socket, Nonce, SecretBoxKey),
-    ?debug("Sent Timestamp ~p ~n",[{Header, TimeStamp}]),
+    ?LOG_DEBUG("Sent Timestamp ~p ~n",[{Header, TimeStamp}]),
     NewNonce;
     %%utils:send_data(?BOX_END, Socket, NewNonce, SecretBoxKey);
 
@@ -121,7 +121,7 @@ proc_request(ReqNo, #ssb_rpc{name = [?blobs, <<"createWants">>],
                     Socket, Nonce, SecretBoxKey);
 
 proc_request(ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
-    ?debug("Default process request, unknown ~p ~n",[ReqBody]),
+    ?LOG_DEBUG("Default process request, unknown ~p ~n",[ReqBody]),
     Flags = create_flags(1,1,10),
     TrueEnd = jiffy:encode(true, [pretty]),
     Header = create_header(Flags,size(TrueEnd), -ReqNo),

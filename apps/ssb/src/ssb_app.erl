@@ -17,7 +17,7 @@
 %% ===================================================================
 start(_StartType, _StartArgs) ->
     LogLevel = application:get_env(ssb, ssb_log_level, notice),
-    ?notice("Log level ~p set from env ~n", [LogLevel]),
+    ?LOG(LogLevel, "Log level ~p set from env ~n", [LogLevel]),
     logger:set_primary_config(level, LogLevel),
     logger:set_module_level(supervisor, error),
 

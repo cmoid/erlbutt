@@ -48,7 +48,7 @@ init([Ip, PubKey]) ->
                          enc_nonce = EncNonce}}
     catch
         error:Reason ->
-            ?debug("Handshake failed, perhaps server is afraid of Corona beer ~p ~n",
+            ?LOG_DEBUG("Handshake failed, perhaps server is afraid of Corona beer ~p ~n",
                    [Reason]),
             {stop, Reason}
     end.
@@ -78,7 +78,7 @@ process(#sbox_state{socket = Socket,
             {Done, NewState} =
                 boxstream:unbox_and_parse(BoxData, State),
 
-            ?debug("The box returns ~p ~n",[{Done, NewState}]),
+            ?LOG_DEBUG("The box returns ~p ~n",[{Done, NewState}]),
 
             case Done of
                 complete ->
@@ -90,7 +90,7 @@ process(#sbox_state{socket = Socket,
                     process(NewState)
             end;
         {error, Reason} ->
-            ?debug("nothing to read now? ~p ~n",[Reason]),
+            ?LOG_DEBUG("nothing to read now? ~p ~n",[Reason]),
             State#sbox_state{response = Reason}
     end.
 
@@ -109,7 +109,7 @@ handle_info({tcp, Socket, Data},
 
     % combine new data with left overs from previous packets
     BoxData = combine(BoxLeftOver, Data),
-    ?debug("Client needs to process data ~p ~n",[BoxData]),
+    ?LOG_DEBUG("Client needs to process data ~p ~n",[BoxData]),
 
     {Done, NewState} = boxstream:unbox_and_parse(BoxData, State),
 
@@ -122,7 +122,7 @@ handle_info({tcp, Socket, Data},
     end;
 
 handle_info(Info, State) ->
-    ?debug("Random info request ~p ~n",[Info]),
+    ?LOG_DEBUG("Random info request ~p ~n",[Info]),
     utils:log(Info),
     {noreply, State}.
 
@@ -140,7 +140,7 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 network_error(Reason, State) ->
-    ?debug("Network error ~p ~n",[Reason]),
+    ?LOG_DEBUG("Network error ~p ~n",[Reason]),
     stop({shutdown, conn_closed}, State).
 
 connect(Host, Port) ->

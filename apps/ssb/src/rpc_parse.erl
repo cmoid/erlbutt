@@ -19,7 +19,7 @@
 %%% API
 %%%===================================================================
 parse(Data) ->
-    ?debug("The data to parse ~p ~n",[Data]),
+    ?LOG_DEBUG("The data to parse ~p ~n",[Data]),
     parse_header(Data).
 
 %% private funs

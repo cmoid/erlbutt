@@ -144,7 +144,7 @@ handle_call({refs, MsgId, TangleId}, _From, #state{refs = Refs} = State) ->
             {ok, IoDev} ->
                 int_foldr(Fun, [], IoDev);
             {error, enoent} ->
-                ?info("Ill formed tangle arcs file ~n",[]),
+                ?LOG_INFO("Ill formed tangle arcs file ~n",[]),
                 done
         end,
     {reply, Result, State};
@@ -155,7 +155,7 @@ handle_call({foldl, Fun, Acc}, _From, #state{feed = Feed} = State) ->
             {ok, IoDev} ->
                 int_foldr(Fun, Acc, IoDev);
             {error, enoent} ->
-                ?info("Ill formed feed ~p ~n",[Feed]),
+                ?LOG_INFO("Ill formed feed ~p ~n",[Feed]),
                 Acc
         end,
 
@@ -167,13 +167,13 @@ handle_cast(_Request, State) ->
 %% info
 
 handle_info(Info, State) ->
-    ?info("WTF: ~p ~n",[Info]),
+    ?LOG_INFO("WTF: ~p ~n",[Info]),
     {noreply, State}.
 
 %%
 
 terminate(Reason, _State) ->
-    ?info("Closed gen_server: ~p ~n",[Reason]),
+    ?LOG_INFO("Closed gen_server: ~p ~n",[Reason]),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -262,7 +262,7 @@ feed_get(Feed, [{Key, Pos}], Key) ->
             file:position(IoDev, Pos),
             scan(IoDev, Pos, Key);
         {error, enoent} ->
-            ?info("Probably bad input ~n",[]),
+            ?LOG_INFO("Probably bad input ~n",[]),
             done
     end.
 
@@ -285,7 +285,7 @@ feed_get_last(Feed) ->
                             done
                     end;
                {error, Error} ->
-                    ?info("Probably bad input ~p ~n",[{Error, Feed}]),
+                    ?LOG_INFO("Probably bad input ~p ~n",[{Error, Feed}]),
                     done
             end;
         false ->
@@ -307,10 +307,10 @@ scan(IoDev, Pos, Key) ->
                     scan(IoDev, NextPos, Key)
             end;
         {error, eof} ->
-            ?info("Key not found: ~p ~n",[Key]),
+            ?LOG_INFO("Key not found: ~p ~n",[Key]),
             not_found;
         {error, Error} ->
-            ?info("Error ~p scanning for key: ~p ~n",[Error, Key])
+            ?LOG_INFO("Error ~p scanning for key: ~p ~n",[Error, Key])
     end.
 
 int_foldr(Fun, Acc, IoDev) ->
@@ -346,7 +346,7 @@ open_file(File) ->
         {ok, F} ->
             F;
         Else ->
-            ?info("Tried to open failed: ~p ~n",[Else]),
+            ?LOG_INFO("Tried to open failed: ~p ~n",[Else]),
             nil
     end.
 

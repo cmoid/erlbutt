@@ -171,13 +171,13 @@ validate(true, MsgProps) ->
         enacl:sign_verify_detached(SigDec, EncMsg, AuthorPk)
     catch
         error:Reason ->
-            ?info("Unable to validate due to: ~p ~n",
+            ?LOG_INFO("Unable to validate due to: ~p ~n",
                   [Reason]),
             false
     end.
 
 add_sig(NewMsg, EncSig) ->
-    %%?info("The new mess is: ~p ~n",[NewMsg]),
+    %%?LOG_INFO("The new mess is: ~p ~n",[NewMsg]),
 
     NewMsgList = msg_to_proplist(NewMsg) ++
         [{<<"signature">>, EncSig}],

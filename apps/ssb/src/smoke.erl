@@ -19,7 +19,7 @@
 
 secret_handshake(Host) ->
     {ok, NewSbotClient} = ssb_client:start_link(Host, remote_long_pk()),
-    ?debug("connection made ~n",[]),
+    ?LOG_DEBUG("connection made ~n",[]),
     NewSbotClient.
 
 remote_long_pk() ->
@@ -28,12 +28,12 @@ remote_long_pk() ->
 
 smoke() ->
     NewClient = secret_handshake("localhost"),
-    ?debug("The new client pid ~p ~n", [NewClient]),
+    ?LOG_DEBUG("The new client pid ~p ~n", [NewClient]),
     ssb_client:send(NewClient, utils:ping_req()).
 
 whoami(Peer) ->
     NewClient = secret_handshake(Peer),
-    ?debug("The new client pid ~p ~n", [NewClient]),
+    ?LOG_DEBUG("The new client pid ~p ~n", [NewClient]),
     ssb_client:send(NewClient, utils:whoami_req()).
 
 largest_feed() ->

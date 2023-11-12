@@ -51,7 +51,7 @@ init([]) ->
             first_time ->
                 init_secret();
             _Any ->
-                ?debug("Should not get this ~p ~n",[_Any]),
+                ?LOG_DEBUG("Should not get this ~p ~n",[_Any]),
                 {<<"whatkey">>,<<"whatkey">>}
         end,
     {ok, #state{pub_key = PubKey,
@@ -91,7 +91,7 @@ fetch_key() ->
     SecretFileName = Home ++ "/.ssberl/secret",
     case file:open(SecretFileName, [read]) of
         {error, enoent} ->
-            ?info("first time empty dir ~n",[]),
+            ?LOG_INFO("first time empty dir ~n",[]),
             first_time;
         {ok, IoDevice} ->
                 extract_key(IoDevice)

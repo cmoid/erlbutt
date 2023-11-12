@@ -36,11 +36,11 @@ convert(OffsetLog, Sleep, Feeds)->
                                     end
                             end,{<<"FFF">>, {0, 0}},get()),
             mess_auth:close(),
-            ?info("number of unique feeds: ~p ~n",[length(get())]),
-            ?info("largest feed belongs to: ~p ~n",
+            ?LOG_INFO("number of unique feeds: ~p ~n",[length(get())]),
+            ?LOG_INFO("largest feed belongs to: ~p ~n",
                   [{BiggestId, NumMsgs}]);
         {error, enoent} ->
-            ?info("Probably bad input ~n",[]),
+            ?LOG_INFO("Probably bad input ~n",[]),
             done
     end.
 
@@ -58,13 +58,13 @@ convert_terms(IoDev, Found, Sleep, Feeds) ->
             %% read spacer in file, at end this will cause eof but that will be picked
             %% up in the next iteration
             {ok, <<_PosInt:32/integer>>} = file:read(IoDev, 4),
-            %%?info("The pos is ~p ~n",[PosInt]),
+            %%?LOG_INFO("The pos is ~p ~n",[PosInt]),
             convert_terms(IoDev, Found + 1, Sleep, Feeds);
         {error, eof} ->
-            ?info("Found ~p messages ~n",[Found]),
+            ?LOG_INFO("Found ~p messages ~n",[Found]),
             done;
         {error, Error} ->
-            ?info("Error loading the ~p term: ~p ~n",[Found, Error])
+            ?LOG_INFO("Error loading the ~p term: ~p ~n",[Found, Error])
     end.
 
 count({_key, {_Pid, Count}}) ->
@@ -86,7 +86,7 @@ get_feed(Author, Sleep) ->
             if PrintCount ->
                     timer:sleep(Sleep),
                     io:format("~n",[]),
-                    ?info("This author ~p has ~p records ~n", [Author, Count]);
+                    ?LOG_INFO("This author ~p has ~p records ~n", [Author, Count]);
                true ->
                     true
             end,
@@ -114,7 +114,7 @@ store(Msg, Sleep, Feeds) ->
                     nop;
                true ->
                     io:format("~n",[]),
-                    ?info("Stored message that does not validate ~p ~n",[{MsgId, AuthId}])
+                    ?LOG_INFO("Stored message that does not validate ~p ~n",[{MsgId, AuthId}])
             end;
             %% need to do this in two passes now, in order to look up message/auth pairs
             %% in the cache.

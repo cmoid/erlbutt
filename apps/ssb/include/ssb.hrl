@@ -1,15 +1,12 @@
 %% SPDX-License-Identifier: GPL-2.0-only
 %%
 %% Copyright (C) 2018 Dionne Associates, LLC.
+
+-include_lib("kernel/include/logger.hrl").
+
 -define(l2b(List), list_to_binary(List)).
 -define(b2l(List), binary_to_list(List)).
 -define(pgv(K,V), proplists:get_value(K, V)).
-
--define(debug(FormatStr, Args), logger:debug(FormatStr, Args)).
--define(info(FormatStr, Args), logger:info(FormatStr, Args)).
--define(warning(FormatStr, Args), logger:warning(FormatStr, Args)).
--define(notice(FormatStr, Args), logger:notice(FormatStr, Args)).
--define(error(FormatStr, Args), logger:error(FormatStr, Args)).
 
 -define(KEEP_ALIVE_GRACE, 1500).
 
