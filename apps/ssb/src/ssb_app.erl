@@ -26,7 +26,6 @@ start(_StartType, _StartArgs) ->
                                                {max_connections, 10}],
                                    ssb_server, []),
 
-
     ssb_sup:start_link().
 
 stop(_State) ->
@@ -35,9 +34,9 @@ stop(_State) ->
 
 -ifdef(TEST).
 
-%% simple_test() ->
-%%     application:ensure_all_started(ssb),
-%%     ?assertNot(undefined == whereis(ssb_sup)),
-%%     application:stop(ssb).
+simple_test() ->
+    application:ensure_all_started(ssb),
+    ?assertNot(undefined == whereis(ssb_sup)),
+    application:stop(ssb).
 
 -endif.
