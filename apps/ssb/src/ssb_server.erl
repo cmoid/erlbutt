@@ -34,8 +34,6 @@ handle_info({tcp, Socket, Data},
             #sbox_state{socket=Socket,
                    transport=Transport,
                    shook_hands = 0} = State) ->
-    utils:log({Socket, Data}),
-
     try
         {ok, {DecBoxKey, DecNonce, EncBoxKey, EncNonce}}
             = shs:server_shake_hands(Data, Socket, Transport),
@@ -47,7 +45,7 @@ handle_info({tcp, Socket, Data},
                                shook_hands = 1}}
     catch
         error:Reason ->
-            ?LOG_DEBUG("Unable to shake hands with stranger ~p ~n",
+            ?LOG_ERROR("Unable to shake hands with stranger ~p ~n",
                    [Reason]),
             {stop, Reason}
     end;
@@ -58,7 +56,6 @@ handle_info({tcp, Socket, Data},
             #sbox_state{socket=Socket,
                    transport=Transport,
                    box_rem_bytes = BoxLeftOver} = State) ->
-    utils:log({Socket, Data}),
 
     % combine new data with left overs from previous packets
     BoxData = combine(BoxLeftOver, Data),
@@ -108,7 +105,7 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 
 network_error(Reason, State) ->
-    ?LOG_DEBUG("Network error ~p ~n",[Reason]),
+    ?LOG_ERROR("Network error ~p ~n",[Reason]),
     stop({shutdown, conn_closed}, State).
 
 stop(Reason, State) ->

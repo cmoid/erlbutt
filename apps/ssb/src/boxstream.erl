@@ -51,7 +51,6 @@ unbox(SecretBoxKey, Nonce, DataProc) ->
 
     case EndBox of
         true ->
-            ?LOG_DEBUG("Ok, that's all folks, just got the BOX END ~p ~n",[Msg]),
             {done, ?BOX_END, Nonce, <<>>};
         _Else ->
             <<Len:2/binary,Rest:16/binary>> = Msg,
@@ -89,11 +88,8 @@ unbox_and_parse(BoxData, #sbox_state{socket=Socket,
         unbox(DecBoxKey, DecNonce,
                         BoxData),
 
-    ?LOG_DEBUG("This is what we unboxed ~p ~n",[{Done, Msg, NewDecNonce, NewBoxLeftOver}]),
-
     %% Should append Msg to rpc_rem_bytes from previous call?
     Parsed = rpc_parse(Done, combine(RpcLeftOver, Msg)),
-    ?LOG_DEBUG("This is what we parsed ~p ~n",[Parsed]),
     {NewRpcLeftOver, NewEncNonce, NewResponse} =
         case Parsed of
             nop ->
@@ -101,9 +97,7 @@ unbox_and_parse(BoxData, #sbox_state{socket=Socket,
             {partial, nil, Rest} ->
                 % if partial parse then Rest is the original input
                 {Rest, EncNonce, Response};
-            {complete, {?RPC_END, <<>>}, Rest} ->
-                ?LOG_DEBUG("This is the end of the RPC stream ~p ~n",
-                       [Rest]),
+            {complete, {?RPC_END, <<>>}, _Rest} ->
                 {RpcLeftOver, EncNonce, Response};
             {complete, {Header, Body}, Rest} ->
                 {ProcEncNonce, Resp} =
@@ -122,7 +116,6 @@ unbox_and_parse(BoxData, #sbox_state{socket=Socket,
                       response = NewResponse},
     if (Done == complete andalso
         size(NewBoxLeftOver) > 34) ->
-            ?LOG_DEBUG("There is more to do ~p ~n",[{size(NewBoxLeftOver), NewResponse}]),
             unbox_and_parse(NewBoxLeftOver,
                             NewState#sbox_state{box_rem_bytes = <<>>});
        true ->
@@ -131,7 +124,6 @@ unbox_and_parse(BoxData, #sbox_state{socket=Socket,
     end.
 
 rpc_parse(complete, ?BOX_END) ->
-    ?LOG_DEBUG("THIS IS THE END OF BOXSTREAM ~n",[]),
     nop;
 
 rpc_parse(complete, Msg) ->

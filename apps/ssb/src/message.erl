@@ -177,8 +177,6 @@ validate(true, MsgProps) ->
     end.
 
 add_sig(NewMsg, EncSig) ->
-    %%?LOG_INFO("The new mess is: ~p ~n",[NewMsg]),
-
     NewMsgList = msg_to_proplist(NewMsg) ++
         [{<<"signature">>, EncSig}],
     %% added sig to msg before computing id

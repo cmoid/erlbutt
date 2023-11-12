@@ -101,7 +101,7 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(Reason, #state{mess_auth = BitHand}) ->
-    ?LOG_INFO("terminate called: ~p close bitcask ~n",[Reason]),
+    ?LOG_INFO("Terminate called for reason: ~p ~n",[Reason]),
     bitcask:close(BitHand).
 
 code_change(_OldVsn, State, _Extra) ->

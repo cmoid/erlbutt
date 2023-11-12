@@ -78,8 +78,6 @@ process(#sbox_state{socket = Socket,
             {Done, NewState} =
                 boxstream:unbox_and_parse(BoxData, State),
 
-            ?LOG_DEBUG("The box returns ~p ~n",[{Done, NewState}]),
-
             case Done of
                 complete ->
                     ranch_tcp:setopts(Socket, [{active, once}]),
@@ -105,11 +103,8 @@ handle_info({tcp, Socket, Data},
             #sbox_state{socket=Socket,
                    transport=Transport,
                    box_rem_bytes = BoxLeftOver} = State) ->
-    utils:log({Socket, Data}),
-
     % combine new data with left overs from previous packets
     BoxData = combine(BoxLeftOver, Data),
-    ?LOG_DEBUG("Client needs to process data ~p ~n",[BoxData]),
 
     {Done, NewState} = boxstream:unbox_and_parse(BoxData, State),
 
@@ -121,9 +116,7 @@ handle_info({tcp, Socket, Data},
             {noreply, NewState}
     end;
 
-handle_info(Info, State) ->
-    ?LOG_DEBUG("Random info request ~p ~n",[Info]),
-    utils:log(Info),
+handle_info(_Info, State) ->
     {noreply, State}.
 
 
@@ -140,7 +133,7 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 network_error(Reason, State) ->
-    ?LOG_DEBUG("Network error ~p ~n",[Reason]),
+    ?LOG_ERROR("Network error ~p ~n",[Reason]),
     stop({shutdown, conn_closed}, State).
 
 connect(Host, Port) ->

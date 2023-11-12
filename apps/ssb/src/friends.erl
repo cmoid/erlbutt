@@ -30,7 +30,6 @@ follows(FeedPid, HopCount) ->
     put(visited, [ssb_feed:whoami(FeedPid)]),
     FinalFeeds = follows2(FeedPid, HopCount),
     put(visited, []),
-    ?LOG_DEBUG("visited is ~p ~n",[length(get(visited))]),
     lists:foldl(fun(E, Acc) ->
                         Cf = lists:member(E, Acc),
                         if Cf ->

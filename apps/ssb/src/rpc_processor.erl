@@ -19,7 +19,6 @@ process({Header, Body}, #ssb_conn{
                            socket = Socket,
                            nonce = Nonce,
                            secret_box = SecretBoxKey}) ->
-    ?LOG_DEBUG("Please parse header ~p ~n from pid: ~p ~n",[Header, self()]),
     ReqNo = req_no(Header),
 
     ?LOG_DEBUG("Please process ~p ~n from pid: ~p ~n",[{ReqNo, Body}, self()]),
@@ -54,9 +53,11 @@ create_header(Flags, BodySize, ReqNo) ->
 %%%===================================================================
 
 req_no(Header) ->
-    <<_Flags:1/binary,
-      _BodySize:4/binary,
+    <<Flags:1/binary,
+      BodySize:4/binary,
       Req:4/big-signed-integer-unit:8>> = Header,
+    ?LOG_DEBUG("The parsed header ~p ~n from pid: ~p ~n",[{Flags, BodySize, Req}, self()]),
+
     Req.
 
 create_req(Body) ->

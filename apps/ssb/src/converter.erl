@@ -58,7 +58,6 @@ convert_terms(IoDev, Found, Sleep, Feeds) ->
             %% read spacer in file, at end this will cause eof but that will be picked
             %% up in the next iteration
             {ok, <<_PosInt:32/integer>>} = file:read(IoDev, 4),
-            %%?LOG_INFO("The pos is ~p ~n",[PosInt]),
             convert_terms(IoDev, Found + 1, Sleep, Feeds);
         {error, eof} ->
             ?LOG_INFO("Found ~p messages ~n",[Found]),

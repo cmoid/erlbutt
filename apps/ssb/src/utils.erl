@@ -54,7 +54,7 @@ combine(Bin1, Bin2) ->
 
 send_data(Data, Socket, Nonce, SecretBoxKey) ->
 
-    ?LOG_DEBUG("Sending data ~p ~n",[Data]),
+    ?LOG_DEBUG("Sending data ~p on socket: ~p ~n",[Data, Socket]),
 
     {EncBox, NewNonce} =
         boxstream:box(Data, Nonce, SecretBoxKey),
