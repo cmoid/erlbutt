@@ -5,7 +5,7 @@ An implementation of the [`SSB`][1] protocol.
 
 ## [Project notes][2]
 
-## Building and running
+## Building
 
 ```
 ./rebar3 eunit
@@ -14,6 +14,15 @@ An implementation of the [`SSB`][1] protocol.
 
 ./rebar3 release
 
+```
+To run:
+```
+_build/default/rel/ssb/bin/ssb-0.0.1 console
+
+```
+An environment variable can be used to control logging, .eg.:
+
+```
 SSB_LOG_LEVEL=debug _build/default/rel/ssb/bin/ssb-0.0.1 console
 ```
 
