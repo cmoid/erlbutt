@@ -24,7 +24,7 @@ start(_StartType, _StartArgs) ->
     {ok, _} = ranch:start_listener(erlbutt_listener, 5,
                                    ranch_tcp, [{port, 8008},
                                                {max_connections, 10}],
-                                   ssb_server, []),
+                                   ssb_peer, []),
 
     ssb_sup:start_link().
 

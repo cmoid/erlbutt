@@ -13,13 +13,22 @@
 -include("ssb.hrl").
 
 %% API
--export([parse/1]).
+-export([parse/2]).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
-parse(Data) ->
-    parse_header(Data).
+parse(complete, ?BOX_END) ->
+    nop;
+
+parse(complete, Msg) ->
+    parse_header(Msg);
+
+parse(partial, _Msg) ->
+    nop;
+
+parse(done, _Msg) ->
+    nop.
 
 %% private funs
 
@@ -54,36 +63,36 @@ body_size(Header) ->
 simple_test() ->
     Flags = create_flags(1,0,2),
     Header = create_header(Flags, 0, 1),
-    ?assert(parse(utils:combine(Header, <<>>)) ==
+    ?assert(parse(complete, utils:combine(Header, <<>>)) ==
                 {complete,{<<10,0,0,0,0,0,0,0,1>>,<<>>},<<>>}).
 
 no_body_test() ->
     Flags = create_flags(1,0,2),
     Header = create_header(Flags, 6, 1),
-    ?assert(parse(utils:combine(Header, <<"true">>)) ==
+    ?assert(parse(complete, utils:combine(Header, <<"true">>)) ==
                 {partial,nil,utils:combine(Header, <<"true">>)}).
 
 no_header_test() ->
     Header = <<10,0,0,0,0,0,0,0>>,
-    ?assert(parse(Header) ==
+    ?assert(parse(complete, Header) ==
                 {partial,nil,Header}).
 
 full_test() ->
     Flags = create_flags(1,0,2),
     Header = create_header(Flags, 4, 1),
-    ?assert(parse(utils:combine(Header, <<"true">>)) ==
+    ?assert(parse(complete, utils:combine(Header, <<"true">>)) ==
                 {complete,{<<10,0,0,0,4,0,0,0,1>>,<<"true">>},<<>>}).
 
 not_enough_test() ->
     Flags = create_flags(1,0,2),
     Header = create_header(Flags, 12, 1),
-    ?assert(parse(utils:combine(Header, <<"trueorfalse">>)) ==
+    ?assert(parse(complete, utils:combine(Header, <<"trueorfalse">>)) ==
                 {partial,nil,utils:combine(Header, <<"trueorfalse">>)}).
 
 over_test() ->
     Flags = create_flags(1,0,2),
     Header = create_header(Flags, 4, 1),
-    ?assert(parse(utils:combine(Header, <<"trueorfalse">>)) ==
+    ?assert(parse(complete, utils:combine(Header, <<"trueorfalse">>)) ==
                 {complete,{<<10,0,0,0,4,0,0,0,1>>,<<"true">>},<<"orfalse">>}).
 
 -endif.

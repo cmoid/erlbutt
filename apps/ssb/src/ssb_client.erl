@@ -76,7 +76,7 @@ process(#sbox_state{socket = Socket,
             BoxData = combine(BoxLeftOver, Data),
 
             {Done, NewState} =
-                boxstream:unbox_and_parse(BoxData, State),
+                ssb_peer:unbox_and_parse(BoxData, State),
 
             case Done of
                 complete ->
@@ -106,7 +106,7 @@ handle_info({tcp, Socket, Data},
     % combine new data with left overs from previous packets
     BoxData = combine(BoxLeftOver, Data),
 
-    {Done, NewState} = boxstream:unbox_and_parse(BoxData, State),
+    {Done, NewState} = ssb_peer:unbox_and_parse(BoxData, State),
 
     case Done of
         done ->
