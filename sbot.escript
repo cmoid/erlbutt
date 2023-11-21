@@ -5,57 +5,72 @@
 
 -define(INFO(Fmt,Args), io:format(Fmt,Args)).
 
-main([Command | CommandArgs]) ->
+main([Command]) ->
     code:add_path("./_build/default/lib/jiffy/ebin/"),
     code:add_path("./_build/default/lib/ssb/ebin/"),
     code:add_path("./_build/default/lib/enacl/ebin/"),
     code:add_path("./_build/default/lib/ranch/ebin/"),
     code:add_path("./_build/default/lib/bitcask/ebin/"),
-    logger:set_primary_config(level, debug),
+    logger:set_primary_config(level, error),
     keys:start_link(),
     config:start_link(),
 
-    Args = parse_arguments(CommandArgs),
-    %% invoke the command passed as argument
-    F = fun(_Args) ->
-                NewClient = secret_handshake("10.0.0.251"),
+   %% invoke the command passed as argument
+    F = fun() ->
+                NewClient = secret_handshake("10.0.0.208"),
                 ?INFO("~p~n",[NewClient]),
                 ?INFO("~s~n",[Command]),
                 Req = case Command of
                              "whoami" ->
-                                 utils:whoami_req();
+                                 whoami_req();
+                             "menu" ->
+                                 menu_req();
                              "ping" ->
-                                 utils:ping_req()
+                                 ping_req()
                          end,
                 Resp = ssb_client:send(NewClient, Req),
                 ?INFO("~s~n",[Resp])
         end,
-    F(Args);
+    F();
 
 main(Args) ->
     ?INFO("unknown args: ~p\n", [Args]),
     erlang:halt(1).
 
-parse_arguments(Args) ->
-    parse_arguments(Args, []).
-
-parse_arguments([], Acc) -> Acc;
-
-parse_arguments(Else, _Acc) ->
-    ?INFO("Args not supported yet ~p \n",
-          [Else]).
-
-
-
-
 secret_handshake(Host) ->
-    {ok, NewSbotClient} = ssb_client:start_link(Host, remote_long_pk()),
+    {ok, NewSbotClient} = ssb_client:start_link(Host, base64:decode(<<"aBkmLQLxnsJleW1LyyCrS3DA6a/Wfz57vIK321vRumc=">>)),
     NewSbotClient.
 
 %%base64:decode(<<"LrNsx/3v3rBPk1zFkDp3V8mdsNQrcup8iu4FdymtFm0=">>)
 
 %%base64:decode(<<"bombBa/UwB792ilEh7wXooqBSluIvzrJbrWzZAFhnxw=">>)
 
+%%base64:decode(<<"aBkmLQLxnsJleW1LyyCrS3DA6a/Wfz57vIK321vRumc=">>)
+
 
 remote_long_pk() ->
     base64:decode(keys:pub_key()).
+
+whoami_req() ->
+    Flags = rpc_processor:create_flags(0,0,2),
+    Body = jiffy:encode({[{<<"name">>,[<<"whoami">>]},
+                          {<<"args">>,[]},
+                          {<<"type">>,<<"sync">>}]}),
+    Header = rpc_processor:create_header(Flags, size(Body), 1),
+    utils:combine(Header, Body).
+
+menu_req() ->
+    Flags = rpc_processor:create_flags(0,0,2),
+    Body = jiffy:encode({[{<<"name">>,[<<"manifest">>]},
+                          {<<"args">>,[]},
+                          {<<"type">>,<<"sync">>}]}),
+    Header = rpc_processor:create_header(Flags, size(Body), 1),
+    utils:combine(Header, Body).
+
+ping_req() ->
+    Flags = rpc_processor:create_flags(1,0,2),
+    Body = jiffy:encode({[{<<"name">>,[<<"ping">>]},
+                          {<<"args">>,[{[{<<"timeout">>, 30}]}]},
+                          {<<"type">>,<<"duplex">>}]}),
+    Header = rpc_processor:create_header(Flags, size(Body), 1),
+    utils:combine(Header, Body).

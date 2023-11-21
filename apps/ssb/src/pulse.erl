@@ -41,7 +41,7 @@ init([]) ->
                           {active,true}]),
     case Resp of
         {ok, Socket} ->
-            {ok, TRef} = timer:send_after(1000, advertise),
+            {ok, TRef} = timer:send_after(3000, advertise),
             {ok, #state{socket = Socket,
                         timer = TRef}};
         {error, Reason} ->
@@ -73,7 +73,7 @@ handle_info(advertise, #state{socket=Socket}=State) ->
                  {255,255,255,255},
                  8008,
                  whoami()),
-    {noreply, State#state{timer=timer:send_after(1000, advertise)}};
+    {noreply, State#state{timer=timer:send_after(3000, advertise)}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -142,6 +142,7 @@ ping() ->
                           {<<"args">>,[{[{<<"timeout">>, 700000}]}]},
                           {<<"type">>,<<"duplex">>}]}),
     Header = rpc_processor:create_header(Flags, size(Body), 1),
+    ?LOG_DEBUG("Sending ping request from pulsw ~p ~n",[{Header, Body}]),
     utils:combine(Header, Body).
 
 extract_key(Data) ->
