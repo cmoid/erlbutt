@@ -14,9 +14,13 @@ test: compile
 	$(REBAR) eunit
 	rm -Rf testdata
 
+ct:  compile
+	$(REBAR) ct
+
 rel: compile
 	$(REBAR) release
 
 prod: compile
 	$(REBAR) as prod release
 
+all:  clean compile test prod
