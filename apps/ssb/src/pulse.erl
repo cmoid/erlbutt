@@ -19,7 +19,7 @@
 -define(SERVER, ?MODULE).
 
 -record(state, {socket,
-                clients = ets:new(ssb_clients, [set, named_table]),
+                peers = ets:new(ssb_peers, [set, named_table]),
                timer}).
 
 %%%===================================================================
@@ -61,11 +61,11 @@ handle_cast(_Msg, State) ->
 
 %% info
 
-handle_info({udp, _ClientSocket, Ip, _Port, Data},
+handle_info({udp, _PeerSocket, Ip, _Port, Data},
             #state{socket =_Socket}=State) ->
     %% don't talk to yourself, unless you want complete agreement
     IsSelf = local_ip_v4() == Ip,
-    new_ssb_client(Ip, Data, IsSelf),
+    new_ssb_peer(Ip, Data, IsSelf),
     {noreply, State};
 
 handle_info(advertise, #state{socket=Socket}=State) ->
@@ -108,16 +108,16 @@ local_ip_v4() ->
             hd(Ips)
     end.
 
-new_ssb_client(_Ip, _Data, true) ->
+new_ssb_peer(_Ip, _Data, true) ->
     ok;
 
-new_ssb_client(Ip, Data, _) ->
-    ClientExists = ets:member(ssb_clients, Ip),
-    reuse_or_create(Ip, Data, ClientExists).
+new_ssb_peer(Ip, Data, _) ->
+    PeerExists = ets:member(ssb_peers, Ip),
+    reuse_or_create(Ip, Data, PeerExists).
 
 reuse_or_create(Ip, _Data, true) ->
-    [{_Ip, NSClient}] = ets:lookup(ssb_clients, Ip),
-    ssb_client:send(NSClient, ping());
+    [{_Ip, NSPeer}] = ets:lookup(ssb_peers, Ip),
+    ssb_peer:send(NSPeer, ping());
 
 reuse_or_create(Ip, Data, false) ->
     PubKey = extract_key(Data),
@@ -125,14 +125,14 @@ reuse_or_create(Ip, Data, false) ->
             ?LOG_ERROR("No public key in data ~p ~n",[Data]);
        true ->
             Result =
-                ssb_client:start_link(Ip, PubKey),
+                ssb_peer:start_link(Ip, PubKey),
             case Result of
-                {ok, NewSbotClient} ->
+                {ok, NewSbotPeer} ->
                     ?LOG_INFO("Started new link with ~p ~n",[{Ip, PubKey}]),
-                    ets:insert(ssb_clients, {Ip, NewSbotClient}),
-                    ssb_client:send(NewSbotClient, ping());
+                    ets:insert(ssb_peers, {Ip, NewSbotPeer}),
+                    ssb_peer:send(NewSbotPeer, ping());
                 Else ->
-                    ?LOG_ERROR("Issue connecting to client ~p ~n",[Else])
+                    ?LOG_ERROR("Issue connecting to peer ~p ~n",[Else])
             end
     end.
 

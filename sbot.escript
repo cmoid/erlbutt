@@ -28,7 +28,7 @@ main([Command]) ->
                              "ping" ->
                                  ping_req()
                          end,
-                Resp = ssb_client:send(NewClient, Req),
+                Resp = ssb_peer:send(NewClient, Req),
                 ?INFO("~s~n",[Resp])
         end,
     F();
@@ -38,7 +38,7 @@ main(Args) ->
     erlang:halt(1).
 
 secret_handshake(Host) ->
-    {ok, NewSbotClient} = ssb_client:start_link(Host, base64:decode(<<"aBkmLQLxnsJleW1LyyCrS3DA6a/Wfz57vIK321vRumc=">>)),
+    {ok, NewSbotClient} = ssb_peer:start_link(Host, base64:decode(<<"aBkmLQLxnsJleW1LyyCrS3DA6a/Wfz57vIK321vRumc=">>)),
     NewSbotClient.
 
 %%base64:decode(<<"LrNsx/3v3rBPk1zFkDp3V8mdsNQrcup8iu4FdymtFm0=">>)

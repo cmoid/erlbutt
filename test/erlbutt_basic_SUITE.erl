@@ -47,24 +47,24 @@ all() ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 connect_test(Config) ->
     Host = get_value(hostname, Config, "localhost"),
-    {ok, NewSbotClient} = ssb_client:start_link(Host, remote_long_pk()),
+    {ok, NewSbotClient} = ssb_peer:start_link(Host, remote_long_pk()),
     ?assert(is_process_alive(NewSbotClient)),
     Config.
 
 
 ping_test(Config) ->
     Host = get_value(hostname, Config, "localhost"),
-    {ok, NewSbotClient} = ssb_client:start_link(Host, remote_long_pk()),
+    {ok, NewSbotClient} = ssb_peer:start_link(Host, remote_long_pk()),
     Now = erlang:system_time(millisecond),
-    Time = ssb_client:send(NewSbotClient, ping()),
+    Time = ssb_peer:send(NewSbotClient, ping()),
     End = binary_to_integer(jiffy:decode(Time)),
     ?assert((End - Now) < 5),
     Config.
 
 whoami_test(Config) ->
     Host = get_value(hostname, Config, "localhost"),
-    {ok, NewSbotClient} = ssb_client:start_link(Host, remote_long_pk()),
-    {WhoAmI} = jiffy:decode(ssb_client:send(NewSbotClient, whoami_req())),
+    {ok, NewSbotClient} = ssb_peer:start_link(Host, remote_long_pk()),
+    {WhoAmI} = jiffy:decode(ssb_peer:send(NewSbotClient, whoami_req())),
     ?assert(keys:pub_key_disp() == ?pgv(<<"id">>, WhoAmI)),
     Config.
 
