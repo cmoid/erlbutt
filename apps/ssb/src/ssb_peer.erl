@@ -1,7 +1,7 @@
 %% SPDX-License-Identifier: GPL-2.0-only
 %%
 %% Copyright (C) 2023 Charles Moid
--module(ssb_server).
+-module(ssb_peer).
 
 -behaviour(gen_server).
 -behaviour(ranch_protocol).
@@ -9,7 +9,8 @@
 -include("ssb.hrl").
 
 %% API for ranch protocol
--export([start_link/4]).
+-export([start_link/4,
+         unbox_and_parse/2]).
 
 %% gen_server exports
 -export([init/1, handle_call/3, handle_cast/2,
@@ -60,7 +61,7 @@ handle_info({tcp, Socket, Data},
     % combine new data with left overs from previous packets
     BoxData = combine(BoxLeftOver, Data),
 
-    {Done, NewState} = boxstream:unbox_and_parse(BoxData, State),
+    {Done, NewState} = unbox_and_parse(BoxData, State),
 
     case Done of
         done ->
@@ -103,6 +104,54 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+unbox_and_parse(BoxData, #sbox_state{socket=Socket,
+                                dec_sbox_key = DecBoxKey,
+                                enc_sbox_key = EncBoxKey,
+                                dec_nonce = DecNonce,
+                                enc_nonce = EncNonce,
+                                rpc_rem_bytes = RpcLeftOver,
+                                response = Response} = State) ->
+    {Done, Msg, NewDecNonce, NewBoxLeftOver} =
+        boxstream:unbox(DecBoxKey, DecNonce,
+                        BoxData),
+
+    %% Should append Msg to rpc_rem_bytes from previous call?
+    Parsed = rpc_parse:parse(Done, combine(RpcLeftOver, Msg)),
+    {NewRpcLeftOver, NewEncNonce, NewResponse} =
+        case Parsed of
+            nop ->
+                {RpcLeftOver, EncNonce, Response};
+            {partial, nil, Rest} ->
+                % if partial parse then Rest is the original input
+                {Rest, EncNonce, Response};
+            {complete, {?RPC_END, <<>>}, _Rest} ->
+                {RpcLeftOver, EncNonce, Response};
+            {complete, {Header, Body}, Rest} ->
+                %% Need to track request here somehow
+                {ProcEncNonce, Resp} =
+                    rpc_processor:process({Header, Body},
+                                          #ssb_conn{
+                                             socket = Socket,
+                                             nonce = EncNonce,
+                                             secret_box = EncBoxKey}),
+                {Rest, ProcEncNonce, Resp}
+        end,
+
+    NewState = State#sbox_state{dec_nonce = NewDecNonce,
+                      enc_nonce = NewEncNonce,
+                      box_rem_bytes = NewBoxLeftOver,
+                      rpc_rem_bytes = NewRpcLeftOver,
+                      response = NewResponse},
+    if (Done == complete andalso
+        size(NewBoxLeftOver) > 34) ->
+            unbox_and_parse(NewBoxLeftOver,
+                            NewState#sbox_state{box_rem_bytes = <<>>});
+       true ->
+            ?LOG_DEBUG("complete or no more to process ~p ~n",[{NewRpcLeftOver, NewBoxLeftOver, Done}]),
+            {Done, NewState}
+    end.
+
 
 network_error(Reason, State) ->
     ?LOG_ERROR("Network error ~p ~n",[Reason]),
