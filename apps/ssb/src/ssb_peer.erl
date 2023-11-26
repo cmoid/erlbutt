@@ -8,11 +8,9 @@
 
 -include("ssb.hrl").
 
-%% API for ranch protocol
--export([start_link/2, send/2]).
-
--export([start_link/4,
-         unbox_and_parse/2]).
+-export([start_link/2,
+         start_link/4,
+         send/2]).
 
 %% gen_server exports
 -export([init/1, handle_call/3, handle_cast/2,
@@ -28,7 +26,6 @@ start_link(Ip, PubKey) ->
 
 send(Pid, Data) ->
     gen_server:call(Pid, {send, Data}).
-
 
 start_link(Ref, Socket, Transport, Opts) ->
     gen_server:start_link(?MODULE, [Ref, Socket, Transport, Opts], []).
@@ -175,7 +172,6 @@ process(#sbox_state{socket = Socket,
             ?LOG_DEBUG("nothing to read now? ~p ~n",[Reason]),
             State#sbox_state{response = Reason}
     end.
-
 
 unbox_and_parse(BoxData, #sbox_state{socket=Socket,
                                 dec_sbox_key = DecBoxKey,

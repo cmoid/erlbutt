@@ -47,16 +47,16 @@ all() ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 connect_test(Config) ->
     Host = get_value(hostname, Config, "localhost"),
-    {ok, NewSbotClient} = ssb_peer:start_link(Host, remote_long_pk()),
-    ?assert(is_process_alive(NewSbotClient)),
+    {ok, NewSbotPeer} = ssb_peer:start_link(Host, remote_long_pk()),
+    ?assert(is_process_alive(NewSbotPeer)),
     Config.
 
 
 ping_test(Config) ->
     Host = get_value(hostname, Config, "localhost"),
-    {ok, NewSbotClient} = ssb_peer:start_link(Host, remote_long_pk()),
+    {ok, NewSbotPeer} = ssb_peer:start_link(Host, remote_long_pk()),
     Now = erlang:system_time(millisecond),
-    Time = ssb_peer:send(NewSbotClient, ping()),
+    Time = ssb_peer:send(NewSbotPeer, ping()),
     End = binary_to_integer(jiffy:decode(Time)),
     ?assert((End - Now) < 5),
     Config.
