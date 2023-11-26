@@ -164,6 +164,8 @@ process(#sbox_state{socket = Socket,
                     ranch_tcp:setopts(Socket, [{active, once}]),
                     %% need the response here
                     NewState;
+                done ->
+                    stop(done, NewState);
                 _Else ->
                     %% recursive call, keep processing until complete
                     process(NewState)
