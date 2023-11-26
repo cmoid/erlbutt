@@ -44,7 +44,8 @@ init([Ip, PubKey]) ->
                          dec_sbox_key = DecBoxKey,
                          enc_sbox_key = EncBoxKey,
                          dec_nonce = DecNonce,
-                         enc_nonce = EncNonce}}
+                         enc_nonce = EncNonce,
+                         rpc_procs = ets:new(rpc_procs, [])}}
     catch
         error:Reason ->
             ?LOG_DEBUG("Handshake failed, perhaps server is afraid of Corona beer ~p ~n",
@@ -60,7 +61,8 @@ init([Ref, Socket, Transport, _Opts = []]) ->
     %% until init does.
     {ok, #sbox_state{ref = Ref,
                 socket = Socket,
-                transport = Transport}, 0}.
+                transport = Transport,
+                rpc_procs = ets:new(rpc_procs, [])}, 0}.
 
 handle_info({tcp, Socket, Data},
             #sbox_state{socket=Socket,
