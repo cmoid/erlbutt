@@ -13,35 +13,28 @@
 -include("ssb.hrl").
 
 %% API
--export([parse/2]).
+-export([parse/1]).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
-parse(complete, ?BOX_END) ->
-    nop;
+parse(Msg) when size(Msg) < 9 ->
+    {partial, nil, Msg};
 
-parse(complete, Msg) ->
-    parse_header(Msg);
-
-parse(partial, _Msg) ->
-    nop;
-
-parse(done, _Msg) ->
-    nop.
+parse(Msg) ->
+    <<Header:9/binary,
+      Rest/binary>> = Msg,
+    IsEnd = Header == ?RPC_END,
+    case IsEnd of
+        true ->
+            {complete, ?RPC_END, Rest};
+        false ->
+            parseRest(Header, Rest, Msg)
+    end.
 
 %% private funs
 
-parse_header(Data) when size(Data) >= 9 ->
-    <<Header:9/binary,
-      Rest/binary>> = Data,
-    %% may also have enough data for the body
-    parseBody(Header, Rest, Data);
-
-parse_header(Data) ->
-    {partial, nil, Data}.
-
-parseBody(Header, Rest, OrigData) ->
+parseRest(Header, Rest, OrigData) ->
     BodySize = body_size(Header),
     extract_body(BodySize, Header, Rest, OrigData).
 
@@ -63,36 +56,36 @@ body_size(Header) ->
 simple_test() ->
     Flags = create_flags(1,0,2),
     Header = create_header(Flags, 0, 1),
-    ?assert(parse(complete, utils:combine(Header, <<>>)) ==
+    ?assert(parse(utils:combine(Header, <<>>)) ==
                 {complete,{<<10,0,0,0,0,0,0,0,1>>,<<>>},<<>>}).
 
 no_body_test() ->
     Flags = create_flags(1,0,2),
     Header = create_header(Flags, 6, 1),
-    ?assert(parse(complete, utils:combine(Header, <<"true">>)) ==
+    ?assert(parse(utils:combine(Header, <<"true">>)) ==
                 {partial,nil,utils:combine(Header, <<"true">>)}).
 
 no_header_test() ->
     Header = <<10,0,0,0,0,0,0,0>>,
-    ?assert(parse(complete, Header) ==
+    ?assert(parse(Header) ==
                 {partial,nil,Header}).
 
 full_test() ->
     Flags = create_flags(1,0,2),
     Header = create_header(Flags, 4, 1),
-    ?assert(parse(complete, utils:combine(Header, <<"true">>)) ==
+    ?assert(parse(utils:combine(Header, <<"true">>)) ==
                 {complete,{<<10,0,0,0,4,0,0,0,1>>,<<"true">>},<<>>}).
 
 not_enough_test() ->
     Flags = create_flags(1,0,2),
     Header = create_header(Flags, 12, 1),
-    ?assert(parse(complete, utils:combine(Header, <<"trueorfalse">>)) ==
+    ?assert(parse(utils:combine(Header, <<"trueorfalse">>)) ==
                 {partial,nil,utils:combine(Header, <<"trueorfalse">>)}).
 
 over_test() ->
     Flags = create_flags(1,0,2),
     Header = create_header(Flags, 4, 1),
-    ?assert(parse(complete, utils:combine(Header, <<"trueorfalse">>)) ==
+    ?assert(parse(utils:combine(Header, <<"trueorfalse">>)) ==
                 {complete,{<<10,0,0,0,4,0,0,0,1>>,<<"true">>},<<"orfalse">>}).
 
 -endif.

@@ -36,6 +36,8 @@ box(Data, Nonce, SecretBoxKey) ->
     {combine(EncHeader, Body),
      incr(incr(Nonce))}.
 
+%% return complete or partial, no need for returning done. Complete
+%% with ?BOX_END indicates done
 unbox(_SecretBoxKey, Nonce, DataProc) when size(DataProc) < 34 ->
     {partial, <<>>, Nonce, DataProc};
 
@@ -51,7 +53,7 @@ unbox(SecretBoxKey, Nonce, DataProc) ->
 
     case EndBox of
         true ->
-            {done, ?BOX_END, Nonce, <<>>};
+            {complete, ?BOX_END, Nonce, <<>>};
         _Else ->
             <<Len:2/binary,Rest:16/binary>> = Msg,
 

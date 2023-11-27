@@ -175,28 +175,51 @@ process(#sbox_state{socket = Socket,
             State#sbox_state{response = Reason}
     end.
 
-unbox_and_parse(BoxData, #sbox_state{socket=Socket,
-                                dec_sbox_key = DecBoxKey,
-                                enc_sbox_key = EncBoxKey,
+unbox_and_parse(BoxData, #sbox_state{dec_sbox_key = DecBoxKey,
                                 dec_nonce = DecNonce,
-                                enc_nonce = EncNonce,
-                                rpc_rem_bytes = RpcLeftOver,
-                                response = Response} = State) ->
-    {Done, Msg, NewDecNonce, NewBoxLeftOver} =
+                                rpc_rem_bytes = RpcLeftOver} = State) ->
+    {Status, Msg, NewDecNonce, NewBoxLeftOver} =
         boxstream:unbox(DecBoxKey, DecNonce,
                         BoxData),
 
+    NewState = State#sbox_state{dec_nonce = NewDecNonce,
+                                box_rem_bytes = NewBoxLeftOver},
+
+    case Status of
+        partial ->
+            {partial, NewState};
+        complete ->
+            Done = Msg == ?BOX_END,
+            case Done of
+                true ->
+                    {done, NewState};
+                false ->
+                    %% now parse rpc
+                    NewState2 = rpc_parse(combine(RpcLeftOver, Msg), NewState),
+                    if (size(NewBoxLeftOver) > 34) ->
+                            unbox_and_parse(NewBoxLeftOver, NewState2);
+                       true ->
+                            ?LOG_DEBUG("complete or no more to process ~p ~n",
+                                       [{complete, NewBoxLeftOver}]),
+                            {complete, NewState2}
+                    end
+            end
+    end.
+
+rpc_parse(Data, #sbox_state{socket = Socket,
+                            enc_nonce = EncNonce,
+                            enc_sbox_key = EncBoxKey,
+                            response = Response} = State) ->
+
     %% Should append Msg to rpc_rem_bytes from previous call?
-    Parsed = rpc_parse:parse(Done, combine(RpcLeftOver, Msg)),
+    Parsed = rpc_parse:parse(Data),
     {NewRpcLeftOver, NewEncNonce, NewResponse} =
         case Parsed of
-            nop ->
-                {RpcLeftOver, EncNonce, Response};
             {partial, nil, Rest} ->
                 % if partial parse then Rest is the original input
                 {Rest, EncNonce, Response};
-            {complete, {?RPC_END, <<>>}, _Rest} ->
-                {RpcLeftOver, EncNonce, Response};
+            {complete, ?RPC_END, <<>>} ->
+                {<<>>, EncNonce, Response};
             {complete, {Header, Body}, Rest} ->
                 %% Need to track request here somehow
                 {ProcEncNonce, Resp} =
@@ -204,24 +227,20 @@ unbox_and_parse(BoxData, #sbox_state{socket=Socket,
                                           #ssb_conn{
                                              socket = Socket,
                                              nonce = EncNonce,
-                                             secret_box = EncBoxKey}),
+                                              secret_box = EncBoxKey}),
                 {Rest, ProcEncNonce, Resp}
         end,
 
-    NewState = State#sbox_state{dec_nonce = NewDecNonce,
-                      enc_nonce = NewEncNonce,
-                      box_rem_bytes = NewBoxLeftOver,
-                      rpc_rem_bytes = NewRpcLeftOver,
-                      response = NewResponse},
-    if (Done == complete andalso
-        size(NewBoxLeftOver) > 34) ->
-            unbox_and_parse(NewBoxLeftOver,
-                            NewState#sbox_state{box_rem_bytes = <<>>});
+    NewState = State#sbox_state{enc_nonce = NewEncNonce,
+                                rpc_rem_bytes = NewRpcLeftOver,
+                                response = NewResponse},
+    if (size(NewRpcLeftOver) >= 9) ->
+            %% parse some more
+            rpc_parse(NewRpcLeftOver, NewState#sbox_state{
+                                        rpc_rem_bytes = <<>>});
        true ->
-            ?LOG_DEBUG("complete or no more to process ~p ~n",[{NewRpcLeftOver, NewBoxLeftOver, Done}]),
-            {Done, NewState}
+            NewState
     end.
-
 
 network_error(Reason, State) ->
     ?LOG_ERROR("Network error ~p ~n",[Reason]),
