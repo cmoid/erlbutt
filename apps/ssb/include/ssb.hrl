@@ -1,6 +1,6 @@
 %% SPDX-License-Identifier: GPL-2.0-only
 %%
-%% Copyright (C) 2018 Dionne Associates, LLC.
+%% Copyright (C) 2023 Charles Moid
 
 -include_lib("kernel/include/logger.hrl").
 
