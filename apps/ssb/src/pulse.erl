@@ -109,6 +109,7 @@ local_ip_v4() ->
     end.
 
 new_ssb_peer(_Ip, _Data, true) ->
+    %%?LOG_DEBUG("Don't talk to self ~p ~n",[Data]),
     ok;
 
 new_ssb_peer(Ip, Data, _) ->

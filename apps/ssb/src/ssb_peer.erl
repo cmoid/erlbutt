@@ -127,6 +127,7 @@ handle_call({send, Data}, _From,
     NewEncNonce = send_data(Data, Socket, EncNonce, EncBoxKey),
     NewState = process(State),
     %%
+    ?LOG_DEBUG("Sent data and received: ~p ~n",[NewState#sbox_state.response]),
     {reply, NewState#sbox_state.response,
      NewState#sbox_state{enc_nonce = NewEncNonce}};
 
@@ -161,8 +162,9 @@ process(#sbox_state{socket = Socket,
 
             case Done of
                 complete ->
-                    ranch_tcp:setopts(Socket, [{active, once}]),
+                    %%ranch_tcp:setopts(Socket, [{active, once}]),
                     %% need the response here
+                    ?LOG_DEBUG("Client is done sending ~p ~n",[NewState#sbox_state.response]),
                     NewState;
                 done ->
                     stop(done, NewState);
