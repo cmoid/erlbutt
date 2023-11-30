@@ -35,14 +35,16 @@ init([Ip, PubKey]) ->
     try
         {ok, {Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce}} =
             shs:client_shake_hands(connect(Ip, 8008), PubKey),
-        %%ranch_tcp:setopts(Socket, [{active, once}]),
+        ranch_tcp:setopts(Socket, [{active, false}]),
+        ?LOG_DEBUG("CLIENT Shook hands with stranger ~p ~n",[Ip]),
         {ok, #sbox_state{socket = Socket,
                          transport = ranch_tcp,
                          dec_sbox_key = DecBoxKey,
                          enc_sbox_key = EncBoxKey,
                          dec_nonce = DecNonce,
                          enc_nonce = EncNonce,
-                         rpc_procs = ets:new(rpc_procs, [])}}
+                         rpc_procs = ets:new(rpc_procs, []),
+                         shook_hands = 1}}
     catch
         error:Reason ->
             ?LOG_DEBUG("Handshake failed, perhaps server is afraid of Corona beer ~p ~n",
@@ -151,7 +153,7 @@ code_change(_OldVsn, State, _Extra) ->
 
 process(#sbox_state{socket = Socket,
                    box_rem_bytes = BoxLeftOver}=State) ->
-    DataRead = gen_tcp:recv(Socket, 0, 3000),
+    DataRead = gen_tcp:recv(Socket, 0, 5000),
 
     case DataRead of
         {ok, Data} ->
@@ -215,13 +217,13 @@ rpc_parse(Data, #sbox_state{socket = Socket,
 
     %% Should append Msg to rpc_rem_bytes from previous call?
     Parsed = rpc_parse:parse(Data),
-    {NewRpcLeftOver, NewEncNonce, NewResponse} =
+    {Status, NewRpcLeftOver, NewEncNonce, NewResponse} =
         case Parsed of
             {partial, nil, Rest} ->
                 % if partial parse then Rest is the original input
-                {Rest, EncNonce, Response};
+                {partial, Rest, EncNonce, Response};
             {complete, ?RPC_END, <<>>} ->
-                {<<>>, EncNonce, Response};
+                {complete, <<>>, EncNonce, Response};
             {complete, {Header, Body}, Rest} ->
                 %% Need to track request here somehow
                 {ProcEncNonce, Resp} =
@@ -230,13 +232,13 @@ rpc_parse(Data, #sbox_state{socket = Socket,
                                              socket = Socket,
                                              nonce = EncNonce,
                                               secret_box = EncBoxKey}),
-                {Rest, ProcEncNonce, Resp}
+                {complete, Rest, ProcEncNonce, Resp}
         end,
 
     NewState = State#sbox_state{enc_nonce = NewEncNonce,
                                 rpc_rem_bytes = NewRpcLeftOver,
                                 response = NewResponse},
-    if (size(NewRpcLeftOver) >= 9) ->
+    if (size(NewRpcLeftOver) >= 9 andalso (Status == complete)) ->
             %% parse some more
             rpc_parse(NewRpcLeftOver, NewState#sbox_state{
                                         rpc_rem_bytes = <<>>});
