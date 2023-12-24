@@ -65,7 +65,7 @@ handle_info({udp, _PeerSocket, Ip, _Port, Data},
             #state{socket =_Socket}=State) ->
     %% don't talk to yourself, unless you want complete agreement
     IsSelf = local_ip_v4() == Ip,
-    new_ssb_peer(Ip, Data, IsSelf),
+    %%new_ssb_peer(Ip, Data, IsSelf),
     {noreply, State};
 
 handle_info(advertise, #state{socket=Socket}=State) ->

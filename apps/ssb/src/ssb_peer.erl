@@ -28,11 +28,13 @@ send(Pid, Data) ->
     gen_server:call(Pid, {send, Data}).
 
 start_link(Ref, Socket, Transport, Opts) ->
+    ?LOG_DEBUG("LISTENER socket connection ~p ~n",[Socket]),
     gen_server:start_link(?MODULE, [Ref, Socket, Transport, Opts], []).
 
 init([Ip, PubKey]) ->
     process_flag(trap_exit, true),
     try
+        ?LOG_DEBUG("CLIENT Trying to shake hands with stranger ~p ~n",[Ip]),
         {ok, {Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce}} =
             shs:client_shake_hands(connect(Ip, 8008), PubKey),
         ranch_tcp:setopts(Socket, [{active, false}]),
@@ -68,9 +70,11 @@ handle_info({tcp, Socket, Data},
                    transport=Transport,
                    shook_hands = 0} = State) ->
     try
+        ?LOG_DEBUG("LISTENER Trying to shake hands with stranger ~p ~n",[Socket]),
         {ok, {DecBoxKey, DecNonce, EncBoxKey, EncNonce}}
             = shs:server_shake_hands(Data, Socket, Transport),
         Transport:setopts(Socket, [{active, once}]),
+        ?LOG_DEBUG("LISTENER Shook hands with stranger ~p ~n",[Socket]),
         {noreply, State#sbox_state{ dec_sbox_key = DecBoxKey,
                                enc_sbox_key = EncBoxKey,
                                dec_nonce = DecNonce,
@@ -90,10 +94,15 @@ handle_info({tcp, Socket, Data},
                    transport=Transport,
                    box_rem_bytes = BoxLeftOver} = State) ->
 
+    ?LOG_DEBUG("LISTENER regular ingo from ~p ~n",[{Socket, Data, size(Data)}]),
+
     % combine new data with left overs from previous packets
     BoxData = combine(BoxLeftOver, Data),
+    ?LOG_DEBUG("SIZE of BozData ~p ~n",[size(BoxData)]),
 
     {Done, NewState} = unbox_and_parse(BoxData, State),
+
+    ?LOG_DEBUG("LISTENER unbox and parse returned ~p ~n",[{Done, NewState}]),
 
     case Done of
         done ->
@@ -186,6 +195,8 @@ unbox_and_parse(BoxData, #sbox_state{dec_sbox_key = DecBoxKey,
         boxstream:unbox(DecBoxKey, DecNonce,
                         BoxData),
 
+    ?LOG_DEBUG("After unbox ~p ~n",[{Status, size(Msg), Msg, size(NewBoxLeftOver), NewBoxLeftOver}]),
+
     NewState = State#sbox_state{dec_nonce = NewDecNonce,
                                 box_rem_bytes = NewBoxLeftOver},
 
@@ -214,6 +225,8 @@ rpc_parse(Data, #sbox_state{socket = Socket,
                             enc_nonce = EncNonce,
                             enc_sbox_key = EncBoxKey,
                             response = Response} = State) ->
+
+    ?LOG_DEBUG("rpc parsing ~p ~n",[{size(Data), Data}]),
 
     %% Should append Msg to rpc_rem_bytes from previous call?
     Parsed = rpc_parse:parse(Data),

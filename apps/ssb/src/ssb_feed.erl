@@ -191,8 +191,9 @@ post(Content, #state{id = FeedId, last_msg = Prev,
     NewState = store(Msg, State),
     NewState#state{last_msg = Id, last_seq = Seq + 1}.
 
-store(#message{id = Id, author = Auth} = Msg, #state{feed = Feed,
-                                                     profile = Profile} = State) ->
+store(#message{id = Id, author = Auth} = Msg,
+      #state{feed = Feed,
+             profile = Profile} = State) ->
     mess_auth:put(Id, Auth),
     write_msg(Msg, Feed),
     utils:update_refs(Msg),

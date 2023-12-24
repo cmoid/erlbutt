@@ -197,8 +197,6 @@ tangle4_test() ->
                    [{Id4, Auth2, [{Id5, Auth2}]},
                     {Id3, Auth, [{Id5, Auth2}]}]}]} == tangle:get_tangle(Id)).
 
-
-
 init() ->
     keys:start_link(),
     config:start_link("test/ssb.cfg"),
