@@ -162,7 +162,7 @@ check_id(<<"@",Id/binary>>) ->
                 ok
         end
     catch
-        error:Reason ->
+        error:_Reason ->
             bad
     end;
 check_id(_Else) ->

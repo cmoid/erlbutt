@@ -53,8 +53,8 @@ create_header(Flags, BodySize, ReqNo) ->
 %%%===================================================================
 
 req_no(Header) ->
-    <<Flags:1/binary,
-      BodySize:4/binary,
+    <<_Flags:1/binary,
+      _BodySize:4/binary,
       Req:4/big-signed-integer-unit:8>> = Header,
     Req.
 
@@ -72,7 +72,7 @@ create_req(Body) ->
             DecBody
     end.
 
-proc_response(ReqNo, RespBody) ->
+proc_response(_ReqNo, RespBody) ->
     RespBody.
 
 proc_request(ReqNo, #ssb_rpc{name = [?createhistorystream],
@@ -117,7 +117,7 @@ proc_request(ReqNo, #ssb_rpc{name = [?blobs, <<"createWants">>],
     utils:send_data(utils:combine(utils:combine(Header,TrueEnd), ?RPC_END),
                     Socket, Nonce, SecretBoxKey);
 
-proc_request(ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
+proc_request(ReqNo, _ReqBody, Socket, Nonce, SecretBoxKey) ->
     Flags = create_flags(1,1,10),
     TrueEnd = jiffy:encode(true, [pretty]),
     Header = create_header(Flags,size(TrueEnd), -ReqNo),
