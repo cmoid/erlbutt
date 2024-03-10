@@ -22,7 +22,7 @@ convert(OffsetLog, Sleep, Feeds)->
     %% create initial store if needed, this info will come from config or
     %% environment at build time
     {ok, [[Home]]} = init:get_argument(home),
-    File = Home ++ "/emacs/erlbutt/" ++ OffsetLog,
+    File = Home ++ "/code/erlbutt/" ++ OffsetLog,
 
     case file:open(File, [read, binary]) of
         {ok, IoDev} ->

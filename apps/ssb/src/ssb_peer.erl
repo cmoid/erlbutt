@@ -54,8 +54,6 @@ init([Ip, PubKey]) ->
             {stop, Reason}
     end;
 
-
-
 init([Ref, Socket, Transport, _Opts = []]) ->
     %% note the return of a 0 timeout, this is required to notify
     %% ranch that it owns the socket, and start_link doesn't return

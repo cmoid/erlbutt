@@ -57,7 +57,6 @@ req_no(Header) ->
       BodySize:4/binary,
       Req:4/big-signed-integer-unit:8>> = Header,
     ?LOG_DEBUG("The parsed header ~p ~n from pid: ~p ~n",[{Flags, BodySize, Req}, self()]),
-
     Req.
 
 create_req(Body) ->

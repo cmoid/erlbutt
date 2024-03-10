@@ -17,7 +17,7 @@ main([Command]) ->
 
    %% invoke the command passed as argument
     F = fun() ->
-                NewClient = secret_handshake("10.0.0.208"),
+                NewClient = secret_handshake("10.0.0.159"),
                 ?INFO("~p~n",[NewClient]),
                 ?INFO("~s~n",[Command]),
                 Req = case Command of
@@ -38,7 +38,7 @@ main(Args) ->
     erlang:halt(1).
 
 secret_handshake(Host) ->
-    {ok, NewSbotClient} = ssb_peer:start_link(Host, base64:decode(<<"aBkmLQLxnsJleW1LyyCrS3DA6a/Wfz57vIK321vRumc=">>)),
+    {ok, NewSbotClient} = ssb_peer:start_link(Host, base64:decode(<<"ceHuIsvTt71cD5IsoXBlqwda8S+W9l5JKb5b89MbTo8=">>)),
     NewSbotClient.
 
 %%base64:decode(<<"LrNsx/3v3rBPk1zFkDp3V8mdsNQrcup8iu4FdymtFm0=">>)
@@ -46,6 +46,8 @@ secret_handshake(Host) ->
 %%base64:decode(<<"bombBa/UwB792ilEh7wXooqBSluIvzrJbrWzZAFhnxw=">>)
 
 %%base64:decode(<<"aBkmLQLxnsJleW1LyyCrS3DA6a/Wfz57vIK321vRumc=">>)
+
+%%base64:decode(<<"ceHuIsvTt71cD5IsoXBlqwda8S+W9l5JKb5b89MbTo8=">>)
 
 
 remote_long_pk() ->
