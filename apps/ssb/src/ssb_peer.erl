@@ -21,12 +21,14 @@
                 combine/2,
                 send_data/4]).
 
+%% connect to another peer
 start_link(Ip, PubKey) ->
     gen_server:start_link(?MODULE, [Ip, PubKey], []).
 
 send(Pid, Data) ->
     gen_server:call(Pid, {send, Data}).
 
+%% accept a connection from another peer
 start_link(Ref, Socket, Transport, Opts) ->
     ?LOG_DEBUG("LISTENER socket connection ~p ~n",[Socket]),
     gen_server:start_link(?MODULE, [Ref, Socket, Transport, Opts], []).
