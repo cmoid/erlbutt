@@ -36,7 +36,6 @@ parse(Msg) ->
 
 parseRest(Header, Rest, OrigData) ->
     BodySize = body_size(Header),
-    ?LOG_DEBUG("Inside pareser ~p ~n",[{BodySize, Header, size(Rest)}]),
     extract_body(BodySize, Header, Rest, OrigData).
 
 extract_body(BodySize, Header, Rest, _OrigData) when BodySize =< size(Rest) ->

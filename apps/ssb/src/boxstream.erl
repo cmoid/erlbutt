@@ -39,7 +39,6 @@ box(Data, Nonce, SecretBoxKey) ->
 %% return complete or partial, no need for returning done. Complete
 %% with ?BOX_END indicates done
 unbox(_SecretBoxKey, Nonce, DataProc) when size(DataProc) < 34 ->
-    ?LOG_DEBUG("boxstream unbox ~p ~n",[size(DataProc)]),
     {partial, <<>>, Nonce, DataProc};
 
 unbox(SecretBoxKey, Nonce, DataProc) ->
@@ -49,8 +48,6 @@ unbox(SecretBoxKey, Nonce, DataProc) ->
     Msg = shs:open_box(Header,
                        Nonce,
                        SecretBoxKey),
-
-    ?LOG_DEBUG("boxstream unbox msg is ~p ~n",[Msg]),
 
     EndBox = Msg == ?BOX_END,
 
@@ -69,8 +66,6 @@ unbox(SecretBoxKey, Nonce, DataProc) ->
 
                     <<_DontCare:LenInt/binary,RemBytes/binary>> = RestData,
                     FullPacket = <<Rest:16/binary, RestData:LenInt/binary>>,
-                    ?LOG_DEBUG("Have the boxstrema bytes ~p ~n",
-                               [{LenInt, FullPacket, size(RemBytes)}]),
                     {complete,
                      shs:open_box(FullPacket,
                                   incr(Nonce),
@@ -78,7 +73,6 @@ unbox(SecretBoxKey, Nonce, DataProc) ->
                      incr(incr(Nonce)),
                      RemBytes};
                true ->
-                    ?LOG_DEBUG("boxstream unbox have header ~p ~n",[{LenInt, size(RestData)}]),
                     {partial,
                      <<>>,
                      Nonce,

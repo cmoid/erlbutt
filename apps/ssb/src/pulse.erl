@@ -109,7 +109,6 @@ local_ip_v4() ->
     end.
 
 new_ssb_peer(_Ip, _Data, true) ->
-    %%?LOG_DEBUG("Don't talk to self ~p ~n",[Data]),
     ok;
 
 new_ssb_peer(Ip, Data, _) ->
@@ -143,7 +142,6 @@ ping() ->
                           {<<"args">>,[{[{<<"timeout">>, 700000}]}]},
                           {<<"type">>,<<"duplex">>}]}),
     Header = rpc_processor:create_header(Flags, size(Body), 1),
-    ?LOG_DEBUG("Sending ping request from pulsw ~p ~n",[{Header, Body}]),
     utils:combine(Header, Body).
 
 extract_key(Data) ->

@@ -54,8 +54,6 @@ combine(Bin1, Bin2) ->
 
 send_data(Data, Socket, Nonce, SecretBoxKey) ->
 
-    ?LOG_DEBUG("Sending data ~p on socket: ~p ~n",[Data, Socket]),
-
     {EncBox, NewNonce} =
         boxstream:box(Data, Nonce, SecretBoxKey),
 
@@ -165,7 +163,6 @@ check_id(<<"@",Id/binary>>) ->
         end
     catch
         error:Reason ->
-            ?LOG_DEBUG("Bad Id ~p ~n",[{Id, Reason}]),
             bad
     end;
 check_id(_Else) ->
