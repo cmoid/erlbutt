@@ -27,6 +27,8 @@ start_link(Ip, PubKey) ->
 
 send(Pid, Data) ->
     gen_server:call(Pid, {send, Data}).
+    %%?LOG_DEBUG("Peer is sending ~p to ~p ~n",[Data, Pid]),
+    %%?LOG_DEBUG("Peer returned ~p ~n", [gen_server:call(Pid, {send, Data})]).
 
 %% accept a connection from another peer
 start_link(Ref, Socket, Transport, Opts) ->
@@ -225,6 +227,7 @@ rpc_parse(Data, #sbox_state{socket = Socket,
                                              socket = Socket,
                                              nonce = EncNonce,
                                               secret_box = EncBoxKey}),
+                ?LOG_DEBUG("The rpc call returned ~p ~n",[Resp]),
                 {complete, Rest, ProcEncNonce, Resp}
         end,
 

@@ -33,6 +33,7 @@ whoami(Peer) ->
     NewClient = secret_handshake(Peer),
     ssb_peer:send(NewClient, utils:whoami_req()).
 
+%% This function is kind of a joke performance-wise :)
 largest_feed() ->
     Auths = mess_auth:all_auths(),
     NoAuths = length(Auths),

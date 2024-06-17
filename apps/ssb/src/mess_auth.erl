@@ -28,7 +28,7 @@
 
 -define(SERVER, ?MODULE).
 
--record(state, {mess_auth}).
+-record(state, {m_a}).
 
 %%% API
 
@@ -57,41 +57,38 @@ all_auths() ->
 
 init([]) ->
     process_flag(trap_exit, true),
-    CacheDir = ?b2l(config:feed_store_loc()) ++ "mess_auth/",
-    Handle = bitcask:open(CacheDir, [read_write]),
-    {ok, #state{mess_auth = Handle}}.
+    TabName = ?b2l(config:feed_store_loc()) ++ "mess_auth",
+    {ok, DetsTab} = dets:open_file(mess, [{file, TabName}]),
+    {ok, #state{m_a = DetsTab}}.
 
-handle_call({put, Key, Val}, _From, #state{mess_auth = BitHand} = State) ->
-    Ok = bitcask:put(BitHand, Key, Val),
+handle_call({put, Key, Val}, _From, #state{m_a = BitHand} = State) ->
+    Ok = dets:insert(BitHand, {Key, Val}),
     {reply, Ok, State};
 
-handle_call({get, Key}, _From, #state{mess_auth = BitHand} = State) ->
-    Res = bitcask:get(BitHand, Key),
+handle_call({get, Key}, _From, #state{m_a = BitHand} = State) ->
+    Res = dets:lookup(BitHand, Key),
     case Res of
-        {ok, Value} ->
-            {reply, Value, State};
-        not_found ->
-            {reply, not_found, State}
+        [{Key, Val}] ->
+            {reply, Val, State};
+        [] ->
+            {reply, not_found, State};
+        {error, Reason} ->
+            {reply, Reason, State}
     end;
 
-handle_call({sync}, _From, #state{mess_auth = BitHand} = State) ->
-    ok = bitcask:sync(BitHand),
+handle_call({sync}, _From, #state{m_a = BitHand} = State) ->
+    ok = dets:sync(BitHand),
     {reply, ok, State};
 
-handle_call({close}, _From, #state{mess_auth = BitHand} = State) ->
-    ok = bitcask:close(BitHand),
+handle_call({close}, _From, #state{m_a = BitHand} = State) ->
+    ok = dets:close(BitHand),
     {reply, ok, State};
 
-handle_call({auths}, _From, #state{mess_auth = BitHand} = State) ->
-    Fun = fun(_M, Auth, Acc) ->
-                  Exists = lists:member(Auth, Acc),
-                  if Exists ->
-                          Acc;
-                     true ->
-                          [Auth | Acc]
-                  end
+handle_call({auths}, _From, #state{m_a = BitHand} = State) ->
+    Fun = fun({_Mess, Auth}) ->
+                  {continue, Auth}
           end,
-    Auths = bitcask:fold(BitHand, Fun, []),
+    Auths = dets:traverse(BitHand, Fun),
     {reply, Auths, State}.
 
 handle_cast(_Request, State) ->
@@ -100,9 +97,9 @@ handle_cast(_Request, State) ->
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(Reason, #state{mess_auth = BitHand}) ->
+terminate(Reason, #state{m_a = BitHand}) ->
     ?LOG_INFO("Terminate called for reason: ~p ~n",[Reason]),
-    bitcask:close(BitHand).
+    dets:close(BitHand).
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.

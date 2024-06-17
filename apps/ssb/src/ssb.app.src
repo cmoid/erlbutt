@@ -14,7 +14,6 @@
                   ranch,
                   enacl,
                   jiffy,
-                  bitcask,
                   compiler,
                   debugger,
                   syntax_tools,
