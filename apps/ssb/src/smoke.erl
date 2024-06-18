@@ -35,7 +35,8 @@ whoami(Peer) ->
 
 %% This function is kind of a joke performance-wise :)
 largest_feed() ->
-    Auths = mess_auth:all_auths(),
+    %%this is silly. all_auths returns duplicates in a list
+    Auths = sets:to_list(sets:from_list(mess_auth:all_auths())),
     NoAuths = length(Auths),
     check_feeds(Auths, 1, NoAuths, {<<"feeds">>,0}).
 
