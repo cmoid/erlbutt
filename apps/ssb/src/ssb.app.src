@@ -13,7 +13,6 @@
                   wx,
                   ranch,
                   enacl,
-                  jiffy,
                   compiler,
                   debugger,
                   syntax_tools,
