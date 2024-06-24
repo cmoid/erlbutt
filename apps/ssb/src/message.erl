@@ -101,7 +101,6 @@ new_msg(Previous, Sequence, Content, {PubKey, PrivKey}) ->
     EncNewMsg = ssb_encoder({msg_to_proplist(NewMsg)},
                             fun ssb_encoder/3,
                             [pretty, use_nil]),
-    %%io:format("after encoding ~p ~n",[EncNewMsg]),
     Sig = enacl:sign_detached(EncNewMsg,
                               base64:decode(PrivKey)),
     EncSig = ?l2b(utils:base_64(Sig) ++ ".sig.ed25519"),
