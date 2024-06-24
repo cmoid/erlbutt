@@ -96,9 +96,12 @@ new_msg(Previous, Sequence, Content, {PubKey, PrivKey}) ->
                       sequence = Sequence,
                       timestamp = Timestamp,
                       hash = Hash,
-                      content = Content},
-    EncNewMsg = jiffy:encode({msg_to_proplist(NewMsg)},
-                             [pretty, use_nil]),
+                      content = Content,
+                      received = Timestamp},
+    EncNewMsg = ssb_encoder({msg_to_proplist(NewMsg)},
+                            fun ssb_encoder/3,
+                            [pretty, use_nil]),
+    %%io:format("after encoding ~p ~n",[EncNewMsg]),
     Sig = enacl:sign_detached(EncNewMsg,
                               base64:decode(PrivKey)),
     EncSig = ?l2b(utils:base_64(Sig) ++ ".sig.ed25519"),
@@ -109,16 +112,15 @@ encode(#message{id = Key, received = Received, swapped = Swapped} = Msg) ->
     MsgProps = msg_to_proplist(Msg),
     EncMsg = build_props(MsgProps, Swapped),
 
-    iolist_to_binary(jiffy:encode({[{<<"key">>, Key},
+    iolist_to_binary(ssb_encoder({[{<<"key">>, Key},
                    {<<"value">>, {EncMsg}},
-                   {<<"timestamp">>, Received}]}, [use_nil, force_utf8])).
+                   {<<"timestamp">>, Received}]}, fun ssb_encoder/3, [use_nil])).
 
 decode(Msg, CheckValid) ->
-    {DecDataProps} = jiffy:decode(Msg),
+    {DecDataProps} = nat_decode(Msg),
     Key = ?pgv(<<"key">>, DecDataProps),
     {Value} = ?pgv(<<"value">>, DecDataProps),
     IsSwapped = is_swapped(Value),
-
     IsValid = validate(CheckValid, Value),
     #message{id = Key,
              previous = ?pgv(<<"previous">>, Value),
@@ -167,7 +169,7 @@ validate(true, MsgProps) ->
 
         %% remove signature from message and encode as json
         DelSigProps = proplists:delete(<<"signature">>, MsgProps),
-        EncMsg = jiffy:encode({DelSigProps}, [pretty, force_utf8]),
+        EncMsg = ssb_encoder({DelSigProps}, fun ssb_encoder/3, [pretty, use_nil]),
 
         %% extract and decode the keys for the signature and the author
         Sig = ?pgv(<<"signature">>, MsgProps),
@@ -188,7 +190,7 @@ add_sig(NewMsg, EncSig) ->
     NewMsgList = msg_to_proplist(NewMsg) ++
         [{<<"signature">>, EncSig}],
     %% added sig to msg before computing id
-    MsgId = compute_id(jiffy:encode({NewMsgList},
+    MsgId = compute_id(ssb_encoder({NewMsgList}, fun ssb_encoder/3,
                             [pretty,
                              use_nil])),
     NewMsg#message{id = MsgId,
@@ -262,7 +264,12 @@ roundtrip_test() ->
     ?assert(lists:all(fun(B) ->
                     B end, Results)).
 
-
+ssb_test() ->
+    O1 = {[{<<"key1">>,<<"val1">>},
+           {<<"key2">>, [{[{<<"skey1">>, <<"sval1">>}]},
+                         {[{<<"skey12">>, <<"sval2">>}]}]}]},
+    BO1 = iolist_to_binary(ssb_encoder(O1, fun ssb_encoder/3, [use_nil])),
+    ?assert(O1 == nat_decode(BO1)).
 
 bad_msg_test() ->
     {ok, Cwd} = file:get_cwd(),

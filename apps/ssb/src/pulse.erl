@@ -138,9 +138,10 @@ reuse_or_create(Ip, Data, false) ->
 
 ping() ->
     Flags = rpc_processor:create_flags(1,0,2),
-    Body = jiffy:encode({[{<<"name">>,[<<"gossip">>,<<"ping">>]},
+    Body = iolist_to_binary(message:ssb_encoder({[{<<"name">>,[<<"gossip">>,<<"ping">>]},
                           {<<"args">>,[{[{<<"timeout">>, 700000}]}]},
-                          {<<"type">>,<<"duplex">>}]}),
+                          {<<"type">>,<<"duplex">>}]},
+                                               fun message:ssb_encoder/3, [])),
     Header = rpc_processor:create_header(Flags, size(Body), 1),
     utils:combine(Header, Body).
 

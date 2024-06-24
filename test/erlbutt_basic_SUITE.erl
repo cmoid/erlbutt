@@ -57,14 +57,14 @@ ping_test(Config) ->
     {ok, NewSbotPeer} = ssb_peer:start_link(Host, remote_long_pk()),
     Now = erlang:system_time(millisecond),
     Time = ssb_peer:send(NewSbotPeer, ping()),
-    End = binary_to_integer(jiffy:decode(Time)),
+    End = binary_to_integer(message:nat_decode(Time)),
     ?assert((End - Now) < 5),
     Config.
 
 whoami_test(Config) ->
     Host = get_value(hostname, Config, "localhost"),
     {ok, NewSbotClient} = ssb_peer:start_link(Host, remote_long_pk()),
-    {WhoAmI} = jiffy:decode(ssb_peer:send(NewSbotClient, whoami_req())),
+    {WhoAmI} = message:nat_decode(ssb_peer:send(NewSbotClient, whoami_req())),
     ?assert(keys:pub_key_disp() == ?pgv(<<"id">>, WhoAmI)),
     Config.
 
@@ -74,16 +74,17 @@ remote_long_pk() ->
 
 ping() ->
     Flags = rpc_processor:create_flags(1,0,2),
-    Body = jiffy:encode({[{<<"name">>,[<<"gossip">>,<<"ping">>]},
+    Body = iolist_to_binary(message:ssb_encoder({[{<<"name">>,[<<"gossip">>,<<"ping">>]},
                           {<<"args">>,[{[{<<"timeout">>, 300000}]}]},
-                          {<<"type">>,<<"duplex">>}]}),
+                          {<<"type">>,<<"duplex">>}]}, fun message:ssb_encoder/3,
+                              [])),
     Header = rpc_processor:create_header(Flags, size(Body), 1),
     utils:combine(Header, Body).
 
 whoami_req() ->
     Flags = rpc_processor:create_flags(1,0,2),
-    Body = jiffy:encode({[{<<"name">>,[?whoami]},
+    Body = iolist_to_binary(message:ssb_encoder({[{<<"name">>,[?whoami]},
                           {<<"args">>,[]},
-                          {<<"type">>,<<"async">>}]}),
+                          {<<"type">>,<<"async">>}]}, fun message:ssb_encoder/3, [])),
     Header = rpc_processor:create_header(Flags, size(Body), 1),
     utils:combine(Header, Body).

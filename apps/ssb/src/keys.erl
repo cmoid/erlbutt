@@ -106,7 +106,7 @@ extract_key(IoDevice) ->
             if IsCommentOrNewLine ->
                     extract_key(IoDevice);
                true ->
-                    KeyMap = jiffy:decode(Data, [return_maps]),
+                    KeyMap = json:decode(iolist_to_binary(Data)),
                     {PubKey, PrKey} = {maps:get(<<"public">>, KeyMap),
                                        maps:get(<<"private">>, KeyMap)},
                     {key_only(PubKey), key_only(PrKey)}
@@ -130,7 +130,7 @@ make_json({Pub, Priv}) ->
             {<<"private">>, ?l2b(base_64(Priv) ++ ".ed25519")},
             {<<"id">>, ?l2b("@" ++ base_64(Pub) ++ ".ed25519")}
            ]},
-    jiffy:encode(Doc).
+    iolist_to_binary(message:ssb_encoder(Doc, fun message:ssb_encoder/3, [])).
 
 check_secret_file() ->
     {ok, [[Home]]} = init:get_argument(home),

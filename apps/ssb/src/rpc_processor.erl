@@ -15,6 +15,7 @@
          create_header/3,
          parse_flags/1]).
 
+-import(message, [ssb_encoder/3]).
 process({Header, Body}, #ssb_conn{
                            socket = Socket,
                            nonce = Nonce,
@@ -59,7 +60,7 @@ req_no(Header) ->
     Req.
 
 create_req(Body) ->
-    DecBody = jiffy:decode(Body),
+    DecBody = message:nat_decode(Body),
     IsTuple = is_tuple(DecBody),
     case IsTuple of
         true ->
@@ -81,7 +82,7 @@ proc_request(ReqNo, #ssb_rpc{name = [?createhistorystream],
     % to start return true and close stream
     Flags = create_flags(1,1,2),
     Header = create_header(Flags,size(<<"true">>), -ReqNo),
-    utils:send_data(utils:combine(Header,jiffy:encode(true, [pretty])),
+    utils:send_data(utils:combine(Header,message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
                     Socket, Nonce, SecretBoxKey);
 
 proc_request(ReqNo, #ssb_rpc{name = [?gossip, ?ping],
@@ -89,7 +90,8 @@ proc_request(ReqNo, #ssb_rpc{name = [?gossip, ?ping],
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     % to start return true and close stream
     Flags = create_flags(1,0,10),
-    TimeStamp = jiffy:encode(integer_to_binary(current_time()), [pretty]),
+    TimeStamp = iolist_to_binary(message:ssb_encoder(integer_to_binary(current_time()),
+                                    fun message:ssb_encoder/3, [pretty])),
     Header = create_header(Flags,size(TimeStamp), -ReqNo),
     NewNonce = utils:send_data(utils:combine(Header, TimeStamp), Socket, Nonce, SecretBoxKey),
     NewNonce;
@@ -112,14 +114,14 @@ proc_request(ReqNo, #ssb_rpc{name = [?blobs, <<"createWants">>],
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     % to start return true and close stream
     Flags = create_flags(1,1,2),
-    TrueEnd = jiffy:encode(true, [pretty]),
+    TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
     Header = create_header(Flags,size(TrueEnd), -ReqNo),
     utils:send_data(utils:combine(utils:combine(Header,TrueEnd), ?RPC_END),
                     Socket, Nonce, SecretBoxKey);
 
 proc_request(ReqNo, _ReqBody, Socket, Nonce, SecretBoxKey) ->
     Flags = create_flags(1,1,10),
-    TrueEnd = jiffy:encode(true, [pretty]),
+    TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
     Header = create_header(Flags,size(TrueEnd), -ReqNo),
     NewNonce = utils:send_data(utils:combine(Header, TrueEnd),
                                Socket, Nonce, SecretBoxKey),
@@ -129,19 +131,20 @@ current_time() ->
     erlang:system_time(millisecond).
 
 whoami() ->
-    jiffy:encode({[{<<"id">>, keys:pub_key_disp()}]}).
+    iolist_to_binary(message:ssb_encoder({[{<<"id">>, keys:pub_key_disp()}]},
+                       fun message:ssb_encoder/3, [])).
 
 -ifdef(TEST).
 
 body1_test() ->
-    Rpc = create_req(jiffy:encode({[{<<"name">>,[<<"gossip">>,<<"ping">>]},
+    Rpc = create_req(iolist_to_binary(ssb_encoder({[{<<"name">>,[<<"gossip">>,<<"ping">>]},
                                     {<<"args">>,[{[{<<"timeout">>,300000}]}]},
-                                    {<<"type">>,<<"duplex">>}]})),
+                                    {<<"type">>,<<"duplex">>}]}, fun message:ssb_encoder/3, []))),
     ?assert(Rpc#ssb_rpc.name == [<<"gossip">>,<<"ping">>]),
     ?assert(Rpc#ssb_rpc.type == <<"duplex">>).
 
 body2_test() ->
-    Rpc = create_req(jiffy:encode(22222)),
+    Rpc = create_req(iolist_to_binary(ssb_encoder(22222, fun message:ssb_encoder/3, []))),
     ?assert(Rpc == 22222).
 
 flags_test() ->

@@ -294,7 +294,7 @@ feed_get_last(Feed) ->
     end.
 
 extract_key(Data) ->
-    {DataProps} = jiffy:decode(Data),
+    {DataProps} = message:nat_decode(Data),
     ?pgv(<<"key">>, DataProps).
 
 scan(IoDev, Pos, Key) ->
@@ -325,7 +325,7 @@ int_foldr(Fun, Acc, IoDev) ->
     end.
 
 has_target(Msg, Id, RootId) ->
-    {DecProps} = jiffy:decode(Msg),
+    {DecProps} = message:nat_decode(Msg),
     Root = ?pgv(<<"root">>, DecProps),
     IsRootId = RootId == Root,
     [Src, _AuthId] = ?pgv(<<"src">>, DecProps),

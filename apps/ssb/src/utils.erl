@@ -144,12 +144,13 @@ update_refs(#message{id = Id, author = AuthId} = Msg) ->
                                                  {<<"src">>, [Bi, Ai]},
                                                  Target]},
                                       Pid = find_or_create_feed_pid(Ai),
-                                      ssb_feed:store_ref(Pid, jiffy:encode(Record))
+                                      ssb_feed:store_ref(Pid, encode_rec(Record))
                               end
                       end, BranchList)
     end.
 
-
+encode_rec(Record) ->
+    iolist_to_binary(message:ssb_encoder(Record, fun message:ssb_encoder/3, [])).
 
 check_id(<<"@",Id/binary>>) ->
     try
@@ -170,7 +171,7 @@ check_id(_Else) ->
 
 ping_req() ->
     Flags = rpc_processor:create_flags(1,0,2),
-    Body = jiffy:encode({[{<<"name">>,[<<"gossip">>,<<"ping">>]},
+    Body = encode_rec({[{<<"name">>,[<<"gossip">>,<<"ping">>]},
                           {<<"args">>,[{[{<<"timeout">>, 300000}]}]},
                           {<<"type">>,<<"duplex">>}]}),
     Header = rpc_processor:create_header(Flags, size(Body), 1),
@@ -178,7 +179,7 @@ ping_req() ->
 
 whoami_req() ->
     Flags = rpc_processor:create_flags(1,0,2),
-    Body = jiffy:encode({[{<<"name">>,[?whoami]},
+    Body = encode_rec({[{<<"name">>,[?whoami]},
                           {<<"args">>,[]},
                           {<<"type">>,<<"sync">>}]}),
     Header = rpc_processor:create_header(Flags, size(Body), 1),
