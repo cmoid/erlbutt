@@ -11,6 +11,8 @@
 %% API
 -export([decode/2,
          encode/1,
+         ssb_encoder/3,
+         nat_decode/1,
          is_follow/1,
          is_about/1,
          is_reply/1,
@@ -151,6 +153,12 @@ check_swapped(Props, Swapped) ->
     end.
 
 %% Internal functions
+nat_decode(Msg) ->
+    {Json, _, _} = json:decode(Msg,[], #{object_finish =>
+                              fun(Acc,OldAcc) ->
+                                      {{lists:reverse(Acc)}, OldAcc} end}),
+    Json.
+
 validate(false, _MsgProps) ->
     false;
 validate(true, MsgProps) ->
@@ -200,6 +208,44 @@ compute_id(Msg) ->
 
 current_time() ->
     erlang:system_time(millisecond).
+
+ssb_encoder([_|_] = V, Encoder, Options) ->
+    json:encode_list(V, fun(Elem, _Enc) ->
+                                ssb_encoder(Elem, Encoder, Options) end);
+
+ssb_encoder({KeyValList}, Encoder, Options) ->
+    Obj = lists:map(fun({_, _} = Val) -> ssb_encoder(Val, Encoder, Options) end,
+                    KeyValList),
+    LastElem = lists:last(Obj),
+    ObjNoLast = lists:reverse(tl(lists:reverse(Obj))),
+    FixElem = lists:reverse(tl(lists:reverse(LastElem))),
+    [<<"{">>, ObjNoLast ++ [FixElem], <<"}">>];
+
+ssb_encoder({Key, Val}, Encoder, Options) ->
+    Pretty = lists:member(pretty, Options),
+    if Pretty ->
+            [<<"\n  ">>, ssb_encoder(Key, Encoder, Options), <<": ">>, ssb_encoder(Val, Encoder, Options), <<",">>];
+       true ->
+            [ssb_encoder(Key, Encoder, Options), <<":">>, ssb_encoder(Val, Encoder, Options), <<",">>]
+    end;
+
+ssb_encoder(Other, Encoder, Options) ->
+    GoodAtom = is_atom(Other) andalso ((Other == null)
+                                       orelse
+                                       (Other == true)
+                                       orelse
+                                       (Other == false)),
+    UseNil = lists:member(use_nil, Options) andalso (Other == nil),
+    if UseNil ->
+            json:encode_value(null, Encoder);
+       true ->
+            if is_atom(Other) andalso (not GoodAtom) ->
+                    json:encode_value(atom_to_binary(Other), Encoder);
+               true ->
+                    json:encode_value(Other, Encoder)
+            end
+    end.
+
 
 -ifdef(TEST).
 
