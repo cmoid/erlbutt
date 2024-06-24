@@ -24,7 +24,7 @@
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
-         terminate/2, code_change/3, format_status/2]).
+         terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
 
@@ -104,8 +104,7 @@ terminate(Reason, #state{m_a = BitHand}) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-format_status(_Opt, Status) ->
-    Status.
+
 
 %%%===================================================================
 %%% Internal functions
