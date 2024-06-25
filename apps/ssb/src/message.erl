@@ -213,17 +213,45 @@ current_time() ->
 ssb_encoder(Val, Encoder, Options) ->
     ssb_encoder1(Val, Encoder, Options, 0).
 
-ssb_encoder1([_|_] = V, Encoder, Options, Ind) ->
-    json:encode_list(V, fun(Elem, _Enc) ->
-                                ssb_encoder1(Elem, Encoder, Options, Ind) end);
+ssb_encoder1([], _Encoder, _Options, _Ind) ->
+    [<<"[]">>];
+
+ssb_encoder1([_|_] = V, Encoder, Options, Ind) when is_list(V) ->
+    Pretty = lists:member(pretty, Options),
+    Array = lists:map(fun(Elem) ->
+                              if Pretty ->
+                                      [<<"\n">>, string:copies("  ", Ind + 1),
+                                 ssb_encoder1(Elem, Encoder, Options, Ind + 1),
+                                 <<",">>];
+                                 true ->
+                                      [ssb_encoder1(Elem, Encoder, Options, Ind + 1),
+                                       <<",">>]
+                              end
+                      end, V),
+    LastElem = lists:last(Array),
+    ArrayNoLast = lists:reverse(tl(lists:reverse(Array))),
+    FixElem = lists:reverse(tl(lists:reverse(LastElem))),
+    if Pretty ->
+            [<<"[">>, ArrayNoLast ++ [FixElem], <<"\n">>, string:copies("  ", Ind), <<"]">>];
+       true ->
+            [<<"[">>, ArrayNoLast ++ [FixElem], <<"]">>]
+    end;
+
+ssb_encoder1({[]}, _Encoder, _Options, _Ind) ->
+    [<<"{}">>];
 
 ssb_encoder1({KeyValList}, Encoder, Options, Ind) ->
+    Pretty = lists:member(pretty, Options),
     Obj = lists:map(fun({_, _} = Val) -> ssb_encoder1(Val, Encoder, Options, Ind + 1) end,
                     KeyValList),
     LastElem = lists:last(Obj),
     ObjNoLast = lists:reverse(tl(lists:reverse(Obj))),
     FixElem = lists:reverse(tl(lists:reverse(LastElem))),
-    [<<"{">>, ObjNoLast ++ [FixElem], <<"\n">>, string:copies("  ", Ind), <<"}">>];
+    if Pretty ->
+            [<<"{">>, ObjNoLast ++ [FixElem], <<"\n">>, string:copies("  ", Ind), <<"}">>];
+       true ->
+            [<<"{">>, ObjNoLast ++ [FixElem], <<"}">>]
+    end;
 
 ssb_encoder1({Key, Val}, Encoder, Options, Ind) ->
     Pretty = lists:member(pretty, Options),
@@ -267,9 +295,7 @@ roundtrip_test() ->
                     B end, Results)).
 
 ssb_test() ->
-    O1 = {[{<<"key1">>,<<"val1">>},
-           {<<"key2">>, [{[{<<"skey1">>, <<"sval1">>}]},
-                         {[{<<"skey12">>, <<"sval2">>}]}]}]},
+    O1 = {[{<<"key1">>,<<"val1">>},{<<"key2">>, [{[{<<"skey1">>, <<"sval1">>}]},{[{<<"skey12">>, <<"sval2">>}]}]}]},
     BO1 = iolist_to_binary(ssb_encoder(O1, fun ssb_encoder/3, [use_nil])),
     ?assert(O1 == nat_decode(BO1)).
 
