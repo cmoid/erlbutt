@@ -210,27 +210,30 @@ compute_id(Msg) ->
 current_time() ->
     erlang:system_time(millisecond).
 
-ssb_encoder([_|_] = V, Encoder, Options) ->
-    json:encode_list(V, fun(Elem, _Enc) ->
-                                ssb_encoder(Elem, Encoder, Options) end);
+ssb_encoder(Val, Encoder, Options) ->
+    ssb_encoder1(Val, Encoder, Options, 0).
 
-ssb_encoder({KeyValList}, Encoder, Options) ->
-    Obj = lists:map(fun({_, _} = Val) -> ssb_encoder(Val, Encoder, Options) end,
+ssb_encoder1([_|_] = V, Encoder, Options, Ind) ->
+    json:encode_list(V, fun(Elem, _Enc) ->
+                                ssb_encoder1(Elem, Encoder, Options, Ind) end);
+
+ssb_encoder1({KeyValList}, Encoder, Options, Ind) ->
+    Obj = lists:map(fun({_, _} = Val) -> ssb_encoder1(Val, Encoder, Options, Ind + 1) end,
                     KeyValList),
     LastElem = lists:last(Obj),
     ObjNoLast = lists:reverse(tl(lists:reverse(Obj))),
     FixElem = lists:reverse(tl(lists:reverse(LastElem))),
-    [<<"{">>, ObjNoLast ++ [FixElem], <<"}">>];
+    [<<"{">>, ObjNoLast ++ [FixElem], <<"\n">>, string:copies("  ", Ind), <<"}">>];
 
-ssb_encoder({Key, Val}, Encoder, Options) ->
+ssb_encoder1({Key, Val}, Encoder, Options, Ind) ->
     Pretty = lists:member(pretty, Options),
     if Pretty ->
-            [<<"\n  ">>, ssb_encoder(Key, Encoder, Options), <<": ">>, ssb_encoder(Val, Encoder, Options), <<",">>];
+            [<<"\n">>, string:copies("  ", Ind), ssb_encoder1(Key, Encoder, Options, Ind), <<": ">>, ssb_encoder1(Val, Encoder, Options, Ind), <<",">>];
        true ->
-            [ssb_encoder(Key, Encoder, Options), <<":">>, ssb_encoder(Val, Encoder, Options), <<",">>]
+            [ssb_encoder1(Key, Encoder, Options, Ind), <<":">>, ssb_encoder1(Val, Encoder, Options, Ind), <<",">>]
     end;
 
-ssb_encoder(Other, Encoder, Options) ->
+ssb_encoder1(Other, Encoder, Options, _Ind) ->
     GoodAtom = is_atom(Other) andalso ((Other == null)
                                        orelse
                                        (Other == true)
