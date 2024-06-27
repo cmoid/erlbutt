@@ -8,16 +8,16 @@ An implementation of the [`SSB`][1] protocol.
 ## Building
 
 ```
-./rebar3 eunit
+make test
 
-./rebar3 ct
+make ct
 
-./rebar3 release
+make rel
 
 ```
 To run:
 ```
-_build/default/rel/ssb/bin/ssb-0.0.1 console
+./_build/default/rel/ssb/bin/ssb-0.0.1 console
 
 ```
 An environment variable can be used to control logging, .eg.:
