@@ -5,7 +5,7 @@
 
 -define(INFO(Fmt,Args), io:format(Fmt,Args)).
 
-main([Command]) ->
+main([Host, Command]) ->
     code:add_path("./_build/default/lib/ssb/ebin/"),
     code:add_path("./_build/default/lib/enacl/ebin/"),
     code:add_path("./_build/default/lib/ranch/ebin/"),
@@ -15,7 +15,7 @@ main([Command]) ->
 
    %% invoke the command passed as argument
     F = fun() ->
-                NewClient = secret_handshake("10.0.0.159"),
+                NewClient = secret_handshake(Host),
                 ?INFO("~p~n",[NewClient]),
                 ?INFO("~s~n",[Command]),
                 Req = case Command of
