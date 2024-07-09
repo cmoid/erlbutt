@@ -6,11 +6,9 @@
 -define(INFO(Fmt,Args), io:format(Fmt,Args)).
 
 main([Command]) ->
-    code:add_path("./_build/default/lib/jiffy/ebin/"),
     code:add_path("./_build/default/lib/ssb/ebin/"),
     code:add_path("./_build/default/lib/enacl/ebin/"),
     code:add_path("./_build/default/lib/ranch/ebin/"),
-    code:add_path("./_build/default/lib/bitcask/ebin/"),
     logger:set_primary_config(level, error),
     keys:start_link(),
     config:start_link(),
@@ -38,8 +36,10 @@ main(Args) ->
     erlang:halt(1).
 
 secret_handshake(Host) ->
-    {ok, NewSbotClient} = ssb_peer:start_link(Host, base64:decode(<<"ceHuIsvTt71cD5IsoXBlqwda8S+W9l5JKb5b89MbTo8=">>)),
+    {ok, NewSbotClient} = ssb_peer:start_link(Host, remote_long_pk()),
     NewSbotClient.
+
+%%base64:decode(<<"ceHuIsvTt71cD5IsoXBlqwda8S+W9l5JKb5b89MbTo8=">>)
 
 %%base64:decode(<<"LrNsx/3v3rBPk1zFkDp3V8mdsNQrcup8iu4FdymtFm0=">>)
 
@@ -55,24 +55,20 @@ remote_long_pk() ->
 
 whoami_req() ->
     Flags = rpc_processor:create_flags(0,0,2),
-    Body = jiffy:encode({[{<<"name">>,[<<"whoami">>]},
-                          {<<"args">>,[]},
-                          {<<"type">>,<<"sync">>}]}),
+    Body = iolist_to_binary(json:encode(maps:from_list([{<<"name">>,[<<"whoami">>]}, {<<"args">>,[]}, {<<"type">>,<<"sync">>}]))),
     Header = rpc_processor:create_header(Flags, size(Body), 1),
     utils:combine(Header, Body).
 
 menu_req() ->
     Flags = rpc_processor:create_flags(0,0,2),
-    Body = jiffy:encode({[{<<"name">>,[<<"manifest">>]},
+    Body = iolist_to_binary(json:encode(maps:from_list([{<<"name">>,[<<"manifest">>]},
                           {<<"args">>,[]},
-                          {<<"type">>,<<"sync">>}]}),
+                          {<<"type">>,<<"sync">>}]))),
     Header = rpc_processor:create_header(Flags, size(Body), 1),
     utils:combine(Header, Body).
 
 ping_req() ->
     Flags = rpc_processor:create_flags(1,0,2),
-    Body = jiffy:encode({[{<<"name">>,[<<"ping">>]},
-                          {<<"args">>,[{[{<<"timeout">>, 30}]}]},
-                          {<<"type">>,<<"duplex">>}]}),
+    Body = iolist_to_binary(json:encode(maps:from_list([{<<"name">>,[<<"ping">>]},{<<"args">>,maps:from_list([{<<"timeout">>, 30}])},{<<"type">>,<<"duplex">>}]))),
     Header = rpc_processor:create_header(Flags, size(Body), 1),
     utils:combine(Header, Body).
