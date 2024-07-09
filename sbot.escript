@@ -20,11 +20,11 @@ main([Command]) ->
                 ?INFO("~s~n",[Command]),
                 Req = case Command of
                              "whoami" ->
-                                 whoami_req();
+                                 utils:whoami_req();
                              "menu" ->
                                  menu_req();
                              "ping" ->
-                                 ping_req()
+                                 utils:ping_req()
                          end,
                 Resp = ssb_peer:send(NewClient, Req),
                 ?INFO("~s~n",[Resp])
@@ -53,22 +53,10 @@ secret_handshake(Host) ->
 remote_long_pk() ->
     base64:decode(keys:pub_key()).
 
-whoami_req() ->
-    Flags = rpc_processor:create_flags(0,0,2),
-    Body = iolist_to_binary(json:encode(maps:from_list([{<<"name">>,[<<"whoami">>]}, {<<"args">>,[]}, {<<"type">>,<<"sync">>}]))),
-    Header = rpc_processor:create_header(Flags, size(Body), 1),
-    utils:combine(Header, Body).
-
 menu_req() ->
     Flags = rpc_processor:create_flags(0,0,2),
     Body = iolist_to_binary(json:encode(maps:from_list([{<<"name">>,[<<"manifest">>]},
                           {<<"args">>,[]},
                           {<<"type">>,<<"sync">>}]))),
-    Header = rpc_processor:create_header(Flags, size(Body), 1),
-    utils:combine(Header, Body).
-
-ping_req() ->
-    Flags = rpc_processor:create_flags(1,0,2),
-    Body = iolist_to_binary(json:encode(maps:from_list([{<<"name">>,[<<"ping">>]},{<<"args">>,maps:from_list([{<<"timeout">>, 30}])},{<<"type">>,<<"duplex">>}]))),
     Header = rpc_processor:create_header(Flags, size(Body), 1),
     utils:combine(Header, Body).
