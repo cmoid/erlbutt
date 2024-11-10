@@ -73,7 +73,7 @@ handle_info(advertise, #state{socket=Socket}=State) ->
                  {255,255,255,255},
                  8008,
                  whoami()),
-    {noreply, State#state{timer=timer:send_after(3000, advertise)}};
+    {noreply, State#state{timer=timer:send_after(5000, advertise)}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -109,6 +109,7 @@ local_ip_v4() ->
     end.
 
 new_ssb_peer(_Ip, _Data, true) ->
+    %%?LOG_DEBUG("No talking to self ~n",[]),
     ok;
 
 new_ssb_peer(Ip, Data, _) ->
@@ -124,6 +125,7 @@ reuse_or_create(Ip, Data, false) ->
     if PubKey == nokey ->
             ?LOG_ERROR("No public key in data ~p ~n",[Data]);
        true ->
+            ?LOG_DEBUG("Trying to connect to ~p ~n",[Ip]),
             Result =
                 ssb_peer:start_link(Ip, PubKey),
             case Result of
