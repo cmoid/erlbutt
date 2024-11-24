@@ -61,6 +61,7 @@ req_no(Header) ->
 
 create_req(Body) ->
     DecBody = message:nat_decode(Body),
+    %%?LOG_DEBUG("Body decoded is ~p ~n",[DecBody]),
     IsTuple = is_tuple(DecBody),
     case IsTuple of
         true ->
@@ -73,7 +74,8 @@ create_req(Body) ->
             DecBody
     end.
 
-proc_response(_ReqNo, RespBody) ->
+proc_response(ReqNo, RespBody) ->
+    ?LOG_DEBUG("The response from ~p was ~p ~n",[ReqNo, RespBody]),
     RespBody.
 
 proc_request(ReqNo, #ssb_rpc{name = [?createhistorystream],
@@ -119,7 +121,8 @@ proc_request(ReqNo, #ssb_rpc{name = [?blobs, <<"createWants">>],
     utils:send_data(utils:combine(utils:combine(Header,TrueEnd), ?RPC_END),
                     Socket, Nonce, SecretBoxKey);
 
-proc_request(ReqNo, _ReqBody, Socket, Nonce, SecretBoxKey) ->
+proc_request(ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
+    ?LOG_DEBUG("Fall thru with ~p ~n",[ReqBody]),
     Flags = create_flags(1,1,10),
     TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
     Header = create_header(Flags,size(TrueEnd), -ReqNo),

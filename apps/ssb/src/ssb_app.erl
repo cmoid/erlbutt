@@ -17,9 +17,9 @@
 %% ===================================================================
 start(_StartType, _StartArgs) ->
     LogLevel = application:get_env(ssb, ssb_log_level, notice),
-    ?LOG(LogLevel, "Log level ~p set from env ~n", [LogLevel]),
     logger:set_primary_config(level, LogLevel),
     logger:set_module_level(supervisor, error),
+    ?LOG(LogLevel, "Log level ~p set from env ~n", [LogLevel]),
 
     {ok, _} = ranch:start_listener(erlbutt_listener, 5,
                                    ranch_tcp, [{port, 8008},

@@ -46,6 +46,7 @@ init([Config]) ->
         true ->
             {ok, load_and_parse(Config, #state{})};
         false ->
+            %%?LOG_DEBUG("try to load the config from ~p ~n", []),
             {ok, #state{store_loc = default_feed_store(),
                         net_id = default_net_id()}}
     end.
