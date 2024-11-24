@@ -108,7 +108,8 @@ store(Msg, Sleep, Feeds) ->
     if Belongs ->
             FeedPid = get_feed(AuthId, Sleep),
             ssb_feed:store_msg(FeedPid, DecMsg),
-            mess_auth:put(MsgId, AuthId),
+            %% Not needed, ssb_feed_store_msg already handles it
+            %%gmess_auth:put(MsgId, AuthId),
             if Valid ->
                     nop;
                true ->
