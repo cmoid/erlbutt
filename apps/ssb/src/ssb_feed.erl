@@ -340,7 +340,6 @@ has_target(Msg, Id, RootId) ->
             false
     end.
 
-
 open_file(File) ->
     Open = file:open(File, [append, sync]),
     case Open of

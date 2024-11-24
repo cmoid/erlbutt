@@ -327,7 +327,6 @@ is_multi_reply_test() ->
     {ListPairs} = message:is_reply(Msg),
     ?assert(length(ListPairs) == 2).
 
-
 is_not_reply_test() ->
     {ok, Cwd} = file:get_cwd(),
     F = Cwd ++ "/testdata/" ++ "not_reply.full",
