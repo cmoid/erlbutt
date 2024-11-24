@@ -12,6 +12,7 @@ main([Host, Command]) ->
     logger:set_primary_config(level, error),
     keys:start_link(),
     config:start_link(),
+    ?INFO("current working directory is ~p ~n",[file:get_cwd()]),
 
    %% invoke the command passed as argument
     F = fun() ->
