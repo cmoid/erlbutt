@@ -72,5 +72,4 @@
                 shook_hands = 0,
                 box_rem_bytes = <<>>,
                 rpc_rem_bytes = <<>>,
-                rpc_procs,
                 response}).

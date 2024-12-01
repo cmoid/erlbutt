@@ -44,7 +44,6 @@ init([Ip, PubKey]) ->
                          enc_sbox_key = EncBoxKey,
                          dec_nonce = DecNonce,
                          enc_nonce = EncNonce,
-                         rpc_procs = ets:new(rpc_procs, []),
                          shook_hands = 1}}
     catch
         error:Reason ->
@@ -57,8 +56,7 @@ init([Ref, Socket, Transport, _Opts = []]) ->
     %% until init does.
     {ok, #sbox_state{ref = Ref,
                 socket = Socket,
-                transport = Transport,
-                rpc_procs = ets:new(rpc_procs, [])}, 0}.
+                transport = Transport}, 0}.
 
 handle_info({tcp, Socket, Data},
             #sbox_state{socket=Socket,
