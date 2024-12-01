@@ -21,14 +21,14 @@
                 combine/2,
                 send_data/4]).
 
-%% connect to another peer
+%% connect to another peer, acting as a client.
 start_link(Ip, PubKey) ->
     gen_server:start_link(?MODULE, [Ip, PubKey], []).
 
 send(Pid, Data) ->
     gen_server:call(Pid, {send, Data}).
 
-%% accept a connection from another peer
+%% accept a connection from another peer, acting as a server.
 start_link(Ref, Socket, Transport, Opts) ->
     gen_server:start_link(?MODULE, [Ref, Socket, Transport, Opts], []).
 

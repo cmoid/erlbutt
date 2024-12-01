@@ -5,7 +5,7 @@ These notes are random thoughts about design I'm having while prototyping. I've 
 Introduction
 -------------
 
-Scuttlebutt is an interesting protocol. A feed is an immutable append-only log file, identified by a public key, where each message is signed by a private key and references the prior message. This ensures a single source of truth since only one peer can sign messages on a feed. At any time, different peers might have different versions of the same feed that only differ by the length. In other words one be a prefix of the other. 
+Scuttlebutt is an interesting protocol. A feed is an immutable append-only log file, identified by a public key, where each message is signed by a private key and references the prior message. This ensures a single source of truth since only one peer can sign messages on a feed. At any time, different peers might have different versions of the same feed that only differ by the length. In other words one can be a prefix of the other. 
 
 Messages are encoded as [json][8] (newer implementations have improved this with various binary formats). Messages have a content object that has a type. Messages of type `follow` form the basis for the social graph that is used to drive the replication process. Feeds follow other feeds more or less. This makes for a simple replication, where one node in the network asks a peer for all messages of a feed beyond the latest sequence number they have.
 
