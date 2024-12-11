@@ -10,7 +10,8 @@
 %% API
 -export([start_link/0]).
 
--export([whoami/0]).
+-export([whoami/0,
+         peers/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -29,6 +30,16 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
+%% identifying string sent out on UDP broadcast
+whoami()->
+    ?l2b("net:" ++
+        inet:ntoa(local_ip_v4()) ++
+        ":8008~shs:" ++
+        keys:pub_key()).
+
+peers() ->
+    gen_server:call(?SERVER, peers).
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -41,7 +52,7 @@ init([]) ->
                           {active,true}]),
     case Resp of
         {ok, Socket} ->
-            {ok, TRef} = timer:send_after(3000, advertise),
+            {ok, TRef} = timer:send_after(5000, beat),
             {ok, #state{socket = Socket,
                         timer = TRef}};
         {error, Reason} ->
@@ -49,6 +60,9 @@ init([]) ->
                    [Reason]),
             {ok, #state{}}
     end.
+
+handle_call(peers, _From, #state{peers=Peers} = State) ->
+    {reply, ets:tab2list(Peers), State};
 
 handle_call(_Request, _From, State) ->
     Reply = ok,
@@ -65,15 +79,15 @@ handle_info({udp, _PeerSocket, Ip, _Port, Data},
             #state{socket =_Socket}=State) ->
     %% don't talk to yourself, unless you want complete agreement
     IsSelf = local_ip_v4() == Ip,
-    new_ssb_peer(Ip, Data, IsSelf),
+    record_peer(Ip, Data, IsSelf),
     {noreply, State};
 
-handle_info(advertise, #state{socket=Socket}=State) ->
+handle_info(beat, #state{socket=Socket}=State) ->
     gen_udp:send(Socket,
                  {255,255,255,255},
                  8008,
                  whoami()),
-    {noreply, State#state{timer=timer:send_after(5000, advertise)}};
+    {noreply, State#state{timer=timer:send_after(5000, beat)}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -88,11 +102,6 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-whoami()->
-    "net:" ++
-        inet:ntoa(local_ip_v4()) ++
-        ":8008~shs:" ++
-        keys:pub_key().
 
 local_ip_v4() ->
     {ok, Addrs} = inet:getifaddrs(),
@@ -108,44 +117,20 @@ local_ip_v4() ->
             hd(Ips)
     end.
 
-new_ssb_peer(_Ip, _Data, true) ->
-    %%?LOG_DEBUG("No talking to self ~n",[]),
+record_peer(_Ip, _Data, true) ->
+    ?LOG_DEBUG("No talking to self ~n",[]),
     ok;
 
-new_ssb_peer(Ip, Data, _) ->
+record_peer(Ip, Data, _) ->
     PeerExists = ets:member(ssb_peers, Ip),
-    reuse_or_create(Ip, Data, PeerExists).
-
-reuse_or_create(Ip, _Data, true) ->
-    [{_Ip, NSPeer}] = ets:lookup(ssb_peers, Ip),
-    ssb_peer:send(NSPeer, ping());
-
-reuse_or_create(Ip, Data, false) ->
-    PubKey = extract_key(Data),
-    if PubKey == nokey ->
-            ?LOG_ERROR("No public key in data ~p ~n",[Data]);
-       true ->
-            ?LOG_DEBUG("Trying to connect to ~p ~n",[Ip]),
-            Result =
-                ssb_peer:start_link(Ip, PubKey),
-            case Result of
-                {ok, NewSbotPeer} ->
-                    ?LOG_INFO("Started new link with ~p ~n",[{Ip, PubKey}]),
-                    ets:insert(ssb_peers, {Ip, NewSbotPeer}),
-                    ssb_peer:send(NewSbotPeer, ping());
-                Else ->
-                    ?LOG_ERROR("Issue connecting to peer ~p ~n",[Else])
-            end
+    case PeerExists of
+        false ->
+            PubKey = extract_key(Data),
+            ?LOG_INFO("Heartbeat received from ~p ~n",[{Ip, utils:display_pub(PubKey)}]),
+            ets:insert(ssb_peers, {Ip, PubKey});
+        _ ->
+            nop
     end.
-
-ping() ->
-    Flags = rpc_processor:create_flags(1,0,2),
-    Body = iolist_to_binary(message:ssb_encoder({[{<<"name">>,[<<"gossip">>,<<"ping">>]},
-                          {<<"args">>,[{[{<<"timeout">>, 700000}]}]},
-                          {<<"type">>,<<"duplex">>}]},
-                                               fun message:ssb_encoder/3, [])),
-    Header = rpc_processor:create_header(Flags, size(Body), 1),
-    utils:combine(Header, Body).
 
 extract_key(Data) ->
     %% may be more that one connection string here, look for semicolon
@@ -162,7 +147,8 @@ extract_key(Data) ->
                       {Pos1, _} ->
                           Pos1
                   end,
-            base64:decode(binary_to_list(binary:part(Data,
-                                                     (Pos + Len),
-                                                     End - (Pos + Len))))
+            %%base64:decode(binary_to_list(
+            binary:part(Data,
+                        (Pos + Len),
+                        End - (Pos + Len))
     end.
