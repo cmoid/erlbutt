@@ -22,7 +22,7 @@ process({Header, Body}, #ssb_conn{
                            secret_box = SecretBoxKey}) ->
     ReqNo = req_no(Header),
 
-    ?LOG_DEBUG("Please process ~p ~n from pid: ~p ~n",[{ReqNo, Body}, self()]),
+    ?LOG_DEBUG("Please process ~p ~p ~n from pid: ~p ~n",[Header, {ReqNo, Body}, self()]),
 
     case ReqNo < 0 of
         %% negative request numbers indicate responses
@@ -95,6 +95,7 @@ proc_request(ReqNo, #ssb_rpc{name = [?gossip, ?ping],
     TimeStamp = iolist_to_binary(message:ssb_encoder(integer_to_binary(current_time()),
                                     fun message:ssb_encoder/3, [pretty])),
     Header = create_header(Flags,size(TimeStamp), -ReqNo),
+    ?LOG_DEBUG("Answering ping with ~p ~n",[{Header, TimeStamp}]),
     NewNonce = utils:send_data(utils:combine(Header, TimeStamp), Socket, Nonce, SecretBoxKey),
     NewNonce;
     %%utils:send_data(?BOX_END, Socket, NewNonce, SecretBoxKey);
@@ -128,7 +129,7 @@ proc_request(ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
     Header = create_header(Flags,size(TrueEnd), -ReqNo),
     NewNonce = utils:send_data(utils:combine(Header, TrueEnd),
                                Socket, Nonce, SecretBoxKey),
-    utils:send_data(?BOX_END, Socket, NewNonce, SecretBoxKey).
+    utils:send_data(?RPC_END, Socket, NewNonce, SecretBoxKey).
 
 current_time() ->
     erlang:system_time(millisecond).

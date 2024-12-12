@@ -26,7 +26,7 @@ start_link(Ip, PubKey) ->
     gen_server:start_link(?MODULE, [Ip, PubKey], []).
 
 send(Pid, Data) ->
-    gen_server:call(Pid, {send, Data}).
+    gen_server:cast(Pid, {send, Data}).
 
 %% accept a connection from another peer, acting as a server.
 start_link(Ref, Socket, Transport, Opts) ->
@@ -117,21 +117,32 @@ handle_info(Info, State) ->
     ?LOG_INFO("Stopped presumably for normal reason: ~p ~n",[Info]),
     {stop, normal, State}.
 
-handle_call({send, Data}, _From,
-            #sbox_state{socket = Socket,
-                   enc_sbox_key = EncBoxKey,
-                   dec_nonce = _ServerNonce,
-                   enc_nonce = EncNonce} = State) ->
-    NewEncNonce = send_data(Data, Socket, EncNonce, EncBoxKey),
-    NewState = process(State),
-    %%
-    {reply, NewState#sbox_state.response,
-     NewState#sbox_state{enc_nonce = NewEncNonce}};
+%% handle_call({send, Data}, _From,
+%%             #sbox_state{socket = Socket,
+%%                    enc_sbox_key = EncBoxKey,
+%%                    dec_nonce = _ServerNonce,
+%%                    enc_nonce = EncNonce} = State) ->
+%%     NewEncNonce = send_data(Data, Socket, EncNonce, EncBoxKey),
+%%     NewState = process(State),
+%%     %%
+%%     ?LOG_DEBUG("Response from send call is: ~p ~n",[NewState#sbox_state.response]),
+%%     {reply, NewState#sbox_state.response,
+%%      NewState#sbox_state{enc_nonce = NewEncNonce}};
 
 
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
+
+
+handle_cast({send, Data}, #sbox_state{socket = Socket,
+                                      transport = Transport,
+                                      enc_sbox_key = EncBoxKey,
+                                      dec_nonce = _ServerNonce,
+                                      enc_nonce = EncNonce} = State) ->
+    NewEncNonce = send_data(Data, Socket, EncNonce, EncBoxKey),
+    Transport:setopts(Socket, [{active, once}]),
+    {noreply, State#sbox_state{enc_nonce = NewEncNonce}};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -146,31 +157,31 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-process(#sbox_state{socket = Socket,
-                   box_rem_bytes = BoxLeftOver}=State) ->
-    DataRead = gen_tcp:recv(Socket, 0, 5000),
+%% process(#sbox_state{socket = Socket,
+%%                    box_rem_bytes = BoxLeftOver}=State) ->
+%%     DataRead = gen_tcp:recv(Socket, 0, 5000),
 
-    case DataRead of
-        {ok, Data} ->
-            BoxData = combine(BoxLeftOver, Data),
+%%     case DataRead of
+%%         {ok, Data} ->
+%%             BoxData = combine(BoxLeftOver, Data),
 
-            {Done, NewState} =
-                unbox_and_parse(BoxData, State),
+%%             {Done, NewState} =
+%%                 unbox_and_parse(BoxData, State),
 
-            case Done of
-                complete ->
-                    %%ranch_tcp:setopts(Socket, [{active, once}]),
-                    %% need the response here
-                    NewState;
-                done ->
-                    stop(done, NewState);
-                _Else ->
-                    %% recursive call, keep processing until complete
-                    process(NewState)
-            end;
-        {error, Reason} ->
-            State#sbox_state{response = Reason}
-    end.
+%%             case Done of
+%%                 complete ->
+%%                     %%ranch_tcp:setopts(Socket, [{active, once}]),
+%%                     %% need the response here
+%%                     NewState;
+%%                 done ->
+%%                     stop(done, NewState);
+%%                 _Else ->
+%%                     %% recursive call, keep processing until complete
+%%                     process(NewState)
+%%             end;
+%%         {error, Reason} ->
+%%             State#sbox_state{response = Reason}
+%%     end.
 
 unbox_and_parse(BoxData, #sbox_state{dec_sbox_key = DecBoxKey,
                                 dec_nonce = DecNonce,
