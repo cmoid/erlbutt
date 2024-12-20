@@ -1,7 +1,7 @@
 %% SPDX-License-Identifier: GPL-2.0-only
 %%
 %% Copyright (C) 2023 Charles Moid
--module(pulse).
+-module(heartbeat).
 
 -include("ssb.hrl").
 
@@ -118,7 +118,7 @@ local_ip_v4() ->
     end.
 
 record_peer(_Ip, _Data, true) ->
-    ?LOG_DEBUG("No talking to self ~n",[]),
+    %%?LOG_DEBUG("No talking to self ~n",[]),
     ok;
 
 record_peer(Ip, Data, _) ->
