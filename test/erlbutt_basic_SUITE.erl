@@ -74,10 +74,9 @@ remote_long_pk() ->
 
 ping() ->
     Flags = rpc_processor:create_flags(1,0,2),
-    Body = iolist_to_binary(message:ssb_encoder({[{<<"name">>,[<<"gossip">>,<<"ping">>]},
+    Body = utils:encode_rec({[{<<"name">>,[<<"gossip">>,<<"ping">>]},
                           {<<"args">>,[{[{<<"timeout">>, 300000}]}]},
-                          {<<"type">>,<<"duplex">>}]}, fun message:ssb_encoder/3,
-                              [])),
+                          {<<"type">>,<<"duplex">>}]}),
     Header = rpc_processor:create_header(Flags, size(Body), 1),
     utils:combine(Header, Body).
 

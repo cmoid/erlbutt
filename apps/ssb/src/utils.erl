@@ -12,6 +12,7 @@
          base_64/1,
          display_pub/1,
          decode_id/1,
+         encode_rec/1,
          concat/1,
          incr/1,
          combine/2,
