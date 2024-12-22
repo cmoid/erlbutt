@@ -32,6 +32,8 @@
 -define(ping, <<"ping">>).
 -define(gossip, <<"gossip">>).
 -define(blobs, <<"blobs">>).
+-define(ebt, <<"ebt">>).
+-define(tunnel, <<"tunnel">>).
 
 -record(ssb_conn,
         { socket,

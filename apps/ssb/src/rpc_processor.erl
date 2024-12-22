@@ -121,6 +121,26 @@ proc_request(ReqNo, #ssb_rpc{name = [?blobs, <<"createWants">>],
     utils:send_data(utils:combine(utils:combine(Header,TrueEnd), ?RPC_END),
                     Socket, Nonce, SecretBoxKey);
 
+proc_request(ReqNo, #ssb_rpc{name = [?tunnel, <<"isRoom">>],
+                             args = []}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    % to start return true and close stream
+    Flags = create_flags(1,1,2),
+    TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
+    Header = create_header(Flags,size(TrueEnd), -ReqNo),
+    utils:send_data(utils:combine(utils:combine(Header,TrueEnd), ?RPC_END),
+                    Socket, Nonce, SecretBoxKey);
+
+proc_request(ReqNo, #ssb_rpc{name = [?ebt, <<"replicate">>],
+                             args = []}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    % to start return true and close stream
+    Flags = create_flags(1,1,2),
+    TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
+    Header = create_header(Flags,size(TrueEnd), -ReqNo),
+    utils:send_data(utils:combine(utils:combine(Header,TrueEnd), ?RPC_END),
+                    Socket, Nonce, SecretBoxKey);
+
 proc_request(ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
     ?LOG_DEBUG("Fall thru with ~p ~n",[ReqBody]),
     Flags = create_flags(1,1,10),
