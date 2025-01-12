@@ -11,7 +11,6 @@
 
 -include("ssb.hrl").
 
-
 -behaviour(gen_server).
 
 %% API
@@ -103,8 +102,6 @@ terminate(Reason, #state{m_a = BitHand}) ->
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
-
-
 
 %%%===================================================================
 %%% Internal functions
