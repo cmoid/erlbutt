@@ -12,7 +12,8 @@
 -export([start_link/0,
          pub_key/0,
          pub_key_disp/0,
-         priv_key/0]).
+         priv_key/0,
+         moid/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -151,3 +152,6 @@ prelude() ->
 
 suffix(Pub) ->
     ?l2b("\n\n%%WARNING! It's vital that you DO NOT edit OR share your secret name\n%%instead, share your public name\n%%your public name: " ++ ?b2l(utils:display_pub(Pub))).
+
+moid() ->
+    <<"@Sur8RwcDh6kBjub8pLZpHNWDfuuRpYVyCHrVo+TdA/4=.ed25519">>.
