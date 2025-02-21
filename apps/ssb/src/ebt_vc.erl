@@ -7,7 +7,8 @@
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
--export([decode_clock_int/1]).
+-export([decode_clock_int/1,
+         decode_clock/1]).
 
 decode_clock_int(Int) ->
     if Int < 0 ->
@@ -15,6 +16,11 @@ decode_clock_int(Int) ->
        true ->
             {true, (Int band 1) == 0, Int bsr 1}
     end.
+
+decode_clock(ClockList) ->
+    lists:map(fun({Feed, Num}) ->
+                      {Feed, decode_clock_int(Num)}
+              end, ClockList).
 
 -ifdef(TEST).
 
