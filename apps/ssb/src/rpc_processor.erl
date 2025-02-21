@@ -61,7 +61,7 @@ req_no(Header) ->
 
 create_req(Body) ->
     DecBody = message:nat_decode(Body),
-    %%?LOG_DEBUG("Body decoded is ~p ~n",[DecBody]),
+    ?LOG_DEBUG("Body decoded is ~p ~n",[DecBody]),
     IsTuple = is_tuple(DecBody),
     case IsTuple of
         true ->
@@ -126,25 +126,27 @@ proc_request(ReqNo, #ssb_rpc{name = [?tunnel, <<"isRoom">>],
                              args = []}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     % to start return true and close stream
-    Flags = create_flags(1,1,2),
-    TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
+    Flags = create_flags(0,0,2),
+    TrueEnd = message:ssb_encoder(false, fun message:ssb_encoder/3, [pretty]),
     Header = create_header(Flags,size(TrueEnd), -ReqNo),
     utils:send_data(utils:combine(utils:combine(Header,TrueEnd), ?RPC_END),
                     Socket, Nonce, SecretBoxKey);
 
-proc_request(ReqNo, #ssb_rpc{name = [?ebt, <<"replicate">>],
-                             args = []}
+proc_request(ReqNo, #ssb_rpc{name = [?ebt, <<"replicate">>] = Name,
+                             args = _Args}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     % to start return true and close stream
-    Flags = create_flags(1,1,2),
-    TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
-    Header = create_header(Flags,size(TrueEnd), -ReqNo),
-    utils:send_data(utils:combine(utils:combine(Header,TrueEnd), ?RPC_END),
+    Flags = create_flags(0,1,2),
+    ErrorMsg = utils:error_msg(Name, <<"Not yet implemented">>),
+    %%TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
+    Header = create_header(Flags,size(ErrorMsg), -ReqNo),
+    ?LOG_DEBUG("Answering ebt_rep with ~p ~n",[{Header, ErrorMsg}]),
+    utils:send_data(utils:combine(utils:combine(Header,ErrorMsg), ?RPC_END),
                     Socket, Nonce, SecretBoxKey);
 
 proc_request(ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
     ?LOG_DEBUG("Fall thru with ~p ~n",[ReqBody]),
-    Flags = create_flags(1,1,10),
+    Flags = create_flags(0,1,2),
     TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
     Header = create_header(Flags,size(TrueEnd), -ReqNo),
     NewNonce = utils:send_data(utils:combine(Header, TrueEnd),
