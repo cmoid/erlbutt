@@ -47,4 +47,40 @@ row6_test() ->
 row7_test() ->
     {true,true,225} == ebt_vc:decode_clock_int(450).
 
+simple_vec_clock1_test() ->
+    {ok, Cwd} = file:get_cwd(),
+    F = Cwd ++ "/testdata/" ++ "vec_clock1",
+    {ok, Vec_Clock} = file:read_file(F),
+    {VClock} = utils:nat_decode(Vec_Clock),
+    ?assert(is_list(VClock)).
+
+simple_vec_clock2_test() ->
+    {ok, Cwd} = file:get_cwd(),
+    F = Cwd ++ "/testdata/" ++ "vec_clock1",
+    {ok, Vec_Clock} = file:read_file(F),
+    {VClock} = utils:nat_decode(Vec_Clock),
+    ?assert(is_list(VClock)),
+    {Feed, Num} = hd(VClock),
+    ?assert(Feed == <<"@qK93G/R9R5J2fiqK+kxV72HqqPUcss+rth8rACcYr4s=.ed25519">>),
+    ?assert({true,true,225} == ebt_vc:decode_clock_int(Num)).
+
+simple_vec_clock3_test() ->
+    {ok, Cwd} = file:get_cwd(),
+    F = Cwd ++ "/testdata/" ++ "vec_clock1",
+    {ok, Vec_Clock} = file:read_file(F),
+    {VClock} = utils:nat_decode(Vec_Clock),
+    ?assert(is_list(VClock)),
+    {Feed, Num} = hd(VClock),
+    ?assert(Feed == <<"@qK93G/R9R5J2fiqK+kxV72HqqPUcss+rth8rACcYr4s=.ed25519">>),
+    ?assert({true,true,225} == ebt_vc:decode_clock_int(Num)),
+
+    Dec_VClock = ebt_vc:decode_clock(VClock),
+    {Feed1, Num1} = hd(Dec_VClock),
+    ?assert(Feed1 == <<"@qK93G/R9R5J2fiqK+kxV72HqqPUcss+rth8rACcYr4s=.ed25519">>),
+    ?assert({true,true,225} == Num1).
+
+
+
+
+
 -endif.
