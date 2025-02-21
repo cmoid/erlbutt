@@ -12,7 +12,6 @@
 -export([decode/2,
          encode/1,
          ssb_encoder/3,
-         nat_decode/1,
          is_follow/1,
          is_about/1,
          is_reply/1,
@@ -116,7 +115,7 @@ encode(#message{id = Key, received = Received, swapped = Swapped} = Msg) ->
                    {<<"timestamp">>, Received}]}, fun ssb_encoder/3, [use_nil])).
 
 decode(Msg, CheckValid) ->
-    {DecDataProps} = nat_decode(Msg),
+    {DecDataProps} = utils:nat_decode(Msg),
     Key = ?pgv(<<"key">>, DecDataProps),
     {Value} = ?pgv(<<"value">>, DecDataProps),
     IsSwapped = is_swapped(Value),
@@ -152,13 +151,6 @@ check_swapped(Props, Swapped) ->
        true ->
             [Auth, Seq]
     end.
-
-%% Internal functions
-nat_decode(Msg) ->
-    {Json, _, _} = json:decode(Msg,[], #{object_finish =>
-                              fun(Acc,OldAcc) ->
-                                      {{lists:reverse(Acc)}, OldAcc} end}),
-    Json.
 
 validate(false, _MsgProps) ->
     false;
@@ -297,7 +289,7 @@ roundtrip_test() ->
 ssb_test() ->
     O1 = {[{<<"key1">>,<<"val1">>},{<<"key2">>, [{[{<<"skey1">>, <<"sval1">>}]},{[{<<"skey12">>, <<"sval2">>}]}]}]},
     BO1 = iolist_to_binary(ssb_encoder(O1, fun ssb_encoder/3, [use_nil])),
-    ?assert(O1 == nat_decode(BO1)).
+    ?assert(O1 == utils:nat_decode(BO1)).
 
 bad_msg_test() ->
     {ok, Cwd} = file:get_cwd(),

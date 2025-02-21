@@ -95,6 +95,7 @@ handle_info({tcp, Socket, Data},
         done ->
             stop(done, NewState);
         _Else ->
+            ?LOG_DEBUG("Are we complete and need to wait? ~p ~n",[Done]),
             Transport:setopts(Socket, [{active, once}]),
             {noreply, NewState}
     end;
@@ -160,6 +161,7 @@ unbox_and_parse(BoxData, #sbox_state{dec_sbox_key = DecBoxKey,
             Done = Msg == ?BOX_END,
             case Done of
                 true ->
+                    ?LOG_DEBUG("Box end received ~p ~n",[Msg]),
                     {done, NewState};
                 false ->
                     %% now parse rpc

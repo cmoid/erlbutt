@@ -60,7 +60,7 @@ req_no(Header) ->
     Req.
 
 create_req(Body) ->
-    DecBody = message:nat_decode(Body),
+    DecBody = utils:nat_decode(Body),
     ?LOG_DEBUG("Body decoded is ~p ~n",[DecBody]),
     IsTuple = is_tuple(DecBody),
     case IsTuple of

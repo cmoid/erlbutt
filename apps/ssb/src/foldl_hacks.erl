@@ -38,7 +38,7 @@ reply_root(FeedId) ->
     ssb_feed:foldl(Pid, Fun, {0, 0, 0, 0, 0}).
 
 check_branch_root(Msg) ->
-    {DecProps} = message:nat_decode(Msg),
+    {DecProps} = utils:nat_decode(Msg),
     {Value} = ?pgv(<<"value">>, DecProps),
     Val = ?pgv(<<"content">>, Value),
     if is_binary(Val) ->
@@ -75,7 +75,7 @@ check_branch_root(Msg) ->
     end.
 
 check_reply_root(Msg) ->
-    {DecProps} = message:nat_decode(Msg),
+    {DecProps} = utils:nat_decode(Msg),
     {Value} = ?pgv(<<"value">>, DecProps),
     Val = ?pgv(<<"content">>, Value),
     if is_binary(Val) ->
