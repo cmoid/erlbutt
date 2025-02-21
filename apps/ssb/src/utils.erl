@@ -23,7 +23,16 @@
          update_refs/1,
          log/1,
          ping_req/0,
-         whoami_req/0]).
+         whoami_req/0,
+         error_msg/2,
+         nat_decode/1]).
+
+nat_decode(Msg) ->
+    {Json, _, _} = json:decode(Msg,[], #{object_finish =>
+                              fun(Acc,OldAcc) ->
+                                      {{lists:reverse(Acc)}, OldAcc} end}),
+    Json.
+
 
 create_key_pair() ->
     {Pub, Priv} = shs:create_long_pair(),
@@ -185,6 +194,12 @@ whoami_req() ->
                           {<<"type">>,<<"sync">>}]}),
     Header = rpc_processor:create_header(Flags, size(Body), 1),
     utils:combine(Header, Body).
+
+error_msg(Name, Mess) ->
+    encode_rec({[{<<"name">>, Name},
+                 {<<"message">>, Mess},
+                 {<<"stack">>, <<"_">>}
+                 ]}).
 
 
 
