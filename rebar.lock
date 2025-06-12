@@ -1,6 +1,6 @@
 [{<<"enacl">>,
   {git,"https://github.com/cmoid/enacl",
-       {ref,"9b807afd3a177630b235694f1489ba0cbaa9bc92"}},
+       {ref,"3be2ed2e4ee1fdfbd73c04207c0b572fcde49720"}},
   0},
  {<<"ranch">>,
   {git,"https://github.com/cmoid/ranch",

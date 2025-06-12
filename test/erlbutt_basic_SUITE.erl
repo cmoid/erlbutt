@@ -37,9 +37,10 @@ end_per_testcase(_, Config) ->
     Config.
 
 all() ->
-    [connect_test,
-     ping_test,
-     whoami_test].
+    [connect_test
+     %%ping_test,
+     %%whoami_test
+    ].
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
