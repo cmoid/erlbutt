@@ -27,4 +27,5 @@ init([]) ->
            [?CHILD(heartbeat, worker),
             ?CHILD(config, worker),
             ?CHILD(keys, worker),
+            ?CHILD(blobs, worker),
             ?CHILD(mess_auth, worker)]}}.
