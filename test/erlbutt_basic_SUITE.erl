@@ -64,7 +64,7 @@ ping_test(Config) ->
 whoami_test(Config) ->
     Host = get_value(hostname, Config, "localhost"),
     {ok, NewSbotClient} = ssb_peer:start_link(Host, remote_long_pk()),
-    {WhoAmI} = message:nat_decode(ssb_peer:send(NewSbotClient, whoami_req())),
+    {WhoAmI} = utils:nat_decode(ssb_peer:send(NewSbotClient, whoami_req())),
     ?assert(keys:pub_key_disp() == ?pgv(<<"id">>, WhoAmI)),
     Config.
 
