@@ -3,7 +3,7 @@
 %% Copyright (C) 2023 Charles Moid
 -module(mess_auth).
 
-%% A thin shell around bitcask store used as a simple message-author cache
+%% A thin shell around dets store used as a simple message-author cache
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
