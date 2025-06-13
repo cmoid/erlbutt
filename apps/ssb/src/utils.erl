@@ -245,6 +245,20 @@ create_pid_kill_test() ->
     find_or_create_feed_pid(FeedId2),
     ?assert(length(get()) == 2).
 
+simple_blob_decode_test() ->
+    Coded = <<"&ybENuaMAdmfjmwR852FNDsj3biaMl5P4HF/jJj7OtQQ=.sha256">>,
+    {ok, Cwd} = file:get_cwd(),
+    F = Cwd ++ "/testdata/" ++ "b10db9a3007667e39b047ce7614d0ec8f76e268c9793f81c5fe3263eceb504",
+    {ok, Blob} = file:read_file(F),
+    CompCoded = list_to_binary("&" ++
+                         utils:base_64(crypto:hash(sha256, Blob))
+                     ++
+                         ".sha256"),
+    ?assert(CompCoded == Coded).
+
+
+
+
 
 
 
