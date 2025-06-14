@@ -11,7 +11,7 @@
 -export([create_key_pair/0,
          base_64/1,
          display_pub/1,
-         decode_id/1,
+         decode_id/2,
          encode_rec/1,
          concat/1,
          incr/1,
@@ -44,9 +44,22 @@ base_64(Binary) ->
 display_pub(PubKey) ->
     ?l2b("@" ++ ?b2l(PubKey) ++ ".ed25519").
 
-decode_id(FeedId) ->
-    <<"@",Id/binary>> = FeedId,
-    RawId = hd(string:replace(Id,".ed25519","")),
+decode_id(Id, feed) ->
+    <<"@",RemId/binary>> = Id,
+    RawId = hd(string:replace(RemId,".ed25519","")),
+    decode_id1(RawId);
+
+decode_id(Id, msg) ->
+    <<"%",RemId/binary>> = Id,
+    RawId = hd(string:replace(RemId,".sha256","")),
+    decode_id1(RawId);
+
+decode_id(Id, blob) ->
+    <<"&",RemId/binary>> = Id,
+    RawId = hd(string:replace(RemId,".sha256","")),
+    decode_id1(RawId).
+
+decode_id1(RawId) ->
     integer_to_binary(binary:decode_unsigned(base64:decode(RawId)),16).
 
 concat(ListOfBins) ->

@@ -75,7 +75,7 @@ foldl(FeedPid, Fun, Acc) ->
 %%%===================================================================
 init([FeedId]) ->
     process_flag(trap_exit, true),
-    DecodeId = utils:decode_id(FeedId),
+    DecodeId = utils:decode_id(FeedId, feed),
     {Feed, Profile, Refs} = init_directories(DecodeId),
     State = #state{id = FeedId,
                    feed = Feed,
