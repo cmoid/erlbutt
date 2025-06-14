@@ -220,6 +220,7 @@ combine_test() ->
 
 create_pid_test() ->
     erase(),
+    keys:start_link(),
     config:start_link("test/ssb.cfg"),
     {Pub, _Priv} = create_key_pair(),
     FeedId1 = display_pub(Pub),
@@ -231,6 +232,7 @@ create_pid_test() ->
 
 create_pid_kill_test() ->
     erase(),
+    keys:start_link(),
     config:start_link("test/ssb.cfg"),
     {Pub, _Priv} = create_key_pair(),
     FeedId1 = display_pub(Pub),
