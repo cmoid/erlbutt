@@ -197,6 +197,7 @@ store(#message{id = Id, author = Auth} = Msg,
     mess_auth:put(Id, Auth),
     write_msg(Msg, Feed),
     utils:update_refs(Msg),
+    %% need to fix is_about to really look for profile changes
     IsAbout = message:is_about(Msg),
     case IsAbout of
         true ->
