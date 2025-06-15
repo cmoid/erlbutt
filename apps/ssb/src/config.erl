@@ -8,7 +8,8 @@
 %% API
 -export([start_link/0,
          start_link/1,
-         feed_store_loc/0,
+         ssb_repo_loc/0,
+         feed_loc/0,
          network_id/0]).
 
 %% gen_server callbacks
@@ -17,15 +18,19 @@
 
 -define(SERVER, ?MODULE).
 
--record(state, {store_loc,
+-record(state, {repo_loc,
+                feed_loc,
                 net_id}).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 
-feed_store_loc() ->
-    gen_server:call(?MODULE, location, infinity).
+ssb_repo_loc() ->
+    gen_server:call(?MODULE, repo, infinity).
+
+feed_loc() ->
+    gen_server:call(?MODULE, feeds, infinity).
 
 network_id() ->
     gen_server:call(?MODULE, netid, infinity).
@@ -47,12 +52,16 @@ init([Config]) ->
             {ok, load_and_parse(Config, #state{})};
         false ->
             %%?LOG_DEBUG("try to load the config from ~p ~n", []),
-            {ok, #state{store_loc = default_feed_store(),
+            {ok, #state{repo_loc = default_repo(),
+                        feed_loc = default_feed_store(),
                         net_id = default_net_id()}}
     end.
 
-handle_call(location, _From, #state{store_loc = DbLoc}=State) ->
-    {reply, DbLoc, State};
+handle_call(repo, _From, #state{repo_loc = RepLoc}=State) ->
+    {reply, RepLoc, State};
+
+handle_call(feeds, _From, #state{feed_loc = FeedLoc}=State) ->
+    {reply, FeedLoc, State};
 
 handle_call(netid, _From, #state{net_id = NetId}=State) ->
     {reply, NetId, State}.
@@ -83,10 +92,15 @@ load_and_parse(CfgFile, #state{} = State) ->
                         parse(CfgTerm, StateIn)
                 end, State, CfgTerms).
 
+parse({repo_location, Loc}, State) ->
+    Store = ?l2b(Loc),
+    filelib:ensure_dir(Store),
+    State#state{repo_loc = Store};
+
 parse({feed_store_location, Loc}, State) ->
     Store = ?l2b(Loc),
     filelib:ensure_dir(Store),
-    State#state{store_loc = Store};
+    State#state{feed_loc = Store};
 
 parse({network_id, NetId}, State) ->
     State#state{net_id = base64:decode(NetId)};
@@ -94,6 +108,9 @@ parse({network_id, NetId}, State) ->
 parse(_Any, State) ->
     %% ignore for now, this is an error technically
     State.
+
+default_repo() ->
+    ?l2b("./").
 
 default_feed_store() ->
     DataStore = ?l2b("./feeds/"),

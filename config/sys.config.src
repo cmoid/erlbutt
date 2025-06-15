@@ -12,5 +12,6 @@
       #{level => debug,
         config => #{type => {file, "log/debug.log"}}}}
     ]}]},
- {ssb, [{ssb_log_level, ${SSB_LOG_LEVEL:-error}}]}].
+ {ssb, [{ssb_log_level, ${SSB_LOG_LEVEL:-error}},
+        {ssb_home, "${HOME}"}]}].
 

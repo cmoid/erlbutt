@@ -24,8 +24,8 @@ start_link() ->
 %% ===================================================================
 init([]) ->
     {ok, { {one_for_one, 5, 10},
-           [?CHILD(heartbeat, worker),
-            ?CHILD(config, worker),
+           [?CHILD(config, worker),
+            ?CHILD(heartbeat, worker),
             ?CHILD(keys, worker),
             ?CHILD(blobs, worker),
             ?CHILD(mess_auth, worker)]}}.

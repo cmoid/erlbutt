@@ -221,7 +221,7 @@ write_msg(Msg, Store) ->
     close_file(O).
 
 init_directories(AuthDir) ->
-    Location = config:feed_store_loc(),
+    Location = config:feed_loc(),
     %% Author is already decoded as hex, use first two chars for directory
     <<Dir:2/binary,RestAuth/binary>> = AuthDir,
      FeedDir = <<Location/binary,Dir/binary,<<"/">>/binary,RestAuth/binary>>,

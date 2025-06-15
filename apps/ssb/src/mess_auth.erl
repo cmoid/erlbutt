@@ -56,7 +56,7 @@ all_auths() ->
 
 init([]) ->
     process_flag(trap_exit, true),
-    TabName = ?b2l(config:feed_store_loc()) ++ "mess_auth",
+    TabName = ?b2l(config:feed_loc()) ++ "mess_auth",
     {ok, DetsTab} = dets:open_file(mess, [{file, TabName}]),
     {ok, #state{m_a = DetsTab}}.
 

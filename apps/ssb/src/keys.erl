@@ -153,5 +153,6 @@ prelude() ->
 suffix(Pub) ->
     ?l2b("\n\n%%WARNING! It's vital that you DO NOT edit OR share your secret name\n%%instead, share your public name\n%%your public name: " ++ ?b2l(utils:display_pub(Pub))).
 
+%% hack to get Moid's key, the number one thing I seem to need in my REPL :)
 moid() ->
     <<"@Sur8RwcDh6kBjub8pLZpHNWDfuuRpYVyCHrVo+TdA/4=.ed25519">>.
