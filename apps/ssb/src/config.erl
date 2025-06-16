@@ -18,7 +18,8 @@
 
 -define(SERVER, ?MODULE).
 
--record(state, {repo_loc,
+-record(state, {ssb_home,
+                repo_loc,
                 feed_loc,
                 net_id}).
 
@@ -47,13 +48,16 @@ start_link(Config) ->
 
 init([Config]) ->
     process_flag(trap_exit, true),
+    SSBHome = application:get_env(ssb, ssb_home, "~/"),
     case filelib:is_file(Config) of
         true ->
-            {ok, load_and_parse(Config, #state{})};
+            {ok, load_and_parse(Config, #state{ssb_home = SSBHome,
+                                               repo_loc = default_repo(SSBHome)})};
         false ->
             %%?LOG_DEBUG("try to load the config from ~p ~n", []),
-            {ok, #state{repo_loc = default_repo(),
-                        feed_loc = default_feed_store(),
+            {ok, #state{ssb_home = SSBHome,
+                        repo_loc = default_repo(SSBHome),
+                        feed_loc = default_feed_store(SSBHome),
                         net_id = default_net_id()}}
     end.
 
@@ -92,13 +96,8 @@ load_and_parse(CfgFile, #state{} = State) ->
                         parse(CfgTerm, StateIn)
                 end, State, CfgTerms).
 
-parse({repo_location, Loc}, State) ->
-    Store = ?l2b(Loc),
-    filelib:ensure_dir(Store),
-    State#state{repo_loc = Store};
-
-parse({feed_store_location, Loc}, State) ->
-    Store = ?l2b(Loc),
+parse({feed_store_location, Loc}, #state{repo_loc = RepLoc} = State) ->
+    Store = ?l2b(?b2l(RepLoc) ++ Loc),
     filelib:ensure_dir(Store),
     State#state{feed_loc = Store};
 
@@ -109,11 +108,11 @@ parse(_Any, State) ->
     %% ignore for now, this is an error technically
     State.
 
-default_repo() ->
-    ?l2b("./").
+default_repo(SSBHome) ->
+    ?l2b(SSBHome ++ "/.ssberl/").
 
-default_feed_store() ->
-    DataStore = ?l2b("./feeds/"),
+default_feed_store(SSBHome) ->
+    DataStore = ?l2b(SSBHome ++ "/.ssberl/feeds/"),
     filelib:ensure_dir(DataStore),
     DataStore.
 

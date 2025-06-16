@@ -356,8 +356,8 @@ close_file(File) ->
 
 -ifdef(TEST).
 instance_feed_test() ->
-    keys:start_link(),
     config:start_link("test/ssb.cfg"),
+    keys:start_link(),
     mess_auth:start_link(),
     {ok, F1} = ssb_feed:start_link(keys:pub_key_disp()),
     ok = ssb_feed:post_content(F1, <<"foo">>).

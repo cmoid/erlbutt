@@ -88,8 +88,7 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 fetch_key() ->
-    {ok, [[Home]]} = init:get_argument(home),
-    SecretFileName = Home ++ "/.ssberl/secret",
+    SecretFileName = ?b2l(config:ssb_repo_loc()) ++ "secret",
     case file:open(SecretFileName, [read]) of
         {error, enoent} ->
             ?LOG_INFO("first time empty dir ~n"),
@@ -134,14 +133,13 @@ make_json({Pub, Priv}) ->
     iolist_to_binary(message:ssb_encoder(Doc, fun message:ssb_encoder/3, [])).
 
 check_secret_file() ->
-    {ok, [[Home]]} = init:get_argument(home),
-    SSBDir = Home ++ "/.ssberl",
+    SSBDir = ?b2l(config:ssb_repo_loc()),
     case file:list_dir(SSBDir) of
         {error, enoent} ->
             file:make_dir(SSBDir);
         _ -> ok
     end,
-    SSBDir ++ "/secret".
+    SSBDir ++ "secret".
 
 key_only(Key) ->
     hd(string:replace(Key,".ed25519","")).
