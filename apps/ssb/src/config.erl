@@ -10,6 +10,7 @@
          start_link/1,
          ssb_repo_loc/0,
          feed_loc/0,
+         blob_loc/0,
          network_id/0]).
 
 %% gen_server callbacks
@@ -21,6 +22,7 @@
 -record(state, {ssb_home,
                 repo_loc,
                 feed_loc,
+                blob_loc,
                 net_id}).
 
 %%%===================================================================
@@ -32,6 +34,9 @@ ssb_repo_loc() ->
 
 feed_loc() ->
     gen_server:call(?MODULE, feeds, infinity).
+
+blob_loc() ->
+    gen_server:call(?MODULE, blobs, infinity).
 
 network_id() ->
     gen_server:call(?MODULE, netid, infinity).
@@ -58,6 +63,7 @@ init([Config]) ->
             {ok, #state{ssb_home = SSBHome,
                         repo_loc = default_repo(SSBHome),
                         feed_loc = default_feed_store(SSBHome),
+                        blob_loc = default_blob_store(SSBHome),
                         net_id = default_net_id()}}
     end.
 
@@ -66,6 +72,9 @@ handle_call(repo, _From, #state{repo_loc = RepLoc}=State) ->
 
 handle_call(feeds, _From, #state{feed_loc = FeedLoc}=State) ->
     {reply, FeedLoc, State};
+
+handle_call(blobs, _From, #state{blob_loc = BlobLoc}=State) ->
+    {reply, BlobLoc, State};
 
 handle_call(netid, _From, #state{net_id = NetId}=State) ->
     {reply, NetId, State}.
@@ -101,6 +110,11 @@ parse({feed_store_location, Loc}, #state{repo_loc = RepLoc} = State) ->
     filelib:ensure_dir(Store),
     State#state{feed_loc = Store};
 
+parse({blob_store_location, Loc}, #state{repo_loc = RepLoc} = State) ->
+    Store = ?l2b(?b2l(RepLoc) ++ Loc),
+    filelib:ensure_dir(Store),
+    State#state{blob_loc = Store};
+
 parse({network_id, NetId}, State) ->
     State#state{net_id = base64:decode(NetId)};
 
@@ -113,6 +127,11 @@ default_repo(SSBHome) ->
 
 default_feed_store(SSBHome) ->
     DataStore = ?l2b(SSBHome ++ "/.ssberl/feeds/"),
+    filelib:ensure_dir(DataStore),
+    DataStore.
+
+default_blob_store(SSBHome) ->
+    DataStore = ?l2b(SSBHome ++ "/.ssberl/blobs/"),
     filelib:ensure_dir(DataStore),
     DataStore.
 
