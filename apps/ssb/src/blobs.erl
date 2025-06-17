@@ -3,10 +3,19 @@
 %% Copyright (C) 2025 Charles Moid
 -module(blobs).
 
+-include("ssb.hrl").
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
+
+
 -behaviour(gen_server).
 
 %% API
--export([start_link/0]).
+-export([start_link/0,
+         fetch/1,
+         store/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -16,112 +25,44 @@
 
 -record(state, {}).
 
+
 %%%===================================================================
 %%% API
 %%%===================================================================
 
-%%--------------------------------------------------------------------
-%% @doc
-%% Starts the server
-%% @end
-%%--------------------------------------------------------------------
--spec start_link() -> {ok, Pid :: pid()} |
-          {error, Error :: {already_started, pid()}} |
-          {error, Error :: term()} |
-          ignore.
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+
+fetch(BlobId) ->
+    gen_server:call(?MODULE, {fetch, BlobId}).
+
+store(Blob) ->
+    gen_server:call(?MODULE, {store, Blob}).
 
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% Initializes the server
-%% @end
-%%--------------------------------------------------------------------
--spec init(Args :: term()) -> {ok, State :: term()} |
-          {ok, State :: term(), Timeout :: timeout()} |
-          {ok, State :: term(), hibernate} |
-          {stop, Reason :: term()} |
-          ignore.
 init([]) ->
     process_flag(trap_exit, true),
     {ok, #state{}}.
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% Handling call messages
-%% @end
-%%--------------------------------------------------------------------
--spec handle_call(Request :: term(), From :: {pid(), term()}, State :: term()) ->
-          {reply, Reply :: term(), NewState :: term()} |
-          {reply, Reply :: term(), NewState :: term(), Timeout :: timeout()} |
-          {reply, Reply :: term(), NewState :: term(), hibernate} |
-          {noreply, NewState :: term()} |
-          {noreply, NewState :: term(), Timeout :: timeout()} |
-          {noreply, NewState :: term(), hibernate} |
-          {stop, Reason :: term(), Reply :: term(), NewState :: term()} |
-          {stop, Reason :: term(), NewState :: term()}.
-handle_call(_Request, _From, State) ->
-    Reply = ok,
-    {reply, Reply, State}.
+handle_call({fetch, BlobId}, _From, State) ->
+    DecBId = utils:decode_id(BlobId, blob),
+    {reply, lookup(DecBId), State};
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% Handling cast messages
-%% @end
-%%--------------------------------------------------------------------
--spec handle_cast(Request :: term(), State :: term()) ->
-          {noreply, NewState :: term()} |
-          {noreply, NewState :: term(), Timeout :: timeout()} |
-          {noreply, NewState :: term(), hibernate} |
-          {stop, Reason :: term(), NewState :: term()}.
+handle_call({store, Blob}, _From, State) ->
+    {reply, insert(Blob), State}.
+
 handle_cast(_Request, State) ->
     {noreply, State}.
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% Handling all non call/cast messages
-%% @end
-%%--------------------------------------------------------------------
--spec handle_info(Info :: timeout() | term(), State :: term()) ->
-          {noreply, NewState :: term()} |
-          {noreply, NewState :: term(), Timeout :: timeout()} |
-          {noreply, NewState :: term(), hibernate} |
-          {stop, Reason :: normal | term(), NewState :: term()}.
 handle_info(_Info, State) ->
     {noreply, State}.
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% This function is called by a gen_server when it is about to
-%% terminate. It should be the opposite of Module:init/1 and do any
-%% necessary cleaning up. When it returns, the gen_server terminates
-%% with Reason. The return value is ignored.
-%% @end
-%%--------------------------------------------------------------------
--spec terminate(Reason :: normal | shutdown | {shutdown, term()} | term(),
-                State :: term()) -> any().
 terminate(_Reason, _State) ->
     ok.
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% Convert process state when code is changed
-%% @end
-%%--------------------------------------------------------------------
--spec code_change(OldVsn :: term() | {down, term()},
-                  State :: term(),
-                  Extra :: term()) -> {ok, NewState :: term()} |
-          {error, Reason :: term()}.
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
@@ -133,6 +74,63 @@ format_status(Status) ->
 %%% Internal functions
 %%%===================================================================
 
-%% SPDX-License-Identifier: GPL-2.0-only
-%%
-%% Copyright (C) 2025 Charles Moid
+lookup(DecBId) ->
+    BlobLoc = config:blob_loc(),
+    <<Dir:2/binary,RestBlob/binary>> = DecBId,
+    BlobFile = <<BlobLoc/binary,Dir/binary,<<"/">>/binary,RestBlob/binary>>,
+    {ok, Blob} = file:read_file(BlobFile),
+    Blob.
+
+insert(Blob) ->
+    CodedBlob = list_to_binary("&" ++
+                                   utils:base_64(crypto:hash(sha256, Blob))
+                               ++
+                                   ".sha256"),
+    PathName = utils:decode_id(CodedBlob, blob),
+    BlobLoc = config:blob_loc(),
+    <<Dir:2/binary,RestName/binary>> = PathName,
+    BlobFile = <<BlobLoc/binary,Dir/binary,<<"/">>/binary,RestName/binary>>,
+    filelib:ensure_dir(BlobFile),
+    Open = file:open(BlobFile, [write]),
+    case Open of
+        {ok, F} ->
+            file:write(F, Blob);
+        Else ->
+            ?LOG_INFO("Tried to open failed: ~p ~n",[Else]),
+            nil
+    end,
+    CodedBlob.
+
+-ifdef(TEST).
+
+
+simple_blob_round_trip_test() ->
+    Coded = <<"&ybENuaMAdmfjmwR852FNDsj3biaMl5P4HF/jJj7OtQQ=.sha256">>,
+
+    {ok, Pid} = config:start_link("test/ssb.cfg"),
+    {ok, Pid2} = blobs:start_link(),
+
+    %% read a blob
+    {ok, Cwd} = file:get_cwd(),
+    F = Cwd ++ "/testdata/" ++ "b10db9a3007667e39b047ce7614d0ec8f76e268c9793f81c5fe3263eceb504",
+    {ok, Blob} = file:read_file(F),
+
+    %% store blob
+    StoreCode = blobs:store(Blob),
+
+    ?assert(StoreCode == Coded),
+    NewBlob = blobs:fetch(StoreCode),
+    ?assert(Blob == NewBlob),
+    gen_server:stop(Pid),
+    gen_server:stop(Pid2).
+
+
+
+
+
+
+
+
+
+
+-endif.
