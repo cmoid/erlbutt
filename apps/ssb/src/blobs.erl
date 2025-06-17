@@ -103,7 +103,6 @@ insert(Blob) ->
 
 -ifdef(TEST).
 
-
 simple_blob_round_trip_test() ->
     Coded = <<"&ybENuaMAdmfjmwR852FNDsj3biaMl5P4HF/jJj7OtQQ=.sha256">>,
 
@@ -123,14 +122,5 @@ simple_blob_round_trip_test() ->
     ?assert(Blob == NewBlob),
     gen_server:stop(Pid),
     gen_server:stop(Pid2).
-
-
-
-
-
-
-
-
-
 
 -endif.

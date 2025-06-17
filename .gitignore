@@ -20,3 +20,4 @@ __MACOSX
 feeds
 *.swp
 TAGS
+.ssberl
