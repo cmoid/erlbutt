@@ -53,7 +53,7 @@ start_link(Config) ->
 
 init([Config]) ->
     process_flag(trap_exit, true),
-    SSBHome = application:get_env(ssb, ssb_home, "~/"),
+    SSBHome = application:get_env(ssb, ssb_home, "."),
     case filelib:is_file(Config) of
         true ->
             {ok, load_and_parse(Config, #state{ssb_home = SSBHome,
