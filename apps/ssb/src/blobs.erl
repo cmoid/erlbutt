@@ -91,6 +91,7 @@ insert(Blob) ->
     <<Dir:2/binary,RestName/binary>> = PathName,
     BlobFile = <<BlobLoc/binary,Dir/binary,<<"/">>/binary,RestName/binary>>,
     filelib:ensure_dir(BlobFile),
+    %% note that opening with write truncates if file exists
     Open = file:open(BlobFile, [write]),
     case Open of
         {ok, F} ->
