@@ -10,8 +10,8 @@ main([Host, Command]) ->
     code:add_path("./_build/default/lib/enacl/ebin/"),
     code:add_path("./_build/default/lib/ranch/ebin/"),
     logger:set_primary_config(level, error),
-    keys:start_link(),
     config:start_link(),
+    keys:start_link(),
     ?INFO("current working directory is ~p ~n",[file:get_cwd()]),
 
    %% invoke the command passed as argument

@@ -12,6 +12,7 @@
 -export([decode/2,
          encode/1,
          ssb_encoder/3,
+         %% These next 4 should move elsewhere
          is_follow/1,
          is_about/1,
          is_reply/1,
@@ -121,7 +122,7 @@ decode(Msg, CheckValid) ->
     IsSwapped = is_swapped(Value),
     IsValid = validate(CheckValid, Value),
     #message{id = Key,
-             previous = ?pgv(<<"previous">>, Value),
+             previous = ?pgv(~"previous", Value),
              author = ?pgv(<<"author">>, Value),
              sequence = ?pgv(<<"sequence">>, Value),
              timestamp = ?pgv(<<"timestamp">>, Value),

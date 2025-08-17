@@ -53,7 +53,7 @@ init([]) ->
                 init_secret();
             _Any ->
                 ?LOG_ERROR("Should not get this ~p ~n",[_Any]),
-                {<<"whatkey">>,<<"whatkey">>}
+                {~"whatkey",~"whatkey"}
         end,
     {ok, #state{pub_key = PubKey,
                 priv_key = PrivKey}}.
@@ -97,23 +97,32 @@ fetch_key() ->
                 extract_key(IoDevice)
     end.
 
-extract_key(IoDevice) ->
-    case file:read_line(IoDevice) of
-        {ok, Data} ->
-            FirstChar = string:sub_string(Data,1,1),
-            IsCommentOrNewLine = FirstChar == "%" orelse
-                FirstChar == "\n",
-            if IsCommentOrNewLine ->
-                    extract_key(IoDevice);
-               true ->
-                    KeyMap = json:decode(iolist_to_binary(Data)),
-                    {PubKey, PrKey} = {maps:get(<<"public">>, KeyMap),
-                                       maps:get(<<"private">>, KeyMap)},
-                    {key_only(PubKey), key_only(PrKey)}
-            end;
-        eof ->
-            {<<"nokey">>,<<"nokey">>}
-    end.
+    extract_key(IoDevice) ->
+        case file:read_line(IoDevice) of
+            {ok, Data} ->
+                DataStr = case Data of
+                    Bin when is_binary(Bin) -> binary_to_list(Bin);
+                    Str when is_list(Str) -> Str
+                end,
+                FirstChar = string:sub_string(DataStr,1,1),
+                IsCommentOrNewLine = FirstChar == "%" orelse
+                    FirstChar == "\n",
+                if IsCommentOrNewLine ->
+                        extract_key(IoDevice);
+                   true ->
+                        DecodedValue = json:decode(iolist_to_binary(DataStr)),
+                        case DecodedValue of
+                            KeyMap when is_map(KeyMap) ->
+                                {PubKey, PrKey} = {maps:get(~"public", KeyMap),
+                                                   maps:get(~"private", KeyMap)},
+                                {key_only(PubKey), key_only(PrKey)};
+                            _ ->
+                                {~"nokey",~"nokey"}
+                        end
+                end;
+            eof ->
+                {~"nokey",~"nokey"}
+        end.
 
 init_secret() ->
     {Pub, Priv} = shs:create_long_pair(),
@@ -124,13 +133,13 @@ init_secret() ->
     file:write_file(SecretFileName, suffix(Pub), [append]),
     {?l2b(base_64(Pub)), ?l2b(base_64(Priv))}.
 
-make_json({Pub, Priv}) ->
-    Doc = {[{<<"curve">>, <<"ed25519">>},
-            {<<"public">>, ?l2b(base_64(Pub) ++ ".ed25519")},
-            {<<"private">>, ?l2b(base_64(Priv) ++ ".ed25519")},
-            {<<"id">>, ?l2b("@" ++ base_64(Pub) ++ ".ed25519")}
-           ]},
-    iolist_to_binary(message:ssb_encoder(Doc, fun message:ssb_encoder/3, [])).
+    make_json({Pub, Priv}) ->
+        Doc = {[{~"curve", ~"ed25519"},
+                {~"public", ?l2b(base_64(Pub) ++ ".ed25519")},
+                {~"private", ?l2b(base_64(Priv) ++ ".ed25519")},
+                {~"id", ?l2b("@" ++ base_64(Pub) ++ ".ed25519")}
+               ]},
+        iolist_to_binary(message:ssb_encoder(Doc, fun message:ssb_encoder/3, [])).
 
 check_secret_file() ->
     SSBDir = ?b2l(config:ssb_repo_loc()),
@@ -146,11 +155,11 @@ key_only(Key) ->
 
 
 prelude() ->
-    <<"%% this is your SECRET name.\n%% this name gives you magical powers.\n%% with it you can mark your messages so that your friends can verify\n%% that they really did come from you.%%\n%% if any one learns this name, they can use it to destroy your identity\n%% NEVER show this to anyone!!!\n\n">>.
+    ~"%% this is your SECRET name.\n%% this name gives you magical powers.\n%% with it you can mark your messages so that your friends can verify\n%% that they really did come from you.%%\n%% if any one learns this name, they can use it to destroy your identity\n%% NEVER show this to anyone!!!\n\n".
 
 suffix(Pub) ->
     ?l2b("\n\n%%WARNING! It's vital that you DO NOT edit OR share your secret name\n%%instead, share your public name\n%%your public name: " ++ ?b2l(utils:display_pub(Pub))).
 
 %% hack to get Moid's key, the number one thing I seem to need in my REPL :)
 moid() ->
-    <<"@Sur8RwcDh6kBjub8pLZpHNWDfuuRpYVyCHrVo+TdA/4=.ed25519">>.
+    ~"@Sur8RwcDh6kBjub8pLZpHNWDfuuRpYVyCHrVo+TdA/4=.ed25519".

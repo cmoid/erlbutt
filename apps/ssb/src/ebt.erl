@@ -10,7 +10,7 @@
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
-         terminate/2, code_change/3, format_status/1]).
+         terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
 
@@ -21,10 +21,8 @@
 %%%===================================================================
 
 %%--------------------------------------------------------------------
-%% @doc
-%% Starts the server
-%% @end
-%%--------------------------------------------------------------------
+-doc "Starts the server.".
+
 -spec start_link() -> {ok, Pid :: pid()} |
           {error, Error :: {already_started, pid()}} |
           {error, Error :: term()} |
@@ -36,12 +34,9 @@ start_link() ->
 %%% gen_server callbacks
 %%%===================================================================
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% Initializes the server
-%% @end
-%%--------------------------------------------------------------------
+
+-doc "Initializes the server.".
+
 -spec init(Args :: term()) -> {ok, State :: term()} |
           {ok, State :: term(), Timeout :: timeout()} |
           {ok, State :: term(), hibernate} |
@@ -125,17 +120,6 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% This function is called for changing the form and appearance
-%% of gen_server status when it is returned from sys:get_status/1,2
-%% or when it appears in termination error logs.
-%% @end
-%%--------------------------------------------------------------------
--spec format_status(Status :: list()) -> Status :: term().
-format_status(Status) ->
-    Status.
 
 %%%===================================================================
 %%% Internal functions

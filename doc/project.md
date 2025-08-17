@@ -9,7 +9,7 @@ Scuttlebutt is an interesting protocol. A feed is an immutable append-only log f
 
 Messages are encoded as [json][8] (newer implementations have improved this with various binary formats). Messages have a content object that has a type. Messages of type `follow` form the basis for the social graph that is used to drive the replication process. Feeds follow other feeds more or less. This makes for a simple replication, where one node in the network asks a peer for all messages of a feed beyond the latest sequence number they have.
 
-It's unfortunate that the social graph definition is in the content part of the message. It seems to be more an application concern. At the system level of connections, feeds and replication, there shouldn't be any awareness of the content. It's hard to say. The social graph drives the replication, once connections to other peers are made. Regardless though, almost anything can be worked around becuase the feeds are immutable, so a collection of feeds will only ever grow and anything needed can be built and maintained incrementally.
+It's unfortunate that the social graph definition is in the content part of the message. It seems to be more an application concern. At the system level of connections, feeds and replication, there shouldn't be any awareness of the content. It's hard to say. The social graph drives the replication, once connections to other peers are made. Regardless though, almost anything can be worked around because the feeds are immutable, so a collection of feeds will only ever grow and anything needed can be built and maintained incrementally.
 
 
 ----
