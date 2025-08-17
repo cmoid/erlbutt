@@ -2,11 +2,13 @@
 %%
 %% Copyright (C) 2023 Charles Moid
 -module(utils).
--include("ssb.hrl").
+-include_lib("ssb/include/ssb.hrl").
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 -endif.
+
+-type input() :: tuple() | binary().
 
 -export([create_key_pair/0,
          base_64/1,
@@ -25,7 +27,15 @@
          ping_req/0,
          whoami_req/0,
          error_msg/2,
-         nat_decode/1]).
+         nat_decode/1,
+         size/1]).
+
+-doc "Calculate the size of an input, suggested by elp".
+-spec size(input()) -> non_neg_integer().
+size(Input) when is_tuple(Input) ->
+    erlang:tuple_size(Input);
+size(Input) when is_binary(Input) ->
+    erlang:byte_size(Input).
 
 nat_decode(Msg) ->
     {Json, _, _} = json:decode(Msg,[], #{object_finish =>
@@ -72,7 +82,7 @@ combine(nil, Bin) ->
     Bin;
 
 combine(Bin1, Bin2) ->
-    Bin1Len = size(Bin1),
+    Bin1Len = utils:size(Bin1),
     <<Bin1:Bin1Len/binary, Bin2/binary>>.
 
 send_data(Data, Socket, Nonce, SecretBoxKey) ->
@@ -147,7 +157,7 @@ update_refs(#message{id = Id, author = AuthId} = Msg) ->
         false ->
             none;
         {Root, BranchList} ->
-            Target = {<<"tar">>, [Id, AuthId]},
+            Target = {~"tar", [Id, AuthId]},
             lists:map(fun(Bi) ->
                               %% this is really ugly, branch most often is either a binary
                               %% or a list of such, but occasionally it's an
@@ -163,8 +173,8 @@ update_refs(#message{id = Id, author = AuthId} = Msg) ->
                                   not_found ->
                                       nop;
                                   _Else ->
-                                      Record = {[{<<"root">>, Root},
-                                                 {<<"src">>, [Bi, Ai]},
+                                      Record = {[{~"root", Root},
+                                                 {~"src", [Bi, Ai]},
                                                  Target]},
                                       Pid = find_or_create_feed_pid(Ai),
                                       ssb_feed:store_ref(Pid, encode_rec(Record))
@@ -175,43 +185,43 @@ update_refs(#message{id = Id, author = AuthId} = Msg) ->
 encode_rec(Record) ->
     iolist_to_binary(message:ssb_encoder(Record, fun message:ssb_encoder/3, [])).
 
-check_id(<<"@",Id/binary>>) ->
-    try
-        case binary:matches(Id,[<<".ed25519">>]) of
-            [] ->
-                bad;
-            _Else ->
-                RawId = hd(string:replace(Id,".ed25519","")),
-                integer_to_binary(binary:decode_unsigned(base64:decode(RawId)),16),
-                ok
-        end
-    catch
-        error:_Reason ->
-            bad
-    end;
+    check_id(<<"@",Id/binary>>) ->
+        try
+            case binary:matches(Id,[~".ed25519"]) of
+                [] ->
+                    bad;
+                _Else ->
+                    RawId = hd(string:replace(Id,".ed25519","")),
+                    _DecodedId = integer_to_binary(binary:decode_unsigned(base64:decode(?b2l(RawId))),16),
+                    ok
+            end
+        catch
+            error:_Reason ->
+                bad
+        end;
 check_id(_Else) ->
     bad.
 
 ping_req() ->
     Flags = rpc_processor:create_flags(1,0,2),
-    Body = encode_rec({[{<<"name">>,[<<"gossip">>,<<"ping">>]},
-                          {<<"args">>,[{[{<<"timeout">>, 300000}]}]},
-                          {<<"type">>,<<"duplex">>}]}),
-    Header = rpc_processor:create_header(Flags, size(Body), 1),
+    Body = encode_rec({[{~"name",[~"gossip",~"ping"]},
+                          {~"args",[{[{~"timeout", 300000}]}]},
+                          {~"type",~"duplex"}]}),
+    Header = rpc_processor:create_header(Flags, utils:size(Body), 1),
     utils:combine(Header, Body).
 
 whoami_req() ->
     Flags = rpc_processor:create_flags(1,0,2),
-    Body = encode_rec({[{<<"name">>,[?whoami]},
-                          {<<"args">>,[]},
-                          {<<"type">>,<<"sync">>}]}),
-    Header = rpc_processor:create_header(Flags, size(Body), 1),
+    Body = encode_rec({[{~"name",[?whoami]},
+                          {~"args",[]},
+                          {~"type",~"sync"}]}),
+    Header = rpc_processor:create_header(Flags, utils:size(Body), 1),
     utils:combine(Header, Body).
 
 error_msg(Name, Mess) ->
-    encode_rec({[{<<"name">>, Name},
-                 {<<"message">>, Mess},
-                 {<<"stack">>, <<"_">>}
+    encode_rec({[{~"name", Name},
+                 {~"message", Mess},
+                 {~"stack", ~"_"}
                  ]}).
 
 
@@ -219,7 +229,7 @@ error_msg(Name, Mess) ->
 
 log({Socket, Data}) ->
     ?LOG_DEBUG("received a tcp packet of size: ~p ~n on socket ~p ~n",
-           [size(Data), Socket]);
+           [utils:size(Data), Socket]);
 
 log(Info) ->
     ?LOG_DEBUG("received random info message ~p ~n",

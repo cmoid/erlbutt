@@ -9,7 +9,7 @@
 %% feeds for each author in the log. Each feed is stored as a log file with the
 %% same format, but in it's own directory along with a profile file and a references file.
 
--include("ssb.hrl").
+-include_lib("ssb/include/ssb.hrl").
 
 -export([convert/3,
          build_refs/1]).
@@ -34,7 +34,7 @@ convert(OffsetLog, Sleep, Feeds)->
                                         true -> Elem;
                                         _Else -> Acc
                                     end
-                            end,{<<"FFF">>, {0, 0}},get()),
+                            end,{~"FFF", {0, 0}},get()),
             mess_auth:close(),
             ?LOG_INFO("number of unique feeds: ~p ~n",[length(get())]),
             ?LOG_INFO("largest feed belongs to: ~p ~n",
@@ -72,27 +72,27 @@ count(_) ->
     0.
 
 
-get_feed(Author, Sleep) ->
-    Val = get(Author),
-    case Val of
-        undefined ->
-            {ok, Pid} = ssb_feed:start_link(Author),
-            put(Author, {Pid, 1}),
-            Pid;
-        {Pid, Count} ->
-            put(Author, {Pid, Count + 1}),
-            PrintCount = Count rem 10000 == 0,
-            if PrintCount ->
-                    timer:sleep(Sleep),
-                    io:format("~n",[]),
-                    ?LOG_INFO("This author ~p has ~p records ~n", [Author, Count]);
-               true ->
-                    true
-            end,
-            Pid;
-        _Else ->
-            bad
-    end.
+    get_feed(Author, Sleep) ->
+        Val = get(Author),
+        case Val of
+            undefined ->
+                {ok, Pid} = ssb_feed:start_link(Author),
+                put(Author, {Pid, 1}),
+                Pid;
+            {Pid, Count} when is_integer(Count) ->
+                put(Author, {Pid, Count + 1}),
+                PrintCount = Count rem 10000 == 0,
+                if PrintCount ->
+                        timer:sleep(Sleep),
+                        io:format("~n",[]),
+                        ?LOG_INFO("This author ~p has ~p records ~n", [Author, Count]);
+                   true ->
+                        true
+                end,
+                Pid;
+            _Else ->
+                bad
+        end.
 
 store(Msg, Sleep, Feeds) ->
 

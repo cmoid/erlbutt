@@ -16,11 +16,6 @@
 
 -record(state, {}).
 
-%%%===================================================================
-%%% API
-%%%===================================================================
-
-%%--------------------------------------------------------------------
 -doc "Starts the server.".
 
 -spec start_link() -> {ok, Pid :: pid()} |
@@ -29,11 +24,6 @@
           ignore.
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
-
-%%%===================================================================
-%%% gen_server callbacks
-%%%===================================================================
-
 
 -doc "Initializes the server.".
 
@@ -46,12 +36,10 @@ init([]) ->
     process_flag(trap_exit, true),
     {ok, #state{}}.
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% Handling call messages
-%% @end
-%%--------------------------------------------------------------------
+-doc """
+Handling call messages
+""".
+
 -spec handle_call(Request :: term(), From :: {pid(), term()}, State :: term()) ->
           {reply, Reply :: term(), NewState :: term()} |
           {reply, Reply :: term(), NewState :: term(), Timeout :: timeout()} |
@@ -65,12 +53,10 @@ handle_call(_Request, _From, State) ->
     Reply = ok,
     {reply, Reply, State}.
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% Handling cast messages
-%% @end
-%%--------------------------------------------------------------------
+-doc """
+Handling cast messages
+""".
+
 -spec handle_cast(Request :: term(), State :: term()) ->
           {noreply, NewState :: term()} |
           {noreply, NewState :: term(), Timeout :: timeout()} |
@@ -79,12 +65,10 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Request, State) ->
     {noreply, State}.
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% Handling all non call/cast messages
-%% @end
-%%--------------------------------------------------------------------
+-doc """
+Handling all non call/cast messages
+""".
+
 -spec handle_info(Info :: timeout() | term(), State :: term()) ->
           {noreply, NewState :: term()} |
           {noreply, NewState :: term(), Timeout :: timeout()} |
@@ -93,34 +77,25 @@ handle_cast(_Request, State) ->
 handle_info(_Info, State) ->
     {noreply, State}.
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% This function is called by a gen_server when it is about to
-%% terminate. It should be the opposite of Module:init/1 and do any
-%% necessary cleaning up. When it returns, the gen_server terminates
-%% with Reason. The return value is ignored.
-%% @end
-%%--------------------------------------------------------------------
+-doc """
+This function is called by a gen_server when it is about to
+terminate. It should be the opposite of Module:init/1 and do any
+necessary cleaning up. When it returns, the gen_server terminates
+with Reason. The return value is ignored.
+""".
+
 -spec terminate(Reason :: normal | shutdown | {shutdown, term()} | term(),
                 State :: term()) -> any().
 terminate(_Reason, _State) ->
     ok.
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% Convert process state when code is changed
-%% @end
-%%--------------------------------------------------------------------
+-doc """
+Convert process state when code is changed
+""".
+
 -spec code_change(OldVsn :: term() | {down, term()},
                   State :: term(),
                   Extra :: term()) -> {ok, NewState :: term()} |
           {error, Reason :: term()}.
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
-
-
-%%%===================================================================
-%%% Internal functions
-%%%===================================================================

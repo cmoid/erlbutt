@@ -16,6 +16,9 @@
          parse_flags/1]).
 
 -import(message, [ssb_encoder/3]).
+-compile({no_auto_import,[size/1]}).
+-import(utils, [size/1]).
+
 process({Header, Body}, #ssb_conn{
                            socket = Socket,
                            nonce = Nonce,
@@ -67,9 +70,9 @@ create_req(Body) ->
         true ->
             {Props} = DecBody,
             #ssb_rpc{
-               name = proplists:get_value(<<"name">>, Props),
-               args = proplists:get_value(<<"args">>, Props),
-               type = proplists:get_value(<<"type">>, Props)};
+               name = proplists:get_value(~"name", Props),
+               args = proplists:get_value(~"args", Props),
+               type = proplists:get_value(~"type", Props)};
         _Else ->
             DecBody
     end.
@@ -83,7 +86,7 @@ proc_request(ReqNo, #ssb_rpc{name = [?createhistorystream],
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     % to start return true and close stream
     Flags = create_flags(1,1,2),
-    Header = create_header(Flags,size(<<"true">>), -ReqNo),
+    Header = create_header(Flags,size(~"true"), -ReqNo),
     utils:send_data(utils:combine(Header,message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
                     Socket, Nonce, SecretBoxKey);
 
@@ -112,7 +115,7 @@ proc_request(ReqNo, #ssb_rpc{name = [?whoami],
     NewNonce1 = utils:send_data(?RPC_END, Socket, NewNonce, SecretBoxKey),
     utils:send_data(?BOX_END, Socket, NewNonce1, SecretBoxKey);
 
-proc_request(ReqNo, #ssb_rpc{name = [?blobs, <<"createWants">>],
+proc_request(ReqNo, #ssb_rpc{name = [?blobs, ~"createWants"],
                              args = []}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     % to start return true and close stream
@@ -122,7 +125,7 @@ proc_request(ReqNo, #ssb_rpc{name = [?blobs, <<"createWants">>],
     utils:send_data(utils:combine(utils:combine(Header,TrueEnd), ?RPC_END),
                     Socket, Nonce, SecretBoxKey);
 
-proc_request(ReqNo, #ssb_rpc{name = [?tunnel, <<"isRoom">>],
+proc_request(ReqNo, #ssb_rpc{name = [?tunnel, ~"isRoom"],
                              args = []}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     % to start return true and close stream
@@ -132,12 +135,12 @@ proc_request(ReqNo, #ssb_rpc{name = [?tunnel, <<"isRoom">>],
     utils:send_data(utils:combine(utils:combine(Header,TrueEnd), ?RPC_END),
                     Socket, Nonce, SecretBoxKey);
 
-proc_request(ReqNo, #ssb_rpc{name = [?ebt, <<"replicate">>] = Name,
+proc_request(ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"] = Name,
                              args = _Args}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     % to start return true and close stream
     Flags = create_flags(0,1,2),
-    ErrorMsg = utils:error_msg(Name, <<"Not yet implemented">>),
+    ErrorMsg = utils:error_msg(Name, ~"Not yet implemented"),
     %%TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
     Header = create_header(Flags,size(ErrorMsg), -ReqNo),
     ?LOG_DEBUG("Answering ebt_rep with ~p ~n",[{Header, ErrorMsg}]),
@@ -157,17 +160,17 @@ current_time() ->
     erlang:system_time(millisecond).
 
 whoami() ->
-    iolist_to_binary(message:ssb_encoder({[{<<"id">>, keys:pub_key_disp()}]},
+    iolist_to_binary(message:ssb_encoder({[{~"id", keys:pub_key_disp()}]},
                        fun message:ssb_encoder/3, [])).
 
 -ifdef(TEST).
 
 body1_test() ->
-    Rpc = create_req(iolist_to_binary(ssb_encoder({[{<<"name">>,[<<"gossip">>,<<"ping">>]},
-                                    {<<"args">>,[{[{<<"timeout">>,300000}]}]},
-                                    {<<"type">>,<<"duplex">>}]}, fun message:ssb_encoder/3, []))),
-    ?assert(Rpc#ssb_rpc.name == [<<"gossip">>,<<"ping">>]),
-    ?assert(Rpc#ssb_rpc.type == <<"duplex">>).
+    Rpc = create_req(iolist_to_binary(ssb_encoder({[{~"name",[~"gossip",~"ping"]},
+                                    {~"args",[{[{~"timeout",300000}]}]},
+                                    {~"type",~"duplex"}]}, fun message:ssb_encoder/3, []))),
+    ?assert(Rpc#ssb_rpc.name == [~"gossip",~"ping"]),
+    ?assert(Rpc#ssb_rpc.type == ~"duplex").
 
 body2_test() ->
     Rpc = create_req(iolist_to_binary(ssb_encoder(22222, fun message:ssb_encoder/3, []))),

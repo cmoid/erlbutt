@@ -7,7 +7,7 @@
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
--include("ssb.hrl").
+-include_lib("ssb/include/ssb.hrl").
 
 -behaviour(gen_server).
 
@@ -27,9 +27,10 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
--import(utils, [load_term/1]).
+-compile({no_auto_import,[size/1]}).
+-import(utils, [load_term/1,
+                 size/1]).
 
--define(SERVER, ?MODULE).
 
 -record(state, {id,
                 last_msg = null,
@@ -224,10 +225,10 @@ init_directories(AuthDir) ->
     Location = config:feed_loc(),
     %% Author is already decoded as hex, use first two chars for directory
     <<Dir:2/binary,RestAuth/binary>> = AuthDir,
-     FeedDir = <<Location/binary,Dir/binary,<<"/">>/binary,RestAuth/binary>>,
-    Feed = <<FeedDir/binary,<<"/">>/binary,<<"log.offset">>/binary>>,
-    Profile = <<FeedDir/binary,<<"/">>/binary,<<"profile">>/binary>>,
-    Refs = <<FeedDir/binary,<<"/">>/binary,<<"references">>/binary>>,
+     FeedDir = <<Location/binary,Dir/binary,~"/"/binary,RestAuth/binary>>,
+    Feed = <<FeedDir/binary,~"/"/binary,~"log.offset"/binary>>,
+    Profile = <<FeedDir/binary,~"/"/binary,~"profile"/binary>>,
+    Refs = <<FeedDir/binary,~"/"/binary,~"references"/binary>>,
     filelib:ensure_dir(Feed),
     filelib:ensure_dir(Profile),
     filelib:ensure_dir(Refs),
@@ -296,7 +297,7 @@ feed_get_last(Feed) ->
 
 extract_key(Data) ->
     {DataProps} = utils:nat_decode(Data),
-    ?pgv(<<"key">>, DataProps).
+    ?pgv(~"key", DataProps).
 
 scan(IoDev, Pos, Key) ->
     case load_term(IoDev) of
@@ -327,13 +328,13 @@ int_foldr(Fun, Acc, IoDev) ->
 
 has_target(Msg, Id, RootId) ->
     {DecProps} = utils:nat_decode(Msg),
-    Root = ?pgv(<<"root">>, DecProps),
+    Root = ?pgv(~"root", DecProps),
     IsRootId = RootId == Root,
-    [Src, _AuthId] = ?pgv(<<"src">>, DecProps),
+    [Src, _AuthId] = ?pgv(~"src", DecProps),
     case IsRootId of
         true ->
             if Src == Id ->
-                    ?pgv(<<"tar">>, DecProps);
+                    ?pgv(~"tar", DecProps);
                true ->
                     false
             end;
@@ -360,5 +361,5 @@ instance_feed_test() ->
     keys:start_link(),
     mess_auth:start_link(),
     {ok, F1} = ssb_feed:start_link(keys:pub_key_disp()),
-    ok = ssb_feed:post_content(F1, <<"foo">>).
+    ok = ssb_feed:post_content(F1, ~"foo").
 -endif.

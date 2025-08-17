@@ -3,7 +3,7 @@
 %% Copyright (C) 2025 Charles Moid
 -module(blobs).
 
--include("ssb.hrl").
+-include_lib("ssb/include/ssb.hrl").
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -77,7 +77,7 @@ format_status(Status) ->
 lookup(DecBId) ->
     BlobLoc = config:blob_loc(),
     <<Dir:2/binary,RestBlob/binary>> = DecBId,
-    BlobFile = <<BlobLoc/binary,Dir/binary,<<"/">>/binary,RestBlob/binary>>,
+    BlobFile = <<BlobLoc/binary,Dir/binary,~"/"/binary,RestBlob/binary>>,
     {ok, Blob} = file:read_file(BlobFile),
     Blob.
 
@@ -89,7 +89,7 @@ insert(Blob) ->
     PathName = utils:decode_id(CodedBlob, blob),
     BlobLoc = config:blob_loc(),
     <<Dir:2/binary,RestName/binary>> = PathName,
-    BlobFile = <<BlobLoc/binary,Dir/binary,<<"/">>/binary,RestName/binary>>,
+    BlobFile = <<BlobLoc/binary,Dir/binary,~"/"/binary,RestName/binary>>,
     filelib:ensure_dir(BlobFile),
     %% note that opening with write truncates if file exists
     Open = file:open(BlobFile, [write]),
@@ -105,7 +105,7 @@ insert(Blob) ->
 -ifdef(TEST).
 
 simple_blob_round_trip_test() ->
-    Coded = <<"&ybENuaMAdmfjmwR852FNDsj3biaMl5P4HF/jJj7OtQQ=.sha256">>,
+    Coded = ~"&ybENuaMAdmfjmwR852FNDsj3biaMl5P4HF/jJj7OtQQ=.sha256",
 
     {ok, Pid} = config:start_link("test/ssb.cfg"),
     {ok, Pid2} = blobs:start_link(),

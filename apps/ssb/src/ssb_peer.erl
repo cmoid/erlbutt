@@ -6,7 +6,7 @@
 -behaviour(gen_server).
 -behaviour(ranch_protocol).
 
--include("ssb.hrl").
+-include_lib("ssb/include/ssb.hrl").
 
 -export([start_link/2,
          start_link/4,
@@ -17,9 +17,11 @@
          handle_info/2, terminate/2,
          code_change/3]).
 
+-compile({no_auto_import,[size/1]}).
 -import(utils, [concat/1,
                 combine/2,
-                send_data/4]).
+                send_data/4,
+                size/1]).
 
 %% connect to another peer, acting as a client.
 start_link(Ip, PubKey) ->
@@ -166,50 +168,52 @@ unbox_and_parse(BoxData, #sbox_state{dec_sbox_key = DecBoxKey,
                 false ->
                     %% now parse rpc
                     NewState2 = rpc_parse(combine(RpcLeftOver, Msg), NewState),
-                    if (size(NewBoxLeftOver) > 34) ->
+                    case size(NewBoxLeftOver) > 34 of
+                        true ->
                             unbox_and_parse(NewBoxLeftOver, NewState2);
-                       true ->
+                        false ->
                             {complete, NewState2}
                     end
             end
     end.
 
-rpc_parse(Data, #sbox_state{socket = Socket,
-                            enc_nonce = EncNonce,
-                            enc_sbox_key = EncBoxKey,
-                            response = Response} = State) ->
+    rpc_parse(Data, #sbox_state{socket = Socket,
+                                    enc_nonce = EncNonce,
+                                    enc_sbox_key = EncBoxKey,
+                                    response = Response} = State) ->
 
-    %% Should append Msg to rpc_rem_bytes from previous call?
-    Parsed = rpc_parse:parse(Data),
-    {Status, NewRpcLeftOver, NewEncNonce, NewResponse} =
-        case Parsed of
-            {partial, nil, Rest} ->
-                % if partial parse then Rest is the original input
-                {partial, Rest, EncNonce, Response};
-            {complete, ?RPC_END, <<>>} ->
-                {complete, <<>>, EncNonce, Response};
-            {complete, {Header, Body}, Rest} ->
-                %% Need to track request here somehow
-                {ProcEncNonce, Resp} =
-                    rpc_processor:process({Header, Body},
-                                          #ssb_conn{
-                                             socket = Socket,
-                                             nonce = EncNonce,
-                                              secret_box = EncBoxKey}),
-                ?LOG_DEBUG("The rpc call returned ~p ~n",[Resp]),
-                {complete, Rest, ProcEncNonce, Resp}
-        end,
+            %% Should append Msg to rpc_rem_bytes from previous call?
+            Parsed = rpc_parse:parse(Data),
+            {Status, NewRpcLeftOver, NewEncNonce, NewResponse} =
+                case Parsed of
+                    {partial, nil, Rest} ->
+                        % if partial parse then Rest is the original input
+                        {partial, Rest, EncNonce, Response};
+                    {complete, ?RPC_END, <<>>} ->
+                        {complete, <<>>, EncNonce, Response};
+                {complete, {Header, Body}, Rest} ->
+                    %% Need to track request here somehow
+                    {ProcEncNonce, Resp} =
+                        rpc_processor:process({Header, Body},
+                                              #ssb_conn{
+                                                 socket = Socket,
+                                                 nonce = EncNonce,
+                                                  secret_box = EncBoxKey}),
+                    ?LOG_DEBUG("The rpc call returned ~p ~n",[Resp]),
+                    {complete, Rest, ProcEncNonce, Resp}
+            end,
 
-    NewState = State#sbox_state{enc_nonce = NewEncNonce,
-                                rpc_rem_bytes = NewRpcLeftOver,
-                                response = NewResponse},
-    if (size(NewRpcLeftOver) >= 9 andalso (Status == complete)) ->
-            %% parse some more
-            rpc_parse(NewRpcLeftOver, NewState#sbox_state{
-                                        rpc_rem_bytes = <<>>});
-       true ->
-            NewState
-    end.
+        NewState = State#sbox_state{enc_nonce = NewEncNonce,
+                                    rpc_rem_bytes = NewRpcLeftOver,
+                                    response = NewResponse},
+        case {size(NewRpcLeftOver) >= 9, Status} of
+            {true, complete} ->
+                %% parse some more
+                rpc_parse(NewRpcLeftOver, NewState#sbox_state{
+                                            rpc_rem_bytes = <<>>});
+            _ ->
+                NewState
+        end.
 
 network_error(Reason, State) ->
     ?LOG_ERROR("Network error ~p ~n",[Reason]),

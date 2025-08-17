@@ -2,7 +2,7 @@
 %%
 %% Copyright (C) 2023 Charles Moid
 -module(message).
--include("ssb.hrl").
+-include_lib("ssb/include/ssb.hrl").
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -23,11 +23,11 @@ is_follow(#message{content = Val}) when is_binary(Val) ->
     nope;
 
 is_follow(#message{content = {ContentProps}}) ->
-    Type = ?pgv(<<"type">>, ContentProps),
+    Type = ?pgv(~"type", ContentProps),
     case Type of
-        <<"contact">> ->
-            check_contact(?pgv(<<"contact">>,ContentProps),
-                          ?pgv(<<"following">>, ContentProps));
+        ~"contact" ->
+            check_contact(?pgv(~"contact",ContentProps),
+                          ?pgv(~"following", ContentProps));
         _Else ->
             nope
     end.
@@ -36,20 +36,20 @@ is_about(#message{content = Content}) when is_binary(Content) ->
     false;
 
 is_about(#message{content = {ContentProps}}) ->
-    Type = ?pgv(<<"type">>, ContentProps),
+    Type = ?pgv(~"type", ContentProps),
     case Type of
         undefined ->
             false;
         Type ->
-            Type == <<"about">>
+            Type == ~"about"
     end.
 
 is_branch(#message{content = Content}) when is_binary(Content) ->
     false;
 
 is_branch(#message{content = {Content}}) ->
-    Root = ?pgv(<<"root">>, Content),
-    Branch = ?pgv(<<"branch">>, Content),
+    Root = ?pgv(~"root", Content),
+    Branch = ?pgv(~"branch", Content),
     build_branch(Root, Branch).
 
 build_branch(undefined, _Branch) ->
@@ -69,7 +69,7 @@ is_reply(#message{content = Content}) when is_binary(Content) ->
     false;
 
 is_reply(#message{content = {Content}}) ->
-    build_reply(?pgv(<<"reply">>, Content)).
+    build_reply(?pgv(~"reply", Content)).
 
 build_reply(undefined) ->
     false;
@@ -90,7 +90,7 @@ check_contact(_Contact, _Following) ->
 
 new_msg(Previous, Sequence, Content, {PubKey, PrivKey}) ->
     Timestamp = integer_to_binary(current_time()),
-    Hash = <<"sha256">>,
+    Hash = ~"sha256",
     NewMsg = #message{previous = Previous,
                       author = PubKey,
                       sequence = Sequence,
@@ -111,42 +111,47 @@ encode(#message{id = Key, received = Received, swapped = Swapped} = Msg) ->
     MsgProps = msg_to_proplist(Msg),
     EncMsg = build_props(MsgProps, Swapped),
 
-    iolist_to_binary(ssb_encoder({[{<<"key">>, Key},
-                   {<<"value">>, {EncMsg}},
-                   {<<"timestamp">>, Received}]}, fun ssb_encoder/3, [use_nil])).
+    iolist_to_binary(ssb_encoder({[{~"key", Key},
+                   {~"value", {EncMsg}},
+                   {~"timestamp", Received}]}, fun ssb_encoder/3, [use_nil])).
 
-decode(Msg, CheckValid) ->
-    {DecDataProps} = utils:nat_decode(Msg),
-    Key = ?pgv(<<"key">>, DecDataProps),
-    {Value} = ?pgv(<<"value">>, DecDataProps),
-    IsSwapped = is_swapped(Value),
-    IsValid = validate(CheckValid, Value),
-    #message{id = Key,
-             previous = ?pgv(~"previous", Value),
-             author = ?pgv(<<"author">>, Value),
-             sequence = ?pgv(<<"sequence">>, Value),
-             timestamp = ?pgv(<<"timestamp">>, Value),
-             hash = ?pgv(<<"hash">>, Value),
-             content = ?pgv(<<"content">>, Value),
-             signature = ?pgv(<<"signature">>, Value),
-             received = ?pgv(<<"timestamp">>, DecDataProps),
-             validated = IsValid,
-             swapped = IsSwapped}.
+    decode(Msg, CheckValid) ->
+        {DecDataProps} = utils:nat_decode(Msg),
+        Key = ?pgv(~"key", DecDataProps),
+        ValueTuple = ?pgv(~"value", DecDataProps),
+        {Value} = ValueTuple,
+        IsSwapped = is_swapped(Value),
+        IsValid = validate(CheckValid, Value),
+        #message{id = Key,
+                 previous = ?pgv(~"previous", Value),
+                 author = ?pgv(~"author", Value),
+                 sequence = ?pgv(~"sequence", Value),
+                 timestamp = ?pgv(~"timestamp", Value),
+                 hash = ?pgv(~"hash", Value),
+                 content = ?pgv(~"content", Value),
+                 signature = ?pgv(~"signature", Value),
+                 received = ?pgv(~"timestamp", DecDataProps),
+                 validated = IsValid,
+                 swapped = IsSwapped}.
 
-is_swapped(PropList) ->
-    element(1, lists:nth(2, PropList)) == <<"sequence">>.
+    is_swapped(PropList) ->
+        SecondElement = lists:nth(2, PropList),
+        case SecondElement of
+            {Key, _Value} -> Key == ~"sequence";
+            _ -> false
+        end.
 
 build_props(Props, Swapped) ->
-    [{<<"previous">>, ?pgv(<<"previous">>, Props)}] ++
+    [{~"previous", ?pgv(~"previous", Props)}] ++
         check_swapped(Props, Swapped) ++
-        [{<<"timestamp">>, ?pgv(<<"timestamp">>, Props)},
-         {<<"hash">>, ?pgv(<<"hash">>, Props)},
-         {<<"content">>, ?pgv(<<"content">>, Props)},
-         {<<"signature">>, ?pgv(<<"signature">>, Props)}].
+        [{~"timestamp", ?pgv(~"timestamp", Props)},
+         {~"hash", ?pgv(~"hash", Props)},
+         {~"content", ?pgv(~"content", Props)},
+         {~"signature", ?pgv(~"signature", Props)}].
 
 check_swapped(Props, Swapped) ->
-    Seq = {<<"sequence">>, ?pgv(<<"sequence">>, Props)},
-    Auth = {<<"author">>, ?pgv(<<"author">>, Props)},
+    Seq = {~"sequence", ?pgv(~"sequence", Props)},
+    Auth = {~"author", ?pgv(~"author", Props)},
     if Swapped ->
             [Seq, Auth];
        true ->
@@ -157,14 +162,14 @@ validate(false, _MsgProps) ->
     false;
 validate(true, MsgProps) ->
     try
-        Author = ?pgv(<<"author">>, MsgProps),
+        Author = ?pgv(~"author", MsgProps),
 
         %% remove signature from message and encode as json
-        DelSigProps = proplists:delete(<<"signature">>, MsgProps),
+        DelSigProps = proplists:delete(~"signature", MsgProps),
         EncMsg = ssb_encoder({DelSigProps}, fun ssb_encoder/3, [pretty, use_nil]),
 
         %% extract and decode the keys for the signature and the author
-        Sig = ?pgv(<<"signature">>, MsgProps),
+        Sig = ?pgv(~"signature", MsgProps),
         <<"@",KeySuf/binary>> = Author,
         AuthorPk = base64:decode(hd(string:replace(KeySuf,".ed25519",""))),
         SigDec = base64:decode(hd(string:replace(Sig,".sig.ed25519",""))),
@@ -180,7 +185,7 @@ validate(true, MsgProps) ->
 
 add_sig(NewMsg, EncSig) ->
     NewMsgList = msg_to_proplist(NewMsg) ++
-        [{<<"signature">>, EncSig}],
+        [{~"signature", EncSig}],
     %% added sig to msg before computing id
     MsgId = compute_id(ssb_encoder({NewMsgList}, fun ssb_encoder/3,
                             [pretty,
@@ -213,25 +218,25 @@ ssb_encoder1([_|_] = V, Encoder, Options, Ind) when is_list(V) ->
     Pretty = lists:member(pretty, Options),
     Array = lists:map(fun(Elem) ->
                               if Pretty ->
-                                      [<<"\n">>, string:copies("  ", Ind + 1),
+                                      [~"\n", string:copies("  ", Ind + 1),
                                  ssb_encoder1(Elem, Encoder, Options, Ind + 1),
-                                 <<",">>];
+                                 ~","];
                                  true ->
                                       [ssb_encoder1(Elem, Encoder, Options, Ind + 1),
-                                       <<",">>]
+                                       ~","]
                               end
                       end, V),
     LastElem = lists:last(Array),
     ArrayNoLast = lists:reverse(tl(lists:reverse(Array))),
     FixElem = lists:reverse(tl(lists:reverse(LastElem))),
     if Pretty ->
-            [<<"[">>, ArrayNoLast ++ [FixElem], <<"\n">>, string:copies("  ", Ind), <<"]">>];
+            [~"[", ArrayNoLast ++ [FixElem], ~"\n", string:copies("  ", Ind), ~"]"];
        true ->
-            [<<"[">>, ArrayNoLast ++ [FixElem], <<"]">>]
+            [~"[", ArrayNoLast ++ [FixElem], ~"]"]
     end;
 
 ssb_encoder1({[]}, _Encoder, _Options, _Ind) ->
-    [<<"{}">>];
+    [~"{}"];
 
 ssb_encoder1({KeyValList}, Encoder, Options, Ind) ->
     Pretty = lists:member(pretty, Options),
@@ -241,17 +246,17 @@ ssb_encoder1({KeyValList}, Encoder, Options, Ind) ->
     ObjNoLast = lists:reverse(tl(lists:reverse(Obj))),
     FixElem = lists:reverse(tl(lists:reverse(LastElem))),
     if Pretty ->
-            [<<"{">>, ObjNoLast ++ [FixElem], <<"\n">>, string:copies("  ", Ind), <<"}">>];
+            [~"{", ObjNoLast ++ [FixElem], ~"\n", string:copies("  ", Ind), ~"}"];
        true ->
-            [<<"{">>, ObjNoLast ++ [FixElem], <<"}">>]
+            [~"{", ObjNoLast ++ [FixElem], ~"}"]
     end;
 
 ssb_encoder1({Key, Val}, Encoder, Options, Ind) ->
     Pretty = lists:member(pretty, Options),
     if Pretty ->
-            [<<"\n">>, string:copies("  ", Ind), ssb_encoder1(Key, Encoder, Options, Ind), <<": ">>, ssb_encoder1(Val, Encoder, Options, Ind), <<",">>];
+            [~"\n", string:copies("  ", Ind), ssb_encoder1(Key, Encoder, Options, Ind), <<": ">>, ssb_encoder1(Val, Encoder, Options, Ind), <<",">>];
        true ->
-            [ssb_encoder1(Key, Encoder, Options, Ind), <<":">>, ssb_encoder1(Val, Encoder, Options, Ind), <<",">>]
+            [ssb_encoder1(Key, Encoder, Options, Ind), ~":", ssb_encoder1(Val, Encoder, Options, Ind), <<",">>]
     end;
 
 ssb_encoder1(Other, Encoder, Options, _Ind) ->
@@ -284,11 +289,11 @@ roundtrip_test() ->
           end,
 
     Results = lists:map(Fun, Ints),
-    ?assert(lists:all(fun(B) ->
+    ?assert(lists:all(fun(B) when is_boolean(B) ->
                     B end, Results)).
 
 ssb_test() ->
-    O1 = {[{<<"key1">>,<<"val1">>},{<<"key2">>, [{[{<<"skey1">>, <<"sval1">>}]},{[{<<"skey12">>, <<"sval2">>}]}]}]},
+    O1 = {[{~"key1",~"val1"},{~"key2", [{[{~"skey1", ~"sval1"}]},{[{~"skey12", ~"sval2"}]}]}]},
     BO1 = iolist_to_binary(ssb_encoder(O1, fun ssb_encoder/3, [use_nil])),
     ?assert(O1 == utils:nat_decode(BO1)).
 

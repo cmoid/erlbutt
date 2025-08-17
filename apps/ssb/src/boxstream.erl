@@ -3,10 +3,12 @@
 %% Copyright (C) 2023 Charles Moid
 -module(boxstream).
 
--include("ssb.hrl").
+-include_lib("ssb/include/ssb.hrl").
 
+-compile({no_auto_import,[size/1]}).
 -import(utils, [combine/2,
-                incr/1]).
+                incr/1,
+                size/1]).
 
 -export([box/3,
          unbox/3]).
@@ -38,7 +40,7 @@ box(Data, Nonce, SecretBoxKey) ->
 
 %% return complete or partial, no need for returning done. Complete
 %% with ?BOX_END indicates done
-unbox(_SecretBoxKey, Nonce, DataProc) when size(DataProc) < 34 ->
+unbox(_SecretBoxKey, Nonce, DataProc) when byte_size(DataProc) < 34 ->
     {partial, <<>>, Nonce, DataProc};
 
 unbox(SecretBoxKey, Nonce, DataProc) ->

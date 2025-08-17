@@ -2,7 +2,7 @@
 %%
 %% Copyright (C) 2023 Charles Moid
 -module(config).
--include("ssb.hrl").
+-include_lib("ssb/include/ssb.hrl").
 -behaviour(gen_server).
 
 %% API
