@@ -3,9 +3,12 @@
 %% Copyright (C) 2023 Charles Moid
 -module(heartbeat).
 
--include("ssb.hrl").
+-include_lib("ssb/include/ssb.hrl").
 
 -behaviour(gen_server).
+
+-compile({no_auto_import,[size/1]}).
+-import(utils, [size/1]).
 
 %% API
 -export([start_link/0]).
