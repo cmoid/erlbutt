@@ -7,7 +7,7 @@
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
--include("ssb.hrl").
+-include_lib("ssb/include/ssb.hrl").
 
 -export([get_tangle/1,
          parents/2,
@@ -49,7 +49,7 @@ get_msg(Id, Auth) ->
     Feed = utils:find_or_create_feed_pid(Auth),
     Msg = ssb_feed:fetch_msg(Feed, Id),
     {Content} = Msg#message.content,
-    ?pgv(<<"text">>, Content).
+    ?pgv(~"text", Content).
 
 children(MsgId, TangleId) ->
     %% retrieve tangle root author
@@ -141,7 +141,7 @@ basic_test() ->
     {Auth, Priv, Feed} = init(),
     #message{id = Id} = make_msg_one(Auth, Priv, Feed),
     #message{content = {Content}} = ssb_feed:fetch_msg(Feed, Id),
-    ?assert(<<"bar">> == ?pgv(<<"foo">>, Content)).
+    ?assert(~"bar" == ?pgv(~"foo", Content)).
 
 tangle1_test() ->
     {Auth, Priv, Feed} = init(),
@@ -210,15 +210,15 @@ create_id() ->
     {Auth, Priv, Feed}.
 
 make_msg_one(Auth, Priv, Feed) ->
-    Msg = message:new_msg(nil, 1, {[{<<"foo">>, <<"bar">>}]}, {Auth, Priv}),
+    Msg = message:new_msg(nil, 1, {[{~"foo", ~"bar"}]}, {Auth, Priv}),
     ssb_feed:store_msg(Feed, Msg),
     Msg.
 
 make_msg(N, Prev, Root, BranchList, Auth, Priv, Feed) ->
-    Msg = message:new_msg(Prev, N, {[{<<"type">>, <<"post">>},
-                                    {<<"test">>, <<"bar">>},
-                                    {<<"root">>, Root},
-                                    {<<"branch">>, BranchList}]}, {Auth, Priv}),
+    Msg = message:new_msg(Prev, N, {[{~"type", ~"post"},
+                                    {~"test", ~"bar"},
+                                    {~"root", Root},
+                                    {~"branch", BranchList}]}, {Auth, Priv}),
 
     ssb_feed:store_msg(Feed, Msg),
     Msg.

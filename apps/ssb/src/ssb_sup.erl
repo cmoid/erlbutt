@@ -5,7 +5,7 @@
 
 -behaviour(supervisor).
 
--include("ssb.hrl").
+-include_lib("ssb/include/ssb.hrl").
 
 %% API
 -export([start_link/0]).

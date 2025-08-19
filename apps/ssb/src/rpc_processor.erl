@@ -7,7 +7,7 @@
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
--include("ssb.hrl").
+-include_lib("ssb/include/ssb.hrl").
 
 %% API
 -export([process/2,
