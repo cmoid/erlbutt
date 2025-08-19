@@ -116,23 +116,23 @@ encode(#message{id = Key, received = Received, swapped = Swapped} = Msg) ->
                    {~"timestamp", Received}]}, fun ssb_encoder/3, [use_nil])).
 
     decode(Msg, CheckValid) ->
-        {DecDataProps} = utils:nat_decode(Msg),
-        Key = ?pgv(~"key", DecDataProps),
-        ValueTuple = ?pgv(~"value", DecDataProps),
-        {Value} = ValueTuple,
-        IsSwapped = is_swapped(Value),
-        IsValid = validate(CheckValid, Value),
-        #message{id = Key,
-                 previous = ?pgv(~"previous", Value),
-                 author = ?pgv(~"author", Value),
-                 sequence = ?pgv(~"sequence", Value),
-                 timestamp = ?pgv(~"timestamp", Value),
-                 hash = ?pgv(~"hash", Value),
-                 content = ?pgv(~"content", Value),
-                 signature = ?pgv(~"signature", Value),
-                 received = ?pgv(~"timestamp", DecDataProps),
-                 validated = IsValid,
-                 swapped = IsSwapped}.
+            {DecDataProps} = utils:nat_decode(Msg),
+            Key = ?pgv(~"key", DecDataProps),
+            ValueTuple = ?pgv(~"value", DecDataProps),
+            {Value} = ValueTuple,
+            IsSwapped = is_swapped(Value),
+            IsValid = validate(CheckValid, Value),
+            #message{id = Key,
+                     previous = ?pgv(~"previous", Value),
+                     author = ?pgv(~"author", Value),
+                     sequence = ?pgv(~"sequence", Value),
+                     timestamp = ?pgv(~"timestamp", Value),
+                     hash = ?pgv(~"hash", Value),
+                     content = ?pgv(~"content", Value),
+                     signature = ?pgv(~"signature", Value),
+                     received = ?pgv(~"timestamp", DecDataProps),
+                     validated = IsValid,
+                     swapped = IsSwapped}.
 
     is_swapped(PropList) ->
         SecondElement = lists:nth(2, PropList),
@@ -193,11 +193,17 @@ add_sig(NewMsg, EncSig) ->
     NewMsg#message{id = MsgId,
                    signature = EncSig}.
 
-msg_to_proplist(Msg) ->
-    lists:zip(lists:map(fun(A) ->
-                                atom_to_binary(A, utf8) end,
-                        record_info(fields, message)),
-              tl(tuple_to_list(Msg))).
+    msg_to_proplist(Msg) ->
+        Fields = record_info(fields, message),
+        FieldsBinary = lists:map(fun(A) when is_atom(A) ->
+                                    atom_to_binary(A, utf8) end,
+                            Fields),
+        MsgList = tuple_to_list(Msg),
+        MsgTail = case MsgList of
+                      [_|Tail] -> Tail;
+                      [] -> []
+                  end,
+        lists:zip(FieldsBinary, MsgTail).
 
 compute_id(Msg) ->
     ?l2b("%" ++
@@ -238,18 +244,23 @@ ssb_encoder1([_|_] = V, Encoder, Options, Ind) when is_list(V) ->
 ssb_encoder1({[]}, _Encoder, _Options, _Ind) ->
     [~"{}"];
 
-ssb_encoder1({KeyValList}, Encoder, Options, Ind) ->
-    Pretty = lists:member(pretty, Options),
-    Obj = lists:map(fun({_, _} = Val) -> ssb_encoder1(Val, Encoder, Options, Ind + 1) end,
-                    KeyValList),
-    LastElem = lists:last(Obj),
-    ObjNoLast = lists:reverse(tl(lists:reverse(Obj))),
-    FixElem = lists:reverse(tl(lists:reverse(LastElem))),
-    if Pretty ->
-            [~"{", ObjNoLast ++ [FixElem], ~"\n", string:copies("  ", Ind), ~"}"];
-       true ->
-            [~"{", ObjNoLast ++ [FixElem], ~"}"]
-    end;
+    ssb_encoder1({KeyValList}, Encoder, Options, Ind) ->
+        Pretty = lists:member(pretty, Options),
+        case KeyValList of
+            [] ->
+                [~"{}"];
+            _ ->
+                Obj = lists:map(fun({_, _} = Val) -> ssb_encoder1(Val, Encoder, Options, Ind + 1) end,
+                                KeyValList),
+                LastElem = lists:last(Obj),
+                ObjNoLast = lists:reverse(tl(lists:reverse(Obj))),
+                FixElem = lists:reverse(tl(lists:reverse(LastElem))),
+                if Pretty ->
+                        [~"{", ObjNoLast ++ [FixElem], ~"\n", string:copies("  ", Ind), ~"}"];
+                   true ->
+                        [~"{", ObjNoLast ++ [FixElem], ~"}"]
+                end
+        end;
 
 ssb_encoder1({Key, Val}, Encoder, Options, Ind) ->
     Pretty = lists:member(pretty, Options),

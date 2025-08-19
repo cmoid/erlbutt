@@ -35,10 +35,15 @@ start_link() ->
 
 %% identifying string sent out on UDP broadcast
 whoami()->
-    ?l2b("net:" ++
-        inet:ntoa(local_ip_v4()) ++
-        ":8008~shs:" ++
-        keys:pub_key()).
+    case inet:ntoa(local_ip_v4()) of
+        {error, einval} ->
+            ?l2b("net:127.0.0.1:8008~shs:" ++ keys:pub_key());
+        IpString ->
+            ?l2b("net:" ++
+                IpString ++
+                ":8008~shs:" ++
+                keys:pub_key())
+    end.
 
 peers() ->
     gen_server:call(?SERVER, peers).
