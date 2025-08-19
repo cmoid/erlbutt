@@ -3,14 +3,17 @@
 %% Copyright (C) 2023 Charles Moid
 -module(shs).
 
--include("ssb.hrl").
+-include_lib("ssb/include/ssb.hrl").
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
+-compile({no_auto_import,[size/1]}).
 -import(utils, [concat/1,
-                combine/2]).
+                combine/2,
+                size/1]).
+
 -export([open_box/3,
          create_long_pair/0,
          client_shake_hands/2,
@@ -55,7 +58,7 @@ open_box(Data, Nonce, Key) ->
     case Resp of
         {error, failed_verification} ->
             %% need to handle this above somewhere, for now let it crash!
-            <<"bad">>;
+            ~"bad";
         {ok, Msg} ->
             Msg
     end.
