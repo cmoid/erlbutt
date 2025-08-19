@@ -212,7 +212,7 @@ ssb_encoder(Val, Encoder, Options) ->
     ssb_encoder1(Val, Encoder, Options, 0).
 
 ssb_encoder1([], _Encoder, _Options, _Ind) ->
-    [<<"[]">>];
+    [~"[]"];
 
 ssb_encoder1([_|_] = V, Encoder, Options, Ind) when is_list(V) ->
     Pretty = lists:member(pretty, Options),
