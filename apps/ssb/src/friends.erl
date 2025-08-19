@@ -7,8 +7,6 @@
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
--include("ssb.hrl").
-
 -export([direct_follows/1,
          follows/2]).
 
