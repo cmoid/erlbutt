@@ -152,7 +152,7 @@ find_or_create_feed_pid(Id) ->
     end.
 
 update_refs(#message{id = Id, author = AuthId} = Msg) ->
-    Branches = message:is_branch(Msg),
+    Branches = social_msg:is_branch(Msg),
     case Branches of
         false ->
             none;

@@ -199,7 +199,7 @@ store(#message{id = Id, author = Auth} = Msg,
     write_msg(Msg, Feed),
     utils:update_refs(Msg),
     %% need to fix is_about to really look for profile changes
-    IsAbout = message:is_about(Msg),
+    IsAbout = social_msg:is_about(Msg),
     case IsAbout of
         true ->
             write_msg(Msg, Profile),
