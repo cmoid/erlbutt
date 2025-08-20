@@ -37,13 +37,22 @@ get_msgs1(Nodes, Msgs) ->
                   lists:reverse([get_msg(Id, Auth) | Msgs])
           end,
     TmpRes = lists:flatten(lists:map(Fun, Nodes)),
-    lists:reverse(lists:foldl(fun(E, Acc) ->
+    ResTerm = lists:foldl(fun(E, Acc) when is_list(Acc) ->
                         case lists:member(E, Acc) of
                             true ->
                                 Acc;
                             _Else ->
                                 [E | Acc]
-                        end end, [], TmpRes)).
+                        end;
+                       (_, Acc) ->
+                            Acc
+                    end, [], TmpRes),
+    case is_list(ResTerm) of
+        true ->
+            lists:reverse(ResTerm);
+        false ->
+            []
+    end.
 
 get_msg(Id, Auth) ->
     Feed = utils:find_or_create_feed_pid(Auth),
