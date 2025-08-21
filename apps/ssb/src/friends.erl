@@ -13,7 +13,7 @@
 direct_follows(FeedPid) ->
     Fun = fun(Data, Acc) ->
                   Msg = message:decode(Data, false),
-                  Follow = message:is_follow(Msg),
+                  Follow = social_msg:is_follow(Msg),
                   case Follow of
                       nope -> Acc;
                       %% this next clause handles legacy garbage from planetary feeds

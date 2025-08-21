@@ -81,7 +81,7 @@ parents(MsgId, TangleId) ->
     Auth = mess_auth:get(MsgId),
     FeedPid = utils:find_or_create_feed_pid(Auth),
     Msg = ssb_feed:fetch_msg(FeedPid, MsgId),
-    Branches = message:is_branch(Msg),
+    Branches = social_msg:is_branch(Msg),
     case Branches of
         false ->
             none;
@@ -97,7 +97,7 @@ ancestors(MsgId, TangleId) ->
     Auth = mess_auth:get(MsgId),
     FeedPid = utils:find_or_create_feed_pid(Auth),
     Msg = ssb_feed:fetch_msg(FeedPid, MsgId),
-    Branches = message:is_branch(Msg),
+    Branches = social_msg:is_branch(Msg),
     case Branches of
         false ->
             none;
@@ -130,7 +130,7 @@ find_paths(MsgId, AuthId, RootId) ->
 find_par_paths(MsgId, AuthId, RootId) ->
     Pid = utils:find_or_create_feed_pid(AuthId),
     Msg = ssb_feed:fetch_msg(Pid, MsgId),
-    Branches = message:is_branch(Msg),
+    Branches = social_msg:is_branch(Msg),
     case Branches of
         false ->
             {MsgId, AuthId};
@@ -207,8 +207,8 @@ tangle4_test() ->
                     {Id3, Auth, [{Id5, Auth2}]}]}]} == tangle:get_tangle(Id)).
 
 init() ->
-    keys:start_link(),
     config:start_link("test/ssb.cfg"),
+    keys:start_link(),
     mess_auth:start_link(),
     create_id().
 
