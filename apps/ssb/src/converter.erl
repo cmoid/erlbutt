@@ -72,27 +72,27 @@ count(_) ->
     0.
 
 
-    get_feed(Author, Sleep) ->
-        Val = get(Author),
-        case Val of
-            undefined ->
-                {ok, Pid} = ssb_feed:start_link(Author),
-                put(Author, {Pid, 1}),
-                Pid;
-            {Pid, Count} when is_integer(Count) ->
-                put(Author, {Pid, Count + 1}),
-                PrintCount = Count rem 10000 == 0,
-                if PrintCount ->
-                        timer:sleep(Sleep),
-                        io:format("~n",[]),
-                        ?LOG_INFO("This author ~p has ~p records ~n", [Author, Count]);
-                   true ->
-                        true
-                end,
-                Pid;
-            _Else ->
-                bad
-        end.
+get_feed(Author, Sleep) ->
+    Val = get(Author),
+    case Val of
+        undefined ->
+            {ok, Pid} = ssb_feed:start_link(Author),
+            put(Author, {Pid, 1}),
+            Pid;
+        {Pid, Count} when is_integer(Count) ->
+            put(Author, {Pid, Count + 1}),
+            PrintCount = Count rem 10000 == 0,
+            if PrintCount ->
+                    timer:sleep(Sleep),
+                    io:format("~n",[]),
+                    ?LOG_INFO("This author ~p has ~p records ~n", [Author, Count]);
+               true ->
+                    true
+            end,
+            Pid;
+        _Else ->
+            bad
+    end.
 
 store(Msg, Sleep, Feeds) ->
 
