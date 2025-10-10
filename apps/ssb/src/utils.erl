@@ -241,8 +241,8 @@ log(Info) ->
 -ifdef(TEST).
 
 combine_test() ->
-    <<"foo">> = combine(nil, <<"foo">>),
-    <<"foobar">> = combine(<<"foo">>,<<"bar">>).
+    ~"foo" = combine(nil, ~"foo"),
+    ~"foobar" = combine(~"foo",~"bar").
 
 create_pid_test() ->
     erase(),
