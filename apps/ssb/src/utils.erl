@@ -94,6 +94,9 @@ send_data(Data, Socket, Nonce, SecretBoxKey) ->
 
     NewNonce.
 
+%% Specific to the SSB feed format, each message is prefixed with a 4 byte length
+%% field and followed by the same length field. This enables on to check that a message
+%% was correctly read.
 load_term(IoDev) ->
     case file:read(IoDev, 4) of
         {ok, <<TermLenInt:32/integer>>} ->

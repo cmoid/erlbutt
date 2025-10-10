@@ -57,6 +57,7 @@ ping_test(Config) ->
     Host = get_value(hostname, Config, "localhost"),
     {ok, NewSbotPeer} = ssb_peer:start_link(Host, remote_long_pk()),
     Now = erlang:system_time(millisecond),
+    %% This send call is no longer synchronous but something like it needs to exist
     Time = ssb_peer:send(NewSbotPeer, ping()),
     End = binary_to_integer(message:nat_decode(Time)),
     ?assert((End - Now) < 5),
