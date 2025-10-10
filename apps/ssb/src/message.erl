@@ -42,24 +42,24 @@ encode(#message{id = Key, received = Received, swapped = Swapped} = Msg) ->
                                    {~"value", {EncMsg}},
                                    {~"timestamp", Received}]}, fun ssb_encoder/3, [use_nil])).
 
-decode(Msg, CheckValid) ->
-    {DecDataProps} = utils:nat_decode(Msg),
-    Key = ?pgv(~"key", DecDataProps),
-    ValueTuple = ?pgv(~"value", DecDataProps),
-    {Value} = ValueTuple,
-    IsSwapped = is_swapped(Value),
-    IsValid = validate(CheckValid, Value),
-    #message{id = Key,
-             previous = ?pgv(~"previous", Value),
-             author = ?pgv(~"author", Value),
-             sequence = ?pgv(~"sequence", Value),
-             timestamp = ?pgv(~"timestamp", Value),
-             hash = ?pgv(~"hash", Value),
-             content = ?pgv(~"content", Value),
-             signature = ?pgv(~"signature", Value),
-             received = ?pgv(~"timestamp", DecDataProps),
-             validated = IsValid,
-             swapped = IsSwapped}.
+    decode(Msg, CheckValid) ->
+        {DecDataProps} = utils:nat_decode(Msg),
+        Key = ?pgv(~"key", DecDataProps),
+        {Value} = ?pgv(~"value", DecDataProps),
+        IsSwapped = is_swapped(Value),
+        IsValid = validate(CheckValid, Value),
+        #message{id = Key,
+                 previous = ?pgv(~"previous", Value),
+                 author = ?pgv(~"author", Value),
+                 sequence = ?pgv(~"sequence", Value),
+                 timestamp = ?pgv(~"timestamp", Value),
+                 hash = ?pgv(~"hash", Value),
+                 content = ?pgv(~"content", Value),
+                 signature = ?pgv(~"signature", Value),
+                 received = ?pgv(~"timestamp", DecDataProps),
+                 validated = IsValid,
+                 swapped = IsSwapped}.
+
 
 is_swapped(PropList) ->
     SecondElement = lists:nth(2, PropList),
