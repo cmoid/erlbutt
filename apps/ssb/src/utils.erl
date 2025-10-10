@@ -185,7 +185,7 @@ update_refs(#message{id = Id, author = AuthId} = Msg) ->
 encode_rec(Record) ->
     iolist_to_binary(message:ssb_encoder(Record, fun message:ssb_encoder/3, [])).
 
-    check_id(<<"@",Id/binary>>) ->
+check_id(<<"@",Id/binary>>) ->
         try
             case binary:matches(Id,[~".ed25519"]) of
                 [] ->
