@@ -8,7 +8,9 @@
 -endif.
 
 -export([decode_clock_int/1,
-         decode_clock/1]).
+         encode_clock_int/3,
+         decode_clock/1,
+         encode_clock/1]).
 
 decode_clock_int(Int) ->
     if Int < 0 ->
@@ -17,10 +19,27 @@ decode_clock_int(Int) ->
             {true, (Int band 1) == 0, Int bsr 1}
     end.
 
+encode_clock_int(Replicate, Receive, Seq) ->
+    case Replicate of
+        false ->
+            -1;
+        true ->
+            Shift = Seq bsl 1,
+            case Receive of
+                true ->
+                    Shift;
+                false ->
+                    Shift bor 1
+            end
+    end.
+
 decode_clock(ClockList) ->
     lists:map(fun({Feed, Num}) ->
                       {Feed, decode_clock_int(Num)}
               end, ClockList).
+
+encode_clock(_ClockList) ->
+    nop.
 
 -ifdef(TEST).
 
@@ -78,6 +97,19 @@ simple_vec_clock3_test() ->
     {Feed1, Num1} = hd(Dec_VClock),
     ?assert(Feed1 == ~"@qK93G/R9R5J2fiqK+kxV72HqqPUcss+rth8rACcYr4s=.ed25519"),
     ?assert({true,true,225} == Num1).
+
+simple_encode_test() ->
+    ?assert(ebt_vc:encode_clock_int(false, true, 0) == -1).
+
+%% From the protocol guide
+more_encode_test() ->
+    ?assert(ebt_vc:encode_clock_int(true, true, 0) == 0),
+    ?assert(ebt_vc:encode_clock_int(true, false, 0) == 1),
+    ?assert(ebt_vc:encode_clock_int(true, true, 1) == 2),
+    ?assert(ebt_vc:encode_clock_int(true, false, 1) == 3),
+    ?assert(ebt_vc:encode_clock_int(true, true, 6) == 12),
+    ?assert(ebt_vc:encode_clock_int(true, true, 225) == 450).
+
 
 
 
