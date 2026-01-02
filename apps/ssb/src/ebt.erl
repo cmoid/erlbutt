@@ -26,8 +26,11 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
+%% send simple vector with feed of the peer node,
+%% in case this is a restore of a backup
 initial_vector() ->
-    nop.
+    PeerKey = keys:pub_key_disp(),
+    {[{PeerKey, ebt_vc:encode_clock_int(true, true, 0)}]}.
 
 -doc "Initializes the server.".
 

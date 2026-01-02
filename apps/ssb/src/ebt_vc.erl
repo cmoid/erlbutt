@@ -10,6 +10,8 @@
 -export([decode_clock_int/1,
          encode_clock_int/3,
          decode_clock/1,
+         %% this is a placeholder for now, not sure if we'll need it or
+         %% what form it will take in the ways of args
          encode_clock/1]).
 
 decode_clock_int(Int) ->

@@ -135,16 +135,15 @@ proc_request(ReqNo, #ssb_rpc{name = [?tunnel, ~"isRoom"],
     utils:send_data(utils:combine(utils:combine(Header,TrueEnd), ?RPC_END),
                     Socket, Nonce, SecretBoxKey);
 
-proc_request(ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"] = Name,
+proc_request(ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"] = _Name,
                              args = _Args}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     % to start return true and close stream
-    Flags = create_flags(0,1,2),
-    ErrorMsg = utils:error_msg(Name, ~"Not yet implemented"),
-    %%TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
-    Header = create_header(Flags,size(ErrorMsg), -ReqNo),
-    ?LOG_DEBUG("Answering ebt_rep with ~p ~n",[{Header, ErrorMsg}]),
-    utils:send_data(utils:combine(utils:combine(Header,ErrorMsg), ?RPC_END),
+    Flags = create_flags(1,0,2),
+    InitVectorEnc = utils:encode_rec(ebt:initial_vector()),
+    Header = create_header(Flags, size(InitVectorEnc), -ReqNo),
+    ?LOG_DEBUG("Answering ebt_rep with ~p ~n",[{Header, InitVectorEnc}]),
+    utils:send_data(utils:combine(utils:combine(Header, InitVectorEnc), ?RPC_END),
                     Socket, Nonce, SecretBoxKey);
 
 proc_request(ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
