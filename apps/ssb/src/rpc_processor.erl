@@ -64,6 +64,7 @@ start_link() ->
 
 init([]) ->
     process_flag(trap_exit, true),
+    ?LOG_INFO("Started rpc processor ~n",[]),
     {ok, #rpc_state{calls = ets:new(rpc_calls, [set, public, named_table])}}.
 
 handle_info(Info, State) ->
