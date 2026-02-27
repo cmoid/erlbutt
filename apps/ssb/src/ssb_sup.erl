@@ -29,4 +29,5 @@ init([]) ->
             ?CHILD(keys, worker),
             ?CHILD(blobs, worker),
             ?CHILD(mess_auth, worker),
+            ?CHILD(rpc_processor, worker),
             ?CHILD(ebt, worker)]}}.
