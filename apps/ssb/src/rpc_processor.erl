@@ -7,10 +7,18 @@
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
+-behaviour(gen_server).
+
 -include_lib("ssb/include/ssb.hrl").
 
+%% gen_server exports
+-export([init/1, handle_call/3, handle_cast/2,
+         handle_info/2, terminate/2,
+         code_change/3]).
+
 %% API
--export([process/2,
+-export([start_link/0,
+         process/2,
          create_flags/3,
          create_header/3,
          parse_flags/1]).
@@ -51,6 +59,29 @@ create_header(Flags, BodySize, ReqNo) ->
       BodySize:4/big-unsigned-integer-unit:8,
       ReqNo:4/big-signed-integer-unit:8>>.
 
+start_link() ->
+    gen_server:start_link(?MODULE, [], []).
+
+init([]) ->
+    process_flag(trap_exit, true),
+    {ok, #rpc_state{calls = ets:new(rpc_calls, [set, public, named_table])}}.
+
+handle_info(Info, State) ->
+    ?LOG_INFO("Stopped presumably for normal reason: ~p ~n",[Info]),
+    {stop, normal, State}.
+
+handle_call(_Request, _From, State) ->
+   {reply, ok, State}.
+
+ handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+   {ok, State}.
+
 
 %%%===================================================================
 %%% Internal functions
@@ -87,7 +118,8 @@ proc_request(ReqNo, #ssb_rpc{name = [?createhistorystream],
     % to start return true and close stream
     Flags = create_flags(1,1,2),
     Header = create_header(Flags,size(~"true"), -ReqNo),
-    utils:send_data(utils:combine(Header,message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+    utils:send_data(utils:combine(Header,message:ssb_encoder(true,
+        fun message:ssb_encoder/3, [pretty])),
                     Socket, Nonce, SecretBoxKey);
 
 proc_request(ReqNo, #ssb_rpc{name = [?gossip, ?ping],

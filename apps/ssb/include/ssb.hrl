@@ -47,6 +47,9 @@
           type
         }).
 
+-record(rpc_state,
+        { calls }).
+
 -record(message,
         { id,
           previous,
