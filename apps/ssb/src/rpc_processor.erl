@@ -214,4 +214,15 @@ flags_test() ->
     ?assert({1,1,2} == parse_flags(<<14>>)),
     ?assert(<<14>> == create_flags(1,1,2)).
 
+req_no_test() ->
+    Flags = create_flags(1,1,2),
+    Header = create_header(Flags,size(~"true"), 5),
+    ?assert(req_no(Header) == 5).
+
+neg_req_no_test() ->
+    Flags = create_flags(1,1,2),
+    Header = create_header(Flags,size(~"true"), -5),
+    ?assert(req_no(Header) == -5).
+
+
 -endif.
