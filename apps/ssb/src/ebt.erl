@@ -27,7 +27,6 @@ initial_vector() ->
     PeerKey = keys:pub_key_disp(),
     {[{PeerKey, ebt_vc:encode_clock_int(true, true, 0)}]}.
 
-
 init([]) ->
     process_flag(trap_exit, true),
     {ok, #state{}}.
