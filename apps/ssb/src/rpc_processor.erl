@@ -27,24 +27,8 @@
 -compile({no_auto_import,[size/1]}).
 -import(utils, [size/1]).
 
-process({Header, Body}, #ssb_conn{
-                           socket = Socket,
-                           nonce = Nonce,
-                           secret_box = SecretBoxKey}) ->
-    ReqNo = req_no(Header),
-
-    ?LOG_DEBUG("Please process ~p ~p ~n from pid: ~p ~n",[Header, {ReqNo, Body}, self()]),
-
-    case ReqNo < 0 of
-        %% negative request numbers indicate responses
-        true ->
-            Resp = proc_response(ReqNo, Body),
-            {Nonce, Resp};
-        _Else ->
-            ReqBod = create_req(Body),
-            NewNonce = proc_request(ReqNo, ReqBod, Socket, Nonce, SecretBoxKey),
-            {NewNonce, none}
-    end.
+process({Header, Body}, Connection) ->
+    gen_server:call(?MODULE, {rpc_process, {Header, Body}, Connection}).
 
 parse_flags(Header) ->
     <<Flags:1/binary, _Rest/binary>> = Header,
@@ -60,7 +44,7 @@ create_header(Flags, BodySize, ReqNo) ->
       ReqNo:4/big-signed-integer-unit:8>>.
 
 start_link() ->
-    gen_server:start_link(?MODULE, [], []).
+    gen_server:start_link({global, ?MODULE}, ?MODULE, [], []).
 
 init([]) ->
     process_flag(trap_exit, true),
@@ -71,10 +55,28 @@ handle_info(Info, State) ->
     ?LOG_INFO("Stopped presumably for normal reason: ~p ~n",[Info]),
     {stop, normal, State}.
 
-handle_call(_Request, _From, State) ->
-   {reply, ok, State}.
+handle_call({rpc_process, {Header, Body}, #ssb_conn{
+                                             socket = Socket,
+                                             nonce = Nonce,
+                                             secret_box = SecretBoxKey}}, _From, State) ->
+    ReqNo = req_no(Header),
 
- handle_cast(_Msg, State) ->
+    ?LOG_DEBUG("Please process ~p ~p ~n from pid: ~p ~n",[Header, {ReqNo, Body}, self()]),
+
+    {Non, Res} =
+        case ReqNo < 0 of
+            %% negative request numbers indicate responses
+            true ->
+                Resp = proc_response(ReqNo, Body),
+                {Nonce, Resp};
+            _Else ->
+                ReqBod = create_req(Body),
+                NewNonce = proc_request(ReqNo, ReqBod, Socket, Nonce, SecretBoxKey),
+                {NewNonce, none}
+        end,
+    {reply, {Non, Res}, State}.
+
+handle_cast(_Msg, State) ->
     {noreply, State}.
 
 terminate(_Reason, _State) ->
