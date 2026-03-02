@@ -28,7 +28,7 @@
 -import(utils, [size/1]).
 
 process({Header, Body}, Connection) ->
-    gen_server:call(?MODULE, {rpc_process, {Header, Body}, Connection}).
+    gen_server:call({global, ?MODULE}, {rpc_process, {Header, Body}, Connection}).
 
 parse_flags(Header) ->
     <<Flags:1/binary, _Rest/binary>> = Header,
