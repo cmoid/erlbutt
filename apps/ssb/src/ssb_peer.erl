@@ -189,6 +189,7 @@ rpc_parse(Data, #sbox_state{socket = Socket,
                                                 % if partial parse then Rest is the original input
                 {partial, Rest, EncNonce, Response};
             {complete, ?RPC_END, <<>>} ->
+                ?LOG_DEBUG("The rpc call has ended ~n",[]),
                 {complete, <<>>, EncNonce, Response};
             {complete, {Header, Body}, Rest} ->
                 %% Need to track request here somehow
