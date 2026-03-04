@@ -56,24 +56,12 @@ handle_info(Info, State) ->
     {stop, normal, State}.
 
 handle_call({rpc_process, {Header, Body}, #ssb_conn{
-                                             socket = Socket,
-                                             nonce = Nonce,
-                                             secret_box = SecretBoxKey}}, _From, State) ->
+                                            socket = Socket,
+                                            nonce = Nonce,
+                                            secret_box = SecretBoxKey}}, _From, State) ->
+
     ReqNo = req_no(Header),
-
-    ?LOG_DEBUG("Please process ~p ~p ~n from pid: ~p ~n",[Header, {ReqNo, Body}, self()]),
-
-    {Non, Res} =
-        case ReqNo < 0 of
-            %% negative request numbers indicate responses
-            true ->
-                Resp = proc_response(ReqNo, Body),
-                {Nonce, Resp};
-            _Else ->
-                ReqBod = create_req(Body),
-                NewNonce = proc_request(ReqNo, ReqBod, Socket, Nonce, SecretBoxKey),
-                {NewNonce, none}
-        end,
+    {Non, Res} = dispatch(ReqNo, Body, Socket, Nonce, SecretBoxKey),
     {reply, {Non, Res}, State}.
 
 handle_cast(_Msg, State) ->
@@ -99,17 +87,23 @@ req_no(Header) ->
 create_req(Body) ->
     DecBody = utils:nat_decode(Body),
     ?LOG_DEBUG("Body decoded is ~p ~n",[DecBody]),
-    IsTuple = is_tuple(DecBody),
-    case IsTuple of
-        true ->
-            {Props} = DecBody,
-            #ssb_rpc{
-               name = proplists:get_value(~"name", Props),
-               args = proplists:get_value(~"args", Props),
-               type = proplists:get_value(~"type", Props)};
-        _Else ->
-            DecBody
-    end.
+    decode_body(DecBody).
+
+decode_body({Props}) ->
+    #ssb_rpc{
+        name = proplists:get_value(~"name", Props),
+        args = proplists:get_value(~"args", Props),
+        type = proplists:get_value(~"type", Props)};
+
+decode_body(Other) ->
+    Other.
+
+dispatch(ReqNo, Body, _Socket, Nonce, _SecretBoxKey) when ReqNo < 0 ->
+    {Nonce, proc_response(ReqNo, Body)};
+dispatch(ReqNo, Body, Socket, Nonce, SecretBoxKey) ->
+    NewNonce = proc_request(ReqNo, create_req(Body), Socket, Nonce, SecretBoxKey),
+    {NewNonce, none}.
+
 
 proc_response(ReqNo, RespBody) ->
     ?LOG_DEBUG("The response from ~p was ~p ~n",[ReqNo, RespBody]),
