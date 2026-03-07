@@ -14,26 +14,17 @@
          %% what form it will take in the ways of args
          encode_clock/1]).
 
+decode_clock_int(Int) when Int < 0 ->
+    {false, false, 0};
 decode_clock_int(Int) ->
-    if Int < 0 ->
-            {false, false, 0};
-       true ->
-            {true, (Int band 1) == 0, Int bsr 1}
-    end.
+    {true, (Int band 1) == 0, Int bsr 1}.
 
-encode_clock_int(Replicate, Receive, Seq) ->
-    case Replicate of
-        false ->
-            -1;
-        true ->
-            Shift = Seq bsl 1,
-            case Receive of
-                true ->
-                    Shift;
-                false ->
-                    Shift bor 1
-            end
-    end.
+encode_clock_int(false, _Receive, _Seq) ->
+    -1;
+encode_clock_int(true, true, Seq) ->
+    Seq bsl 1;
+encode_clock_int(true, false, Seq) ->
+    (Seq bsl 1) bor 1.
 
 decode_clock(ClockList) ->
     lists:map(fun({Feed, Num}) ->
