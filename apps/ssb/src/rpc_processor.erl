@@ -58,7 +58,8 @@ handle_info(Info, State) ->
 handle_call({rpc_process, {Header, Body}, #ssb_conn{
                                             socket = Socket,
                                             nonce = Nonce,
-                                            secret_box = SecretBoxKey}}, _From, State) ->
+                                            secret_box = SecretBoxKey}},
+                            _From, State) ->
 
     ReqNo = req_no(Header),
     {Non, Res} = dispatch(ReqNo, Body, Socket, Nonce, SecretBoxKey),
@@ -219,6 +220,5 @@ neg_req_no_test() ->
     Flags = create_flags(1,1,2),
     Header = create_header(Flags,size(~"true"), -5),
     ?assert(req_no(Header) == -5).
-
 
 -endif.
