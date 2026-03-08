@@ -159,8 +159,8 @@ ssb_encoder1([_|_] = V, Encoder, Options, Ind) when is_list(V) ->
                               end
                       end, V),
     LastElem = lists:last(Array),
-    ArrayNoLast = lists:reverse(tl(lists:reverse(Array))),
-    FixElem = lists:reverse(tl(lists:reverse(LastElem))),
+    ArrayNoLast = lists:droplast(Array),
+    FixElem = lists:droplast(LastElem),
     if Pretty ->
             [~"[", ArrayNoLast ++ [FixElem], ~"\n", string:copies("  ", Ind), ~"]"];
        true ->
@@ -179,8 +179,8 @@ ssb_encoder1({[]}, _Encoder, _Options, _Ind) ->
                 Obj = lists:map(fun({_, _} = Val) -> ssb_encoder1(Val, Encoder, Options, Ind + 1) end,
                                 KeyValList),
                 LastElem = lists:last(Obj),
-                ObjNoLast = lists:reverse(tl(lists:reverse(Obj))),
-                FixElem = lists:reverse(tl(lists:reverse(LastElem))),
+                ObjNoLast = lists:droplast(Obj),
+                FixElem = lists:droplast(LastElem),
                 if Pretty ->
                         [~"{", ObjNoLast ++ [FixElem], ~"\n", string:copies("  ", Ind), ~"}"];
                    true ->
