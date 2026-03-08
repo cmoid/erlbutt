@@ -158,9 +158,8 @@ ssb_encoder1([_|_] = V, Encoder, Options, Ind) when is_list(V) ->
                                        ~","]
                               end
                       end, V),
-    LastElem = lists:last(Array),
     ArrayNoLast = lists:droplast(Array),
-    FixElem = lists:droplast(LastElem),
+    FixElem = lists:droplast(lists:last(Array)),
     if Pretty ->
             [~"[", ArrayNoLast ++ [FixElem], ~"\n", string:copies("  ", Ind), ~"]"];
        true ->
