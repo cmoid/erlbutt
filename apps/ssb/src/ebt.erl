@@ -34,6 +34,9 @@ initial_vector() ->
     PeerKey = keys:pub_key_disp(),
     {[{PeerKey, ebt_vc:encode_clock_int(true, true, 0)}]}.
 
+exec_rpc(Request) ->
+    gen_server:call(?SERVER, Request).
+
 init([]) ->
     process_flag(trap_exit, true),
     {ok, #state{}}.
@@ -58,6 +61,3 @@ terminate(_Reason, _State) ->
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
-
-exec_rpc(Request) ->
-    gen_server:call(?SERVER, Request).

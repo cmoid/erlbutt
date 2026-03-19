@@ -224,9 +224,6 @@ error_msg(Name, Mess) ->
                  {~"stack", ~"_"}
                  ]}).
 
-
-
-
 log({Socket, Data}) ->
     ?LOG_DEBUG("received a tcp packet of size: ~p ~n on socket ~p ~n",
            [utils:size(Data), Socket]);
