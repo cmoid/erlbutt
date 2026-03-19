@@ -59,9 +59,21 @@ handle_call({rpc_process, {Header, Body}, #ssb_conn{
                                             socket = Socket,
                                             nonce = Nonce,
                                             secret_box = SecretBoxKey}},
-                            _From, State) ->
-
+                            _From, #rpc_state{calls = Calls} = State) ->
+    %% if the request is positive and it's not in the ets table it's a new
+    %% request. If it's negative then it's a response and the request should
+    %% already be in the table.
     ReqNo = req_no(Header),
+    HasSeen = ets:lookup(Calls, ReqNo),
+    case HasSeen of
+        [] ->
+            ?LOG_DEBUG("No request yet for: ~p ~n",[ReqNo]);
+        _Else ->
+            ?LOG_DEBUG("The req in the table: ~p ~n",[HasSeen]),
+            [{Num, Mod}] = HasSeen,
+            Mod:exec_rpc(Num)
+    end,
+
     {Non, Res} = dispatch(ReqNo, Body, Socket, Nonce, SecretBoxKey),
     {reply, {Non, Res}, State}.
 
@@ -169,6 +181,9 @@ proc_request(ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"] = _Name,
                              args = _Args}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     % to start return true and close stream
+    %
+    % should pass the ets table around or reference globally
+    ets:insert(rpc_calls, {ReqNo, ebt}),
     Flags = create_flags(1,0,2),
     InitVectorEnc = utils:encode_rec(ebt:initial_vector()),
     Header = create_header(Flags, size(InitVectorEnc), -ReqNo),
