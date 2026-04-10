@@ -58,23 +58,22 @@ handle_info(Info, State) ->
 handle_call({rpc_process, {Header, Body}, #ssb_conn{
                                             socket = Socket,
                                             nonce = Nonce,
-                                            secret_box = SecretBoxKey}},
+                                            secret_box = SecretBoxKey} = Conn},
                             _From, #rpc_state{calls = Calls} = State) ->
-    %% if the request is positive and it's not in the ets table it's a new
-    %% request. If it's negative then it's a response and the request should
-    %% already be in the table.
+    %% Positive ReqNo = new or continuing request from peer.
+    %% Negative ReqNo = response to a request we initiated.
+    %% For a known duplex stream (ReqNo already in table, positive), route
+    %% all subsequent data directly to the owning module's handle_data/3.
     ReqNo = req_no(Header),
     HasSeen = ets:lookup(Calls, ReqNo),
-    case HasSeen of
-        [] ->
-            ?LOG_DEBUG("No request yet for: ~p ~n",[ReqNo]);
-        _Else ->
-            ?LOG_DEBUG("The req in the table: ~p ~n",[HasSeen]),
-            [{Num, Mod}] = HasSeen,
-            Mod:exec_rpc(Num)
+    {Non, Res} = case {HasSeen, ReqNo > 0} of
+        {[{ReqNo, Mod}], true} ->
+            ?LOG_DEBUG("Stream continuation for req: ~p ~n",[ReqNo]),
+            NewNonce = Mod:handle_data(ReqNo, Body, Conn),
+            {NewNonce, none};
+        _ ->
+            dispatch(ReqNo, Body, Socket, Nonce, SecretBoxKey)
     end,
-
-    {Non, Res} = dispatch(ReqNo, Body, Socket, Nonce, SecretBoxKey),
     {reply, {Non, Res}, State}.
 
 handle_cast(_Msg, State) ->
@@ -177,19 +176,32 @@ proc_request(ReqNo, #ssb_rpc{name = [?tunnel, ~"isRoom"],
     utils:send_data(utils:combine(utils:combine(Header,TrueEnd), ?RPC_END),
                     Socket, Nonce, SecretBoxKey);
 
-proc_request(ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"] = _Name,
-                             args = _Args}
+proc_request(ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"],
+                             args = Args}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
-    % to start return true and close stream
-    %
-    % should pass the ets table around or reference globally
-    ets:insert(rpc_calls, {ReqNo, ebt}),
-    Flags = create_flags(1,0,2),
-    InitVectorEnc = utils:encode_rec(ebt:initial_vector()),
-    Header = create_header(Flags, size(InitVectorEnc), -ReqNo),
-    ?LOG_DEBUG("Answering ebt_rep with ~p ~n",[{Header, InitVectorEnc}]),
-    utils:send_data(utils:combine(utils:combine(Header, InitVectorEnc), ?RPC_END),
-                    Socket, Nonce, SecretBoxKey);
+    {Version, Format} = case Args of
+        [{ArgProps}] ->
+            {proplists:get_value(~"version", ArgProps),
+             proplists:get_value(~"format", ArgProps)};
+        _ ->
+            {undefined, undefined}
+    end,
+    case {Version, Format} of
+        {3, ~"classic"} ->
+            ets:insert(rpc_calls, {ReqNo, ebt}),
+            Flags = create_flags(1, 0, 2),
+            InitVectorEnc = utils:encode_rec(ebt:initial_vector()),
+            Header = create_header(Flags, size(InitVectorEnc), -ReqNo),
+            ?LOG_DEBUG("Answering ebt_rep with ~p ~n",[{Header, InitVectorEnc}]),
+            %% Keep the duplex stream open — do NOT send RPC_END
+            utils:send_data(utils:combine(Header, InitVectorEnc),
+                            Socket, Nonce, SecretBoxKey);
+        _ ->
+            ErrMsg = utils:error_msg(~"Error", ~"unsupported EBT version or format"),
+            Flags = create_flags(0, 1, 2),
+            Header = create_header(Flags, size(ErrMsg), -ReqNo),
+            utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey)
+    end;
 
 proc_request(ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
     ?LOG_DEBUG("Fall thru with ~p ~n",[ReqBody]),

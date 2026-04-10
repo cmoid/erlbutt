@@ -1,3 +1,3 @@
 -module(rpc_behavior).
 
--callback exec_rpc(I :: term()) -> O :: term().
+-callback handle_data(ReqNo :: integer(), Body :: binary(), Conn :: term()) -> NewNonce :: binary().
