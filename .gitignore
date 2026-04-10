@@ -21,3 +21,4 @@ feeds
 *.swp
 TAGS
 .ssberl
+.claude

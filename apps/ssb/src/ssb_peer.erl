@@ -97,7 +97,7 @@ handle_info({tcp, Socket, Data},
         done ->
             stop(done, NewState);
         _Else ->
-            ?LOG_DEBUG("Are we complete and need to wait? ~p ~n",[Done]),
+            %%?LOG_DEBUG("Are we complete and need to wait? ~p ~n",[Done]),
             Transport:setopts(Socket, [{active, once}]),
             {noreply, NewState}
     end;
