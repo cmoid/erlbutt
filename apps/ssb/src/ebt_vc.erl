@@ -31,8 +31,9 @@ decode_clock(ClockList) ->
                       {Feed, decode_clock_int(Num)}
               end, ClockList).
 
-encode_clock(_ClockList) ->
-    nop.
+encode_clock(ClockList) ->
+    {[{Feed, encode_clock_int(Rcv, Sync, Seq)}
+      || {Feed, {Rcv, Sync, Seq}} <- ClockList]}.
 
 -ifdef(TEST).
 
