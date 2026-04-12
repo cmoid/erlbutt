@@ -156,7 +156,7 @@ handle_call({foldl, Fun, Acc}, _From, #state{feed = Feed} = State) ->
             {ok, IoDev} ->
                 int_foldr(Fun, Acc, IoDev);
             {error, enoent} ->
-                ?LOG_INFO("Ill formed feed ~p ~n",[Feed]),
+                %%?LOG_INFO("Ill formed feed ~p ~n",[Feed]),
                 Acc
         end,
 

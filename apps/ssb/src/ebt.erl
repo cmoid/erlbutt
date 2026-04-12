@@ -57,7 +57,7 @@ handle_data(ReqNo, Body, #ssb_conn{socket = Socket,
             ?LOG_DEBUG("EBT: received vector clock ~n", []),
             handle_clock(ReqNo, Decoded, Socket, Nonce, Key);
         false ->
-            ?LOG_DEBUG("EBT: received message from peer ~n", []),
+            ?LOG_DEBUG("EBT: received message from peer ~n", [Body]),
             store_message(Body),
             Nonce
     end.
