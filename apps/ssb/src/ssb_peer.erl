@@ -41,12 +41,14 @@ init([Ip, PubKey]) ->
         {ok, {Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce}} =
             shs:client_shake_hands(connect(Ip, 8008), PubKey),
         ranch_tcp:setopts(Socket, [{active, false}]),
+        {ok, RpcProc} = rpc_processor:start_link(),
         {ok, #sbox_state{socket = Socket,
                          transport = ranch_tcp,
                          dec_sbox_key = DecBoxKey,
                          enc_sbox_key = EncBoxKey,
                          dec_nonce = DecNonce,
                          enc_nonce = EncNonce,
+                         rpc_proc = RpcProc,
                          shook_hands = 1}}
     catch
         error:Reason ->
@@ -68,11 +70,13 @@ handle_info({tcp, Socket, Data},
     try
         {ok, {DecBoxKey, DecNonce, EncBoxKey, EncNonce}}
             = shs:server_shake_hands(Data, Socket, Transport),
+        {ok, RpcProc} = rpc_processor:start_link(),
         Transport:setopts(Socket, [{active, once}]),
         {noreply, State#sbox_state{ dec_sbox_key = DecBoxKey,
                                enc_sbox_key = EncBoxKey,
                                dec_nonce = DecNonce,
                                enc_nonce = EncNonce,
+                               rpc_proc = RpcProc,
                                shook_hands = 1}}
     catch
         error:Reason ->
@@ -135,6 +139,9 @@ handle_cast({send, Data}, #sbox_state{socket = Socket,
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+terminate(_Reason, #sbox_state{rpc_proc = RpcProc}) when is_pid(RpcProc) ->
+    gen_server:stop(RpcProc),
+    ok;
 terminate(_Reason, _State) ->
     ok.
 
@@ -179,6 +186,7 @@ unbox_and_parse(BoxData, #sbox_state{dec_sbox_key = DecBoxKey,
 rpc_parse(Data, #sbox_state{socket = Socket,
                             enc_nonce = EncNonce,
                             enc_sbox_key = EncBoxKey,
+                            rpc_proc = RpcProc,
                             response = Response} = State) ->
 
     %% Should append Msg to rpc_rem_bytes from previous call?
@@ -194,7 +202,8 @@ rpc_parse(Data, #sbox_state{socket = Socket,
             {complete, {Header, Body}, Rest} ->
                 %% Need to track request here somehow
                 {ProcEncNonce, Resp} =
-                    rpc_processor:process({Header, Body},
+                    rpc_processor:process(RpcProc,
+                                          {Header, Body},
                                           #ssb_conn{
                                              socket = Socket,
                                              nonce = EncNonce,

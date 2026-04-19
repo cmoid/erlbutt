@@ -18,7 +18,7 @@
 
 %% API
 -export([start_link/0,
-         process/2,
+         process/3,
          create_flags/3,
          create_header/3,
          parse_flags/1]).
@@ -27,9 +27,13 @@
 -compile({no_auto_import,[size/1]}).
 -import(utils, [size/1]).
 
-process({Header, Body}, Connection) ->
-    gen_server:call({global, ?MODULE}, {rpc_process, {Header, Body}, Connection},
-        45000).
+%% Start a per-connection rpc_processor; returns {ok, Pid}.
+start_link() ->
+    gen_server:start_link(?MODULE, [], []).
+
+%% Pid is the per-connection rpc_processor started by ssb_peer.
+process(Pid, {Header, Body}, Connection) ->
+    gen_server:call(Pid, {rpc_process, {Header, Body}, Connection}, 45000).
 
 parse_flags(Header) ->
     <<Flags:1/binary, _Rest/binary>> = Header,
@@ -44,16 +48,13 @@ create_header(Flags, BodySize, ReqNo) ->
       BodySize:4/big-unsigned-integer-unit:8,
       ReqNo:4/big-signed-integer-unit:8>>.
 
-start_link() ->
-    gen_server:start_link({global, ?MODULE}, ?MODULE, [], []).
-
 init([]) ->
     process_flag(trap_exit, true),
-    ?LOG_INFO("Started rpc processor ~n",[]),
-    {ok, #rpc_state{calls = ets:new(rpc_calls, [set, public, named_table])}}.
+    ?LOG_INFO("Started rpc processor ~n", []),
+    {ok, #rpc_state{calls = ets:new(rpc_calls, [set, public])}}.
 
 handle_info(Info, State) ->
-    ?LOG_INFO("Stopped presumably for normal reason: ~p ~n",[Info]),
+    ?LOG_INFO("Stopped presumably for normal reason: ~p ~n", [Info]),
     {stop, normal, State}.
 
 handle_call({rpc_process, {Header, Body}, #ssb_conn{
@@ -69,11 +70,11 @@ handle_call({rpc_process, {Header, Body}, #ssb_conn{
     HasSeen = ets:lookup(Calls, ReqNo),
     {Non, Res} = case {HasSeen, ReqNo > 0} of
         {[{ReqNo, Mod}], true} ->
-            ?LOG_DEBUG("Stream continuation for req: ~p ~n",[ReqNo]),
+            ?LOG_DEBUG("Stream continuation for req: ~p ~n", [ReqNo]),
             NewNonce = Mod:handle_data(ReqNo, Body, Conn),
             {NewNonce, none};
         _ ->
-            dispatch(ReqNo, Body, Socket, Nonce, SecretBoxKey)
+            dispatch(Calls, ReqNo, Body, Socket, Nonce, SecretBoxKey)
     end,
     {reply, {Non, Res}, State}.
 
@@ -99,7 +100,7 @@ req_no(Header) ->
 
 create_req(Body) ->
     DecBody = utils:nat_decode(Body),
-    ?LOG_DEBUG("Body decoded is ~p ~n",[DecBody]),
+    ?LOG_DEBUG("Body decoded is ~p ~n", [DecBody]),
     decode_body(DecBody).
 
 decode_body({Props}) ->
@@ -111,44 +112,39 @@ decode_body({Props}) ->
 decode_body(Other) ->
     Other.
 
-dispatch(ReqNo, Body, _Socket, Nonce, _SecretBoxKey) when ReqNo < 0 ->
+dispatch(_Calls, ReqNo, Body, _Socket, Nonce, _SecretBoxKey) when ReqNo < 0 ->
     {Nonce, proc_response(ReqNo, Body)};
-dispatch(ReqNo, Body, Socket, Nonce, SecretBoxKey) ->
-    NewNonce = proc_request(ReqNo, create_req(Body), Socket, Nonce, SecretBoxKey),
+dispatch(Calls, ReqNo, Body, Socket, Nonce, SecretBoxKey) ->
+    NewNonce = proc_request(Calls, ReqNo, create_req(Body), Socket, Nonce, SecretBoxKey),
     {NewNonce, none}.
 
 
 proc_response(ReqNo, RespBody) ->
-    ?LOG_DEBUG("The response from ~p was ~p ~n",[ReqNo, RespBody]),
+    ?LOG_DEBUG("The response from ~p was ~p ~n", [ReqNo, RespBody]),
     RespBody.
 
-proc_request(ReqNo, #ssb_rpc{name = [?createhistorystream],
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [?createhistorystream],
                              args = [{_Args}]}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
-    % to start return true and close stream
     Flags = create_flags(1,1,2),
-    Header = create_header(Flags,size(~"true"), -ReqNo),
-    utils:send_data(utils:combine(Header,message:ssb_encoder(true,
+    Header = create_header(Flags, size(~"true"), -ReqNo),
+    utils:send_data(utils:combine(Header, message:ssb_encoder(true,
         fun message:ssb_encoder/3, [pretty])),
                     Socket, Nonce, SecretBoxKey);
 
-proc_request(ReqNo, #ssb_rpc{name = [?gossip, ?ping],
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [?gossip, ?ping],
                              args = [{_Args}]}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
-    % to start return true and close stream
     Flags = create_flags(1,0,10),
     TimeStamp = iolist_to_binary(message:ssb_encoder(integer_to_binary(current_time()),
                                     fun message:ssb_encoder/3, [pretty])),
-    Header = create_header(Flags,size(TimeStamp), -ReqNo),
-    ?LOG_DEBUG("Answering ping with ~p ~n",[{Header, TimeStamp}]),
-    NewNonce = utils:send_data(utils:combine(Header, TimeStamp), Socket, Nonce, SecretBoxKey),
-    NewNonce;
-    %%utils:send_data(?BOX_END, Socket, NewNonce, SecretBoxKey);
+    Header = create_header(Flags, size(TimeStamp), -ReqNo),
+    ?LOG_DEBUG("Answering ping with ~p ~n", [{Header, TimeStamp}]),
+    utils:send_data(utils:combine(Header, TimeStamp), Socket, Nonce, SecretBoxKey);
 
-proc_request(ReqNo, #ssb_rpc{name = [?whoami],
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [?whoami],
                              args = []}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
-    % to start return true and close stream
     Flags = create_flags(1,0,10),
     Body = whoami(),
     Header = create_header(Flags, size(Body), -ReqNo),
@@ -157,12 +153,12 @@ proc_request(ReqNo, #ssb_rpc{name = [?whoami],
     NewNonce1 = utils:send_data(?RPC_END, Socket, NewNonce, SecretBoxKey),
     utils:send_data(?BOX_END, Socket, NewNonce1, SecretBoxKey);
 
-proc_request(ReqNo, #ssb_rpc{name = [?blobs, ?createwants],
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?blobs, ?createwants],
                              args = []}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     %% Register this as a live duplex stream so subsequent messages
     %% on the same ReqNo are routed to blob_wants:handle_data/3.
-    ets:insert(rpc_calls, {ReqNo, blob_wants}),
+    ets:insert(Calls, {ReqNo, blob_wants}),
     %% Send an empty wants map to open the stream; we will push haves
     %% reactively in blob_wants:handle_data/3 as the peer sends wants.
     EmptyWants = utils:encode_rec({[]}),
@@ -170,7 +166,7 @@ proc_request(ReqNo, #ssb_rpc{name = [?blobs, ?createwants],
     Header = create_header(Flags, size(EmptyWants), -ReqNo),
     utils:send_data(utils:combine(Header, EmptyWants), Socket, Nonce, SecretBoxKey);
 
-proc_request(ReqNo, #ssb_rpc{name = [?blobs, ?blobshas],
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobshas],
                              args = [BlobId]}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     Has  = blobs:has(BlobId),
@@ -180,7 +176,7 @@ proc_request(ReqNo, #ssb_rpc{name = [?blobs, ?blobshas],
     NewNonce = utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey),
     utils:send_data(?RPC_END, Socket, NewNonce, SecretBoxKey);
 
-proc_request(ReqNo, #ssb_rpc{name = [?blobs, ?blobsget],
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobsget],
                              args = Args}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     BlobId = case Args of
@@ -197,17 +193,16 @@ proc_request(ReqNo, #ssb_rpc{name = [?blobs, ?blobsget],
             send_blob_chunks(BlobData, -ReqNo, Socket, Nonce, SecretBoxKey)
     end;
 
-proc_request(ReqNo, #ssb_rpc{name = [?tunnel, ~"isRoom"],
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [?tunnel, ~"isRoom"],
                              args = []}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
-    % to start return true and close stream
     Flags = create_flags(0,0,2),
     TrueEnd = message:ssb_encoder(false, fun message:ssb_encoder/3, [pretty]),
-    Header = create_header(Flags,size(TrueEnd), -ReqNo),
-    utils:send_data(utils:combine(utils:combine(Header,TrueEnd), ?RPC_END),
+    Header = create_header(Flags, size(TrueEnd), -ReqNo),
+    utils:send_data(utils:combine(utils:combine(Header, TrueEnd), ?RPC_END),
                     Socket, Nonce, SecretBoxKey);
 
-proc_request(ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"],
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"],
                              args = Args}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     {Version, Format} = case Args of
@@ -219,11 +214,11 @@ proc_request(ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"],
     end,
     case {Version, Format} of
         {3, ~"classic"} ->
-            ets:insert(rpc_calls, {ReqNo, ebt}),
+            ets:insert(Calls, {ReqNo, ebt}),
             Flags = create_flags(1, 0, 2),
             InitVectorEnc = utils:encode_rec(ebt:initial_vector()),
             Header = create_header(Flags, size(InitVectorEnc), -ReqNo),
-            ?LOG_DEBUG("Answering ebt_rep with ~p ~n",[{Header, InitVectorEnc}]),
+            ?LOG_DEBUG("Answering ebt_rep with ~p ~n", [{Header, InitVectorEnc}]),
             %% Keep the duplex stream open — do NOT send RPC_END
             utils:send_data(utils:combine(Header, InitVectorEnc),
                             Socket, Nonce, SecretBoxKey);
@@ -234,11 +229,11 @@ proc_request(ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"],
             utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey)
     end;
 
-proc_request(ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
-    ?LOG_DEBUG("Fall thru with ~p ~n",[ReqBody]),
+proc_request(_Calls, ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
+    ?LOG_DEBUG("Fall thru with ~p ~n", [ReqBody]),
     Flags = create_flags(0,1,2),
     TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
-    Header = create_header(Flags,size(TrueEnd), -ReqNo),
+    Header = create_header(Flags, size(TrueEnd), -ReqNo),
     NewNonce = utils:send_data(utils:combine(Header, TrueEnd),
                                Socket, Nonce, SecretBoxKey),
     utils:send_data(?RPC_END, Socket, NewNonce, SecretBoxKey).
