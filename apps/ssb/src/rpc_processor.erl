@@ -157,15 +157,45 @@ proc_request(ReqNo, #ssb_rpc{name = [?whoami],
     NewNonce1 = utils:send_data(?RPC_END, Socket, NewNonce, SecretBoxKey),
     utils:send_data(?BOX_END, Socket, NewNonce1, SecretBoxKey);
 
-proc_request(ReqNo, #ssb_rpc{name = [?blobs, ~"createWants"],
+proc_request(ReqNo, #ssb_rpc{name = [?blobs, ?createwants],
                              args = []}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
-    % to start return true and close stream
-    Flags = create_flags(1,1,2),
-    TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
-    Header = create_header(Flags,size(TrueEnd), -ReqNo),
-    utils:send_data(utils:combine(utils:combine(Header,TrueEnd), ?RPC_END),
-                    Socket, Nonce, SecretBoxKey);
+    %% Register this as a live duplex stream so subsequent messages
+    %% on the same ReqNo are routed to blob_wants:handle_data/3.
+    ets:insert(rpc_calls, {ReqNo, blob_wants}),
+    %% Send an empty wants map to open the stream; we will push haves
+    %% reactively in blob_wants:handle_data/3 as the peer sends wants.
+    EmptyWants = utils:encode_rec({[]}),
+    Flags  = create_flags(1, 0, 2),
+    Header = create_header(Flags, size(EmptyWants), -ReqNo),
+    utils:send_data(utils:combine(Header, EmptyWants), Socket, Nonce, SecretBoxKey);
+
+proc_request(ReqNo, #ssb_rpc{name = [?blobs, ?blobshas],
+                             args = [BlobId]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    Has  = blobs:has(BlobId),
+    Body = iolist_to_binary(message:ssb_encoder(Has, fun message:ssb_encoder/3, [pretty])),
+    Flags  = create_flags(0, 0, 2),
+    Header = create_header(Flags, size(Body), -ReqNo),
+    NewNonce = utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey),
+    utils:send_data(?RPC_END, Socket, NewNonce, SecretBoxKey);
+
+proc_request(ReqNo, #ssb_rpc{name = [?blobs, ?blobsget],
+                             args = Args}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    BlobId = case Args of
+        [Id] when is_binary(Id) -> Id;
+        [{Props}] -> proplists:get_value(~"hash", Props)
+    end,
+    case blobs:fetch(BlobId) of
+        {error, not_found} ->
+            ErrMsg = utils:error_msg(~"Error", ~"blob not found"),
+            Flags  = create_flags(0, 1, 2),
+            Header = create_header(Flags, size(ErrMsg), -ReqNo),
+            utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey);
+        {ok, BlobData} ->
+            send_blob_chunks(BlobData, -ReqNo, Socket, Nonce, SecretBoxKey)
+    end;
 
 proc_request(ReqNo, #ssb_rpc{name = [?tunnel, ~"isRoom"],
                              args = []}
@@ -212,6 +242,23 @@ proc_request(ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
     NewNonce = utils:send_data(utils:combine(Header, TrueEnd),
                                Socket, Nonce, SecretBoxKey),
     utils:send_data(?RPC_END, Socket, NewNonce, SecretBoxKey).
+
+%% Stream BlobData in 65 536-byte binary chunks, then close with JSON true.
+send_blob_chunks(<<>>, ReqNo, Socket, Nonce, Key) ->
+    TrueBody = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+    Flags    = create_flags(1, 1, 2),
+    Header   = create_header(Flags, size(TrueBody), ReqNo),
+    utils:send_data(utils:combine(Header, TrueBody), Socket, Nonce, Key);
+send_blob_chunks(Data, ReqNo, Socket, Nonce, Key) ->
+    ChunkSize = 65536,
+    {Chunk, Rest} = case Data of
+        <<C:ChunkSize/binary, R/binary>> -> {C, R};
+        Last                             -> {Last, <<>>}
+    end,
+    Flags    = create_flags(1, 0, 0),
+    Header   = create_header(Flags, size(Chunk), ReqNo),
+    NewNonce = utils:send_data(utils:combine(Header, Chunk), Socket, Nonce, Key),
+    send_blob_chunks(Rest, ReqNo, Socket, NewNonce, Key).
 
 current_time() ->
     erlang:system_time(millisecond).

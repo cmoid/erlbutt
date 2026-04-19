@@ -34,6 +34,9 @@
 -define(blobs, <<"blobs">>).
 -define(ebt, <<"ebt">>).
 -define(tunnel, <<"tunnel">>).
+-define(createwants, <<"createWants">>).
+-define(blobsget, <<"get">>).
+-define(blobshas, <<"has">>).
 
 -record(ssb_conn,
         { socket,
