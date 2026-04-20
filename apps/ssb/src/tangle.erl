@@ -210,12 +210,13 @@ init() ->
     config:start_link("test/ssb.cfg"),
     keys:start_link(),
     mess_auth:start_link(),
+    ssb_feed_sup:start_link(),
     create_id().
 
 create_id() ->
     {Pub, Priv} = utils:create_key_pair(),
     Auth = utils:display_pub(Pub),
-    {ok, Feed} = ssb_feed:start_link(Auth),
+    Feed = ssb_feed_sup:find_or_start(Auth),
     {Auth, Priv, Feed}.
 
 make_msg_one(Auth, Priv, Feed) ->

@@ -125,30 +125,9 @@ check_data(IoDev, Data, Len) ->
     end.
 
 find_or_create_feed_pid(Id) ->
-    %% ugh, using process dictionary for global state :(
     case check_id(Id) of
-        bad ->
-            bad;
-        ok ->
-
-            Val = get(Id),
-            case Val of
-                undefined ->
-                    {ok, Pid} = ssb_feed:start_link(Id),
-                    put(Id, Pid),
-                    Pid;
-                Pid when is_pid(Pid) ->
-                    Alive = is_process_alive(Pid),
-                    if Alive ->
-                            Pid;
-                       true ->
-                            erase(Id),
-                            find_or_create_feed_pid(Id)
-                    end;
-                _Else ->
-                    erase(Id),
-                    find_or_create_feed_pid(Id)
-            end
+        bad -> bad;
+        ok  -> ssb_feed_sup:find_or_start(Id)
     end.
 
 update_refs(#message{id = Id, author = AuthId} = Msg) ->
@@ -239,33 +218,32 @@ combine_test() ->
     ~"foobar" = combine(~"foo",~"bar").
 
 create_pid_test() ->
-    erase(),
     config:start_link("test/ssb.cfg"),
     keys:start_link(),
+    ssb_feed_sup:start_link(),
     {Pub, _Priv} = create_key_pair(),
     FeedId1 = display_pub(Pub),
-    find_or_create_feed_pid(FeedId1),
+    Pid1 = find_or_create_feed_pid(FeedId1),
+    ?assert(is_pid(Pid1)),
     {Pub2, _Priv2} = create_key_pair(),
     FeedId2 = display_pub(Pub2),
-    find_or_create_feed_pid(FeedId2),
-    ?assert(length(get()) == 2).
+    Pid2 = find_or_create_feed_pid(FeedId2),
+    ?assert(is_pid(Pid2)),
+    ?assert(Pid1 =/= Pid2).
 
 create_pid_kill_test() ->
-    erase(),
     config:start_link("test/ssb.cfg"),
     keys:start_link(),
+    ssb_feed_sup:start_link(),
     {Pub, _Priv} = create_key_pair(),
     FeedId1 = display_pub(Pub),
-    find_or_create_feed_pid(FeedId1),
-    {Pub2, _Priv2} = create_key_pair(),
-    FeedId2 = display_pub(Pub2),
-    find_or_create_feed_pid(FeedId2),
-
-    ?assert(length(get()) == 2),
-    erase(FeedId2),
-    ?assert(length(get()) == 1),
-    find_or_create_feed_pid(FeedId2),
-    ?assert(length(get()) == 2).
+    Pid1 = find_or_create_feed_pid(FeedId1),
+    exit(Pid1, kill),
+    timer:sleep(50),
+    Pid2 = find_or_create_feed_pid(FeedId1),
+    %% After a crash the supervisor restarts the feed; we get a fresh pid.
+    ?assert(is_pid(Pid2)),
+    ?assert(Pid1 =/= Pid2).
 
 simple_blob_decode_test() ->
     Coded = <<"&ybENuaMAdmfjmwR852FNDsj3biaMl5P4HF/jJj7OtQQ=.sha256">>,

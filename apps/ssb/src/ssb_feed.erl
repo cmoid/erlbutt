@@ -62,7 +62,7 @@ fetch_last_msg(FeedPid) ->
     gen_server:call(FeedPid, {fetch_last_msg}).
 
 store_ref(FeedPid, Arrow) ->
-    gen_server:call(FeedPid, {store_ref, Arrow}, infinity).
+    gen_server:cast(FeedPid, {store_ref, Arrow}).
 
 references(FeedPid, MsgId, RootId) ->
     gen_server:call(FeedPid, {refs, MsgId, RootId}, infinity).
@@ -83,6 +83,12 @@ init([FeedId]) ->
                    profile = Profile,
                    refs = Refs,
                    msg_cache = ets:new(messages, [])},
+    %% Register in the global feed registry when running under ssb_feed_sup.
+    %% The guard keeps direct start_link/1 calls (e.g. in unit tests) working.
+    case ets:info(ssb_feed_registry) of
+        undefined -> ok;
+        _         -> ets:insert(ssb_feed_registry, {FeedId, self()})
+    end,
     {ok, check_owner_feed(State)}.
 
 handle_call(whoami, _From, #state{id = Id} = State) ->
@@ -102,9 +108,6 @@ handle_call({store, Msg}, _From, State) ->
     NewState = store(Msg, State),
     {reply, ok, NewState};
 
-handle_call({store_ref, Arrow}, _From, #state{refs = Refs} = State) ->
-    write_msg(Arrow, Refs),
-    {reply, ok, State};
 
 handle_call({fetch, Key}, _From, #state{feed = Feed,
                                        msg_cache = Messages} = State) ->
@@ -162,6 +165,10 @@ handle_call({foldl, Fun, Acc}, _From, #state{feed = Feed} = State) ->
 
     {reply, Result, State}.
 
+handle_cast({store_ref, Arrow}, #state{refs = Refs} = State) ->
+    write_msg(Arrow, Refs),
+    {noreply, State};
+
 handle_cast(_Request, State) ->
     {noreply, State}.
 
@@ -173,8 +180,12 @@ handle_info(Info, State) ->
 
 %%
 
-terminate(Reason, _State) ->
-    ?LOG_INFO("Closed gen_server: ~p ~n",[Reason]),
+terminate(Reason, #state{id = FeedId}) ->
+    ?LOG_INFO("Closed gen_server: ~p ~n", [Reason]),
+    case ets:info(ssb_feed_registry) of
+        undefined -> ok;
+        _         -> ets:delete(ssb_feed_registry, FeedId)
+    end,
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
