@@ -34,7 +34,7 @@ convert(OffsetLog, Sleep, Feeds)->
                                         true -> Elem;
                                         _Else -> Acc
                                     end
-                            end,{~"FFF", {0, 0}},get()),
+                            end, {~"FFF", 0}, get()),
             mess_auth:close(),
             ?LOG_INFO("number of unique feeds: ~p ~n",[length(get())]),
             ?LOG_INFO("largest feed belongs to: ~p ~n",
@@ -66,32 +66,27 @@ convert_terms(IoDev, Found, Sleep, Feeds) ->
             ?LOG_INFO("Error loading the ~p term: ~p ~n",[Found, Error])
     end.
 
-count({_key, {_Pid, Count}}) ->
+count({_Key, Count}) when is_integer(Count) ->
     Count;
 count(_) ->
     0.
 
 get_feed(Author, Sleep) ->
-    Val = get(Author),
-    case Val of
-        undefined ->
-            {ok, Pid} = ssb_feed:start_link(Author),
-            put(Author, {Pid, 1}),
-            Pid;
-        {Pid, Count} when is_integer(Count) ->
-            put(Author, {Pid, Count + 1}),
-            PrintCount = Count rem 10000 == 0,
-            if PrintCount ->
-                    timer:sleep(Sleep),
-                    io:format("~n",[]),
-                    ?LOG_INFO("This author ~p has ~p records ~n", [Author, Count]);
-               true ->
-                    true
+    Pid = ssb_feed_sup:find_or_start(Author),
+    Count = case get(Author) of
+                undefined -> 1;
+                N         -> N + 1
             end,
-            Pid;
-        _Else ->
-            bad
-    end.
+    put(Author, Count),
+    PrintCount = Count rem 10000 == 0,
+    if PrintCount ->
+            timer:sleep(Sleep),
+            io:format("~n", []),
+            ?LOG_INFO("This author ~p has ~p records ~n", [Author, Count]);
+       true ->
+            true
+    end,
+    Pid.
 
 store(Msg, Sleep, Feeds) ->
 
@@ -123,7 +118,7 @@ store(Msg, Sleep, Feeds) ->
     end.
 
 build_refs(FeedId) ->
-    {ok, Feed} = ssb_feed:start_link(FeedId),
+    Feed = ssb_feed_sup:find_or_start(FeedId),
     Fun = fun(Term, Acc) ->
                   %% possibly no need to validate this here
                   Msg = message:decode(Term, false),
