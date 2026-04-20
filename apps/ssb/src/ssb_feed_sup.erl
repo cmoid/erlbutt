@@ -18,6 +18,8 @@
 %% have already been killed by the supervisor restart).
 -module(ssb_feed_sup).
 
+-include_lib("ssb/include/ssb.hrl").
+
 -behaviour(supervisor).
 
 -export([start_link/0,
@@ -89,7 +91,7 @@ do_start(FeedId) ->
         {ok, Pid}                       -> Pid;
         {error, {already_started, Pid}} -> Pid;
         {error, Reason} ->
-            error_logger:error_msg("ssb_feed_sup: failed to start feed ~p: ~p~n",
+            ?LOG_ERROR("ssb_feed_sup: failed to start feed ~p: ~p~n",
                                    [FeedId, Reason]),
             error(Reason)
     end.
