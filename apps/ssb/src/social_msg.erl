@@ -15,7 +15,8 @@
          is_follow/1,
          is_about/1,
          is_reply/1,
-         is_branch/1]).
+         is_branch/1,
+         is_private_box/1]).
 
 is_follow(#message{content = Val}) when is_binary(Val) ->
     nope;
@@ -74,6 +75,9 @@ build_reply(undefined) ->
 
 build_reply(Reply) ->
     Reply.
+
+is_private_box(#message{content = Content}) ->
+    private_box:is_private(Content).
 
 check_contact(undefined, _Following) ->
     nope;
