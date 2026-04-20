@@ -16,6 +16,7 @@
 
 -export([whoami/1,
          post_content/2,
+         post_private/3,
          store_msg/2,
          fetch_msg/2,
          fetch_last_msg/1,
@@ -51,6 +52,13 @@ whoami(FeedPid) ->
 
 post_content(FeedPid, Content) ->
     gen_server:call(FeedPid, {post, Content}, infinity).
+
+%% Encrypt Content as a private-box message addressed to RecipientIds
+%% (list of <<"@pubkey.ed25519">> strings) and post it to the feed.
+post_private(FeedPid, Content, RecipientIds) ->
+    JsonContent = iolist_to_binary(message:ssb_encoder(Content, fun message:ssb_encoder/3, [])),
+    Encrypted = private_box:encrypt(JsonContent, RecipientIds),
+    gen_server:call(FeedPid, {post, Encrypted}, infinity).
 
 store_msg(FeedPid, Msg) ->
     gen_server:call(FeedPid, {store, Msg}, infinity).
