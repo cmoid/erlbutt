@@ -1,6 +1,20 @@
 %% SPDX-License-Identifier: GPL-2.0-only
 %%
 %% Copyright (C) 2025 Charles Moid
+%%
+%% Implements the SSB private-box encryption scheme.
+%%
+%% Wire format (before base64 + ".box" suffix):
+%%
+%%   nonce      (24 bytes, random)
+%%   header_pk  (32 bytes, ephemeral curve25519 public key)
+%%   headers    (49 bytes × N recipients, max 7)
+%%     each = secretbox( num_recipients(1) || body_key(32) )
+%%             under key = HMAC-SHA512256( scalarmult(header_sk, recip_pk),
+%%                                        nonce || header_pk )
+%%   body       secretbox( plaintext, nonce, body_key )
+%%
+%% The ".box" suffix lets peers detect private messages without parsing JSON.
 -module(private_box).
 
 -ifdef(TEST).
@@ -21,6 +35,8 @@
 %%% Public API
 %%%===================================================================
 
+%% Returns <<"base64ciphertext.box">> addressed to up to 7 recipient feed IDs
+%% (strings like <<"@pubkey.ed25519">>).
 -spec encrypt(binary(), [binary()]) -> binary().
 encrypt(Content, RecipientIds) when length(RecipientIds) =< ?MAX_RECIPIENTS ->
     Nonce    = enacl:randombytes(?NONCE_BYTES),
@@ -33,6 +49,7 @@ encrypt(Content, RecipientIds) when length(RecipientIds) =< ?MAX_RECIPIENTS ->
     Ciphertext = iolist_to_binary([Nonce, HeaderPk | EncHeaders] ++ [EncBody]),
     <<(base64:encode(Ciphertext))/binary, ".box">>.
 
+%% Returns {ok, Plaintext} if addressed to us, not_for_me otherwise.
 -spec decrypt(binary()) -> {ok, binary()} | not_for_me.
 decrypt(Boxed) ->
     case is_private(Boxed) of
@@ -59,6 +76,7 @@ is_private(_) ->
 %%% Internal functions
 %%%===================================================================
 
+%% enacl:auth (HMAC-SHA512256) is used here as a KDF, not for authentication.
 encrypt_header(NumRecips, BodyKey, HeaderSk, HeaderPk, Nonce, RecipId) ->
     RecipCurvePk  = id_to_curve25519_pk(RecipId),
     SharedSecret  = enacl:curve25519_scalarmult(HeaderSk, RecipCurvePk),
@@ -74,6 +92,8 @@ try_decrypt(Data) ->
     MyKey          = enacl:auth(<<Nonce/binary, HeaderPk/binary>>, SharedSecret),
     try_headers(HeadersAndBody, Nonce, MyKey, 0).
 
+%% We don't know which slot holds our header, so try each in turn.
+%% NumRecips in the plaintext tells us where the body begins (after all headers).
 try_headers(HeadersAndBody, Nonce, MyKey, SlotIdx) when SlotIdx < ?MAX_RECIPIENTS ->
     Offset = SlotIdx * ?HEADER_ENC,
     case HeadersAndBody of
@@ -95,6 +115,7 @@ try_headers(HeadersAndBody, Nonce, MyKey, SlotIdx) when SlotIdx < ?MAX_RECIPIENT
 try_headers(_, _, _, _) ->
     not_for_me.
 
+%% Keys on disk are ed25519; DH requires curve25519, so convert here.
 my_curve25519_sk() ->
     Ed25519Sk = base64:decode(keys:priv_key()),
     enacl:crypto_sign_ed25519_secret_to_curve25519(Ed25519Sk).

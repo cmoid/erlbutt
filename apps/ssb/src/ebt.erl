@@ -26,13 +26,18 @@
 
 -define(SERVER, ?MODULE).
 
+%% ebt is both a gen_server (supervised singleton in ssb_sup) and an
+%% rpc_behavior (callbacks invoked per-connection by each rpc_processor).
+%% The gen_server carries no state; all connection context arrives via args.
 -record(state, {}).
 
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
-%% Build our initial vector clock: include our own feed with its current
-%% last sequence so the peer knows what we already have.
+%% We only advertise our own feed here because on connect we only know our
+%% own state.  Remote feeds we've replicated are discovered from the peer's
+%% clock response — their clock tells us which feeds they have, and we fill
+%% in the gaps from our local storage.
 initial_vector() ->
     PeerKey = keys:pub_key_disp(),
     Pid = utils:find_or_create_feed_pid(PeerKey),
@@ -99,8 +104,8 @@ handle_clock(ReqNo, {PeerClock}, Socket, Nonce, Key) ->
                 end, Nonce, PeerClock).
 
 %% Iterate through a feed and send all messages with sequence > AfterSeq.
-%% The raw bytes from foldl are already in the {key, value, timestamp}
-%% JSON format that EBT expects, so we send them directly.
+%% ssb_feed:foldl yields raw stored bytes already in {key,value,timestamp}
+%% JSON — the same format EBT expects — so no re-encoding step is needed.
 send_feed_msgs_after(FeedId, AfterSeq, OutReqNo, Socket, Nonce, Key) ->
     Pid = utils:find_or_create_feed_pid(FeedId),
     case Pid of
