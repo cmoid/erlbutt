@@ -1,6 +1,10 @@
 %% SPDX-License-Identifier: GPL-2.0-only
 %%
 %% Copyright (C) 2023 Charles Moid
+%%
+%% Per-feed gen_server.  Each SSB author gets one instance, managed by
+%% ssb_feed_sup.  Owns three append-only files: log.offset (all messages),
+%% profile (about messages only), and references (tangle arc records).
 -module(ssb_feed).
 
 -ifdef(TEST).
@@ -69,6 +73,8 @@ fetch_msg(FeedPid, Key) ->
 fetch_last_msg(FeedPid) ->
     gen_server:call(FeedPid, {fetch_last_msg}).
 
+%% Cast, not call: tangle calls this from inside a feed's handle_call, so a
+%% synchronous call here would deadlock the same process.
 store_ref(FeedPid, Arrow) ->
     gen_server:cast(FeedPid, {store_ref, Arrow}).
 
@@ -231,6 +237,10 @@ write_msg(#message{} = DecMsg, Store) ->
     Msg = message:encode(DecMsg),
     write_msg(Msg, Store);
 
+%% On-disk frame: <<Len:32, Msg:Len/binary, Len:32, NextOffset:32>>
+%% Trailing Len enables backward seek to find the last record.
+%% NextOffset is the absolute file position of the following record's Len field,
+%% used by scan/3 to step forward without re-reading the leading length.
 write_msg(Msg, Store) ->
     DataSiz = size(Msg),
     O = open_file(Store),
@@ -293,6 +303,8 @@ feed_get_last(Feed) ->
         true ->
             case file:open(Feed, [read, binary]) of
                 {ok, IoDev} ->
+                    %% Last 8 bytes = trailing Len(4) + NextOffset(4) of final record.
+                    %% Read trailing Len, then seek back Len+4 to reach record start.
                     Beg = filelib:file_size(Feed) - 8,
                     file:position(IoDev, Beg),
                     case file:read(IoDev, 4) of
