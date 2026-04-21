@@ -104,8 +104,8 @@ handle_clock(ReqNo, {PeerClock}, Socket, Nonce, Key) ->
                 end, Nonce, PeerClock).
 
 %% Iterate through a feed and send all messages with sequence > AfterSeq.
-%% ssb_feed:foldl yields raw stored bytes already in {key,value,timestamp}
-%% JSON — the same format EBT expects — so no re-encoding step is needed.
+%% Each message is re-encoded: only the "value" field is sent, not the full
+%% {key, value, timestamp} envelope stored on disk.
 send_feed_msgs_after(FeedId, AfterSeq, OutReqNo, Socket, Nonce, Key) ->
     Pid = utils:find_or_create_feed_pid(FeedId),
     case Pid of
