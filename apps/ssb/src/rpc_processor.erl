@@ -212,8 +212,10 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"],
         _ ->
             {undefined, undefined}
     end,
+    %% Temporarily ignore Format to support PonchoWonky, which doesn't send it
+    %% It's sort of not really needed currently, will revisit this.
     case {Version, Format} of
-        {3, ~"classic"} ->
+        {3, Format} ->
             ets:insert(Calls, {ReqNo, ebt}),
             Flags = create_flags(1, 0, 2),
             InitVectorEnc = utils:encode_rec(ebt:initial_vector()),
