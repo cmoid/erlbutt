@@ -38,8 +38,9 @@ start_link(Ref, Socket, Transport, Opts) ->
 init([Ip, PubKey]) ->
     process_flag(trap_exit, true),
     try
+        Port = application:get_env(ssb, port, 8008),
         {ok, {Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce}} =
-            shs:client_shake_hands(connect(Ip, 8008), PubKey),
+            shs:client_shake_hands(connect(Ip, Port), PubKey),
         ranch_tcp:setopts(Socket, [{active, false}]),
         {ok, RpcProc} = rpc_processor:start_link(),
         {ok, #sbox_state{socket = Socket,

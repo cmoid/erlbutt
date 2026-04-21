@@ -21,8 +21,10 @@ start(_StartType, _StartArgs) ->
     logger:set_module_level(supervisor, error),
     ?LOG(LogLevel, "Log level ~p set from env ~n", [LogLevel]),
 
+    Port = application:get_env(ssb, port, 8008),
+    catch ranch:stop_listener(erlbutt_listener),
     {ok, _} = ranch:start_listener(erlbutt_listener, 5,
-                                   ranch_tcp, [{port, 8008},
+                                   ranch_tcp, [{port, Port},
                                                {max_connections, 10}],
                                    ssb_peer, []),
 
