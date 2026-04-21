@@ -9,7 +9,10 @@
 -include_lib("ssb/include/ssb.hrl").
 
 -export([start_link/2,
+         start_link/3,
          start_link/4,
+         start/2,
+         start/3,
          send/2]).
 
 %% gen_server exports
@@ -23,9 +26,20 @@
                 send_data/4,
                 size/1]).
 
-%% connect to another peer.
+%% connect to another peer on the default port (ssb app env or 8008).
 start_link(Ip, PubKey) ->
     gen_server:start_link(?MODULE, [Ip, PubKey], []).
+
+%% connect to another peer on an explicit port.
+start_link(Ip, Port, PubKey) when is_integer(Port) ->
+    gen_server:start_link(?MODULE, [Ip, Port, PubKey], []).
+
+%% Unlinked variants — use when the caller is a temporary process (e.g. rpc:call).
+start(Ip, PubKey) ->
+    gen_server:start(?MODULE, [Ip, PubKey], []).
+
+start(Ip, Port, PubKey) when is_integer(Port) ->
+    gen_server:start(?MODULE, [Ip, Port, PubKey], []).
 
 %% send data to another peer, asynchronously
 send(Pid, Data) ->
@@ -36,19 +50,25 @@ start_link(Ref, Socket, Transport, Opts) ->
     gen_server:start_link(?MODULE, [Ref, Socket, Transport, Opts], []).
 
 init([Ip, PubKey]) ->
+    Port = application:get_env(ssb, port, 8008),
+    init([Ip, Port, PubKey]);
+
+init([Ip, Port, PubKey]) ->
     process_flag(trap_exit, true),
     try
-        Port = application:get_env(ssb, port, 8008),
         {ok, {Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce}} =
             shs:client_shake_hands(connect(Ip, Port), PubKey),
         ranch_tcp:setopts(Socket, [{active, false}]),
         {ok, RpcProc} = rpc_processor:start_link(),
+        NewEncNonce = initiate_ebt(Socket, EncBoxKey, EncNonce, PubKey),
+        ok = rpc_processor:register_stream(RpcProc, -1, ebt),
+        ranch_tcp:setopts(Socket, [{active, once}]),
         {ok, #sbox_state{socket = Socket,
                          transport = ranch_tcp,
                          dec_sbox_key = DecBoxKey,
                          enc_sbox_key = EncBoxKey,
                          dec_nonce = DecNonce,
-                         enc_nonce = EncNonce,
+                         enc_nonce = NewEncNonce,
                          rpc_proc = RpcProc,
                          shook_hands = 1}}
     catch
@@ -120,6 +140,15 @@ handle_info(timeout, #sbox_state{ref = Ref,
     ok = ranch:accept_ack(Ref),
     ok = Transport:setopts(Socket, [{active, once}]),
     {noreply, State};
+
+handle_info({'EXIT', Pid, Reason}, #sbox_state{rpc_proc = RpcProc} = State) ->
+    case Pid of
+        RpcProc ->
+            ?LOG_ERROR("ssb_peer: rpc_processor exited ~p~n", [Reason]),
+            {stop, Reason, State};
+        _ ->
+            {noreply, State}
+    end;
 
 handle_info(Info, State) ->
     ?LOG_INFO("Stopped presumably for normal reason: ~p ~n",[Info]),
@@ -242,3 +271,27 @@ connect(Host, Port) ->
                         ],
                         5000),
     Socket.
+
+%% Send the EBT replicate request and our initial clock.
+%% ReqNo = 1 for the outbound duplex stream.
+%% The clock includes the remote peer's feedId at seq 0 so the server
+%% knows we want all of its messages.
+initiate_ebt(Socket, EncBoxKey, EncNonce, RemotePubKey) ->
+    EbtReq = utils:encode_rec({[{~"name", [~"ebt", ~"replicate"]},
+                                 {~"args", [{[{~"version", 3},
+                                              {~"format", ~"classic"}]}]},
+                                 {~"type", ~"duplex"}]}),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header1 = rpc_processor:create_header(Flags, size(EbtReq), 1),
+    N1 = send_data(combine(Header1, EbtReq), Socket, EncNonce, EncBoxKey),
+    Clock = build_initial_clock(RemotePubKey),
+    Header2 = rpc_processor:create_header(Flags, size(Clock), 1),
+    send_data(combine(Header2, Clock), Socket, N1, EncBoxKey).
+
+%% Build our initial vector clock, including the remote peer's feedId at seq 0
+%% so the server sends us everything it has for that feed.
+build_initial_clock(RemotePubKey) ->
+    RemoteFeedId = <<"@", (base64:encode(RemotePubKey))/binary, ".ed25519">>,
+    {OurFeeds} = ebt:initial_vector(),
+    AllFeeds = [{RemoteFeedId, ebt_vc:encode_clock_int(true, true, 0)} | OurFeeds],
+    utils:encode_rec({AllFeeds}).

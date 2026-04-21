@@ -19,6 +19,7 @@
 %% API
 -export([start_link/0,
          process/3,
+         register_stream/3,
          create_flags/3,
          create_header/3,
          parse_flags/1]).
@@ -34,6 +35,12 @@ start_link() ->
 %% Pid is the per-connection rpc_processor started by ssb_peer.
 process(Pid, {Header, Body}, Connection) ->
     gen_server:call(Pid, {rpc_process, {Header, Body}, Connection}, 45000).
+
+%% Register a duplex stream so that subsequent messages on ReqNo are
+%% routed to Module:handle_data/3.  Used by the client-side peer to
+%% register the negative ReqNo it expects for its outbound requests.
+register_stream(Pid, ReqNo, Module) ->
+    gen_server:call(Pid, {register_stream, ReqNo, Module}).
 
 parse_flags(Header) ->
     <<Flags:1/binary, _Rest/binary>> = Header,
@@ -57,6 +64,11 @@ handle_info(Info, State) ->
     ?LOG_INFO("Stopped presumably for normal reason: ~p ~n", [Info]),
     {stop, normal, State}.
 
+handle_call({register_stream, ReqNo, Module}, _From,
+            #rpc_state{calls = Calls} = State) ->
+    ets:insert(Calls, {ReqNo, Module}),
+    {reply, ok, State};
+
 handle_call({rpc_process, {Header, Body}, #ssb_conn{
                                             socket = Socket,
                                             nonce = Nonce,
@@ -64,16 +76,16 @@ handle_call({rpc_process, {Header, Body}, #ssb_conn{
                             _From, #rpc_state{calls = Calls} = State) ->
     %% Positive ReqNo = new or continuing request from peer.
     %% Negative ReqNo = response to a request we initiated.
-    %% For a known duplex stream (ReqNo already in table, positive), route
-    %% all subsequent data directly to the owning module's handle_data/3.
+    %% Both positive and negative registered streams are routed to the
+    %% owning module's handle_data/3.
     ReqNo = req_no(Header),
     HasSeen = ets:lookup(Calls, ReqNo),
-    {Non, Res} = case {HasSeen, ReqNo > 0} of
-        {[{ReqNo, Mod}], true} ->
+    {Non, Res} = case HasSeen of
+        [{ReqNo, Mod}] ->
             ?LOG_DEBUG("Stream continuation for req: ~p ~n", [ReqNo]),
             NewNonce = Mod:handle_data(ReqNo, Body, Conn),
             {NewNonce, none};
-        _ ->
+        [] ->
             dispatch(Calls, ReqNo, Body, Socket, Nonce, SecretBoxKey)
     end,
     {reply, {Non, Res}, State}.

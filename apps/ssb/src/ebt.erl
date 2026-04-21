@@ -127,18 +127,13 @@ send_feed_msgs_after(FeedId, AfterSeq, OutReqNo, Socket, Nonce, Key) ->
     end.
 
 %% Send a single raw message binary over the duplex stream.
+%% MsgData is already the full {key, value, timestamp} envelope from disk,
+%% which is what store_message expects on the receiving side.
 send_msg_data(MsgData, OutReqNo, Socket, Nonce, Key) ->
-    %% We only want to send the value of the message, not the full
-    %% key, Value, and Timestamp
-    {PropList} = utils:nat_decode(MsgData),
-    SendData =
-    iolist_to_binary(message:ssb_encoder(proplists:get_value(~"value",PropList),
-        fun message:ssb_encoder/3, [use_nil])),
-    ?LOG_DEBUG("EBT: msg dsta ~p to output request
-        ~p  ~n", [SendData, OutReqNo]),
+    ?LOG_DEBUG("EBT: sending msg to output req ~p~n", [OutReqNo]),
     Flags = rpc_processor:create_flags(1, 0, 2),
-    Header = rpc_processor:create_header(Flags, size(SendData), OutReqNo),
-    utils:send_data(utils:combine(Header, SendData), Socket, Nonce, Key).
+    Header = rpc_processor:create_header(Flags, size(MsgData), OutReqNo),
+    utils:send_data(utils:combine(Header, MsgData), Socket, Nonce, Key).
 
 %% Decode an incoming message and store it in the appropriate feed.
 %% Body is the raw JSON bytes in {key, value, timestamp} format.
