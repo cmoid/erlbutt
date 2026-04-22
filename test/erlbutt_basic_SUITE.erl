@@ -11,9 +11,7 @@
 -import(proplists, [get_value/2,
                     get_value/3]).
 
--export([connect_test/1,
-         ping_test/1,
-         whoami_test/1]).
+-export([connect_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
