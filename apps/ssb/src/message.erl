@@ -10,6 +10,7 @@
 
 %% API
 -export([decode/2,
+         decode_value/2,
          encode/1,
          ssb_encoder/3,
          new_msg/4]).
@@ -41,6 +42,26 @@ encode(#message{id = Key, received = Received, swapped = Swapped} = Msg) ->
     iolist_to_binary(ssb_encoder({[{~"key", Key},
                                    {~"value", {EncMsg}},
                                    {~"timestamp", Received}]}, fun ssb_encoder/3, [use_nil])).
+
+%% Decode a value-only JSON binary (as sent by EBT / createHistoryStream keys:false).
+%% The message ID is computed by hashing the canonical (pretty) JSON, matching
+%% the same form used when the message was originally signed and stored.
+decode_value(ValueJson, CheckValid) ->
+    {ValueProps} = utils:nat_decode(ValueJson),
+    IsSwapped = is_swapped(ValueProps),
+    IsValid   = validate(CheckValid, ValueProps),
+    Id        = compute_id(ValueJson),
+    #message{id        = Id,
+             previous  = ?pgv(~"previous",  ValueProps),
+             author    = ?pgv(~"author",    ValueProps),
+             sequence  = ?pgv(~"sequence",  ValueProps),
+             timestamp = ?pgv(~"timestamp", ValueProps),
+             hash      = ?pgv(~"hash",      ValueProps),
+             content   = ?pgv(~"content",   ValueProps),
+             signature = ?pgv(~"signature", ValueProps),
+             received  = integer_to_binary(current_time()),
+             validated = IsValid,
+             swapped   = IsSwapped}.
 
 decode(Msg, CheckValid) ->
     {DecDataProps} = utils:nat_decode(Msg),

@@ -127,19 +127,24 @@ send_feed_msgs_after(FeedId, AfterSeq, OutReqNo, Socket, Nonce, Key) ->
     end.
 
 %% Send a single raw message binary over the duplex stream.
-%% MsgData is already the full {key, value, timestamp} envelope from disk,
-%% which is what store_message expects on the receiving side.
+%% Only the "value" object is sent (not the full {key,value,timestamp} envelope),
+%% consistent with how createHistoryStream works with keys:false.
 send_msg_data(MsgData, OutReqNo, Socket, Nonce, Key) ->
+    {PropList} = utils:nat_decode(MsgData),
+    SendData = iolist_to_binary(
+                   message:ssb_encoder(proplists:get_value(~"value", PropList),
+                                       fun message:ssb_encoder/3, [pretty, use_nil])),
     ?LOG_DEBUG("EBT: sending msg to output req ~p~n", [OutReqNo]),
     Flags = rpc_processor:create_flags(1, 0, 2),
-    Header = rpc_processor:create_header(Flags, size(MsgData), OutReqNo),
-    utils:send_data(utils:combine(Header, MsgData), Socket, Nonce, Key).
+    Header = rpc_processor:create_header(Flags, size(SendData), OutReqNo),
+    utils:send_data(utils:combine(Header, SendData), Socket, Nonce, Key).
 
 %% Decode an incoming message and store it in the appropriate feed.
-%% Body is the raw JSON bytes in {key, value, timestamp} format.
+%% Body is the value-only JSON (no key/timestamp wrapper), as sent by EBT
+%% and createHistoryStream with keys:false.
 store_message(Body) ->
     try
-        Msg = message:decode(Body, false),
+        Msg = message:decode_value(Body, false),
         case utils:find_or_create_feed_pid(Msg#message.author) of
             bad ->
                 ?LOG_INFO("EBT: bad author in received message: ~p~n",
