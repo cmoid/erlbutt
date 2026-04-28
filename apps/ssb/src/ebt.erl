@@ -99,7 +99,8 @@ is_vector_clock(_) -> false.
 %% missing (i.e. messages with sequence > their last known sequence).
 handle_clock(ReqNo, {PeerClock}, Socket, Nonce, Key) ->
     lists:foldl(fun({FeedId, EncodedInt}, NonceAcc) ->
-                        {_Rcv, _Sync, PeerSeq} = ebt_vc:decode_clock_int(EncodedInt),
+                        {Rcv, Sync, PeerSeq} = ebt_vc:decode_clock_int(EncodedInt),
+                        ?LOG_DEBUG("EBT: decode vector to ~p for feed ~p ~n", [{Rcv, Sync, PeerSeq}, FeedId]),
                         send_feed_msgs_after(FeedId, PeerSeq, -ReqNo, Socket, NonceAcc, Key)
                 end, Nonce, PeerClock).
 
