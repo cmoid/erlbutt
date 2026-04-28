@@ -30,6 +30,7 @@
 -define(HEADER_PK_BYTES, 32).
 -define(BODY_KEY_BYTES,  32).
 -define(HEADER_ENC,      49).   %% 33 + 16 (secretbox MAC)
+-define(ZERO_NONCE,      <<0:192>>).  %% 24 zero bytes — required by spec for header secretbox
 
 %%%===================================================================
 %%% Public API
@@ -81,7 +82,7 @@ encrypt_header(NumRecips, BodyKey, HeaderSk, HeaderPk, Nonce, RecipId) ->
     RecipCurvePk  = id_to_curve25519_pk(RecipId),
     SharedSecret  = enacl:curve25519_scalarmult(HeaderSk, RecipCurvePk),
     RecipKey      = enacl:auth(<<Nonce/binary, HeaderPk/binary>>, SharedSecret),
-    enacl:secretbox(<<NumRecips:8, BodyKey/binary>>, Nonce, RecipKey).
+    enacl:secretbox(<<NumRecips:8, BodyKey/binary>>, ?ZERO_NONCE, RecipKey).
 
 try_decrypt(Data) ->
     <<Nonce:?NONCE_BYTES/binary,
@@ -94,20 +95,20 @@ try_decrypt(Data) ->
 
 %% We don't know which slot holds our header, so try each in turn.
 %% NumRecips in the plaintext tells us where the body begins (after all headers).
-try_headers(HeadersAndBody, Nonce, MyKey, SlotIdx) when SlotIdx < ?MAX_RECIPIENTS ->
+try_headers(HeadersAndBody, MsgNonce, MyKey, SlotIdx) when SlotIdx < ?MAX_RECIPIENTS ->
     Offset = SlotIdx * ?HEADER_ENC,
     case HeadersAndBody of
         <<_:Offset/binary, Header:?HEADER_ENC/binary, _/binary>> ->
-            case enacl:secretbox_open(Header, Nonce, MyKey) of
+            case enacl:secretbox_open(Header, ?ZERO_NONCE, MyKey) of
                 {ok, <<NumRecips:8, BodyKey:?BODY_KEY_BYTES/binary>>} ->
                     BodyStart = NumRecips * ?HEADER_ENC,
                     <<_:BodyStart/binary, EncBody/binary>> = HeadersAndBody,
-                    case enacl:secretbox_open(EncBody, Nonce, BodyKey) of
+                    case enacl:secretbox_open(EncBody, MsgNonce, BodyKey) of
                         {ok, Body} -> {ok, Body};
                         _          -> not_for_me
                     end;
                 {error, _} ->
-                    try_headers(HeadersAndBody, Nonce, MyKey, SlotIdx + 1)
+                    try_headers(HeadersAndBody, MsgNonce, MyKey, SlotIdx + 1)
             end;
         _ ->
             not_for_me
