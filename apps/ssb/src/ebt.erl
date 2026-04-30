@@ -99,8 +99,8 @@ is_vector_clock(_) -> false.
 %% missing (i.e. messages with sequence > their last known sequence).
 handle_clock(ReqNo, {PeerClock}, Socket, Nonce, Key) ->
     lists:foldl(fun({FeedId, EncodedInt}, NonceAcc) ->
-                        {Rcv, Sync, PeerSeq} = ebt_vc:decode_clock_int(EncodedInt),
-                        ?LOG_DEBUG("EBT: decode vector to ~p for feed ~p ~n", [{Rcv, Sync, PeerSeq}, FeedId]),
+                        {_Rcv, _Sync, PeerSeq} = ebt_vc:decode_clock_int(EncodedInt),
+                        %%?LOG_DEBUG("EBT: decode vector to ~p for feed ~p ~n", [{Rcv, Sync, PeerSeq}, FeedId]),
                         send_feed_msgs_after(FeedId, PeerSeq, -ReqNo, Socket, NonceAcc, Key)
                 end, Nonce, PeerClock).
 
@@ -135,7 +135,7 @@ send_msg_data(MsgData, OutReqNo, Socket, Nonce, Key) ->
     SendData = iolist_to_binary(
                    message:ssb_encoder(proplists:get_value(~"value", PropList),
                                        fun message:ssb_encoder/3, [pretty, use_nil])),
-    ?LOG_DEBUG("EBT: sending msg to output req ~p~n", [OutReqNo]),
+    ?LOG_DEBUG("EBT: sending msg ~p to output req ~p~n", [SendData, OutReqNo]),
     Flags = rpc_processor:create_flags(1, 0, 2),
     Header = rpc_processor:create_header(Flags, size(SendData), OutReqNo),
     utils:send_data(utils:combine(Header, SendData), Socket, Nonce, Key).
