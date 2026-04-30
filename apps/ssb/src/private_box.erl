@@ -20,7 +20,8 @@
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
--include_lib("ssb/include/ssb.hrl").
+%% only needed for debugging
+%% -include_lib("ssb/include/ssb.hrl").
 
 -export([encrypt/2,
          decrypt/1,
@@ -69,7 +70,7 @@ decrypt(Boxed) ->
 %% True when the content binary ends with ".box".
 -spec is_private(binary()) -> boolean().
 is_private(Content) when is_binary(Content) ->
-    binary:longest_common_suffix([Content, <<".box">>]) == 4;
+    binary:longest_common_suffix([Content, ~".box"]) == 4;
 is_private(_) ->
     false.
 
