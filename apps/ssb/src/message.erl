@@ -26,7 +26,7 @@ new_msg(Previous, Sequence, Content, {PubKey, PrivKey}) ->
                       hash = Hash,
                       content = Content,
                       received = Timestamp},
-    EncNewMsg = ssb_encoder({msg_to_proplist(NewMsg)},
+    EncNewMsg = ssb_encoder({canonical_sign_props(NewMsg)},
                             fun ssb_encoder/3,
                             [pretty, use_nil]),
     Sig = enacl:sign_detached(EncNewMsg,
@@ -131,12 +131,8 @@ validate(true, MsgProps) ->
     end.
 
 add_sig(NewMsg, EncSig) ->
-    NewMsgList = msg_to_proplist(NewMsg) ++
-        [{~"signature", EncSig}],
-    %% added sig to msg before computing id
-    MsgId = compute_id(ssb_encoder({NewMsgList}, fun ssb_encoder/3,
-                            [pretty,
-                             use_nil])),
+    CanonProps = canonical_sign_props(NewMsg) ++ [{~"signature", EncSig}],
+    MsgId = compute_id(ssb_encoder({CanonProps}, fun ssb_encoder/3, [pretty, use_nil])),
     NewMsg#message{id = MsgId,
                    signature = EncSig}.
 
@@ -151,6 +147,17 @@ msg_to_proplist(Msg) ->
                   [] -> []
               end,
     lists:zip(FieldsBinary, MsgTail).
+
+%% Only the 6 fields that SSB signs over — no id, received, validated, swapped.
+canonical_sign_props(#message{previous  = Prev,  author    = Auth,
+                               sequence  = Seq,   timestamp = TS,
+                               hash      = Hash,  content   = Content}) ->
+    [{~"previous",  Prev},
+     {~"author",    Auth},
+     {~"sequence",  Seq},
+     {~"timestamp", TS},
+     {~"hash",      Hash},
+     {~"content",   Content}].
 
 compute_id(Msg) ->
     ?l2b("%" ++
