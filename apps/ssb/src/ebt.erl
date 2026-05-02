@@ -99,15 +99,20 @@ is_vector_clock(_) -> false.
 %% missing (i.e. messages with sequence > their last known sequence).
 handle_clock(ReqNo, {PeerClock}, Socket, Nonce, Key) ->
     lists:foldl(fun({FeedId, EncodedInt}, NonceAcc) ->
-                        {_Rcv, _Sync, PeerSeq} = ebt_vc:decode_clock_int(EncodedInt),
-                        %%?LOG_DEBUG("EBT: decode vector to ~p for feed ~p ~n", [{Rcv, Sync, PeerSeq}, FeedId]),
-                        send_feed_msgs_after(FeedId, PeerSeq, -ReqNo, Socket, NonceAcc, Key)
+                        {Rep, Rec, PeerSeq} = ebt_vc:decode_clock_int(EncodedInt),
+                        ?LOG_DEBUG("EBT: decode vector to ~p for feed ~p ~n", [{Rep, Rec, PeerSeq},
+                            {FeedId, EncodedInt}]),
+                        send_feed_msgs_after(FeedId, {Rep, Rec,PeerSeq}, -ReqNo, Socket, NonceAcc, Key)
                 end, Nonce, PeerClock).
+
+send_feed_msgs_after(_, {false, _, _}, _, _, _, _) -> ok;
+
+send_feed_msgs_after(_, {true, false, _}, _, _, _, _) -> ok;
 
 %% Iterate through a feed and send all messages with sequence > AfterSeq.
 %% Each message is re-encoded: only the "value" field is sent, not the full
 %% {key, value, timestamp} envelope stored on disk.
-send_feed_msgs_after(FeedId, AfterSeq, OutReqNo, Socket, Nonce, Key) ->
+send_feed_msgs_after(FeedId, {true, true,AfterSeq}, OutReqNo, Socket, Nonce, Key) ->
     Pid = utils:find_or_create_feed_pid(FeedId),
     case Pid of
         bad ->
