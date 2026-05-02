@@ -157,13 +157,12 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [?gossip, ?ping],
 proc_request(_Calls, ReqNo, #ssb_rpc{name = [?whoami],
                              args = []}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
-    Flags = create_flags(1,0,10),
+    %% stream+end+json closes only this call; never send ?RPC_END/?BOX_END
+    %% while other streams (e.g. EBT) may be active.
+    Flags = create_flags(1, 1, 2),
     Body = whoami(),
     Header = create_header(Flags, size(Body), -ReqNo),
-    Data = utils:combine(Header, Body),
-    NewNonce = utils:send_data(Data, Socket, Nonce, SecretBoxKey),
-    NewNonce1 = utils:send_data(?RPC_END, Socket, NewNonce, SecretBoxKey),
-    utils:send_data(?BOX_END, Socket, NewNonce1, SecretBoxKey);
+    utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
 
 proc_request(Calls, ReqNo, #ssb_rpc{name = [?blobs, ?createwants],
                              args = []}
@@ -208,11 +207,10 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobsget],
 proc_request(_Calls, ReqNo, #ssb_rpc{name = [?tunnel, ~"isRoom"],
                              args = []}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
-    Flags = create_flags(0,0,2),
+    Flags = create_flags(1, 1, 2),
     TrueEnd = message:ssb_encoder(false, fun message:ssb_encoder/3, [pretty]),
     Header = create_header(Flags, size(TrueEnd), -ReqNo),
-    utils:send_data(utils:combine(utils:combine(Header, TrueEnd), ?RPC_END),
-                    Socket, Nonce, SecretBoxKey);
+    utils:send_data(utils:combine(Header, TrueEnd), Socket, Nonce, SecretBoxKey);
 
 proc_request(Calls, ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"],
                              args = Args}
@@ -232,7 +230,7 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"],
             Flags = create_flags(1, 0, 2),
             InitVectorEnc = utils:encode_rec(ebt:initial_vector()),
             Header = create_header(Flags, size(InitVectorEnc), -ReqNo),
-            ?LOG_DEBUG("Answering ebt_rep with ~p ~n", [{Header, InitVectorEnc}]),
+            ?LOG_DEBUG("Answering ebt_rep req ~p with ~p ~n", [ReqNo, {Header, InitVectorEnc}]),
             %% Keep the duplex stream open — do NOT send RPC_END
             utils:send_data(utils:combine(Header, InitVectorEnc),
                             Socket, Nonce, SecretBoxKey);
@@ -245,12 +243,10 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"],
 
 proc_request(_Calls, ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
     ?LOG_DEBUG("Fall thru with ~p ~n", [ReqBody]),
-    Flags = create_flags(0,1,2),
+    Flags = create_flags(1, 1, 2),
     TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
     Header = create_header(Flags, size(TrueEnd), -ReqNo),
-    NewNonce = utils:send_data(utils:combine(Header, TrueEnd),
-                               Socket, Nonce, SecretBoxKey),
-    utils:send_data(?RPC_END, Socket, NewNonce, SecretBoxKey).
+    utils:send_data(utils:combine(Header, TrueEnd), Socket, Nonce, SecretBoxKey).
 
 %% Stream BlobData in 65 536-byte binary chunks, then close with JSON true.
 send_blob_chunks(<<>>, ReqNo, Socket, Nonce, Key) ->
