@@ -292,6 +292,12 @@ initiate_ebt(Socket, EncBoxKey, EncNonce, RemotePubKey) ->
 %% so the server sends us everything it has for that feed.
 build_initial_clock(RemotePubKey) ->
     RemoteFeedId = <<"@", (base64:encode(RemotePubKey))/binary, ".ed25519">>,
+    Pid = utils:find_or_create_feed_pid(RemoteFeedId),
+    RemSeq = case ssb_feed:fetch_last_msg(Pid) of
+        #message{sequence = S} -> S;
+        _ -> 0
+    end,
     {OurFeeds} = ebt:initial_vector(),
-    AllFeeds = [{RemoteFeedId, ebt_vc:encode_clock_int(true, true, 0)} | OurFeeds],
+    AllFeeds = [{RemoteFeedId,
+        ebt_vc:encode_clock_int(true, true, RemSeq)} | OurFeeds],
     utils:encode_rec({AllFeeds}).
