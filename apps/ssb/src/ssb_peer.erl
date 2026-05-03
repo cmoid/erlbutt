@@ -286,6 +286,7 @@ initiate_ebt(Socket, EncBoxKey, EncNonce, RemotePubKey) ->
     N1 = send_data(combine(Header1, EbtReq), Socket, EncNonce, EncBoxKey),
     Clock = build_initial_clock(RemotePubKey),
     Header2 = rpc_processor:create_header(Flags, size(Clock), 1),
+    ?LOG_DEBUG("Send initial vector ~p ~n", [Clock]),
     send_data(combine(Header2, Clock), Socket, N1, EncBoxKey).
 
 %% Build our initial vector clock, including the remote peer's feedId at seq 0
