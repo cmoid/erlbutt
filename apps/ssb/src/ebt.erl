@@ -120,13 +120,19 @@ send_feed_msgs_after(FeedId, {true, true,AfterSeq}, OutReqNo, Socket, Nonce, Key
         _ ->
             ssb_feed:foldl(Pid,
                            fun(MsgData, NonceAcc) ->
-                                   #message{sequence = Seq} =
-                                       message:decode(MsgData, false),
-                                   case Seq > AfterSeq of
-                                       true ->
-                                           send_msg_data(MsgData, OutReqNo,
-                                                         Socket, NonceAcc, Key);
-                                       false ->
+                                   try
+                                       #message{sequence = Seq} =
+                                           message:decode(MsgData, false),
+                                       case Seq > AfterSeq of
+                                           true ->
+                                               send_msg_data(MsgData, OutReqNo,
+                                                             Socket, NonceAcc, Key);
+                                           false ->
+                                               NonceAcc
+                                       end
+                                   catch
+                                       _:Err ->
+                                           ?LOG_INFO("EBT: skipping bad stored msg: ~p~n", [Err]),
                                            NonceAcc
                                    end
                            end, Nonce)
@@ -159,6 +165,6 @@ store_message(Body) ->
                 ssb_feed:store_msg(Pid, Msg)
         end
     catch
-        error:Reason ->
+        _:Reason ->
             ?LOG_INFO("EBT: failed to decode/store message: ~p~n", [Reason])
     end.
