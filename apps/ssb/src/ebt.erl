@@ -105,9 +105,9 @@ handle_clock(ReqNo, {PeerClock}, Socket, Nonce, Key) ->
                         send_feed_msgs_after(FeedId, {Rep, Rec,PeerSeq}, -ReqNo, Socket, NonceAcc, Key)
                 end, Nonce, PeerClock).
 
-send_feed_msgs_after(_, {false, _, _}, _, _, _, _) -> ok;
+send_feed_msgs_after(_, {false, _, _}, _, _, Nonce, _) -> Nonce;
 
-send_feed_msgs_after(_, {true, false, _}, _, _, _, _) -> ok;
+send_feed_msgs_after(_, {true, false, _}, _, _, Nonce, _) -> Nonce;
 
 %% Iterate through a feed and send all messages with sequence > AfterSeq.
 %% Each message is re-encoded: only the "value" field is sent, not the full
