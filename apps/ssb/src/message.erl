@@ -17,7 +17,7 @@
 
 
 new_msg(Previous, Sequence, Content, {PubKey, PrivKey}) ->
-    Timestamp = integer_to_binary(current_time()),
+    Timestamp = current_time(),
     Hash = ~"sha256",
     NewMsg = #message{previous = Previous,
                       author = PubKey,
