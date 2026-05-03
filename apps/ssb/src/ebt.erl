@@ -150,7 +150,7 @@ send_msg_data(MsgData, OutReqNo, Socket, Nonce, Key) ->
 %% and createHistoryStream with keys:false.
 store_message(Body) ->
     try
-        Msg = message:decode_value(Body, false),
+        Msg = message:decode_value(Body, true),
         case utils:find_or_create_feed_pid(Msg#message.author) of
             bad ->
                 ?LOG_INFO("EBT: bad author in received message: ~p~n",
