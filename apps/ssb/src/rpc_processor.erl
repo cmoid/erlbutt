@@ -81,6 +81,9 @@ handle_call({rpc_process, {Header, Body}, #ssb_conn{
     ReqNo = req_no(Header),
     HasSeen = ets:lookup(Calls, ReqNo),
     {Non, Res} = case HasSeen of
+        [{ReqNo, noop}] ->
+            %% Stream already ended or handled; silently ignore continuations.
+            {Nonce, none};
         [{ReqNo, Mod}] ->
             ?LOG_DEBUG("Stream continuation for req: ~p ~n", [ReqNo]),
             NewNonce = Mod:handle_data(ReqNo, Body, Conn),
@@ -144,9 +147,10 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [?createhistorystream],
         fun message:ssb_encoder/3, [pretty])),
                     Socket, Nonce, SecretBoxKey);
 
-proc_request(_Calls, ReqNo, #ssb_rpc{name = [?gossip, ?ping],
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?gossip, ?ping],
                              args = [{_Args}]}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    ets:insert(Calls, {ReqNo, noop}),
     Flags = create_flags(1,0,10),
     TimeStamp = iolist_to_binary(message:ssb_encoder(integer_to_binary(current_time()),
                                     fun message:ssb_encoder/3, [pretty])),
@@ -241,8 +245,9 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"],
             utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey)
     end;
 
-proc_request(_Calls, ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
+proc_request(Calls, ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
     ?LOG_DEBUG("Fall thru with ~p ~n", [ReqBody]),
+    ets:insert(Calls, {ReqNo, noop}),
     Flags = create_flags(1, 1, 2),
     TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
     Header = create_header(Flags, size(TrueEnd), -ReqNo),
