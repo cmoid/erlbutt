@@ -49,7 +49,7 @@ create_key_pair() ->
     {?l2b(base_64(Pub)), ?l2b(base_64(Priv))}.
 
 base_64(Binary) ->
-    base64:encode_to_string(Binary).
+    binary_to_list(base64:encode(Binary)).
 
 display_pub(PubKey) ->
     ?l2b("@" ++ ?b2l(PubKey) ++ ".ed25519").
