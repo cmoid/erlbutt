@@ -168,6 +168,7 @@ check_id(<<"@",Id/binary>>) ->
         try
             case binary:matches(Id,[~".ed25519"]) of
                 [] ->
+                    ?LOG_DEBUG("Bad author ~p ~n", [Id]),
                     bad;
                 _Else ->
                     RawId = hd(string:replace(Id,".ed25519","")),
