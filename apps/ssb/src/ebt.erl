@@ -173,8 +173,7 @@ store_message(Body) ->
             ?LOG_INFO("EBT: failed to decode/store message: ~p~n", [Reason])
     end.
 
-check_feed_cnt(Cnt) ->
-    if (Cnt rem 1000 == 0) ->
-        ?LOG_DEBUG("EBT: feeds processed: ~p~n", [Cnt]);
-        true -> ok
-    end.
+check_feed_cnt(Cnt) when Cnt rem 1000 =:= 0 ->
+    ?LOG_DEBUG("EBT: feeds processed: ~p~n", [Cnt]);
+check_feed_cnt(_) ->
+    ok.
