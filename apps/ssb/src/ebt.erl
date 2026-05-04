@@ -98,12 +98,16 @@ is_vector_clock(_) -> false.
 %% For each feed in the peer's clock, send them any messages they are
 %% missing (i.e. messages with sequence > their last known sequence).
 handle_clock(ReqNo, {PeerClock}, Socket, Nonce, Key) ->
-    lists:foldl(fun({FeedId, EncodedInt}, NonceAcc) ->
+    {NewNonce, Cnt} =
+    lists:foldl(fun({FeedId, EncodedInt}, {NonceAcc, Fc}) ->
+                        check_feed_cnt(Fc),
                         {Rep, Rec, PeerSeq} = ebt_vc:decode_clock_int(EncodedInt),
                         ?LOG_DEBUG("EBT: decode vector to ~p for feed ~p ~n", [{Rep, Rec, PeerSeq},
                             {FeedId, EncodedInt}]),
-                        send_feed_msgs_after(FeedId, {Rep, Rec,PeerSeq}, -ReqNo, Socket, NonceAcc, Key)
-                end, Nonce, PeerClock).
+                        {send_feed_msgs_after(FeedId, {Rep, Rec,PeerSeq}, -ReqNo, Socket, NonceAcc, Key), Fc + 1}
+                end, {Nonce, 0}, PeerClock),
+    ?LOG_DEBUG("EBT: handle_clock: processed ~p clocks ~n", [Cnt]),
+    NewNonce.
 
 send_feed_msgs_after(_, {false, _, _}, _, _, Nonce, _) -> Nonce;
 
@@ -160,11 +164,17 @@ store_message(Body) ->
         case utils:find_or_create_feed_pid(Msg#message.author) of
             bad ->
                 ?LOG_INFO("EBT: bad author in received message: ~p~n",
-                          [Msg#message.author]);
+                    [{Msg#message.author, Msg#message.id}]);
             Pid ->
                 ssb_feed:store_msg(Pid, Msg)
         end
     catch
         _:Reason ->
             ?LOG_INFO("EBT: failed to decode/store message: ~p~n", [Reason])
+    end.
+
+check_feed_cnt(Cnt) ->
+    if (Cnt rem 1000 == 0) ->
+        ?LOG_DEBUG("EBT: feeds processed: ~p~n", [Cnt]);
+        true -> ok
     end.
