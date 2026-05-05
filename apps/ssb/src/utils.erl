@@ -24,8 +24,8 @@
          check_id/1,
          update_refs/1,
          log/1,
-         ping_req/0,
-         whoami_req/0,
+         ping_req/1,
+         whoami_req/1,
          error_msg/2,
          nat_decode/1,
          size/1]).
@@ -182,20 +182,20 @@ check_id(<<"@",Id/binary>>) ->
 check_id(_Else) ->
     bad.
 
-ping_req() ->
+ping_req(ReqNo) ->
     Flags = rpc_processor:create_flags(1,0,2),
     Body = encode_rec({[{~"name",[~"gossip",~"ping"]},
                           {~"args",[{[{~"timeout", 300000}]}]},
                           {~"type",~"duplex"}]}),
-    Header = rpc_processor:create_header(Flags, utils:size(Body), 1),
+    Header = rpc_processor:create_header(Flags, utils:size(Body), ReqNo),
     utils:combine(Header, Body).
 
-whoami_req() ->
+whoami_req(ReqNo) ->
     Flags = rpc_processor:create_flags(1,0,2),
     Body = encode_rec({[{~"name",[?whoami]},
                           {~"args",[]},
                           {~"type",~"sync"}]}),
-    Header = rpc_processor:create_header(Flags, utils:size(Body), 1),
+    Header = rpc_processor:create_header(Flags, utils:size(Body), ReqNo),
     utils:combine(Header, Body).
 
 error_msg(Name, Mess) ->

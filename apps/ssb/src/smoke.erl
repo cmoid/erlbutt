@@ -27,11 +27,11 @@ remote_long_pk() ->
 
 smoke() ->
     NewClient = secret_handshake("localhost"),
-    ssb_peer:send(NewClient, utils:ping_req()).
+    ssb_peer:send(NewClient, utils:ping_req(1)).
 
 whoami(Peer) ->
     NewClient = secret_handshake(Peer),
-    ssb_peer:send(NewClient, utils:whoami_req()).
+    ssb_peer:send(NewClient, utils:whoami_req(1)).
 
 %% This function is kind of a joke performance-wise :)
 largest_feed() ->
