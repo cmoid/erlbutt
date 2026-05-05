@@ -298,6 +298,9 @@ flags_test() ->
     ?assert({1,1,2} == parse_flags(<<14>>)),
     ?assert(<<14>> == create_flags(1,1,2)).
 
+flags_eq_test() ->
+    ?assert(create_flags(1,0,10) == create_flags(1,0,2)).
+
 req_no_test() ->
     Flags = create_flags(1,1,2),
     Header = create_header(Flags,size(~"true"), 5),
