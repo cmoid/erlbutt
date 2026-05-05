@@ -212,24 +212,25 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [?tunnel, ~"isRoom"],
                              args = []}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     Flags = create_flags(1, 1, 2),
-    TrueEnd = message:ssb_encoder(false, fun message:ssb_encoder/3, [pretty]),
-    Header = create_header(Flags, size(TrueEnd), -ReqNo),
-    utils:send_data(utils:combine(Header, TrueEnd), Socket, Nonce, SecretBoxKey);
+    FalseEnd = message:ssb_encoder(false, fun message:ssb_encoder/3, [pretty]),
+    Header = create_header(Flags, size(FalseEnd), -ReqNo),
+    utils:send_data(utils:combine(Header, FalseEnd), Socket, Nonce, SecretBoxKey);
 
 proc_request(Calls, ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"],
                              args = Args}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     {Version, Format} = case Args of
         [{ArgProps}] ->
-            {proplists:get_value(~"version", ArgProps),
-             proplists:get_value(~"format", ArgProps)};
+            {proplists:get_value(~"version", ArgProps, 3),
+             proplists:get_value(~"format", ArgProps, ~"classic")};
         _ ->
             {undefined, undefined}
     end,
-    %% Temporarily ignore Format to support PonchoWonky, which doesn't send it
-    %% It's sort of not really needed currently, will revisit this.
+    %% ponchoWonky/tildefriends don't use these args, though they send the version
+    %% and and tildefriends sends the format. We'll use the defaults for
+    %% both since they seem to be dead args for now.
     case {Version, Format} of
-        {3, Format} ->
+        {3, ~"classic"} ->
             ets:insert(Calls, {ReqNo, ebt}),
             Flags = create_flags(1, 0, 2),
             InitVectorEnc = utils:encode_rec(ebt:initial_vector()),
