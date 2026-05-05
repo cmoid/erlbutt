@@ -142,9 +142,10 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [?createhistorystream],
                              args = [{_Args}]}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     Flags = create_flags(1,1,2),
-    Header = create_header(Flags, size(~"true"), -ReqNo),
-    utils:send_data(utils:combine(Header, message:ssb_encoder(true,
-        fun message:ssb_encoder/3, [pretty])),
+    %% function not supported so just send true to end stream
+    TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
+    Header = create_header(Flags, size(TrueEnd), -ReqNo),
+    utils:send_data(utils:combine(Header, TrueEnd),
                     Socket, Nonce, SecretBoxKey);
 
 proc_request(Calls, ReqNo, #ssb_rpc{name = [?gossip, ?ping],
