@@ -15,8 +15,6 @@
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
--include_lib("ssb/include/ssb.hrl").
-
 %% ===================================================================
 %% common_test callbacks
 %% ===================================================================

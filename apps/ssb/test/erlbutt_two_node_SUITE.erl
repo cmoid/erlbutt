@@ -88,7 +88,7 @@ two_node_ebt_replication_test(Config) ->
     AId     = rpc:call(NodeA, keys, pub_key_disp, []),
     AFeedPid = rpc:call(NodeA, utils, find_or_create_feed_pid, [AId]),
     ok = rpc:call(NodeA, ssb_feed, post_content,
-                  [AFeedPid, <<"hello from node_a">>]),
+                  [AFeedPid, ~"hello from node_a"]),
     #message{sequence = Seq} =
         rpc:call(NodeA, ssb_feed, fetch_last_msg, [AFeedPid]),
     ?assert(Seq >= 1),
