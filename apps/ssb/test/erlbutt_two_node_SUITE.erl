@@ -20,7 +20,9 @@
 -export([two_node_handshake_test/1,
          two_node_ebt_replication_test/1,
          two_node_blob_wants_test/1,
-         blob_sink_loop/2]).
+         two_node_blob_fetch_test/1,
+         blob_sink_loop/2,
+         blob_fetch_loop/3]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -35,7 +37,8 @@
 all() ->
     [two_node_handshake_test,
      two_node_ebt_replication_test,
-     two_node_blob_wants_test].
+     two_node_blob_wants_test,
+     two_node_blob_fetch_test].
 
 init_per_suite(Config) ->
     %% peer:start/1 requires the calling node to be distributed.
@@ -155,6 +158,42 @@ two_node_blob_wants_test(Config) ->
     SinkPid ! stop,
     rpc:call(NodeB, gen_server, stop, [PeerPid]).
 
+%% Connect from node_b to node_a, request a blob via blobs.get, and verify
+%% that node_b receives the complete blob data.
+two_node_blob_fetch_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    %% Store a blob on A
+    BlobData = ~"erlbutt two-node blob fetch test payload",
+    BlobId   = rpc:call(NodeA, blobs, store, [BlobData]),
+    ?assert(rpc:call(NodeA, blobs, has, [BlobId]) =:= true),
+
+    %% Spawn a chunk-accumulator on node B.
+    TestPid = self(),
+    TestRef = make_ref(),
+    SinkPid = spawn(NodeB, erlbutt_two_node_SUITE, blob_fetch_loop,
+                    [TestPid, TestRef, <<>>]),
+    rpc:call(NodeB, erlang, register, [blob_fetch_sink, SinkPid]),
+
+    %% B connects to A (full SHS + EBT)
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                              ["localhost", ?PORT_A, ACurvePk]),
+
+    %% B requests the blob from A
+    ok = rpc:call(NodeB, ssb_peer, fetch_blob, [PeerPid, BlobId]),
+
+    %% Wait for the complete blob data
+    receive
+        {TestRef, blob_fetched, BlobData} -> ok
+    after 3000 ->
+        ct:fail("timed out waiting for blob fetch from node_a")
+    end,
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
 %% Module-level sink loop — must be exported so it can be spawned on a remote node.
 blob_sink_loop(TestPid, TestRef) ->
     receive
@@ -163,6 +202,15 @@ blob_sink_loop(TestPid, TestRef) ->
             blob_sink_loop(TestPid, TestRef);
         stop ->
             ok
+    end.
+
+%% Accumulates binary chunks from blob_get_client; delivers assembled blob on done.
+blob_fetch_loop(TestPid, TestRef, Acc) ->
+    receive
+        {chunk, Data} ->
+            blob_fetch_loop(TestPid, TestRef, <<Acc/binary, Data/binary>>);
+        done ->
+            TestPid ! {TestRef, blob_fetched, Acc}
     end.
 
 %%% Helpers -------------------------------------------------------------

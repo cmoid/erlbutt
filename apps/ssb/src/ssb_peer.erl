@@ -14,7 +14,8 @@
          start/2,
          start/3,
          send/2,
-         request_blob_wants/2]).
+         request_blob_wants/2,
+         fetch_blob/2]).
 
 %% gen_server exports
 -export([init/1, handle_call/3, handle_cast/2,
@@ -160,7 +161,19 @@ handle_info(Info, State) ->
 request_blob_wants(Pid, BlobIds) ->
     gen_server:call(Pid, {request_blob_wants, BlobIds}).
 
+%% Send blobs.get on req 3.  Registers blob_get_client to handle
+%% the incoming binary chunks on stream -3.
+fetch_blob(Pid, BlobId) ->
+    gen_server:call(Pid, {fetch_blob, BlobId}).
 
+handle_call({fetch_blob, BlobId}, _From,
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc} = State) ->
+    ok = rpc_processor:register_stream(RpcProc, -3, blob_get_client),
+    NewEncNonce = send_blob_get(Socket, EncBoxKey, EncNonce, BlobId),
+    {reply, ok, State#sbox_state{enc_nonce = NewEncNonce}};
 
 handle_call({request_blob_wants, BlobIds}, _From,
             #sbox_state{socket = Socket,
@@ -307,6 +320,15 @@ initiate_ebt(Socket, EncBoxKey, EncNonce, RemotePubKey) ->
     Header2 = rpc_processor:create_header(Flags, size(Clock), 1),
     ?LOG_DEBUG("Send initial vector ~p ~n", [Clock]),
     send_data(combine(Header2, Clock), Socket, N1, EncBoxKey).
+
+%% Send blobs.get source RPC on req 3.
+send_blob_get(Socket, Key, Nonce, BlobId) ->
+    GetRpc = utils:encode_rec({[{~"name", [?blobs, ?blobsget]},
+                                 {~"args", [BlobId]},
+                                 {~"type", ~"source"}]}),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(GetRpc), 3),
+    send_data(combine(Header, GetRpc), Socket, Nonce, Key).
 
 %% Send blobs.createWants RPC on req 2, followed by want messages for BlobIds.
 send_blob_wants(Socket, Key, Nonce, BlobIds) ->
