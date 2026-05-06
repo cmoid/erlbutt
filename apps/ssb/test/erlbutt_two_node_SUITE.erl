@@ -18,7 +18,9 @@
          end_per_testcase/2]).
 
 -export([two_node_handshake_test/1,
-         two_node_ebt_replication_test/1]).
+         two_node_ebt_replication_test/1,
+         two_node_blob_wants_test/1,
+         blob_sink_loop/2]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -32,7 +34,8 @@
 
 all() ->
     [two_node_handshake_test,
-     two_node_ebt_replication_test].
+     two_node_ebt_replication_test,
+     two_node_blob_wants_test].
 
 init_per_suite(Config) ->
     %% peer:start/1 requires the calling node to be distributed.
@@ -112,6 +115,56 @@ two_node_ebt_replication_test(Config) ->
 
     rpc:call(NodeB, gen_server, stop, [PeerPid]).
 
+%% Store a blob on node_a, connect from node_b, send a want, and verify
+%% that node_b receives the have response with the correct blob size.
+two_node_blob_wants_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    %% Store a blob on A
+    BlobData = ~"erlbutt two-node blob wants test payload",
+    BlobId   = rpc:call(NodeA, blobs, store, [BlobData]),
+    ExpectedSize = byte_size(BlobData),
+
+    %% Spawn a have-collector on node B that forwards messages to this process.
+    %% Cross-node sends work because Erlang PIDs are location-transparent.
+    %% Use spawn/4 with a module-level fun — closures don't serialize reliably across nodes.
+    TestPid = self(),
+    TestRef = make_ref(),
+    SinkPid = spawn(NodeB, erlbutt_two_node_SUITE, blob_sink_loop, [TestPid, TestRef]),
+    rpc:call(NodeB, erlang, register, [blob_haves_sink, SinkPid]),
+
+    ?assert(rpc:call(NodeA, blobs, has, [BlobId]) =:= true),
+
+    %% B connects to A (full SHS + EBT)
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                              ["localhost", ?PORT_A, ACurvePk]),
+
+    %% Send blob want from B → A (createWants RPC + want message)
+    ok = rpc:call(NodeB, ssb_peer, request_blob_wants, [PeerPid, [BlobId]]),
+
+    %% Wait for the have response from A
+    receive
+        {TestRef, have, BlobId, ExpectedSize} -> ok
+    after 3000 ->
+        ct:fail("timed out waiting for blob have from node_a")
+    end,
+
+    SinkPid ! stop,
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Module-level sink loop — must be exported so it can be spawned on a remote node.
+blob_sink_loop(TestPid, TestRef) ->
+    receive
+        {have, Id, Sz} ->
+            TestPid ! {TestRef, have, Id, Sz},
+            blob_sink_loop(TestPid, TestRef);
+        stop ->
+            ok
+    end.
+
 %%% Helpers -------------------------------------------------------------
 
 %% Start a peer BEAM node, load code paths, configure and start ssb.
@@ -128,17 +181,25 @@ start_ssb_node(Name, DataDir, Port, PAs) ->
     {ok, _} = rpc:call(Node, application, ensure_all_started, [ssb]),
     {ok, Peer, Node}.
 
-%% Build -pa flag strings for all ebin dirs in the test build.
+%% Build -pa flag strings for all ebin and test dirs in the test build.
+%% Test dirs are needed so CT suite modules (like this one) are available
+%% on remote nodes spawned via peer.
 pa_args() ->
     LibDir = filename:join(build_dir(), "lib"),
     {ok, Libs} = file:list_dir(LibDir),
     lists:flatmap(
         fun(Lib) ->
             EbinDir = filename:join([LibDir, Lib, "ebin"]),
-            case filelib:is_dir(EbinDir) of
+            TestDir = filename:join([LibDir, Lib, "test"]),
+            Ebin = case filelib:is_dir(EbinDir) of
                 true  -> ["-pa", EbinDir];
                 false -> []
-            end
+            end,
+            Test = case filelib:is_dir(TestDir) of
+                true  -> ["-pa", TestDir];
+                false -> []
+            end,
+            Ebin ++ Test
         end, Libs).
 
 build_dir() ->
