@@ -13,7 +13,8 @@
          start_link/4,
          start/2,
          start/3,
-         send/2]).
+         send/2,
+         request_blob_wants/2]).
 
 %% gen_server exports
 -export([init/1, handle_call/3, handle_cast/2,
@@ -154,6 +155,24 @@ handle_info(Info, State) ->
     ?LOG_INFO("Stopped presumably for normal reason: ~p ~n",[Info]),
     {stop, normal, State}.
 
+%% Send blobs.createWants on req 2, then a want message for each BlobId.
+%% Registers blob_client to handle have responses on the -2 stream.
+request_blob_wants(Pid, BlobIds) ->
+    gen_server:call(Pid, {request_blob_wants, BlobIds}).
+
+
+
+handle_call({request_blob_wants, BlobIds}, _From,
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc} = State) ->
+    ok = rpc_processor:register_stream(RpcProc, -2, blob_client),
+    NewEncNonce = send_blob_wants(Socket, EncBoxKey, EncNonce, BlobIds),
+    {reply, ok, State#sbox_state{enc_nonce = NewEncNonce}};
+
+
+
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
@@ -288,6 +307,18 @@ initiate_ebt(Socket, EncBoxKey, EncNonce, RemotePubKey) ->
     Header2 = rpc_processor:create_header(Flags, size(Clock), 1),
     ?LOG_DEBUG("Send initial vector ~p ~n", [Clock]),
     send_data(combine(Header2, Clock), Socket, N1, EncBoxKey).
+
+%% Send blobs.createWants RPC on req 2, followed by want messages for BlobIds.
+send_blob_wants(Socket, Key, Nonce, BlobIds) ->
+    WantsRpc = utils:encode_rec({[{~"name", [?blobs, ?createwants]},
+                                   {~"args", []},
+                                   {~"type", ~"duplex"}]}),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header1 = rpc_processor:create_header(Flags, size(WantsRpc), 2),
+    N1 = send_data(combine(Header1, WantsRpc), Socket, Nonce, Key),
+    WantBody = utils:encode_rec({[{Id, -1} || Id <- BlobIds]}),
+    Header2 = rpc_processor:create_header(Flags, size(WantBody), 2),
+    send_data(combine(Header2, WantBody), Socket, N1, Key).
 
 %% Build our initial vector clock, including the remote peer's feedId at seq 0
 %% so the server sends us everything it has for that feed.
