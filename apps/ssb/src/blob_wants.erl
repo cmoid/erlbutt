@@ -42,14 +42,10 @@ handle_data(ReqNo, Body, #ssb_conn{socket = Socket,
 %% For each want entry check whether we hold the blob.
 %% Collect all haves into a single response object.
 respond_to_wants(ReqNo, Props, Socket, Nonce, Key) ->
-    Haves = lists:foldl(fun({BlobId, Val}, Acc) when Val < 0 ->
-                                case blobs:size_of(BlobId) of
-                                    {ok, BlobSize} -> [{BlobId, BlobSize} | Acc];
-                                    _              -> Acc
-                                end;
-                           (_, Acc) ->
-                                Acc
-                        end, [], Props),
+    Haves = [{BlobId, BlobSize}
+             || {BlobId, Val} <- Props,
+                Val < 0,
+                {ok, BlobSize} <- [blobs:size_of(BlobId)]],
     case Haves of
         [] ->
             Nonce;
