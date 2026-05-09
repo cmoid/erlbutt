@@ -10,9 +10,12 @@ main([Host, Command]) ->
     code:add_path("./_build/default/lib/enacl/ebin/"),
     code:add_path("./_build/default/lib/ranch/ebin/"),
     logger:set_primary_config(level, error),
+    SSBHome = os:getenv("SSB_HOME", "."),
+    application:set_env(ssb, ssb_home, SSBHome),
     config:start_link(),
     keys:start_link(),
-    ?INFO("current working directory is ~p ~n",[file:get_cwd()]),
+    ?INFO("current working directory is ~p ~n and repo dir is ~p~n",
+        [file:get_cwd(), config:ssb_repo_loc()]),
 
    %% invoke the command passed as argument
     F = fun() ->
@@ -21,14 +24,14 @@ main([Host, Command]) ->
                 ?INFO("~s~n",[Command]),
                 Req = case Command of
                              "whoami" ->
-                                 utils:whoami_req();
+                                 utils:whoami_req(1);
                              "menu" ->
                                  menu_req();
                              "ping" ->
-                                 utils:ping_req()
+                                 utils:ping_req(1)
                          end,
                 Resp = ssb_peer:send(NewClient, Req),
-                ?INFO("~s~n",[Resp])
+                ?INFO("I sent the request and got: ~s~n",[Resp])
         end,
     F();
 
@@ -37,6 +40,7 @@ main(Args) ->
     erlang:halt(1).
 
 secret_handshake(Host) ->
+    ?INFO("secret_handshake: ~s and key: ~s\n", [Host, keys:pub_key()]),
     {ok, NewSbotClient} = ssb_peer:start_link(Host, remote_long_pk()),
     NewSbotClient.
 

@@ -2,7 +2,7 @@
 %%
 %% Copyright (C) 2023 Charles Moid
 -module(foldl_hacks).
--include("ssb.hrl").
+-include_lib("ssb/include/ssb.hrl").
 -export([branch_root/1,
          reply_root/1]).
 
