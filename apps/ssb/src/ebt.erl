@@ -59,10 +59,10 @@ handle_data(ReqNo, Body, #ssb_conn{socket = Socket,
     Decoded = utils:nat_decode(Body),
     case is_vector_clock(Decoded) of
         true ->
-            ?LOG_DEBUG("EBT: received vector clock ~n", []),
+            ?SSB_DEBUG("EBT: received vector clock ~n", []),
             handle_clock(ReqNo, Decoded, Socket, Nonce, Key);
         false ->
-            ?LOG_DEBUG("EBT: received message from peer ~p ~n", [Body]),
+            ?SSB_DEBUG("EBT: received message from peer ~p ~n", [Body]),
             store_message(Body),
             Nonce
     end.
@@ -102,11 +102,11 @@ handle_clock(ReqNo, {PeerClock}, Socket, Nonce, Key) ->
     lists:foldl(fun({FeedId, EncodedInt}, {NonceAcc, Fc}) ->
                         check_feed_cnt(Fc),
                         {Rep, Rec, PeerSeq} = ebt_vc:decode_clock_int(EncodedInt),
-                        ?LOG_DEBUG("EBT: decode vector to ~p for feed ~p ~n", [{Rep, Rec, PeerSeq},
+                        ?SSB_DEBUG("EBT: decode vector to ~p for feed ~p ~n", [{Rep, Rec, PeerSeq},
                             {FeedId, EncodedInt}]),
                         {send_feed_msgs_after(FeedId, {Rep, Rec,PeerSeq}, -ReqNo, Socket, NonceAcc, Key), Fc + 1}
                 end, {Nonce, 0}, PeerClock),
-    ?LOG_DEBUG("EBT: handle_clock: processed ~p clocks ~n", [Cnt]),
+    ?SSB_DEBUG("EBT: handle_clock: processed ~p clocks ~n", [Cnt]),
     NewNonce.
 
 send_feed_msgs_after(_, {false, _, _}, _, _, Nonce, _) -> Nonce;
@@ -136,7 +136,7 @@ send_feed_msgs_after(FeedId, {true, true,AfterSeq}, OutReqNo, Socket, Nonce, Key
                                        end
                                    catch
                                        _:Err ->
-                                           ?LOG_INFO("EBT: skipping bad stored msg: ~p~n", [Err]),
+                                           ?SSB_INFO("EBT: skipping bad stored msg: ~p~n", [Err]),
                                            NonceAcc
                                    end
                            end, Nonce)
@@ -150,7 +150,7 @@ send_msg_data(MsgData, OutReqNo, Socket, Nonce, Key) ->
     SendData = iolist_to_binary(
                    message:ssb_encoder(proplists:get_value(~"value", PropList),
                                        fun message:ssb_encoder/3, [pretty, use_nil])),
-    ?LOG_DEBUG("EBT: sending msg ~p to output req ~p~n", [SendData, OutReqNo]),
+    ?SSB_DEBUG("EBT: sending msg ~p to output req ~p~n", [SendData, OutReqNo]),
     Flags = rpc_processor:create_flags(1, 0, 2),
     Header = rpc_processor:create_header(Flags, size(SendData), OutReqNo),
     utils:send_data(utils:combine(Header, SendData), Socket, Nonce, Key).
@@ -163,17 +163,17 @@ store_message(Body) ->
         Msg = message:decode_value(Body, true),
         case utils:find_or_create_feed_pid(Msg#message.author) of
             bad ->
-                ?LOG_INFO("EBT: bad author in received message: ~p~n",
+                ?SSB_INFO("EBT: bad author in received message: ~p~n",
                     [{Msg#message.author, Msg#message.id}]);
             Pid ->
                 ssb_feed:store_msg(Pid, Msg)
         end
     catch
         _:Reason ->
-            ?LOG_INFO("EBT: failed to decode/store message: ~p~n", [Reason])
+            ?SSB_INFO("EBT: failed to decode/store message: ~p~n", [Reason])
     end.
 
 check_feed_cnt(Cnt) when Cnt rem 1000 =:= 0 ->
-    ?LOG_DEBUG("EBT: feeds processed: ~p~n", [Cnt]);
+    ?SSB_DEBUG("EBT: feeds processed: ~p~n", [Cnt]);
 check_feed_cnt(_) ->
     ok.

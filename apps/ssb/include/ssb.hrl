@@ -8,6 +8,10 @@
 -define(b2l(List), binary_to_list(List)).
 -define(pgv(K,V), proplists:get_value(K, V)).
 
+-define(SSB_DEBUG(Format, Args), ?LOG_DEBUG("~p " ++ Format, [self() | Args])).
+-define(SSB_ERROR(Format, Args), ?LOG_ERROR("~p " ++ Format, [self() | Args])).
+-define(SSB_INFO(Format, Args), ?LOG_INFO("~p " ++ Format, [self() | Args])).
+
 -define(KEEP_ALIVE_GRACE, 1500).
 
 %% This network id is almost the same

@@ -103,7 +103,7 @@ handle_info({tcp, Socket, Data},
                                shook_hands = 1}}
     catch
         error:Reason ->
-            ?LOG_ERROR("Unable to shake hands with stranger ~p ~n",
+            ?SSB_ERROR("Unable to shake hands with stranger ~p ~n",
                    [Reason]),
             {stop, Reason}
     end;
@@ -146,14 +146,14 @@ handle_info(timeout, #sbox_state{ref = Ref,
 handle_info({'EXIT', Pid, Reason}, #sbox_state{rpc_proc = RpcProc} = State) ->
     case Pid of
         RpcProc ->
-            ?LOG_ERROR("ssb_peer: rpc_processor exited ~p~n", [Reason]),
+            ?SSB_ERROR("ssb_peer: rpc_processor exited ~p~n", [Reason]),
             {stop, Reason, State};
         _ ->
             {noreply, State}
     end;
 
 handle_info(Info, State) ->
-    ?LOG_INFO("Stopped presumably for normal reason: ~p ~n",[Info]),
+    ?SSB_INFO("Stopped presumably for normal reason: ~p ~n",[Info]),
     {stop, normal, State}.
 
 %% Send blobs.createWants on req 2, then a want message for each BlobId.
@@ -231,7 +231,7 @@ unbox_and_parse(BoxData, #sbox_state{dec_sbox_key = DecBoxKey,
             Done = Msg == ?BOX_END,
             case Done of
                 true ->
-                    ?LOG_DEBUG("Box end received ~p ~n",[Msg]),
+                    ?SSB_DEBUG("Box end received ~p ~n",[Msg]),
                     {done, NewState};
                 false ->
                     %% now parse rpc
@@ -259,7 +259,7 @@ rpc_parse(Data, #sbox_state{socket = Socket,
                                                 % if partial parse then Rest is the original input
                 {partial, Rest, EncNonce, Response};
             {complete, ?RPC_END, <<>>} ->
-                ?LOG_DEBUG("The rpc call has ended ~n",[]),
+                ?SSB_DEBUG("The rpc call has ended ~n",[]),
                 {complete, <<>>, EncNonce, Response};
             {complete, {Header, Body}, Rest} ->
                 %% Need to track request here somehow
@@ -270,7 +270,7 @@ rpc_parse(Data, #sbox_state{socket = Socket,
                                              socket = Socket,
                                              nonce = EncNonce,
                                              secret_box = EncBoxKey}),
-                ?LOG_DEBUG("The rpc call returned ~p ~n",[Resp]),
+                ?SSB_DEBUG("The rpc call returned ~p ~n",[Resp]),
                 {complete, Rest, ProcEncNonce, Resp}
         end,
 
@@ -287,7 +287,7 @@ rpc_parse(Data, #sbox_state{socket = Socket,
     end.
 
 network_error(Reason, State) ->
-    ?LOG_ERROR("Network error ~p ~n",[Reason]),
+    ?SSB_ERROR("Network error ~p ~n",[Reason]),
     stop({shutdown, conn_closed}, State).
 
 stop(Reason, State) ->
@@ -318,7 +318,7 @@ initiate_ebt(Socket, EncBoxKey, EncNonce, RemotePubKey) ->
     N1 = send_data(combine(Header1, EbtReq), Socket, EncNonce, EncBoxKey),
     Clock = build_initial_clock(RemotePubKey),
     Header2 = rpc_processor:create_header(Flags, size(Clock), 1),
-    ?LOG_DEBUG("Send initial vector ~p ~n", [Clock]),
+    ?SSB_DEBUG("Send initial vector ~p ~n", [Clock]),
     send_data(combine(Header2, Clock), Socket, N1, EncBoxKey).
 
 %% Send blobs.get source RPC on req 3.

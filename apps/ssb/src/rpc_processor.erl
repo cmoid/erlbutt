@@ -85,7 +85,7 @@ handle_call({rpc_process, {Header, Body}, #ssb_conn{
             %% Stream already ended or handled; silently ignore continuations.
             {Nonce, none};
         [{ReqNo, Mod}] ->
-            ?LOG_DEBUG("Stream continuation for req: ~p ~n", [ReqNo]),
+            ?SSB_DEBUG("~p Stream continuation for req: ~p ~n", [self(), ReqNo]),
             NewNonce = Mod:handle_data(ReqNo, Body, Conn),
             {NewNonce, none};
         [] ->
@@ -115,7 +115,7 @@ req_no(Header) ->
 
 create_req(Body) ->
     DecBody = utils:nat_decode(Body),
-    ?LOG_DEBUG("Body decoded is ~p ~n", [DecBody]),
+    ?SSB_DEBUG("Body decoded is ~p ~n", [DecBody]),
     decode_body(DecBody).
 
 decode_body({Props}) ->
@@ -135,7 +135,7 @@ dispatch(Calls, ReqNo, Body, Socket, Nonce, SecretBoxKey) ->
 
 
 proc_response(ReqNo, RespBody) ->
-    ?LOG_DEBUG("The response from ~p was ~p ~n", [ReqNo, RespBody]),
+    ?SSB_DEBUG("The response from ~p was ~p ~n", [ReqNo, RespBody]),
     RespBody.
 
 proc_request(_Calls, ReqNo, #ssb_rpc{name = [?createhistorystream],
@@ -156,7 +156,7 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?gossip, ?ping],
     TimeStamp = iolist_to_binary(message:ssb_encoder(integer_to_binary(current_time()),
                                     fun message:ssb_encoder/3, [pretty])),
     Header = create_header(Flags, size(TimeStamp), -ReqNo),
-    ?LOG_DEBUG("Answering ping with ~p ~n", [{Header, TimeStamp}]),
+    ?SSB_DEBUG("Answering ping with ~p ~n", [{Header, TimeStamp}]),
     utils:send_data(utils:combine(Header, TimeStamp), Socket, Nonce, SecretBoxKey);
 
 proc_request(_Calls, ReqNo, #ssb_rpc{name = [?whoami],
@@ -174,6 +174,8 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?blobs, ?createwants],
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     %% Register this as a live duplex stream so subsequent messages
     %% on the same ReqNo are routed to blob_wants:handle_data/3.
+    %%
+    ?SSB_DEBUG("rpc_processor: createwants reqno ~p~n", [ReqNo]),
     ets:insert(Calls, {ReqNo, blob_wants}),
     %% Send an empty wants map to open the stream; we will push haves
     %% reactively in blob_wants:handle_data/3 as the peer sends wants.
@@ -236,7 +238,7 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"],
             Flags = create_flags(1, 0, 2),
             InitVectorEnc = utils:encode_rec(ebt:initial_vector()),
             Header = create_header(Flags, size(InitVectorEnc), -ReqNo),
-            ?LOG_DEBUG("Answering ebt_rep req ~p with ~p ~n", [ReqNo, {Header, InitVectorEnc}]),
+            ?SSB_DEBUG("Answering ebt_rep req ~p with ~p ~n", [ReqNo, {Header, InitVectorEnc}]),
             %% Keep the duplex stream open — do NOT send RPC_END
             utils:send_data(utils:combine(Header, InitVectorEnc),
                             Socket, Nonce, SecretBoxKey);
@@ -248,7 +250,7 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"],
     end;
 
 proc_request(Calls, ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
-    ?LOG_DEBUG("Fall thru with ~p ~n", [ReqBody]),
+    ?SSB_DEBUG("Fall thru with ~p ~n", [ReqBody]),
     ets:insert(Calls, {ReqNo, noop}),
     Flags = create_flags(1, 1, 2),
     TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
