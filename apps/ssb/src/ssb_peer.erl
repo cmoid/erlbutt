@@ -14,6 +14,7 @@
          start/2,
          start/3,
          send/2,
+         request_ebt/1,
          request_blob_wants/2,
          fetch_blob/2]).
 
@@ -47,6 +48,10 @@ start(Ip, Port, PubKey) when is_integer(Port) ->
 send(Pid, Data) ->
     gen_server:cast(Pid, {send, Data}).
 
+request_ebt(Pid) ->
+    gen_server:cast(Pid, {request_ebt}).
+
+
 %% accept a connection from another peer.
 start_link(Ref, Socket, Transport, Opts) ->
     gen_server:start_link(?MODULE, [Ref, Socket, Transport, Opts], []).
@@ -62,16 +67,15 @@ init([Ip, Port, PubKey]) ->
             shs:client_shake_hands(connect(Ip, Port), PubKey),
         ranch_tcp:setopts(Socket, [{active, false}]),
         {ok, RpcProc} = rpc_processor:start_link(),
-        NewEncNonce = initiate_ebt(Socket, EncBoxKey, EncNonce, PubKey),
-        ok = rpc_processor:register_stream(RpcProc, -1, ebt),
         ranch_tcp:setopts(Socket, [{active, once}]),
         {ok, #sbox_state{socket = Socket,
                          transport = ranch_tcp,
                          dec_sbox_key = DecBoxKey,
                          enc_sbox_key = EncBoxKey,
                          dec_nonce = DecNonce,
-                         enc_nonce = NewEncNonce,
+                         enc_nonce = EncNonce,
                          rpc_proc = RpcProc,
+                         remote_pk = PubKey,
                          shook_hands = 1}}
     catch
         error:Reason ->
@@ -198,6 +202,15 @@ handle_cast({send, Data}, #sbox_state{socket = Socket,
     Transport:setopts(Socket, [{active, once}]),
     {noreply, State#sbox_state{enc_nonce = NewEncNonce}};
 
+handle_cast({request_ebt}, #sbox_state{socket = Socket,
+                                       enc_sbox_key = EncBoxKey,
+                                       enc_nonce = EncNonce,
+                                       rpc_proc = RpcProc,
+                                       remote_pk = PubKey} = State) ->
+    ok = rpc_processor:register_stream(RpcProc, -1, ebt),
+    NewEncNonce = initiate_ebt(Socket, EncBoxKey, EncNonce, PubKey),
+    {noreply, State#sbox_state{enc_nonce = NewEncNonce}};
+
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -309,6 +322,7 @@ connect(Host, Port) ->
 %% The clock includes the remote peer's feedId at seq 0 so the server
 %% knows we want all of its messages.
 initiate_ebt(Socket, EncBoxKey, EncNonce, RemotePubKey) ->
+    %%NewEncNonce = initiate_ebt(Socket, EncBoxKey, EncNonce, PubKey),
     EbtReq = utils:encode_rec({[{~"name", [~"ebt", ~"replicate"]},
                                  {~"args", [{[{~"version", 3},
                                               {~"format", ~"classic"}]}]},

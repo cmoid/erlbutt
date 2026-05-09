@@ -85,4 +85,7 @@
                 box_rem_bytes = <<>>,
                 rpc_rem_bytes = <<>>,
                 rpc_proc,
+                %% When peer connect to a remote node
+                %% We know the remote pub key when we connect
+                remote_pk,
                 response}).
