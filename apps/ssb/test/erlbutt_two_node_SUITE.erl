@@ -105,6 +105,8 @@ two_node_ebt_replication_test(Config) ->
     {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
                               ["localhost", ?PORT_A, ACurvePk]),
     timer:sleep(300),
+    rpc:call(NodeB, ssb_peer, request_ebt, [PeerPid]),
+    timer:sleep(300),
     ?assert(rpc:call(NodeB, erlang, is_process_alive, [PeerPid])),
 
     %% Give EBT time to stream the message to B
