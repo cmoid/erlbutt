@@ -50,6 +50,7 @@ respond_to_wants(ReqNo, Props, Socket, Nonce, Key) ->
         [] ->
             Nonce;
         _ ->
+            ?SSB_DEBUG("blob_wants: ~p have ~p~n", [self(), Haves]),
             HaveMsg = utils:encode_rec({Haves}),
             Flags   = rpc_processor:create_flags(1, 0, 2),
             Header  = rpc_processor:create_header(Flags, size(HaveMsg), -ReqNo),

@@ -28,7 +28,7 @@ handle_data(_ReqNo, Body, #ssb_conn{nonce = Nonce}) ->
         true  -> done;
         false -> {chunk, Body}
     end,
-    ?LOG_DEBUG("blob_get_client: ~p~n", [Msg]),
+    ?SSB_DEBUG("blob_get_client: ~p~n", [Msg]),
     case whereis(blob_fetch_sink) of
         undefined -> ok;
         Pid       -> Pid ! Msg

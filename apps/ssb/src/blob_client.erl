@@ -39,8 +39,10 @@ handle_data(_ReqNo, Body, #ssb_conn{nonce = Nonce}) ->
 %%%===================================================================
 
 notify_have(BlobId, Size) ->
-    ?LOG_DEBUG("blob_client: have ~p size ~p~n", [BlobId, Size]),
+    ?SSB_DEBUG("blob_client: ~p have ~p size ~p~n", [self(), BlobId, Size]),
     case whereis(blob_haves_sink) of
-        undefined -> ok;
+        undefined ->
+            ?SSB_DEBUG("blob_client has no pid to report to", []),
+            ok;
         Pid       -> Pid ! {have, BlobId, Size}
     end.

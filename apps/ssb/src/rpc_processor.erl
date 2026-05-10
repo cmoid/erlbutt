@@ -166,6 +166,7 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [?whoami],
     %% while other streams (e.g. EBT) may be active.
     Flags = create_flags(1, 1, 2),
     Body = whoami(),
+    ?SSB_DEBUG("rpc_processor: whoami:  ~p~n", [Body]),
     Header = create_header(Flags, size(Body), -ReqNo),
     utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
 
