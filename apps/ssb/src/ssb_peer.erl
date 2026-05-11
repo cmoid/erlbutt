@@ -15,7 +15,7 @@
          start/3,
          send/2,
          request_ebt/1,
-         request_blob_wants/2,
+         request_blob_wants/3,
          fetch_blob/2,
          has_blob/2]).
 
@@ -162,11 +162,6 @@ handle_info({blob_collected, Ref, Data},
     gen_server:reply(From, {ok, Data}),
     {noreply, State#sbox_state{pending_fetch = undefined}};
 
-handle_info({wants_collected, Ref, Haves},
-            #sbox_state{pending_wants = {From, Ref}} = State) ->
-    gen_server:reply(From, {ok, Haves}),
-    {noreply, State#sbox_state{pending_wants = undefined}};
-
 handle_info({has_collected, Ref, Result},
             #sbox_state{pending_has = {From, Ref}} = State) ->
     gen_server:reply(From, {ok, Result}),
@@ -177,9 +172,9 @@ handle_info(Info, State) ->
     {stop, normal, State}.
 
 %% Send blobs.createWants on req 2, then a want message for each BlobId.
-%% Registers blob_client to handle have responses on the -2 stream.
-request_blob_wants(Pid, BlobIds) ->
-    gen_server:call(Pid, {request_blob_wants, BlobIds}, 15000).
+%% Haves arrive asynchronously as {have, BlobId, Size} messages to NotifyPid.
+request_blob_wants(Pid, BlobIds, NotifyPid) ->
+    gen_server:cast(Pid, {request_blob_wants, BlobIds, NotifyPid}).
 
 %% Send blobs.get on req 3.  Registers blob_get_client to handle
 %% the incoming binary chunks on stream -3.
@@ -203,28 +198,6 @@ handle_call({fetch_blob, BlobId}, From,
     {noreply, State#sbox_state{enc_nonce = NewEncNonce,
                                pending_fetch = {From, Ref}}};
 
-handle_call({request_blob_wants, BlobIds}, From,
-            #sbox_state{socket = Socket,
-                        enc_sbox_key = EncBoxKey,
-                        enc_nonce = EncNonce,
-                        rpc_proc = RpcProc,
-                        remote_wants_req = RemoteWantsReq} = State) ->
-    Ref = make_ref(),
-    SelfPid = self(),
-    SinkPid = spawn(fun() -> blob_wants_collect(SelfPid, Ref, BlobIds, []) end),
-    NewEncNonce = case RemoteWantsReq of
-        undefined ->
-            %% Remote hasn't opened createWants — open our own on req 2
-            ok = rpc_processor:register_stream(RpcProc, -2, {blob_client, SinkPid}),
-            send_blob_wants(Socket, EncBoxKey, EncNonce, BlobIds);
-        _ ->
-            %% Reuse remote's createWants stream: register it to forward haves to SinkPid,
-            %% then send our wants on the response channel (-RemoteWantsReq).
-            ok = rpc_processor:register_stream(RpcProc, RemoteWantsReq, {blob_wants, SinkPid}),
-            send_want_body(Socket, EncBoxKey, EncNonce, BlobIds, -RemoteWantsReq)
-    end,
-    {noreply, State#sbox_state{enc_nonce = NewEncNonce,
-                               pending_wants = {From, Ref}}};
 
 handle_call({has_blob, BlobId}, From,
             #sbox_state{socket = Socket,
@@ -249,6 +222,22 @@ handle_cast({send, Data}, #sbox_state{socket = Socket,
                                       enc_nonce = EncNonce} = State) ->
     NewEncNonce = send_data(Data, Socket, EncNonce, EncBoxKey),
     Transport:setopts(Socket, [{active, once}]),
+    {noreply, State#sbox_state{enc_nonce = NewEncNonce}};
+
+handle_cast({request_blob_wants, BlobIds, NotifyPid},
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc,
+                        remote_wants_req = RemoteWantsReq} = State) ->
+    NewEncNonce = case RemoteWantsReq of
+        undefined ->
+            ok = rpc_processor:register_stream(RpcProc, -2, {blob_client, NotifyPid}),
+            send_blob_wants(Socket, EncBoxKey, EncNonce, BlobIds);
+        _ ->
+            ok = rpc_processor:register_stream(RpcProc, RemoteWantsReq, {blob_wants, NotifyPid}),
+            send_want_body(Socket, EncBoxKey, EncNonce, BlobIds, -RemoteWantsReq)
+    end,
     {noreply, State#sbox_state{enc_nonce = NewEncNonce}};
 
 handle_cast({request_ebt}, #sbox_state{socket = Socket,
@@ -396,23 +385,7 @@ blob_collect(Peer, Ref, Acc) ->
         done          -> Peer ! {blob_collected, Ref, Acc}
     end.
 
-%% Collect have responses for BlobIds.  Returns as soon as all requested
-%% blobs are accounted for, or after a 2s timeout (server doesn't respond
-%% for blobs it doesn't have).
-blob_wants_collect(Peer, Ref, Remaining, Acc) ->
-    case Remaining of
-        [] ->
-            Peer ! {wants_collected, Ref, Acc};
-        _ ->
-            receive
-                {have, BlobId, Size} ->
-                    blob_wants_collect(Peer, Ref,
-                                       lists:delete(BlobId, Remaining),
-                                       [{BlobId, Size} | Acc])
-            after 10000 ->
-                Peer ! {wants_collected, Ref, Acc}
-            end
-    end.
+
 
 blob_has_collect(Peer, Ref) ->
     receive

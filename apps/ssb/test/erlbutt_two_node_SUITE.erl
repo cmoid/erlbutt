@@ -136,9 +136,15 @@ two_node_blob_wants_test(Config) ->
     {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
                               ["localhost", ?PORT_A, ACurvePk]),
 
-    %% B sends want to A — returns {ok, [{BlobId, Size}]} directly
-    {ok, Haves} = rpc:call(NodeB, ssb_peer, request_blob_wants, [PeerPid, [BlobId]]),
-    ?assert(lists:member({BlobId, ExpectedSize}, Haves)),
+    %% B sends want to A; haves arrive asynchronously to the test process.
+    Self = self(),
+    rpc:call(NodeB, ssb_peer, request_blob_wants, [PeerPid, [BlobId], Self]),
+    receive
+        {have, BlobId, Size} ->
+            ?assert(Size =:= ExpectedSize)
+    after 5000 ->
+        ct:fail(no_have_received)
+    end,
 
     rpc:call(NodeB, gen_server, stop, [PeerPid]).
 

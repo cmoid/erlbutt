@@ -91,8 +91,6 @@
                 response,
                 %% Deferred reply for an in-flight fetch_blob call: {From, Ref}
                 pending_fetch = undefined,
-                %% Deferred reply for an in-flight request_blob_wants call: {From, Ref}
-                pending_wants = undefined,
                 %% Deferred reply for an in-flight has_blob call: {From, Ref}
                 pending_has = undefined,
                 %% ReqNo of a createWants stream opened by the remote peer (if any)
