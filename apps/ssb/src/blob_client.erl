@@ -19,13 +19,18 @@
 
 -behaviour(rpc_behavior).
 
--export([handle_data/3]).
+-export([handle_data/3, handle_data/4]).
 
-handle_data(_ReqNo, Body, #ssb_conn{nonce = Nonce}) ->
+handle_data(_ReqNo, _Body, #ssb_conn{nonce = Nonce}) ->
+    Nonce.
+
+handle_data(ReqNo, Body, #ssb_conn{nonce = Nonce}, SinkPid) ->
+    ?SSB_DEBUG("blob_client: handle_data req ~p body ~p~n", [ReqNo, Body]),
     case utils:nat_decode(Body) of
         {Props} ->
             lists:foreach(fun({BlobId, Size}) when is_integer(Size), Size > 0 ->
-                                  notify_have(BlobId, Size);
+                                  ?SSB_DEBUG("blob_client: have ~p size ~p~n", [BlobId, Size]),
+                                  SinkPid ! {have, BlobId, Size};
                              (_) ->
                                   ok
                           end, Props);
@@ -33,16 +38,3 @@ handle_data(_ReqNo, Body, #ssb_conn{nonce = Nonce}) ->
             ok
     end,
     Nonce.
-
-%%%===================================================================
-%%% Internal functions
-%%%===================================================================
-
-notify_have(BlobId, Size) ->
-    ?SSB_DEBUG("blob_client: ~p have ~p size ~p~n", [self(), BlobId, Size]),
-    case whereis(blob_haves_sink) of
-        undefined ->
-            ?SSB_DEBUG("blob_client has no pid to report to", []),
-            ok;
-        Pid       -> Pid ! {have, BlobId, Size}
-    end.

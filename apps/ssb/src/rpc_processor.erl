@@ -84,8 +84,12 @@ handle_call({rpc_process, {Header, Body}, #ssb_conn{
         [{ReqNo, noop}] ->
             %% Stream already ended or handled; silently ignore continuations.
             {Nonce, none};
+        [{ReqNo, {Mod, SinkPid}}] ->
+            ?SSB_DEBUG("Stream continuation for req with pid: ~p ~n", [ReqNo]),
+            NewNonce = Mod:handle_data(ReqNo, Body, Conn, SinkPid),
+            {NewNonce, none};
         [{ReqNo, Mod}] ->
-            ?SSB_DEBUG("~p Stream continuation for req: ~p ~n", [self(), ReqNo]),
+            ?SSB_DEBUG("Stream continuation for req: ~p ~n", [ReqNo]),
             NewNonce = Mod:handle_data(ReqNo, Body, Conn),
             {NewNonce, none};
         [] ->
@@ -130,8 +134,13 @@ decode_body(Other) ->
 dispatch(_Calls, ReqNo, Body, _Socket, Nonce, _SecretBoxKey) when ReqNo < 0 ->
     {Nonce, proc_response(ReqNo, Body)};
 dispatch(Calls, ReqNo, Body, Socket, Nonce, SecretBoxKey) ->
-    NewNonce = proc_request(Calls, ReqNo, create_req(Body), Socket, Nonce, SecretBoxKey),
-    {NewNonce, none}.
+    Req = create_req(Body),
+    NewNonce = proc_request(Calls, ReqNo, Req, Socket, Nonce, SecretBoxKey),
+    Tag = case Req of
+        #ssb_rpc{name = [?blobs, ?createwants]} -> {wants_stream, ReqNo};
+        _                                        -> none
+    end,
+    {NewNonce, Tag}.
 
 
 proc_response(ReqNo, RespBody) ->

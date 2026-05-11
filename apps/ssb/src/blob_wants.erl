@@ -18,18 +18,23 @@
 
 -behaviour(rpc_behavior).
 
--export([handle_data/3]).
+-export([handle_data/3, handle_data/4]).
 
 -compile({no_auto_import, [size/1]}).
 -import(utils, [size/1]).
 
 %% Called by rpc_processor for each subsequent message on the open
 %% createWants duplex stream.
+handle_data(ReqNo, Body, Conn) ->
+    handle_data(ReqNo, Body, Conn, undefined).
+
+%% With SinkPid: also forward any incoming haves to the collector.
 handle_data(ReqNo, Body, #ssb_conn{socket = Socket,
                                    nonce = Nonce,
-                                   secret_box = Key}) ->
+                                   secret_box = Key}, SinkPid) ->
     case utils:nat_decode(Body) of
         {Props} ->
+            maybe_forward_haves(Props, SinkPid),
             respond_to_wants(ReqNo, Props, Socket, Nonce, Key);
         _Other ->
             Nonce
@@ -38,6 +43,15 @@ handle_data(ReqNo, Body, #ssb_conn{socket = Socket,
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+maybe_forward_haves(_Props, undefined) ->
+    ok;
+maybe_forward_haves(Props, SinkPid) ->
+    lists:foreach(fun({BlobId, Val}) when is_integer(Val), Val > 0 ->
+                          SinkPid ! {have, BlobId, Val};
+                     (_) ->
+                          ok
+                  end, Props).
 
 %% For each want entry check whether we hold the blob.
 %% Collect all haves into a single response object.

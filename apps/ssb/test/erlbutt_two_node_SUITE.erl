@@ -20,9 +20,7 @@
 -export([two_node_handshake_test/1,
          two_node_ebt_replication_test/1,
          two_node_blob_wants_test/1,
-         two_node_blob_fetch_test/1,
-         blob_sink_loop/2,
-         blob_fetch_loop/3]).
+         two_node_blob_fetch_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -130,15 +128,6 @@ two_node_blob_wants_test(Config) ->
     BlobData = ~"erlbutt two-node blob wants test payload",
     BlobId   = rpc:call(NodeA, blobs, store, [BlobData]),
     ExpectedSize = byte_size(BlobData),
-
-    %% Spawn a have-collector on node B that forwards messages to this process.
-    %% Cross-node sends work because Erlang PIDs are location-transparent.
-    %% Use spawn/4 with a module-level fun — closures don't serialize reliably across nodes.
-    TestPid = self(),
-    TestRef = make_ref(),
-    SinkPid = spawn(NodeB, erlbutt_two_node_SUITE, blob_sink_loop, [TestPid, TestRef]),
-    rpc:call(NodeB, erlang, register, [blob_haves_sink, SinkPid]),
-
     ?assert(rpc:call(NodeA, blobs, has, [BlobId]) =:= true),
 
     %% B connects to A (full SHS + EBT)
@@ -147,17 +136,10 @@ two_node_blob_wants_test(Config) ->
     {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
                               ["localhost", ?PORT_A, ACurvePk]),
 
-    %% Send blob want from B → A (createWants RPC + want message)
-    ok = rpc:call(NodeB, ssb_peer, request_blob_wants, [PeerPid, [BlobId]]),
+    %% B sends want to A — returns {ok, [{BlobId, Size}]} directly
+    {ok, Haves} = rpc:call(NodeB, ssb_peer, request_blob_wants, [PeerPid, [BlobId]]),
+    ?assert(lists:member({BlobId, ExpectedSize}, Haves)),
 
-    %% Wait for the have response from A
-    receive
-        {TestRef, have, BlobId, ExpectedSize} -> ok
-    after 3000 ->
-        ct:fail("timed out waiting for blob have from node_a")
-    end,
-
-    SinkPid ! stop,
     rpc:call(NodeB, gen_server, stop, [PeerPid]).
 
 %% Connect from node_b to node_a, request a blob via blobs.get, and verify
@@ -171,49 +153,16 @@ two_node_blob_fetch_test(Config) ->
     BlobId   = rpc:call(NodeA, blobs, store, [BlobData]),
     ?assert(rpc:call(NodeA, blobs, has, [BlobId]) =:= true),
 
-    %% Spawn a chunk-accumulator on node B.
-    TestPid = self(),
-    TestRef = make_ref(),
-    SinkPid = spawn(NodeB, erlbutt_two_node_SUITE, blob_fetch_loop,
-                    [TestPid, TestRef, <<>>]),
-    rpc:call(NodeB, erlang, register, [blob_fetch_sink, SinkPid]),
-
     %% B connects to A (full SHS + EBT)
     APubKey  = rpc:call(NodeA, keys, pub_key, []),
     ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
     {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
                               ["localhost", ?PORT_A, ACurvePk]),
 
-    %% B requests the blob from A
-    ok = rpc:call(NodeB, ssb_peer, fetch_blob, [PeerPid, BlobId]),
-
-    %% Wait for the complete blob data
-    receive
-        {TestRef, blob_fetched, BlobData} -> ok
-    after 3000 ->
-        ct:fail("timed out waiting for blob fetch from node_a")
-    end,
+    %% B requests the blob from A — returns {ok, Data} directly
+    {ok, BlobData} = rpc:call(NodeB, ssb_peer, fetch_blob, [PeerPid, BlobId]),
 
     rpc:call(NodeB, gen_server, stop, [PeerPid]).
-
-%% Module-level sink loop — must be exported so it can be spawned on a remote node.
-blob_sink_loop(TestPid, TestRef) ->
-    receive
-        {have, Id, Sz} ->
-            TestPid ! {TestRef, have, Id, Sz},
-            blob_sink_loop(TestPid, TestRef);
-        stop ->
-            ok
-    end.
-
-%% Accumulates binary chunks from blob_get_client; delivers assembled blob on done.
-blob_fetch_loop(TestPid, TestRef, Acc) ->
-    receive
-        {chunk, Data} ->
-            blob_fetch_loop(TestPid, TestRef, <<Acc/binary, Data/binary>>);
-        done ->
-            TestPid ! {TestRef, blob_fetched, Acc}
-    end.
 
 %%% Helpers -------------------------------------------------------------
 

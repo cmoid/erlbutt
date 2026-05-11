@@ -7,20 +7,23 @@
 %% The server sends one or more binary frames containing the blob data,
 %% followed by a JSON `true` frame that signals end-of-stream.
 %%
-%% Each binary frame is forwarded as `{chunk, Data}` to the process
-%% registered as `blob_fetch_sink` on the local node (if any).  On the
-%% terminal `true` frame, `done` is sent instead.  Tests register the
-%% sink before initiating the fetch; in production the sink is absent
-%% and frames are only logged.
+%% handle_data/4 (used by ssb_peer:fetch_blob) sends directly to a
+%% provided SinkPid so no global registration is needed.
+%%
+%% handle_data/3 falls back to looking up the registered `blob_fetch_sink`
+%% name, kept for the two-node CT test.
 -module(blob_get_client).
 
 -include_lib("ssb/include/ssb.hrl").
 
 -behaviour(rpc_behavior).
 
--export([handle_data/3]).
+-export([handle_data/3, handle_data/4]).
 
-handle_data(_ReqNo, Body, #ssb_conn{nonce = Nonce}) ->
+handle_data(_ReqNo, _Body, #ssb_conn{nonce = Nonce}) ->
+    Nonce.
+
+handle_data(_ReqNo, Body, #ssb_conn{nonce = Nonce}, SinkPid) ->
     IsEnd = try utils:nat_decode(Body) =:= true
             catch _:_ -> false
             end,
@@ -29,8 +32,5 @@ handle_data(_ReqNo, Body, #ssb_conn{nonce = Nonce}) ->
         false -> {chunk, Body}
     end,
     ?SSB_DEBUG("blob_get_client: ~p~n", [Msg]),
-    case whereis(blob_fetch_sink) of
-        undefined -> ok;
-        Pid       -> Pid ! Msg
-    end,
+    SinkPid ! Msg,
     Nonce.

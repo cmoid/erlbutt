@@ -16,7 +16,8 @@
          send/2,
          request_ebt/1,
          request_blob_wants/2,
-         fetch_blob/2]).
+         fetch_blob/2,
+         has_blob/2]).
 
 %% gen_server exports
 -export([init/1, handle_call/3, handle_cast/2,
@@ -156,6 +157,21 @@ handle_info({'EXIT', Pid, Reason}, #sbox_state{rpc_proc = RpcProc} = State) ->
             {noreply, State}
     end;
 
+handle_info({blob_collected, Ref, Data},
+            #sbox_state{pending_fetch = {From, Ref}} = State) ->
+    gen_server:reply(From, {ok, Data}),
+    {noreply, State#sbox_state{pending_fetch = undefined}};
+
+handle_info({wants_collected, Ref, Haves},
+            #sbox_state{pending_wants = {From, Ref}} = State) ->
+    gen_server:reply(From, {ok, Haves}),
+    {noreply, State#sbox_state{pending_wants = undefined}};
+
+handle_info({has_collected, Ref, Result},
+            #sbox_state{pending_has = {From, Ref}} = State) ->
+    gen_server:reply(From, {ok, Result}),
+    {noreply, State#sbox_state{pending_has = undefined}};
+
 handle_info(Info, State) ->
     ?SSB_INFO("Stopped presumably for normal reason: ~p ~n",[Info]),
     {stop, normal, State}.
@@ -163,32 +179,65 @@ handle_info(Info, State) ->
 %% Send blobs.createWants on req 2, then a want message for each BlobId.
 %% Registers blob_client to handle have responses on the -2 stream.
 request_blob_wants(Pid, BlobIds) ->
-    gen_server:call(Pid, {request_blob_wants, BlobIds}).
+    gen_server:call(Pid, {request_blob_wants, BlobIds}, 15000).
 
 %% Send blobs.get on req 3.  Registers blob_get_client to handle
 %% the incoming binary chunks on stream -3.
 fetch_blob(Pid, BlobId) ->
     gen_server:call(Pid, {fetch_blob, BlobId}).
 
-handle_call({fetch_blob, BlobId}, _From,
+%% Send blobs.has on req 4.  Returns {ok, true} or {ok, false}.
+has_blob(Pid, BlobId) ->
+    gen_server:call(Pid, {has_blob, BlobId}).
+
+handle_call({fetch_blob, BlobId}, From,
             #sbox_state{socket = Socket,
                         enc_sbox_key = EncBoxKey,
                         enc_nonce = EncNonce,
                         rpc_proc = RpcProc} = State) ->
-    ok = rpc_processor:register_stream(RpcProc, -3, blob_get_client),
+    Ref = make_ref(),
+    SelfPid = self(),
+    SinkPid = spawn(fun() -> blob_collect(SelfPid, Ref, <<>>) end),
+    ok = rpc_processor:register_stream(RpcProc, -3, {blob_get_client, SinkPid}),
     NewEncNonce = send_blob_get(Socket, EncBoxKey, EncNonce, BlobId),
-    {reply, ok, State#sbox_state{enc_nonce = NewEncNonce}};
+    {noreply, State#sbox_state{enc_nonce = NewEncNonce,
+                               pending_fetch = {From, Ref}}};
 
-handle_call({request_blob_wants, BlobIds}, _From,
+handle_call({request_blob_wants, BlobIds}, From,
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc,
+                        remote_wants_req = RemoteWantsReq} = State) ->
+    Ref = make_ref(),
+    SelfPid = self(),
+    SinkPid = spawn(fun() -> blob_wants_collect(SelfPid, Ref, BlobIds, []) end),
+    NewEncNonce = case RemoteWantsReq of
+        undefined ->
+            %% Remote hasn't opened createWants — open our own on req 2
+            ok = rpc_processor:register_stream(RpcProc, -2, {blob_client, SinkPid}),
+            send_blob_wants(Socket, EncBoxKey, EncNonce, BlobIds);
+        _ ->
+            %% Reuse remote's createWants stream: register it to forward haves to SinkPid,
+            %% then send our wants on the response channel (-RemoteWantsReq).
+            ok = rpc_processor:register_stream(RpcProc, RemoteWantsReq, {blob_wants, SinkPid}),
+            send_want_body(Socket, EncBoxKey, EncNonce, BlobIds, -RemoteWantsReq)
+    end,
+    {noreply, State#sbox_state{enc_nonce = NewEncNonce,
+                               pending_wants = {From, Ref}}};
+
+handle_call({has_blob, BlobId}, From,
             #sbox_state{socket = Socket,
                         enc_sbox_key = EncBoxKey,
                         enc_nonce = EncNonce,
                         rpc_proc = RpcProc} = State) ->
-    ok = rpc_processor:register_stream(RpcProc, -2, blob_client),
-    NewEncNonce = send_blob_wants(Socket, EncBoxKey, EncNonce, BlobIds),
-    {reply, ok, State#sbox_state{enc_nonce = NewEncNonce}};
-
-
+    Ref = make_ref(),
+    SelfPid = self(),
+    SinkPid = spawn(fun() -> blob_has_collect(SelfPid, Ref) end),
+    ok = rpc_processor:register_stream(RpcProc, -4, {blob_has_client, SinkPid}),
+    NewEncNonce = send_blob_has(Socket, EncBoxKey, EncNonce, BlobId),
+    {noreply, State#sbox_state{enc_nonce = NewEncNonce,
+                               pending_has = {From, Ref}}};
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
@@ -287,9 +336,15 @@ rpc_parse(Data, #sbox_state{socket = Socket,
                 {complete, Rest, ProcEncNonce, Resp}
         end,
 
-    NewState = State#sbox_state{enc_nonce = NewEncNonce,
-                                rpc_rem_bytes = NewRpcLeftOver,
-                                response = NewResponse},
+    NewState0 = State#sbox_state{enc_nonce = NewEncNonce,
+                                 rpc_rem_bytes = NewRpcLeftOver,
+                                 response = NewResponse},
+    NewState = case NewResponse of
+        {wants_stream, ReqNo} ->
+            NewState0#sbox_state{remote_wants_req = ReqNo};
+        _ ->
+            NewState0
+    end,
     case {size(NewRpcLeftOver) >= 9, Status} of
         {true, complete} ->
             %% parse some more
@@ -335,6 +390,46 @@ initiate_ebt(Socket, EncBoxKey, EncNonce, RemotePubKey) ->
     ?SSB_DEBUG("Send initial vector ~p ~n", [Clock]),
     send_data(combine(Header2, Clock), Socket, N1, EncBoxKey).
 
+blob_collect(Peer, Ref, Acc) ->
+    receive
+        {chunk, Data} -> blob_collect(Peer, Ref, <<Acc/binary, Data/binary>>);
+        done          -> Peer ! {blob_collected, Ref, Acc}
+    end.
+
+%% Collect have responses for BlobIds.  Returns as soon as all requested
+%% blobs are accounted for, or after a 2s timeout (server doesn't respond
+%% for blobs it doesn't have).
+blob_wants_collect(Peer, Ref, Remaining, Acc) ->
+    case Remaining of
+        [] ->
+            Peer ! {wants_collected, Ref, Acc};
+        _ ->
+            receive
+                {have, BlobId, Size} ->
+                    blob_wants_collect(Peer, Ref,
+                                       lists:delete(BlobId, Remaining),
+                                       [{BlobId, Size} | Acc])
+            after 10000 ->
+                Peer ! {wants_collected, Ref, Acc}
+            end
+    end.
+
+blob_has_collect(Peer, Ref) ->
+    receive
+        {has_result, Result} -> Peer ! {has_collected, Ref, Result}
+    after 5000 ->
+        Peer ! {has_collected, Ref, false}
+    end.
+
+%% Send blobs.has async RPC on req 4.
+send_blob_has(Socket, Key, Nonce, BlobId) ->
+    HasRpc = utils:encode_rec({[{~"name", [?blobs, ?blobshas]},
+                                 {~"args", [BlobId]},
+                                 {~"type", ~"async"}]}),
+    Flags = rpc_processor:create_flags(0, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(HasRpc), 4),
+    send_data(combine(Header, HasRpc), Socket, Nonce, Key).
+
 %% Send blobs.get source RPC on req 3.
 send_blob_get(Socket, Key, Nonce, BlobId) ->
     GetRpc = utils:encode_rec({[{~"name", [?blobs, ?blobsget]},
@@ -352,9 +447,14 @@ send_blob_wants(Socket, Key, Nonce, BlobIds) ->
     Flags = rpc_processor:create_flags(1, 0, 2),
     Header1 = rpc_processor:create_header(Flags, size(WantsRpc), 2),
     N1 = send_data(combine(Header1, WantsRpc), Socket, Nonce, Key),
+    send_want_body(Socket, Key, N1, BlobIds, 2).
+
+%% Send only the want body on an existing duplex stream at ReqNo.
+send_want_body(Socket, Key, Nonce, BlobIds, ReqNo) ->
     WantBody = utils:encode_rec({[{Id, -1} || Id <- BlobIds]}),
-    Header2 = rpc_processor:create_header(Flags, size(WantBody), 2),
-    send_data(combine(Header2, WantBody), Socket, N1, Key).
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(WantBody), ReqNo),
+    send_data(combine(Header, WantBody), Socket, Nonce, Key).
 
 %% Build our initial vector clock, including the remote peer's feedId at seq 0
 %% so the server sends us everything it has for that feed.
