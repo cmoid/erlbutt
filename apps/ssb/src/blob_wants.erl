@@ -2,7 +2,7 @@
 %%
 %% Copyright (C) 2025 Charles Moid
 %%
-%% Handles the blobs.createWants duplex stream.
+%% Handles incoming messages on a peer's blobs.createWants source stream.
 %%
 %% The SSB blob want/have protocol works as follows:
 %%   - Negative values (-1, -2, …) are "want" signals. The magnitude
@@ -10,8 +10,9 @@
 %%   - Positive values are "have" signals whose value is the blob size
 %%     in bytes.
 %%
-%% When a peer sends us wants we check local storage.  For any blob we
-%% hold we respond with a have message on the same stream.
+%% Both peers open independent source streams. When a peer sends us wants
+%% we check local storage and respond with haves on OUR OWN stream
+%% (ssb_conn.our_wants_req), not on their response channel.
 -module(blob_wants).
 
 -include_lib("ssb/include/ssb.hrl").
@@ -23,19 +24,17 @@
 -compile({no_auto_import, [size/1]}).
 -import(utils, [size/1]).
 
-%% Called by rpc_processor for each subsequent message on the open
-%% createWants duplex stream.
 handle_data(ReqNo, Body, Conn) ->
     handle_data(ReqNo, Body, Conn, undefined).
 
-%% With SinkPid: also forward any incoming haves to the collector.
-handle_data(ReqNo, Body, #ssb_conn{socket = Socket,
-                                   nonce = Nonce,
-                                   secret_box = Key}, SinkPid) ->
+handle_data(_ReqNo, Body, #ssb_conn{socket = Socket,
+                                    nonce = Nonce,
+                                    secret_box = Key,
+                                    our_wants_req = OurWantsReq}, SinkPid) ->
     case utils:nat_decode(Body) of
         {Props} ->
             maybe_forward_haves(Props, SinkPid),
-            respond_to_wants(ReqNo, Props, Socket, Nonce, Key);
+            respond_to_wants(OurWantsReq, Props, Socket, Nonce, Key);
         _Other ->
             Nonce
     end.
@@ -53,9 +52,9 @@ maybe_forward_haves(Props, SinkPid) ->
                           ok
                   end, Props).
 
-%% For each want entry check whether we hold the blob.
-%% Collect all haves into a single response object.
-respond_to_wants(ReqNo, Props, Socket, Nonce, Key) ->
+respond_to_wants(undefined, _Props, _Socket, Nonce, _Key) ->
+    Nonce;
+respond_to_wants(OurWantsReq, Props, Socket, Nonce, Key) ->
     Haves = [{BlobId, BlobSize}
              || {BlobId, Val} <- Props,
                 Val < 0,
@@ -67,6 +66,6 @@ respond_to_wants(ReqNo, Props, Socket, Nonce, Key) ->
             ?SSB_DEBUG("blob_wants: ~p have ~p~n", [self(), Haves]),
             HaveMsg = utils:encode_rec({Haves}),
             Flags   = rpc_processor:create_flags(1, 0, 2),
-            Header  = rpc_processor:create_header(Flags, size(HaveMsg), -ReqNo),
+            Header  = rpc_processor:create_header(Flags, size(HaveMsg), OurWantsReq),
             utils:send_data(utils:combine(Header, HaveMsg), Socket, Nonce, Key)
     end.

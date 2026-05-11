@@ -181,18 +181,12 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [?whoami],
 
 proc_request(Calls, ReqNo, #ssb_rpc{name = [?blobs, ?createwants],
                              args = []}
-             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
-    %% Register this as a live duplex stream so subsequent messages
-    %% on the same ReqNo are routed to blob_wants:handle_data/3.
-    %%
+             = _ReqBody, _Socket, Nonce, _SecretBoxKey) ->
+    %% Register so subsequent messages on this stream route to blob_wants.
+    %% Haves are sent on our own createWants stream, not this response channel.
     ?SSB_DEBUG("rpc_processor: createwants reqno ~p~n", [ReqNo]),
     ets:insert(Calls, {ReqNo, blob_wants}),
-    %% Send an empty wants map to open the stream; we will push haves
-    %% reactively in blob_wants:handle_data/3 as the peer sends wants.
-    EmptyWants = utils:encode_rec({[]}),
-    Flags  = create_flags(1, 0, 2),
-    Header = create_header(Flags, size(EmptyWants), -ReqNo),
-    utils:send_data(utils:combine(Header, EmptyWants), Socket, Nonce, SecretBoxKey);
+    Nonce;
 
 proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobshas],
                              args = [BlobId]}

@@ -45,7 +45,8 @@
 -record(ssb_conn,
         { socket,
           nonce,
-          secret_box
+          secret_box,
+          our_wants_req
         }).
 
 -record(ssb_rpc,
@@ -89,9 +90,13 @@
                 %% We know the remote pub key when we connect
                 remote_pk,
                 response,
+                %% Monotonically increasing counter for outbound RPC request numbers.
+                req_counter = 0,
                 %% Deferred reply for an in-flight fetch_blob call: {From, Ref}
                 pending_fetch = undefined,
                 %% Deferred reply for an in-flight has_blob call: {From, Ref}
                 pending_has = undefined,
-                %% ReqNo of a createWants stream opened by the remote peer (if any)
+                %% ReqNo of our own outbound createWants source stream
+                our_wants_req = undefined,
+                %% ReqNo of the remote peer's createWants source stream (if seen)
                 remote_wants_req = undefined}).
