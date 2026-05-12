@@ -422,18 +422,19 @@ send_blob_get(Socket, Key, Nonce, BlobId, ReqNo) ->
     Header = rpc_processor:create_header(Flags, size(GetRpc), ReqNo),
     send_data(combine(Header, GetRpc), Socket, Nonce, Key).
 
-%% Open our createWants source stream: send the RPC envelope followed by
-%% an empty wants map to signal readiness.  Call once per connection.
+%% Open our createWants source stream.  Call once per connection.
 open_wants_stream(Socket, Key, Nonce, ReqNo) ->
     WantsRpc = utils:encode_rec({[{~"name", [?blobs, ?createwants]},
                                    {~"args", []},
                                    {~"type", ~"source"}]}),
     Flags = rpc_processor:create_flags(1, 0, 2),
-    Header1 = rpc_processor:create_header(Flags, size(WantsRpc), ReqNo),
-    N1 = send_data(combine(Header1, WantsRpc), Socket, Nonce, Key),
-    EmptyWants = utils:encode_rec({[]}),
-    Header2 = rpc_processor:create_header(Flags, size(EmptyWants), ReqNo),
-    send_data(combine(Header2, EmptyWants), Socket, N1, Key).
+    Header = rpc_processor:create_header(Flags, size(WantsRpc), ReqNo),
+    send_data(combine(Header, WantsRpc), Socket, Nonce, Key).
+    %% Previously also sent an empty {} wants map here to "signal readiness",
+    %% but it's redundant — real wants arrive via send_want_body/5 later.
+    %% EmptyWants = utils:encode_rec({[]}),
+    %% Header2 = rpc_processor:create_header(Flags, size(EmptyWants), ReqNo),
+    %% send_data(combine(Header2, EmptyWants), Socket, N1, Key).
 
 %% Send only the want body on an existing duplex stream at ReqNo.
 send_want_body(Socket, Key, Nonce, BlobIds, ReqNo) ->
