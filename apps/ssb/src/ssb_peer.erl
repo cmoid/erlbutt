@@ -71,7 +71,7 @@ init([Ip, Port, PubKey]) ->
         ranch_tcp:setopts(Socket, [{active, once}]),
         WantsReqNo = 1,
         N1 = open_wants_stream(Socket, EncBoxKey, EncNonce, WantsReqNo),
-        ok = rpc_processor:register_stream(RpcProc, -WantsReqNo, blob_client),
+        ok = rpc_processor:register_stream(RpcProc, -WantsReqNo, blob_wants),
         {ok, #sbox_state{socket = Socket,
                          transport = ranch_tcp,
                          dec_sbox_key = DecBoxKey,
@@ -107,7 +107,7 @@ handle_info({tcp, Socket, Data},
         Transport:setopts(Socket, [{active, once}]),
         WantsReqNo = 1,
         N1 = open_wants_stream(Socket, EncBoxKey, EncNonce, WantsReqNo),
-        ok = rpc_processor:register_stream(RpcProc, -WantsReqNo, blob_client),
+        ok = rpc_processor:register_stream(RpcProc, -WantsReqNo, blob_wants),
         {noreply, State#sbox_state{dec_sbox_key = DecBoxKey,
                                    enc_sbox_key = EncBoxKey,
                                    dec_nonce = DecNonce,
@@ -242,13 +242,19 @@ handle_cast({request_blob_wants, BlobIds, NotifyPid},
                         rpc_proc = RpcProc,
                         our_wants_req = OurWantsReq,
                         remote_wants_req = RemoteWantsReq} = State) ->
-    %% External peers send haves on our response channel; erlbutt peers use their own stream.
-    ok = rpc_processor:register_stream(RpcProc, -OurWantsReq, {blob_client, NotifyPid}),
+    %% Register on both channels so haves reach us regardless of peer style.
+    ok = rpc_processor:register_stream(RpcProc, -OurWantsReq, {blob_wants, NotifyPid}),
     case RemoteWantsReq of
         undefined -> ok;
         _         -> ok = rpc_processor:register_stream(RpcProc, RemoteWantsReq, {blob_wants, NotifyPid})
     end,
-    NewEncNonce = send_want_body(Socket, EncBoxKey, EncNonce, BlobIds, OurWantsReq),
+    %% Duplex-style peers (PW, TF) expect our wants on their response channel (-remote_wants_req).
+    %% Peers that haven't opened createWants get wants on our own source stream.
+    SendReqNo = case RemoteWantsReq of
+        undefined -> OurWantsReq;
+        _         -> -RemoteWantsReq
+    end,
+    NewEncNonce = send_want_body(Socket, EncBoxKey, EncNonce, BlobIds, SendReqNo),
     {noreply, State#sbox_state{enc_nonce = NewEncNonce}};
 
 handle_cast({request_ebt}, #sbox_state{socket = Socket,
