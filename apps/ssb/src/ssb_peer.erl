@@ -17,7 +17,8 @@
          request_ebt/1,
          request_blob_wants/3,
          fetch_blob/2,
-         has_blob/2]).
+         has_blob/2,
+         drain_haves/1]).
 
 %% gen_server exports
 -export([init/1, handle_call/3, handle_cast/2,
@@ -193,6 +194,17 @@ fetch_blob(Pid, BlobId) ->
 %% Check whether the remote peer holds a blob. Returns {ok, true} or {ok, false}.
 has_blob(Pid, BlobId) ->
     gen_server:call(Pid, {has_blob, BlobId}).
+
+%% Drain {have, BlobId, Size} messages from the mailbox until Timeout ms of
+%% silence. Returns [{BlobId, Size}] in arrival order.
+drain_haves(Timeout) ->
+    drain_haves(Timeout, []).
+drain_haves(Timeout, Acc) ->
+    receive
+        {have, BlobId, Size} -> drain_haves(Timeout, [{BlobId, Size} | Acc])
+    after Timeout ->
+        lists:reverse(Acc)
+    end.
 
 handle_call({fetch_blob, BlobId}, From,
             #sbox_state{socket = Socket,
