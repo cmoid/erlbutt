@@ -20,6 +20,7 @@
 -export([two_node_handshake_test/1,
          two_node_ebt_replication_test/1,
          two_node_blob_wants_test/1,
+         two_node_multiple_blob_wants_test/1,
          two_node_blob_fetch_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
@@ -36,6 +37,7 @@ all() ->
     [two_node_handshake_test,
      two_node_ebt_replication_test,
      two_node_blob_wants_test,
+     two_node_multiple_blob_wants_test,
      two_node_blob_fetch_test].
 
 init_per_suite(Config) ->
@@ -130,7 +132,7 @@ two_node_blob_wants_test(Config) ->
     ExpectedSize = byte_size(BlobData),
     ?assert(rpc:call(NodeA, blobs, has, [BlobId]) =:= true),
 
-    %% B connects to A (full SHS + EBT)
+    %% B connects to A
     APubKey  = rpc:call(NodeA, keys, pub_key, []),
     ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
     {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
@@ -145,6 +147,40 @@ two_node_blob_wants_test(Config) ->
     after 5000 ->
         ct:fail(no_have_received)
     end,
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Store a blob on node_a, connect from node_b, send a want, and verify
+%% that node_b receives the have response with the correct blob size.
+two_node_multiple_blob_wants_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    %% Store blobs on A
+    BlobData = ~"erlbutt two-node blob wants test payload",
+    BlobId   = rpc:call(NodeA, blobs, store, [BlobData]),
+    ExpectedSize = byte_size(BlobData),
+    ?assert(rpc:call(NodeA, blobs, has, [BlobId]) =:= true),
+
+    BlobData2 = ~"erlbutt two-node blob wants test payload which is diff",
+    BlobId2 = rpc:call(NodeA, blobs, store, [BlobData2]),
+    ExpectedSize2 = byte_size(BlobData2),
+    ?assert(rpc:call(NodeA, blobs, has, [BlobId2]) =:= true),
+
+    %% B connects to A
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                              ["localhost", ?PORT_A, ACurvePk]),
+
+    %% B sends want to A; haves arrive asynchronously to the test process.
+    Self = self(),
+    rpc:call(NodeB, ssb_peer, request_blob_wants, [PeerPid, [BlobId, BlobId2], Self]),
+
+    Haves = rpc:call(NodeB, ssb_peer, drain_haves, [1000]),
+    ?assert(lists:all(fun({_Id, Sz}) ->
+        Sz =:= ExpectedSize orelse Sz =:= ExpectedSize2
+    end, Haves)),
 
     rpc:call(NodeB, gen_server, stop, [PeerPid]).
 
