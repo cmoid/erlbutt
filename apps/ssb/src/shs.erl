@@ -85,10 +85,9 @@ client_shake_hands(Socket, RemotePubKey) ->
     {true, ServEph_pk, EncNonce} = check_hello(ServerHmac),
 
     Shared_ab = mult(Eph_sk, ServEph_pk),
-    Shared_aB = mult(Eph_sk,
-                         pk_to_curve25519(RemotePubKey)),
+    Shared_aB = mult(Eph_sk, pk_to_curve25519(RemotePubKey)),
 
-    ShaSab = crypto:hash(sha256,Shared_ab),
+    ShaSab = crypto:hash(sha256, Shared_ab),
 
     DetSigA = enacl:sign_detached(concat([config:network_id(),
                                           RemotePubKey,
@@ -97,10 +96,9 @@ client_shake_hands(Socket, RemotePubKey) ->
 
     Msg = concat([DetSigA, Pub_pk]),
 
-    Box = create_box(Msg,
-                         concat([config:network_id(),
-                                 Shared_ab,
-                                 Shared_aB])),
+    Box = create_box(Msg, concat([config:network_id(),
+                                  Shared_ab,
+                                  Shared_aB])),
 
     % client authenticates
     gen_tcp:send(Socket, Box),
@@ -111,21 +109,19 @@ client_shake_hands(Socket, RemotePubKey) ->
 
     DetSigB =
         open_box(ServData,
-                     ?SHS_NONCE,
-                     crypto:hash(sha256,
-                                 concat([config:network_id(),
-                                         Shared_ab,
-                                         Shared_aB,
-                                         Shared_Ab]))),
+                 ?SHS_NONCE,
+                 crypto:hash(sha256,
+                             concat([config:network_id(),
+                                     Shared_ab,
+                                     Shared_aB,
+                                     Shared_Ab]))),
 
     M = concat([config:network_id(),
                 DetSigA,
                 Pub_pk,
                 ShaSab]),
 
-    true = enacl:sign_verify_detached(DetSigB,
-                                      M,
-                                      RemotePubKey),
+    true = enacl:sign_verify_detached(DetSigB, M, RemotePubKey),
 
     SharedKey = crypto:hash(sha256,
                             crypto:hash(sha256,
