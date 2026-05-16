@@ -17,6 +17,7 @@
 -export([open_box/3,
          create_long_pair/0,
          client_shake_hands/2,
+         client_shake_hands/3,
          server_shake_hands/3]).
 
 check_hello(BinData) ->
@@ -72,8 +73,9 @@ create_long_pair() ->
      maps:get(secret, KeyPair)}.
 
 client_shake_hands(Socket, RemotePubKey) ->
+    client_shake_hands(Socket, RemotePubKey, {long_pk(), long_sk()}).
 
-    {Pub_pk, Priv_sk} = create_long_pair(),
+client_shake_hands(Socket, RemotePubKey, {OurPubKey, OurPrivKey}) ->
     {Eph_sk, Hmac, DecNonce} = gen_hello(),
 
     % say hello to server
@@ -92,9 +94,9 @@ client_shake_hands(Socket, RemotePubKey) ->
     DetSigA = enacl:sign_detached(concat([config:network_id(),
                                           RemotePubKey,
                                           ShaSab]),
-                                  Priv_sk),
+                                  OurPrivKey),
 
-    Msg = concat([DetSigA, Pub_pk]),
+    Msg = concat([DetSigA, OurPubKey]),
 
     Box = create_box(Msg, concat([config:network_id(),
                                   Shared_ab,
@@ -103,8 +105,7 @@ client_shake_hands(Socket, RemotePubKey) ->
     % client authenticates
     gen_tcp:send(Socket, Box),
 
-    Shared_Ab = mult(sk_to_curve25519(Priv_sk),
-                         ServEph_pk),
+    Shared_Ab = mult(sk_to_curve25519(OurPrivKey), ServEph_pk),
     {ok, ServData} = gen_tcp:recv(Socket, 80, 5000),
 
     DetSigB =
@@ -118,7 +119,7 @@ client_shake_hands(Socket, RemotePubKey) ->
 
     M = concat([config:network_id(),
                 DetSigA,
-                Pub_pk,
+                OurPubKey,
                 ShaSab]),
 
     true = enacl:sign_verify_detached(DetSigB, M, RemotePubKey),
@@ -129,10 +130,8 @@ client_shake_hands(Socket, RemotePubKey) ->
                                                 Shared_ab,
                                                 Shared_aB,
                                                 Shared_Ab]))),
-    DecBoxKey = crypto:hash(sha256,
-                          concat([SharedKey, Pub_pk])),
-    EncBoxKey = crypto:hash(sha256,
-                          concat([SharedKey, RemotePubKey])),
+    DecBoxKey = crypto:hash(sha256, concat([SharedKey, OurPubKey])),
+    EncBoxKey = crypto:hash(sha256, concat([SharedKey, RemotePubKey])),
 
     {ok, {Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce}}.
 
