@@ -193,7 +193,7 @@ server_shake_hands(Data, Socket, Transport) ->
     EncBoxKey = crypto:hash(sha256, combine(SharedKey,
                                             ClLong_pk)),
 
-    {ok, {DecBoxKey, DecNonce, EncBoxKey, EncNonce}}.
+    {ok, {DecBoxKey, DecNonce, EncBoxKey, EncNonce, ClLong_pk}}.
 
 long_sk() ->
     base64:decode(keys:priv_key()).
