@@ -20,6 +20,7 @@
 -export([start_link/0,
          process/3,
          register_stream/3,
+         set_remote_pk/2,
          create_flags/3,
          create_header/3,
          parse_flags/1]).
@@ -41,6 +42,10 @@ process(Pid, {Header, Body}, Connection) ->
 %% register the negative ReqNo it expects for its outbound requests.
 register_stream(Pid, ReqNo, Module) ->
     gen_server:call(Pid, {register_stream, ReqNo, Module}).
+
+%% Store the remote peer's public key so invite.use can validate it.
+set_remote_pk(Pid, RemotePk) ->
+    gen_server:call(Pid, {set_remote_pk, RemotePk}).
 
 parse_flags(Header) ->
     <<Flags:1/binary, _Rest/binary>> = Header,
@@ -67,6 +72,11 @@ handle_info(Info, State) ->
 handle_call({register_stream, ReqNo, Module}, _From,
             #rpc_state{calls = Calls} = State) ->
     ets:insert(Calls, {ReqNo, Module}),
+    {reply, ok, State};
+
+handle_call({set_remote_pk, RemotePk}, _From,
+            #rpc_state{calls = Calls} = State) ->
+    ets:insert(Calls, {remote_pk, RemotePk}),
     {reply, ok, State};
 
 handle_call({rpc_process, {Header, Body}, #ssb_conn{
@@ -249,6 +259,34 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"],
         _ ->
             ErrMsg = utils:error_msg(~"Error", ~"unsupported EBT version or format"),
             Flags = create_flags(0, 1, 2),
+            Header = create_header(Flags, size(ErrMsg), -ReqNo),
+            utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey)
+    end;
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [~"invite", ~"use"],
+                             args = [{ArgProps}]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    FeedId = proplists:get_value(~"feed", ArgProps),
+    ClientPk = case ets:lookup(Calls, remote_pk) of
+        [{remote_pk, Pk}] -> Pk;
+        []                -> undefined
+    end,
+    case invite:validate_and_consume(ClientPk) of
+        ok ->
+            OurId   = keys:pub_key_disp(),
+            FeedPid = utils:find_or_create_feed_pid(OurId),
+            FollowContent = {[{~"type",      ~"contact"},
+                              {~"contact",   FeedId},
+                              {~"following", true},
+                              {~"pub",       true}]},
+            ok = ssb_feed:post_content(FeedPid, FollowContent),
+            TrueBody = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+            Flags  = create_flags(0, 0, 2),
+            Header = create_header(Flags, size(TrueBody), -ReqNo),
+            utils:send_data(utils:combine(Header, TrueBody), Socket, Nonce, SecretBoxKey);
+        {error, _} ->
+            ErrMsg = utils:error_msg(~"Error", ~"invalid or expired invite"),
+            Flags  = create_flags(0, 1, 2),
             Header = create_header(Flags, size(ErrMsg), -ReqNo),
             utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey)
     end;

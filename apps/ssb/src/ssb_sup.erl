@@ -29,5 +29,6 @@ init([]) ->
             ?CHILD(keys, worker),
             ?CHILD(blobs, worker),
             ?CHILD(mess_auth, worker),
+            ?CHILD(invite_store, worker),
             ?CHILD(ssb_feed_sup, supervisor),
             ?CHILD(ebt, worker)]}}.

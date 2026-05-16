@@ -102,21 +102,35 @@ handle_info({tcp, Socket, Data},
                    transport=Transport,
                    shook_hands = 0} = State) ->
     try
-        {ok, {DecBoxKey, DecNonce, EncBoxKey, EncNonce}}
+        {ok, {DecBoxKey, DecNonce, EncBoxKey, EncNonce, ClientPk}}
             = shs:server_shake_hands(Data, Socket, Transport),
         {ok, RpcProc} = rpc_processor:start_link(),
+        ok = rpc_processor:set_remote_pk(RpcProc, ClientPk),
         Transport:setopts(Socket, [{active, once}]),
-        WantsReqNo = 1,
-        N1 = open_wants_stream(Socket, EncBoxKey, EncNonce, WantsReqNo),
-        ok = rpc_processor:register_stream(RpcProc, -WantsReqNo, blob_wants),
+        %% Skip createWants for invite connections — the peer expects invite.use
+        %% as the first message, not a createWants stream frame.
+        IsInvite = invite_store:is_invite(ClientPk),
+        {N1, WantsReqNo} = case IsInvite of
+            true ->
+                {EncNonce, undefined};
+            false ->
+                Req = 1,
+                Nonce1 = open_wants_stream(Socket, EncBoxKey, EncNonce, Req),
+                ok = rpc_processor:register_stream(RpcProc, -Req, blob_wants),
+                {Nonce1, Req}
+        end,
         {noreply, State#sbox_state{dec_sbox_key = DecBoxKey,
                                    enc_sbox_key = EncBoxKey,
                                    dec_nonce = DecNonce,
                                    enc_nonce = N1,
                                    rpc_proc = RpcProc,
                                    shook_hands = 1,
+                                   remote_pk = ClientPk,
                                    our_wants_req = WantsReqNo,
-                                   req_counter = WantsReqNo}}
+                                   req_counter = case WantsReqNo of
+                                                     undefined -> 0;
+                                                     _         -> WantsReqNo
+                                                 end}}
     catch
         error:Reason ->
             ?SSB_ERROR("Unable to shake hands with stranger ~p ~n",
