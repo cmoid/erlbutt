@@ -47,7 +47,8 @@ maybe_forward_haves(_Props, undefined) ->
     ok;
 maybe_forward_haves(Props, SinkPid) ->
     lists:foreach(fun({BlobId, Val}) when is_integer(Val), Val > 0 ->
-                          SinkPid ! {have, BlobId, Val};
+                        ?SSB_DEBUG("sending to pif: ~p ~p ~p~n", [SinkPid, BlobId, Val]),
+                        SinkPid ! {have, BlobId, Val};
                      (_) ->
                           ok
                   end, Props).
@@ -55,6 +56,7 @@ maybe_forward_haves(Props, SinkPid) ->
 respond_to_wants(undefined, _Props, _Socket, Nonce, _Key) ->
     Nonce;
 respond_to_wants(OurWantsReq, Props, Socket, Nonce, Key) ->
+    ?SSB_DEBUG("respond to wants: ~p for req: ~p~n", [Props, OurWantsReq]),
     Haves = [{BlobId, BlobSize}
              || {BlobId, Val} <- Props,
                 Val < 0,

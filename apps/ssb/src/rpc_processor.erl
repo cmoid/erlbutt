@@ -99,7 +99,7 @@ handle_call({rpc_process, {Header, Body}, #ssb_conn{
             NewNonce = Mod:handle_data(ReqNo, Body, Conn, SinkPid),
             {NewNonce, none};
         [{ReqNo, Mod}] ->
-            ?SSB_DEBUG("Stream continuation for req: ~p ~n", [ReqNo]),
+            ?SSB_DEBUG("Stream continuation for req: ~p with body: ~p ~n", [ReqNo, Body]),
             NewNonce = Mod:handle_data(ReqNo, Body, Conn),
             {NewNonce, none};
         [] ->
