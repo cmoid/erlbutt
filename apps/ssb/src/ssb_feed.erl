@@ -289,10 +289,13 @@ feed_get(Feed, [], Key) ->
     feed_get(Feed, [{Key, 0}], Key);
 
 feed_get(Feed, [{Key, Pos}], Key) ->
-    case file:open(Feed, [read, binary]) of
-        {ok, IoDev} ->
-            file:position(IoDev, Pos),
-            scan(IoDev, Pos, Key);
+    try
+        {ok, IoDev} = file:open(Feed, [read, binary]),
+        file:position(IoDev, Pos),
+        Data = scan(IoDev, Pos, Key),
+        file:close(IoDev),
+        Data
+    catch
         {error, enoent} ->
             ?LOG_INFO("Probably bad input ~n",[]),
             done
