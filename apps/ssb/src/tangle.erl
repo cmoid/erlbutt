@@ -14,8 +14,7 @@
          ancestors/2,
          children/2,
          descendants/2,
-         get_msgs/1
-         ]).
+         get_msgs/1]).
 
 get_tangle(TangleId) ->
     %% retrieve tangle root author
