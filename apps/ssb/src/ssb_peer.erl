@@ -10,7 +10,6 @@
 
 -export([start_link/2,
          start_link/3,
-         start_link/4,
          start/2,
          start/3,
          send/2,
@@ -37,7 +36,12 @@ start_link(Ip, PubKey) ->
 
 %% connect to another peer on an explicit port.
 start_link(Ip, Port, PubKey) when is_integer(Port) ->
-    gen_server:start_link(?MODULE, [Ip, Port, PubKey], []).
+    gen_server:start_link(?MODULE, [Ip, Port, PubKey], []);
+
+%% ranch 2.x protocol callback — accept a connection from another peer.
+%% Note: it no longer passes the socket in.
+start_link(Ref, Transport, Opts) ->
+    gen_server:start_link(?MODULE, {ranch, Ref, Transport, Opts}, []).
 
 %% Unlinked variants — use when the caller is a temporary process (e.g. rpc:call).
 start(Ip, PubKey) ->
@@ -53,10 +57,6 @@ send(Pid, Data) ->
 request_ebt(Pid) ->
     gen_server:cast(Pid, {request_ebt}).
 
-
-%% accept a connection from another peer.
-start_link(Ref, Socket, Transport, Opts) ->
-    gen_server:start_link(?MODULE, [Ref, Socket, Transport, Opts], []).
 
 init([Ip, PubKey]) ->
     Port = application:get_env(ssb, port, 8008),
@@ -89,13 +89,11 @@ init([Ip, Port, PubKey]) ->
             {stop, Reason}
     end;
 
-init([Ref, Socket, Transport, _Opts = []]) ->
-    %% note the return of a 0 timeout, this is required to notify
-    %% ranch that it owns the socket, and start_link doesn't return
-    %% until init does.
+%% a 0 timeout on this init is need because the ranch handshake is blocking
+%% we'll make that call and get the socket in the timeout handler.
+init({ranch, Ref, Transport, _Opts}) ->
     {ok, #sbox_state{ref = Ref,
-                socket = Socket,
-                transport = Transport}, 0}.
+                     transport = Transport}, 0}.
 
 handle_info({tcp, Socket, Data},
             #sbox_state{socket=Socket,
@@ -166,12 +164,14 @@ handle_info({tcp_error, _, Reason}, State) ->
     network_error(Reason, State);
 
 handle_info(timeout, #sbox_state{ref = Ref,
-                            socket = Socket,
-                            transport = Transport} = State) ->
-    %% notify ranch that it owns the socket
-    ok = ranch:accept_ack(Ref),
+                                 transport = Transport} = State) ->
+    %% this timeout happens immediately on the init call
+    %% so that the ranch handshake can be called, which
+    %% returns the socket. This handshake replaces the previous accept_ack
+    %% call that was blocking in the ranch 1.x protocol.
+    {ok, Socket} = ranch:handshake(Ref),
     ok = Transport:setopts(Socket, [{active, once}]),
-    {noreply, State};
+    {noreply, State#sbox_state{socket = Socket}};
 
 handle_info({'EXIT', Pid, Reason}, #sbox_state{rpc_proc = RpcProc} = State) ->
     case Pid of

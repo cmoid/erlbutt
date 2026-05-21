@@ -23,9 +23,11 @@ start(_StartType, _StartArgs) ->
 
     Port = application:get_env(ssb, port, 8008),
     catch ranch:stop_listener(erlbutt_listener),
-    {ok, _} = ranch:start_listener(erlbutt_listener, 5,
-                                   ranch_tcp, [{port, Port},
-                                               {max_connections, 10}],
+    {ok, _} = ranch:start_listener(erlbutt_listener,
+                                   ranch_tcp,
+                                   #{socket_opts => [{port, Port}],
+                                     max_connections => 10,
+                                     num_acceptors => 5},
                                    ssb_peer, []),
 
     ssb_sup:start_link().
