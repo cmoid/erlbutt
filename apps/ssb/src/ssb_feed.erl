@@ -450,10 +450,86 @@ close_file(File) ->
     ok = file:close(File).
 
 -ifdef(TEST).
-instance_feed_test() ->
-    config:start_link("test/ssb.cfg"),
-    keys:start_link(),
-    mess_auth:start_link(),
-    {ok, F1} = ssb_feed:start_link(keys:pub_key_disp()),
-    ok = ssb_feed:post_content(F1, ~"foo").
+
+feed_test_() ->
+    {foreach,
+     fun setup/0,
+     fun teardown/1,
+     [fun post_and_fetch_test/1,
+      fun sequence_increments_test/1,
+      fun fetch_last_msg_test/1,
+      fun archive_manual_test/1,
+      fun post_after_archive_test/1]}.
+
+setup() ->
+    ensure_started(config,    fun() -> config:start_link("test/ssb.cfg") end),
+    ensure_started(keys,      fun() -> keys:start_link() end),
+    ensure_started(mess_auth, fun() -> mess_auth:start_link() end),
+    ensure_started(blobs,     fun() -> blobs:start_link() end),
+    FeedId = keys:pub_key_disp(),
+    file:delete(feed_file(FeedId)),
+    {ok, Pid} = ssb_feed:start_link(FeedId),
+    {Pid, FeedId}.
+
+teardown({Pid, _}) ->
+    gen_server:stop(Pid).
+
+ensure_started(Name, StartFun) ->
+    case whereis(Name) of
+        undefined -> StartFun();
+        _         -> ok
+    end.
+
+feed_file(FeedId) ->
+    Location = config:feed_loc(),
+    DecId = utils:decode_id(FeedId),
+    <<Dir:2/binary, Rest/binary>> = DecId,
+    <<Location/binary, Dir/binary, "/", Rest/binary, "/log.offset">>.
+
+post_and_fetch_test({Pid, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"hello world"),
+        #message{id = Key, sequence = 1} = ssb_feed:fetch_last_msg(Pid),
+        #message{content = ~"hello world"} = ssb_feed:fetch_msg(Pid, Key)
+    end.
+
+sequence_increments_test({Pid, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"first"),
+        ok = ssb_feed:post_content(Pid, ~"second"),
+        ok = ssb_feed:post_content(Pid, ~"third"),
+        #message{sequence = 3} = ssb_feed:fetch_last_msg(Pid)
+    end.
+
+fetch_last_msg_test({Pid, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"a"),
+        ok = ssb_feed:post_content(Pid, ~"b"),
+        ok = ssb_feed:post_content(Pid, ~"c"),
+        #message{content = ~"c"} = ssb_feed:fetch_last_msg(Pid)
+    end.
+
+archive_manual_test({Pid, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"x"),
+        ok = ssb_feed:post_content(Pid, ~"y"),
+        {ok, BlobId} = ssb_feed:archive(Pid),
+        ?assert(blobs:has(BlobId) =:= true),
+        #message{sequence = 3,
+                 previous = null,
+                 content  = {Props}} = ssb_feed:fetch_last_msg(Pid),
+        ?assert(proplists:get_value(~"type",        Props) =:= ~"archive"),
+        ?assert(proplists:get_value(~"to_sequence", Props) =:= 2)
+    end.
+
+post_after_archive_test({Pid, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"before"),
+        {ok, _} = ssb_feed:archive(Pid),
+        #message{id = GenesisId, sequence = GenesisSeq} = ssb_feed:fetch_last_msg(Pid),
+        ok = ssb_feed:post_content(Pid, ~"after"),
+        #message{previous = GenesisId, sequence = AfterSeq} = ssb_feed:fetch_last_msg(Pid),
+        ?assert(AfterSeq =:= GenesisSeq + 1)
+    end.
+
 -endif.
