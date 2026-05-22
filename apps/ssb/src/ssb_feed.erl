@@ -26,7 +26,8 @@
          fetch_last_msg/1,
          store_ref/2,
          references/3,
-         foldl/3]).
+         foldl/3,
+         archive/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -40,6 +41,7 @@
 -record(state, {id,
                 last_msg = null,
                 last_seq = 0,
+                segment_start = 1,
                 feed,
                 profile,
                 refs,
@@ -84,6 +86,9 @@ references(FeedPid, MsgId, RootId) ->
 foldl(FeedPid, Fun, Acc) ->
     gen_server:call(FeedPid, {foldl, Fun, Acc}, infinity).
 
+archive(FeedPid) ->
+    gen_server:call(FeedPid, archive, infinity).
+
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -104,6 +109,15 @@ init([FeedId]) ->
         _         -> ets:insert(ssb_feed_registry, {FeedId, self()})
     end,
     {ok, check_owner_feed(State)}.
+
+handle_call(archive, _From, #state{id = Id} = State) ->
+    CanPost = Id == keys:pub_key_disp(),
+    if CanPost ->
+            {NewState, BlobId} = do_archive(State),
+            {reply, {ok, BlobId}, NewState};
+       true ->
+            {reply, {error, not_owner}, State}
+    end;
 
 handle_call(whoami, _From, #state{id = Id} = State) ->
     {reply, Id, State};
@@ -214,8 +228,48 @@ post(Content, #state{id = FeedId, last_msg = Prev,
     #message{id = Id} = Msg =
         message:new_msg(Prev, Seq + 1, Content,
                         {FeedId, keys:priv_key()}),
-    NewState = store(Msg, State),
-    NewState#state{last_msg = Id, last_seq = Seq + 1}.
+    State1 = store(Msg, State),
+    State2 = State1#state{last_msg = Id, last_seq = Seq + 1},
+    maybe_archive(State2).
+
+maybe_archive(#state{last_seq = Seq} = State) ->
+    case archive_length() of
+        undefined ->
+            State;
+        Len when Seq rem Len =:= 0 ->
+            {NewState, _} = do_archive(State),
+            NewState;
+        _ ->
+            State
+    end.
+
+archive_length() ->
+    config:archive_length().
+
+do_archive(#state{id = FeedId, last_seq = LastSeq,
+                  segment_start = From, feed = FeedFile} = State) ->
+    {ok, LogData} = file:read_file(FeedFile),
+    GzData = zlib:gzip(LogData),
+    ArchiveFile = archive_filename(FeedFile, From, LastSeq),
+    ok = file:write_file(ArchiveFile, GzData),
+    BlobId = blobs:store(GzData),
+    ok = file:delete(FeedFile),
+    Content = {[{~"type",          ~"archive"},
+                {~"archive",       BlobId},
+                {~"from_sequence", From},
+                {~"to_sequence",   LastSeq}]},
+    NewSeq = LastSeq + 1,
+    #message{id = NewId} = Msg =
+        message:new_msg(null, NewSeq, Content, {FeedId, keys:priv_key()}),
+    State1 = store(Msg, State),
+    {State1#state{last_msg      = NewId,
+                  last_seq      = NewSeq,
+                  segment_start = NewSeq + 1}, BlobId}.
+
+archive_filename(FeedFile, From, To) ->
+    <<FeedFile/binary, ".",
+      (integer_to_binary(From))/binary, "-",
+      (integer_to_binary(To))/binary, ".gz">>.
 
 store(#message{id = Id, author = Auth} = Msg,
       #state{feed = Feed,
@@ -277,9 +331,15 @@ check_owner_feed(#state{id = FeedId, feed = Feed,
                     State;
                 {Pos, Msg, Key} ->
                     ets:insert(Messages, {Key, Pos}),
-                    #message{sequence = Seq} = message:decode(Msg, true),
-                    State#state{last_msg = Key,
-                                last_seq = Seq}
+                    #message{sequence = Seq,
+                             previous = Prev} = message:decode(Msg, true),
+                    SegStart = case Prev of
+                        null when Seq > 1 -> Seq + 1;
+                        _                 -> 1
+                    end,
+                    State#state{last_msg      = Key,
+                                last_seq      = Seq,
+                                segment_start = SegStart}
             end;
        true ->
             State

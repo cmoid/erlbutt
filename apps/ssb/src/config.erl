@@ -11,7 +11,9 @@
          ssb_repo_loc/0,
          feed_loc/0,
          blob_loc/0,
-         network_id/0]).
+         network_id/0,
+         archive_length/0,
+         set_archive_length/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -23,7 +25,8 @@
                 repo_loc,
                 feed_loc,
                 blob_loc,
-                net_id}).
+                net_id,
+                archive_length = ?DEFAULT_ARCHIVE_LENGTH}).
 
 %%%===================================================================
 %%% API
@@ -40,6 +43,14 @@ blob_loc() ->
 
 network_id() ->
     gen_server:call(?MODULE, netid, infinity).
+
+archive_length() ->
+    gen_server:call(?MODULE, archive_length, infinity).
+
+set_archive_length(undefined) ->
+    gen_server:call(?MODULE, {set_archive_length, undefined}, infinity);
+set_archive_length(Len) when is_integer(Len), Len > 0 ->
+    gen_server:call(?MODULE, {set_archive_length, Len}, infinity).
 
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, ["ssb.cfg"], []).
@@ -77,7 +88,13 @@ handle_call(blobs, _From, #state{blob_loc = BlobLoc}=State) ->
     {reply, BlobLoc, State};
 
 handle_call(netid, _From, #state{net_id = NetId}=State) ->
-    {reply, NetId, State}.
+    {reply, NetId, State};
+
+handle_call(archive_length, _From, #state{archive_length = Len}=State) ->
+    {reply, Len, State};
+
+handle_call({set_archive_length, Len}, _From, State) ->
+    {reply, ok, State#state{archive_length = Len}}.
 
 %% casts
 
@@ -117,6 +134,9 @@ parse({blob_store_location, Loc}, #state{repo_loc = RepLoc} = State) ->
 
 parse({network_id, NetId}, State) ->
     State#state{net_id = base64:decode(NetId)};
+
+parse({archive_length, Len}, State) when is_integer(Len), Len > 0 ->
+    State#state{archive_length = Len};
 
 parse(_Any, State) ->
     %% ignore for now, this is an error technically
