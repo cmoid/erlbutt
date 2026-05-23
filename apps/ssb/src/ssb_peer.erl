@@ -65,25 +65,8 @@ init([Ip, PubKey]) ->
 init([Ip, Port, PubKey]) ->
     process_flag(trap_exit, true),
     try
-        {ok, {Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce}} =
-            shs:client_shake_hands(connect(Ip, Port), PubKey),
-        ranch_tcp:setopts(Socket, [{active, false}]),
-        {ok, RpcProc} = rpc_processor:start_link(),
-        ranch_tcp:setopts(Socket, [{active, once}]),
-        WantsReqNo = 1,
-        N1 = open_wants_stream(Socket, EncBoxKey, EncNonce, WantsReqNo),
-        ok = rpc_processor:register_stream(RpcProc, -WantsReqNo, blob_wants),
-        {ok, #sbox_state{socket = Socket,
-                         transport = ranch_tcp,
-                         dec_sbox_key = DecBoxKey,
-                         enc_sbox_key = EncBoxKey,
-                         dec_nonce = DecNonce,
-                         enc_nonce = N1,
-                         rpc_proc = RpcProc,
-                         remote_pk = PubKey,
-                         shook_hands = 1,
-                         our_wants_req = WantsReqNo,
-                         req_counter = WantsReqNo}}
+        {ok, State} = outbound_connect(Ip, Port, PubKey),
+        {ok, State}
     catch
         error:Reason ->
             {stop, Reason}
@@ -100,8 +83,9 @@ handle_info({tcp, Socket, Data},
                    transport=Transport,
                    shook_hands = 0} = State) ->
     try
-        {ok, {DecBoxKey, DecNonce, EncBoxKey, EncNonce, ClientPk}}
+        {ok, {DecBoxKey, DecNonce, EncBoxKey, EncNonce, ClientPk, WinNetId}}
             = shs:server_shake_hands(Data, Socket, Transport),
+        network_id_cache:record(ClientPk, WinNetId),
         {ok, RpcProc} = rpc_processor:start_link(),
         ok = rpc_processor:set_remote_pk(RpcProc, ClientPk),
         Transport:setopts(Socket, [{active, once}]),
@@ -463,6 +447,57 @@ send_want_body(Socket, Key, Nonce, BlobIds, ReqNo) ->
     Flags = rpc_processor:create_flags(1, 0, 2),
     Header = rpc_processor:create_header(Flags, size(WantBody), ReqNo),
     send_data(combine(Header, WantBody), Socket, Nonce, Key).
+
+outbound_connect(Ip, Port, PubKey) ->
+    NetIds = ordered_net_ids(PubKey),
+    try_net_ids(Ip, Port, PubKey, NetIds, 0).
+
+ordered_net_ids(PubKey) ->
+    All = config:network_ids(),
+    case network_id_cache:lookup(PubKey) of
+        {ok, Cached} -> [Cached | lists:delete(Cached, All)];
+        miss          -> All
+    end.
+
+try_net_ids(_Ip, _Port, _PubKey, [], _Attempt) ->
+    error(no_matching_network_id);
+try_net_ids(Ip, Port, PubKey, [NetId | Rest], Attempt) ->
+    case Attempt > 0 of
+        true  -> timer:sleep(backoff(Attempt));
+        false -> ok
+    end,
+    Socket = connect(Ip, Port),
+    try shs:client_shake_hands(Socket, PubKey, NetId) of
+        {ok, {Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce}} ->
+            network_id_cache:record(PubKey, NetId),
+            {ok, build_outbound_state(Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce, PubKey)}
+    catch
+        _:_ ->
+            gen_tcp:close(Socket),
+            try_net_ids(Ip, Port, PubKey, Rest, Attempt + 1)
+    end.
+
+backoff(N) ->
+    min(1000 * (1 bsl (N - 1)), 30000).
+
+build_outbound_state(Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce, PubKey) ->
+    ranch_tcp:setopts(Socket, [{active, false}]),
+    {ok, RpcProc} = rpc_processor:start_link(),
+    ranch_tcp:setopts(Socket, [{active, once}]),
+    WantsReqNo = 1,
+    N1 = open_wants_stream(Socket, EncBoxKey, EncNonce, WantsReqNo),
+    ok = rpc_processor:register_stream(RpcProc, -WantsReqNo, blob_wants),
+    #sbox_state{socket = Socket,
+                transport = ranch_tcp,
+                dec_sbox_key = DecBoxKey,
+                enc_sbox_key = EncBoxKey,
+                dec_nonce = DecNonce,
+                enc_nonce = N1,
+                rpc_proc = RpcProc,
+                remote_pk = PubKey,
+                shook_hands = 1,
+                our_wants_req = WantsReqNo,
+                req_counter = WantsReqNo}.
 
 %% Build our initial vector clock, including the remote peer's feedId at seq 0
 %% so the server sends us everything it has for that feed.
