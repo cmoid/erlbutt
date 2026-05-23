@@ -31,18 +31,15 @@
 all() -> [invite_redeem_test].
 
 init_per_suite(Config) ->
-    case node() of
-        nonode@nohost -> net_kernel:start([erlbutt_ct_inv, shortnames]);
-        _             -> ok
-    end,
+    ssb_ct_helper:ensure_distributed(),
     DataDir = ?config(priv_dir, Config),
     DirA = filename:join(DataDir, "node_a"),
     DirB = filename:join(DataDir, "node_b"),
     ok = filelib:ensure_dir(DirA ++ "/"),
     ok = filelib:ensure_dir(DirB ++ "/"),
-    PAs = pa_args(),
-    {ok, PeerA, NodeA} = start_ssb_node(node_inv_a, DirA, ?PORT_A, PAs),
-    {ok, PeerB, NodeB} = start_ssb_node(node_inv_b, DirB, ?PORT_B, PAs),
+    PAs = ssb_ct_helper:pa_args(),
+    {ok, PeerA, NodeA} = ssb_ct_helper:start_ssb_node(node_inv_a, DirA, ?PORT_A, PAs),
+    {ok, PeerB, NodeB} = ssb_ct_helper:start_ssb_node(node_inv_b, DirB, ?PORT_B, PAs),
     [{node_a, NodeA}, {peer_a, PeerA},
      {node_b, NodeB}, {peer_b, PeerB}
      | Config].
@@ -85,34 +82,3 @@ invite_redeem_test(Config) ->
         rpc:call(NodeB, ssb_feed, fetch_last_msg, [BFeedPid]),
     ?assert(BSeq >= 2).
 
-%%% Helpers -------------------------------------------------------------
-
-start_ssb_node(Name, DataDir, Port, PAs) ->
-    {ok, Peer, Node} = peer:start(#{name => Name, args => PAs}),
-    rpc:call(Node, code, add_paths,
-             [[filename:join([build_dir(), "lib", "enacl", "priv"])]]),
-    rpc:call(Node, application, set_env, [ssb, ssb_home, DataDir]),
-    rpc:call(Node, application, set_env, [ssb, port, Port]),
-    {ok, _} = rpc:call(Node, application, ensure_all_started, [ssb]),
-    {ok, Peer, Node}.
-
-pa_args() ->
-    LibDir = filename:join(build_dir(), "lib"),
-    {ok, Libs} = file:list_dir(LibDir),
-    lists:flatmap(
-        fun(Lib) ->
-            EbinDir = filename:join([LibDir, Lib, "ebin"]),
-            TestDir = filename:join([LibDir, Lib, "test"]),
-            Ebin = case filelib:is_dir(EbinDir) of
-                true  -> ["-pa", EbinDir];
-                false -> []
-            end,
-            Test = case filelib:is_dir(TestDir) of
-                true  -> ["-pa", TestDir];
-                false -> []
-            end,
-            Ebin ++ Test
-        end, Libs).
-
-build_dir() ->
-    filename:join(code:lib_dir(ssb), "../..").

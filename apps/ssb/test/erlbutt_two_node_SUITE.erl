@@ -42,10 +42,7 @@ all() ->
 
 init_per_suite(Config) ->
     %% peer:start/1 requires the calling node to be distributed.
-    case node() of
-        nonode@nohost -> net_kernel:start([erlbutt_ct, shortnames]);
-        _             -> ok
-    end,
+    ssb_ct_helper:ensure_distributed(),
 
     DataDir = ?config(priv_dir, Config),
     DirA    = filename:join(DataDir, "node_a"),
@@ -53,9 +50,9 @@ init_per_suite(Config) ->
     ok = filelib:ensure_dir(DirA ++ "/"),
     ok = filelib:ensure_dir(DirB ++ "/"),
 
-    PAs = pa_args(),
-    {ok, PeerA, NodeA} = start_ssb_node(node_a, DirA, ?PORT_A, PAs),
-    {ok, PeerB, NodeB} = start_ssb_node(node_b, DirB, ?PORT_B, PAs),
+    PAs = ssb_ct_helper:pa_args(),
+    {ok, PeerA, NodeA} = ssb_ct_helper:start_ssb_node(node_a, DirA, ?PORT_A, PAs),
+    {ok, PeerB, NodeB} = ssb_ct_helper:start_ssb_node(node_b, DirB, ?PORT_B, PAs),
 
     [{node_a, NodeA}, {peer_a, PeerA},
      {node_b, NodeB}, {peer_b, PeerB},
@@ -207,42 +204,3 @@ two_node_blob_fetch_test(Config) ->
     rpc:call(NodeB, gen_server, stop, [PeerPid]).
 
 %%% Helpers -------------------------------------------------------------
-
-%% Start a peer BEAM node, load code paths, configure and start ssb.
-start_ssb_node(Name, DataDir, Port, PAs) ->
-    {ok, Peer, Node} = peer:start(#{
-        name => Name,
-        args => PAs
-    }),
-    %% Load enacl NIF — must be done before starting ssb
-    rpc:call(Node, code, add_paths,
-             [[filename:join([build_dir(), "lib", "enacl", "priv"])]]),
-    rpc:call(Node, application, set_env, [ssb, ssb_home, DataDir]),
-    rpc:call(Node, application, set_env, [ssb, port, Port]),
-    {ok, _} = rpc:call(Node, application, ensure_all_started, [ssb]),
-    {ok, Peer, Node}.
-
-%% Build -pa flag strings for all ebin and test dirs in the test build.
-%% Test dirs are needed so CT suite modules (like this one) are available
-%% on remote nodes spawned via peer.
-pa_args() ->
-    LibDir = filename:join(build_dir(), "lib"),
-    {ok, Libs} = file:list_dir(LibDir),
-    lists:flatmap(
-        fun(Lib) ->
-            EbinDir = filename:join([LibDir, Lib, "ebin"]),
-            TestDir = filename:join([LibDir, Lib, "test"]),
-            Ebin = case filelib:is_dir(EbinDir) of
-                true  -> ["-pa", EbinDir];
-                false -> []
-            end,
-            Test = case filelib:is_dir(TestDir) of
-                true  -> ["-pa", TestDir];
-                false -> []
-            end,
-            Ebin ++ Test
-        end, Libs).
-
-build_dir() ->
-    %% code:lib_dir(ssb) = _build/test/lib/ssb; two levels up = _build/test
-    filename:join(code:lib_dir(ssb), "../..").

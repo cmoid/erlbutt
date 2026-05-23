@@ -31,15 +31,12 @@
 all() -> [auto_archive_test, manual_archive_test].
 
 init_per_suite(Config) ->
-    case node() of
-        nonode@nohost -> net_kernel:start([erlbutt_ct_arc, shortnames]);
-        _             -> ok
-    end,
+    ssb_ct_helper:ensure_distributed(),
     DataDir = ?config(priv_dir, Config),
     Dir = filename:join(DataDir, "node"),
     ok = filelib:ensure_dir(Dir ++ "/"),
-    PAs = pa_args(),
-    {ok, Peer, Node} = start_ssb_node(node_arc, Dir, ?PORT, PAs),
+    PAs = ssb_ct_helper:pa_args(),
+    {ok, Peer, Node} = ssb_ct_helper:start_ssb_node(node_arc, Dir, ?PORT, PAs),
     [{node, Node}, {peer, Peer} | Config].
 
 end_per_suite(Config) ->
@@ -105,34 +102,3 @@ manual_archive_test(Config) ->
     ?assert(proplists:get_value(~"type", ContentProps) =:= ~"archive"),
     ?assert(proplists:get_value(~"to_sequence", ContentProps) =:= PreSeq).
 
-%%% Helpers -------------------------------------------------------------
-
-start_ssb_node(Name, DataDir, Port, PAs) ->
-    {ok, Peer, Node} = peer:start(#{name => Name, args => PAs}),
-    rpc:call(Node, code, add_paths,
-             [[filename:join([build_dir(), "lib", "enacl", "priv"])]]),
-    rpc:call(Node, application, set_env, [ssb, ssb_home, DataDir]),
-    rpc:call(Node, application, set_env, [ssb, port, Port]),
-    {ok, _} = rpc:call(Node, application, ensure_all_started, [ssb]),
-    {ok, Peer, Node}.
-
-pa_args() ->
-    LibDir = filename:join(build_dir(), "lib"),
-    {ok, Libs} = file:list_dir(LibDir),
-    lists:flatmap(
-        fun(Lib) ->
-            EbinDir = filename:join([LibDir, Lib, "ebin"]),
-            TestDir = filename:join([LibDir, Lib, "test"]),
-            Ebin = case filelib:is_dir(EbinDir) of
-                true  -> ["-pa", EbinDir];
-                false -> []
-            end,
-            Test = case filelib:is_dir(TestDir) of
-                true  -> ["-pa", TestDir];
-                false -> []
-            end,
-            Ebin ++ Test
-        end, Libs).
-
-build_dir() ->
-    filename:join(code:lib_dir(ssb), "../..").
