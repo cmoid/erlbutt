@@ -12,6 +12,8 @@
          feed_loc/0,
          blob_loc/0,
          network_id/0,
+         network_ids/0,
+         add_network_id/1,
          archive_length/0,
          set_archive_length/1]).
 
@@ -26,6 +28,7 @@
                 feed_loc,
                 blob_loc,
                 net_id,
+                extra_network_ids = [],
                 archive_length = ?DEFAULT_ARCHIVE_LENGTH}).
 
 %%%===================================================================
@@ -43,6 +46,12 @@ blob_loc() ->
 
 network_id() ->
     gen_server:call(?MODULE, netid, infinity).
+
+network_ids() ->
+    gen_server:call(?MODULE, network_ids, infinity).
+
+add_network_id(NetId) when is_binary(NetId) ->
+    gen_server:call(?MODULE, {add_network_id, NetId}, infinity).
 
 archive_length() ->
     gen_server:call(?MODULE, archive_length, infinity).
@@ -68,7 +77,8 @@ init([Config]) ->
     case filelib:is_file(Config) of
         true ->
             {ok, load_and_parse(Config, #state{ssb_home = SSBHome,
-                                               repo_loc = default_repo(SSBHome)})};
+                                               repo_loc = default_repo(SSBHome),
+                                               net_id = default_net_id()})};
         false ->
             %%?LOG_DEBUG("try to load the config from ~p ~n", []),
             {ok, #state{ssb_home = SSBHome,
@@ -89,6 +99,12 @@ handle_call(blobs, _From, #state{blob_loc = BlobLoc}=State) ->
 
 handle_call(netid, _From, #state{net_id = NetId}=State) ->
     {reply, NetId, State};
+
+handle_call(network_ids, _From, #state{net_id = NetId, extra_network_ids = Extras}=State) ->
+    {reply, [NetId | Extras], State};
+
+handle_call({add_network_id, NetId}, _From, #state{extra_network_ids = Extras}=State) ->
+    {reply, ok, State#state{extra_network_ids = Extras ++ [NetId]}};
 
 handle_call(archive_length, _From, #state{archive_length = Len}=State) ->
     {reply, Len, State};
@@ -134,6 +150,9 @@ parse({blob_store_location, Loc}, #state{repo_loc = RepLoc} = State) ->
 
 parse({network_id, NetId}, State) ->
     State#state{net_id = base64:decode(NetId)};
+
+parse({extra_network_ids, List}, State) when is_list(List) ->
+    State#state{extra_network_ids = [base64:decode(Id) || Id <- List]};
 
 parse({archive_length, Len}, State) when is_integer(Len), Len > 0 ->
     State#state{archive_length = Len};

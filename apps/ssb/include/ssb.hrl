@@ -17,6 +17,7 @@
 %% This network id is almost the same
 -define(DEFAULT_NETWORK_ID, base64:decode("1KHLiKZvAvjbY1ziZEHMXawbCEIM6qwjCDm3VYnaR/s=")).
 -define(DEFAULT_ARCHIVE_LENGTH, 10000).
+-define(DEFAULT_CACHE_CAPACITY, 1000).
 %%
 %% as this one that is for the current main SSB network
 %% 1KHLiKZvAvjbY1ziZEHMXawbCEIM6qwjCDm3VYRan/s=
