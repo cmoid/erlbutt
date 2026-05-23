@@ -18,30 +18,27 @@
          create_long_pair/0,
          client_shake_hands/2,
          client_shake_hands/3,
-         server_shake_hands/3]).
+         server_shake_hands/3,
+         server_shake_hands/4]).
 
-check_hello(BinData) ->
+check_hello(BinData, NetId) ->
     case size(BinData) of
         64 ->
-            <<Hmac:32/binary,Eph_pk:32/binary>> = BinData,
-            Valid = enacl:auth_verify(Hmac, Eph_pk, config:network_id()),
-            <<Nonce:24/binary,_End:8/binary>> = Hmac,
+            <<Hmac:32/binary, Eph_pk:32/binary>> = BinData,
+            Valid = enacl:auth_verify(Hmac, Eph_pk, NetId),
+            <<Nonce:24/binary, _End:8/binary>> = Hmac,
             {Valid, Eph_pk, Nonce};
         _ ->
             {false, nobody, none}
     end.
 
-gen_hello() ->
-
+gen_hello(NetId) ->
     #{public := Eph_pk,
       secret := Eph_sk} = enacl:box_keypair(),
     SizEph_pk = size(Eph_pk),
-
-    NaclAuth = enacl:auth(Eph_pk, config:network_id()),
+    NaclAuth = enacl:auth(Eph_pk, NetId),
     SizNaclAuth = size(NaclAuth),
-
-    <<Nonce:24/binary,_End:8/binary>> = NaclAuth,
-
+    <<Nonce:24/binary, _End:8/binary>> = NaclAuth,
     {Eph_sk, <<NaclAuth:SizNaclAuth/binary,
                 Eph_pk:SizEph_pk/binary>>, Nonce}.
 
@@ -73,127 +70,80 @@ create_long_pair() ->
      maps:get(secret, KeyPair)}.
 
 client_shake_hands(Socket, RemotePubKey) ->
-    client_shake_hands(Socket, RemotePubKey, {long_pk(), long_sk()}).
+    do_client_shake_hands(Socket, RemotePubKey, config:network_id(), long_pk(), long_sk()).
 
+%% NetId as binary: retry-loop path in ssb_peer, uses default node keys.
+client_shake_hands(Socket, RemotePubKey, NetId) when is_binary(NetId) ->
+    do_client_shake_hands(Socket, RemotePubKey, NetId, long_pk(), long_sk());
+
+%% Key-pair tuple: invite path, uses ephemeral invite keys with primary NetId.
 client_shake_hands(Socket, RemotePubKey, {OurPubKey, OurPrivKey}) ->
-    {Eph_sk, Hmac, DecNonce} = gen_hello(),
+    do_client_shake_hands(Socket, RemotePubKey, config:network_id(), OurPubKey, OurPrivKey).
 
-    % say hello to server
+do_client_shake_hands(Socket, RemotePubKey, NetId, OurPubKey, OurPrivKey) ->
+    {Eph_sk, Hmac, DecNonce} = gen_hello(NetId),
     gen_tcp:send(Socket, Hmac),
-
-    % receive response from server
     {ok, ServerHmac} = gen_tcp:recv(Socket, 64, 5000),
-
-    {true, ServEph_pk, EncNonce} = check_hello(ServerHmac),
-
+    {true, ServEph_pk, EncNonce} = check_hello(ServerHmac, NetId),
     Shared_ab = mult(Eph_sk, ServEph_pk),
     Shared_aB = mult(Eph_sk, pk_to_curve25519(RemotePubKey)),
-
     ShaSab = crypto:hash(sha256, Shared_ab),
-
-    DetSigA = enacl:sign_detached(concat([config:network_id(),
-                                          RemotePubKey,
-                                          ShaSab]),
-                                  OurPrivKey),
-
+    DetSigA = enacl:sign_detached(concat([NetId, RemotePubKey, ShaSab]), OurPrivKey),
     Msg = concat([DetSigA, OurPubKey]),
-
-    Box = create_box(Msg, concat([config:network_id(),
-                                  Shared_ab,
-                                  Shared_aB])),
-
-    % client authenticates
+    Box = create_box(Msg, concat([NetId, Shared_ab, Shared_aB])),
     gen_tcp:send(Socket, Box),
-
     Shared_Ab = mult(sk_to_curve25519(OurPrivKey), ServEph_pk),
     {ok, ServData} = gen_tcp:recv(Socket, 80, 5000),
-
-    DetSigB =
-        open_box(ServData,
-                 ?SHS_NONCE,
-                 crypto:hash(sha256,
-                             concat([config:network_id(),
-                                     Shared_ab,
-                                     Shared_aB,
-                                     Shared_Ab]))),
-
-    M = concat([config:network_id(),
-                DetSigA,
-                OurPubKey,
-                ShaSab]),
-
+    DetSigB = open_box(ServData, ?SHS_NONCE,
+                       crypto:hash(sha256, concat([NetId, Shared_ab, Shared_aB, Shared_Ab]))),
+    M = concat([NetId, DetSigA, OurPubKey, ShaSab]),
     true = enacl:sign_verify_detached(DetSigB, M, RemotePubKey),
-
     SharedKey = crypto:hash(sha256,
                             crypto:hash(sha256,
-                                        concat([config:network_id(),
-                                                Shared_ab,
-                                                Shared_aB,
-                                                Shared_Ab]))),
+                                        concat([NetId, Shared_ab, Shared_aB, Shared_Ab]))),
     DecBoxKey = crypto:hash(sha256, concat([SharedKey, OurPubKey])),
     EncBoxKey = crypto:hash(sha256, concat([SharedKey, RemotePubKey])),
-
     {ok, {Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce}}.
 
 server_shake_hands(Data, Socket, Transport) ->
+    server_shake_hands(Data, Socket, Transport, config:network_ids()).
 
-    % check hellow from client
-    {true, ClEph_pk, EncNonce} = check_hello(Data),
+server_shake_hands(Data, Socket, Transport, NetIds) ->
+    WinNetId = find_network_id(Data, NetIds),
+    do_server_shake_hands(Data, Socket, Transport, WinNetId).
 
-    {Eph_sk, ServerHmac, DecNonce} = gen_hello(),
-    % server says hello
-    Transport:send(Socket,ServerHmac),
+find_network_id(_Data, []) ->
+    error(no_matching_network_id);
+find_network_id(Data, [NetId | Rest]) ->
+    case check_hello(Data, NetId) of
+        {true, _, _} -> NetId;
+        _            -> find_network_id(Data, Rest)
+    end.
 
+do_server_shake_hands(Data, Socket, Transport, NetId) ->
+    {true, ClEph_pk, EncNonce} = check_hello(Data, NetId),
+    {Eph_sk, ServerHmac, DecNonce} = gen_hello(NetId),
+    Transport:send(Socket, ServerHmac),
     Shared_ab = mult(Eph_sk, ClEph_pk),
-    Shared_aB = mult(sk_to_curve25519(long_sk()),
-                                 ClEph_pk),
-
-    % receive client autheticate
+    Shared_aB = mult(sk_to_curve25519(long_sk()), ClEph_pk),
     {ok, ServData} = Transport:recv(Socket, 112, 5000),
-
-    ShaSab = crypto:hash(sha256,Shared_ab),
-    MsgPlain =
-        open_box(ServData, ?SHS_NONCE,
-                     crypto:hash(sha256,
-                                 concat([config:network_id(),
-                                         Shared_ab,
-                                         Shared_aB]))),
-    <<DetSigA:64/binary,ClLong_pk:32/binary>> = MsgPlain,
-    true =
-        enacl:sign_verify_detached(DetSigA,
-                                   concat([config:network_id(),
-                                           long_pk(),
-                                           ShaSab]),
-                                   ClLong_pk),
-    Shared_Ab =
-        mult(Eph_sk,pk_to_curve25519(ClLong_pk)),
-    DetSigB =
-        enacl:sign_detached(concat([config:network_id(),
-                                    DetSigA,
-                                    ClLong_pk,
-                                    ShaSab]),
-                            long_sk()),
-    Box =
-        create_box(DetSigB,
-                       concat([config:network_id(),
-                               Shared_ab,
-                               Shared_aB,
-                               Shared_Ab])),
-
-    % server accepts
-    Transport:send(Socket,Box),
-
+    ShaSab = crypto:hash(sha256, Shared_ab),
+    MsgPlain = open_box(ServData, ?SHS_NONCE,
+                        crypto:hash(sha256, concat([NetId, Shared_ab, Shared_aB]))),
+    <<DetSigA:64/binary, ClLong_pk:32/binary>> = MsgPlain,
+    true = enacl:sign_verify_detached(DetSigA,
+                                      concat([NetId, long_pk(), ShaSab]),
+                                      ClLong_pk),
+    Shared_Ab = mult(Eph_sk, pk_to_curve25519(ClLong_pk)),
+    DetSigB = enacl:sign_detached(concat([NetId, DetSigA, ClLong_pk, ShaSab]), long_sk()),
+    Box = create_box(DetSigB, concat([NetId, Shared_ab, Shared_aB, Shared_Ab])),
+    Transport:send(Socket, Box),
     SharedKey = crypto:hash(sha256,
-                            crypto:hash(sha256, concat([config:network_id(),
-                                                        Shared_ab,
-                                                        Shared_aB,
-                                                        Shared_Ab]))),
-    DecBoxKey = crypto:hash(sha256, combine(SharedKey,
-                                            long_pk())),
-    EncBoxKey = crypto:hash(sha256, combine(SharedKey,
-                                            ClLong_pk)),
-
-    {ok, {DecBoxKey, DecNonce, EncBoxKey, EncNonce, ClLong_pk}}.
+                            crypto:hash(sha256,
+                                        concat([NetId, Shared_ab, Shared_aB, Shared_Ab]))),
+    DecBoxKey = crypto:hash(sha256, combine(SharedKey, long_pk())),
+    EncBoxKey = crypto:hash(sha256, combine(SharedKey, ClLong_pk)),
+    {ok, {DecBoxKey, DecNonce, EncBoxKey, EncNonce, ClLong_pk, NetId}}.
 
 long_sk() ->
     base64:decode(keys:priv_key()).
@@ -207,15 +157,17 @@ long_pk() ->
 
 simple_test() ->
     {ok, Pid} = config:start_link("test/ssb.cfg"),
-    {Eph_sk, Hmac, _Nonce} = gen_hello(),
+    NetId = config:network_id(),
+    {Eph_sk, Hmac, _Nonce} = gen_hello(NetId),
     ?assert(size(Eph_sk) == 32),
     ?assert(size(Hmac) == 64),
     gen_server:stop(Pid).
 
 round_trip_test() ->
     {ok, Pid} = config:start_link("test/ssb.cfg"),
-    {_Eph_sk, Hmac, _} = gen_hello(),
-    {true, _Eph_pk, _} = check_hello(Hmac),
+    NetId = config:network_id(),
+    {_Eph_sk, Hmac, _} = gen_hello(NetId),
+    {true, _Eph_pk, _} = check_hello(Hmac, NetId),
     gen_server:stop(Pid).
 
 -endif.
