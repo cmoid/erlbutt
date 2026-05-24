@@ -104,8 +104,8 @@ is_vector_clock(_) -> false.
 %% key but no "author" key.  Discard them silently — they are the remote
 %% peer's internal diagnostics, not SSB data.
 is_peer_error({Props}) when is_list(Props) ->
-    lists:keymember(<<"name">>, 1, Props) andalso
-        not lists:keymember(<<"author">>, 1, Props);
+    lists:keymember(~"name", 1, Props) andalso
+        not lists:keymember(~"author", 1, Props);
 is_peer_error(_) -> false.
 
 %% For each feed in the peer's clock, send them any messages they are
