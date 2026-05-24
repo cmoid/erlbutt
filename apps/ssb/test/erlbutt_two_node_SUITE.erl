@@ -19,6 +19,7 @@
 
 -export([two_node_handshake_test/1,
          two_node_ebt_replication_test/1,
+         two_node_ebt_no_duplicate_stream_test/1,
          two_node_blob_wants_test/1,
          two_node_multiple_blob_wants_test/1,
          two_node_blob_fetch_test/1]).
@@ -36,6 +37,7 @@
 all() ->
     [two_node_handshake_test,
      two_node_ebt_replication_test,
+     two_node_ebt_no_duplicate_stream_test,
      two_node_blob_wants_test,
      two_node_multiple_blob_wants_test,
      two_node_blob_fetch_test].
@@ -114,6 +116,34 @@ two_node_ebt_replication_test(Config) ->
     #message{sequence = RepSeq} =
         rpc:call(NodeB, ssb_feed, fetch_last_msg, [BFeedPid]),
     ?assert(RepSeq == Seq),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Calling request_ebt/1 twice on the same peer must not open a second
+%% EBT duplex stream.  After the first call ebt_active is true; the second
+%% call is a no-op.  The connection must remain alive throughout.
+two_node_ebt_no_duplicate_stream_test(Config) ->
+    NodeB    = ?config(node_b, Config),
+    NodeA    = ?config(node_a, Config),
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                              ["localhost", ?PORT_A, ACurvePk]),
+
+    rpc:call(NodeB, ssb_peer, request_ebt, [PeerPid]),
+    timer:sleep(100),
+
+    %% ebt_active should now be set.
+    State1 = rpc:call(NodeB, sys, get_state, [PeerPid]),
+    ?assert(State1#sbox_state.ebt_active),
+
+    %% Second request_ebt is a no-op — connection must still be alive.
+    rpc:call(NodeB, ssb_peer, request_ebt, [PeerPid]),
+    timer:sleep(100),
+    ?assert(rpc:call(NodeB, erlang, is_process_alive, [PeerPid])),
+
+    State2 = rpc:call(NodeB, sys, get_state, [PeerPid]),
+    ?assert(State2#sbox_state.ebt_active),
 
     rpc:call(NodeB, gen_server, stop, [PeerPid]).
 
