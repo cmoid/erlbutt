@@ -62,9 +62,14 @@ handle_data(ReqNo, Body, #ssb_conn{socket = Socket,
             ?SSB_DEBUG("EBT: received vector clock ~n", []),
             handle_clock(ReqNo, Decoded, Socket, Nonce, Key);
         false ->
-            ?SSB_DEBUG("EBT: received message from peer ~p ~n", [Body]),
-            store_message(Body),
-            Nonce
+            case is_peer_error(Decoded) of
+                true ->
+                    Nonce;
+                false ->
+                    ?SSB_DEBUG("EBT: received message from peer ~p ~n", [Body]),
+                    store_message(Body),
+                    Nonce
+            end
     end.
 
 init([]) ->
@@ -94,6 +99,14 @@ code_change(_OldVsn, State, _Extra) ->
 %% A message's keys are "key", "value", "timestamp".
 is_vector_clock({[{<<$@, _/binary>>, _} | _]}) -> true;
 is_vector_clock(_) -> false.
+
+%% Peer error responses (e.g. PW's "reconnected to peer" JSON) have a "name"
+%% key but no "author" key.  Discard them silently — they are the remote
+%% peer's internal diagnostics, not SSB data.
+is_peer_error({Props}) when is_list(Props) ->
+    lists:keymember(<<"name">>, 1, Props) andalso
+        not lists:keymember(<<"author">>, 1, Props);
+is_peer_error(_) -> false.
 
 %% For each feed in the peer's clock, send them any messages they are
 %% missing (i.e. messages with sequence > their last known sequence).
