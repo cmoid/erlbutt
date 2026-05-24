@@ -267,6 +267,9 @@ handle_cast({request_blob_wants, BlobIds, NotifyPid},
     NewEncNonce = send_want_body(Socket, EncBoxKey, EncNonce, BlobIds, SendReqNo),
     {noreply, State#sbox_state{enc_nonce = NewEncNonce}};
 
+handle_cast({request_ebt}, #sbox_state{ebt_active = true} = State) ->
+    {noreply, State};
+
 handle_cast({request_ebt}, #sbox_state{socket = Socket,
                                        enc_sbox_key = EncBoxKey,
                                        enc_nonce = EncNonce,
@@ -275,7 +278,7 @@ handle_cast({request_ebt}, #sbox_state{socket = Socket,
     {ReqNo, State1} = next_req(State),
     ok = rpc_processor:register_stream(RpcProc, -ReqNo, ebt),
     NewEncNonce = initiate_ebt(Socket, EncBoxKey, EncNonce, PubKey, ReqNo),
-    {noreply, State1#sbox_state{enc_nonce = NewEncNonce}};
+    {noreply, State1#sbox_state{enc_nonce = NewEncNonce, ebt_active = true}};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -360,6 +363,7 @@ rpc_parse(Data, #sbox_state{socket = Socket,
                                  response = NewResponse},
     NewState = case NewResponse of
         {wants_stream, ReqNo} -> NewState0#sbox_state{remote_wants_req = ReqNo};
+        {ebt_stream,   _}     -> NewState0#sbox_state{ebt_active = true};
         _                     -> NewState0
     end,
     case {size(NewRpcLeftOver) >= 9, Status} of

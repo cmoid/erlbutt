@@ -101,4 +101,8 @@
                 %% ReqNo of our own outbound createWants source stream
                 our_wants_req = undefined,
                 %% ReqNo of the remote peer's createWants source stream (if seen)
-                remote_wants_req = undefined}).
+                remote_wants_req = undefined,
+                %% Set to true once an EBT duplex stream is active on this
+                %% connection (either we initiated or the peer did) so that
+                %% request_ebt/1 does not open a duplicate stream.
+                ebt_active = false}).

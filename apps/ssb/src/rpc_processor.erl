@@ -148,6 +148,7 @@ dispatch(Calls, ReqNo, Body, Socket, Nonce, SecretBoxKey) ->
     NewNonce = proc_request(Calls, ReqNo, Req, Socket, Nonce, SecretBoxKey),
     Tag = case Req of
         #ssb_rpc{name = [?blobs, ?createwants]} -> {wants_stream, ReqNo};
+        #ssb_rpc{name = [?ebt,   ~"replicate"]} -> {ebt_stream,   ReqNo};
         _                                        -> none
     end,
     {NewNonce, Tag}.
