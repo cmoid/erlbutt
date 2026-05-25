@@ -18,6 +18,9 @@
 -define(DEFAULT_NETWORK_ID, base64:decode("1KHLiKZvAvjbY1ziZEHMXawbCEIM6qwjCDm3VYnaR/s=")).
 -define(DEFAULT_ARCHIVE_LENGTH, 10000).
 -define(DEFAULT_CACHE_CAPACITY, 1000).
+-define(DEFAULT_EBT_STALE_CHECK_MS,    60_000).  %% staleness poll interval
+-define(DEFAULT_EBT_STALE_THRESHOLD_S,    120).  %% idle seconds before closing
+-define(DEFAULT_EBT_ENTROPY_MS,        30_000).  %% anti-entropy clock interval
 %%
 %% as this one that is for the current main SSB network
 %% 1KHLiKZvAvjbY1ziZEHMXawbCEIM6qwjCDm3VYRan/s=

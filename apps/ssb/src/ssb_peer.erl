@@ -30,9 +30,9 @@
                 send_data/4,
                 size/1]).
 
--define(EBT_STALE_CHECK_MS,    60_000).  %% check every 60s
--define(EBT_STALE_THRESHOLD_S,    120).  %% stale if no activity for 2 minutes
--define(EBT_ENTROPY_MS,        30_000).  %% re-exchange full clock every 30s
+-define(EBT_STALE_CHECK_MS,    ?DEFAULT_EBT_STALE_CHECK_MS).
+-define(EBT_STALE_THRESHOLD_S, ?DEFAULT_EBT_STALE_THRESHOLD_S).
+-define(EBT_ENTROPY_MS,        ?DEFAULT_EBT_ENTROPY_MS).
 
 %% connect to another peer on the default port (ssb app env or 8008).
 start_link(Ip, PubKey) ->
