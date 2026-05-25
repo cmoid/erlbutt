@@ -110,4 +110,9 @@
                 %% while ebt_active = true.  Used to detect stale connections.
                 ebt_last_rx = undefined,
                 %% Timer ref for the periodic staleness check (undefined if EBT not yet active).
-                ebt_stale_ref = undefined}).
+                ebt_stale_ref = undefined,
+                %% The req number to use when sending clock updates to the peer.
+                %% Positive when we initiated EBT (client), negative when the peer did (server).
+                ebt_out_req = undefined,
+                %% Timer ref for the periodic anti-entropy clock re-exchange.
+                ebt_entropy_ref = undefined}).

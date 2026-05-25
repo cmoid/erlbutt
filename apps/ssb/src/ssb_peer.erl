@@ -32,6 +32,7 @@
 
 -define(EBT_STALE_CHECK_MS,    60_000).  %% check every 60s
 -define(EBT_STALE_THRESHOLD_S,    120).  %% stale if no activity for 2 minutes
+-define(EBT_ENTROPY_MS,        30_000).  %% re-exchange full clock every 30s
 
 %% connect to another peer on the default port (ssb app env or 8008).
 start_link(Ip, PubKey) ->
@@ -193,6 +194,22 @@ handle_info(check_ebt_stale, #sbox_state{ebt_active = true,
 handle_info(check_ebt_stale, State) ->
     {noreply, State};
 
+handle_info(ebt_anti_entropy, #sbox_state{ebt_active = true,
+                                           ebt_out_req = OutReq,
+                                           socket = Socket,
+                                           enc_sbox_key = Key,
+                                           enc_nonce = Nonce} = State) ->
+    Clock = utils:encode_rec(ebt:full_clock()),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(Clock), OutReq),
+    NewNonce = send_data(combine(Header, Clock), Socket, Nonce, Key),
+    ?SSB_DEBUG("EBT: sent anti-entropy clock~n", []),
+    {noreply, State#sbox_state{enc_nonce = NewNonce,
+                               ebt_entropy_ref = schedule_ebt_entropy()}};
+
+handle_info(ebt_anti_entropy, State) ->
+    {noreply, State};
+
 handle_info(Info, State) ->
     ?SSB_INFO("Stopped presumably for normal reason: ~p ~n",[Info]),
     {stop, normal, State}.
@@ -297,15 +314,19 @@ handle_cast({request_ebt}, #sbox_state{socket = Socket,
     NewEncNonce = initiate_ebt(Socket, EncBoxKey, EncNonce, PubKey, ReqNo),
     {noreply, State1#sbox_state{enc_nonce = NewEncNonce,
                                 ebt_active = true,
+                                ebt_out_req = ReqNo,
                                 ebt_last_rx = erlang:system_time(second),
-                                ebt_stale_ref = schedule_ebt_stale_check()}};
+                                ebt_stale_ref = schedule_ebt_stale_check(),
+                                ebt_entropy_ref = schedule_ebt_entropy()}};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
 terminate(_Reason, #sbox_state{rpc_proc = RpcProc,
-                               ebt_stale_ref = StaleRef}) when is_pid(RpcProc) ->
+                               ebt_stale_ref = StaleRef,
+                               ebt_entropy_ref = EntropyRef}) when is_pid(RpcProc) ->
     cancel_ebt_timer(StaleRef),
+    cancel_ebt_timer(EntropyRef),
     gen_server:stop(RpcProc),
     ok;
 terminate(_Reason, _State) ->
@@ -323,6 +344,9 @@ schedule_ebt_stale_check() ->
 
 cancel_ebt_timer(undefined) -> ok;
 cancel_ebt_timer(Ref)       -> erlang:cancel_timer(Ref), ok.
+
+schedule_ebt_entropy() ->
+    erlang:send_after(?EBT_ENTROPY_MS, self(), ebt_anti_entropy).
 
 next_req(#sbox_state{req_counter = N} = State) ->
     {N + 1, State#sbox_state{req_counter = N + 1}}.
@@ -392,10 +416,12 @@ rpc_parse(Data, #sbox_state{socket = Socket,
     NewState = case NewResponse of
         {wants_stream, ReqNo} ->
             NewState0#sbox_state{remote_wants_req = ReqNo};
-        {ebt_stream, _} ->
+        {ebt_stream, ReqNo} ->
             NewState0#sbox_state{ebt_active = true,
+                                 ebt_out_req = -ReqNo,
                                  ebt_last_rx = erlang:system_time(second),
-                                 ebt_stale_ref = schedule_ebt_stale_check()};
+                                 ebt_stale_ref = schedule_ebt_stale_check(),
+                                 ebt_entropy_ref = schedule_ebt_entropy()};
         _ ->
             case NewState0#sbox_state.ebt_active of
                 true  -> NewState0#sbox_state{ebt_last_rx = erlang:system_time(second)};
