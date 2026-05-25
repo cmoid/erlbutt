@@ -4,4 +4,4 @@
 -pa /usr/local/lib/erlang/lib/tools-4.0/
 -pa ${HOME}/code/erlbutt/_build/default/lib/ssb/ebin
 -pa ${HOME}/code/erlbutt/_build/test/extras/test
--pa ${HOME}/code/emacs-ext/distel/ebin
+-pa ${HOME}/code/maxbutt/ebin
