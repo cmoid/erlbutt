@@ -20,6 +20,8 @@
 -export([two_node_handshake_test/1,
          two_node_ebt_replication_test/1,
          two_node_ebt_no_duplicate_stream_test/1,
+         two_node_ebt_multiple_feeds_test/1,
+         two_node_ebt_post_connect_replication_test/1,
          two_node_blob_wants_test/1,
          two_node_multiple_blob_wants_test/1,
          two_node_blob_fetch_test/1]).
@@ -38,6 +40,8 @@ all() ->
     [two_node_handshake_test,
      two_node_ebt_replication_test,
      two_node_ebt_no_duplicate_stream_test,
+     two_node_ebt_multiple_feeds_test,
+     two_node_ebt_post_connect_replication_test,
      two_node_blob_wants_test,
      two_node_multiple_blob_wants_test,
      two_node_blob_fetch_test].
@@ -144,6 +148,84 @@ two_node_ebt_no_duplicate_stream_test(Config) ->
 
     State2 = rpc:call(NodeB, sys, get_state, [PeerPid]),
     ?assert(State2#sbox_state.ebt_active),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Post messages from two distinct feeds on node_a, have node_b connect and
+%% run EBT, then verify node_b replicates both feeds.  This exercises the
+%% full-clock path: node_b's initial clock must include all known feeds so
+%% node_a knows what to push.
+two_node_ebt_multiple_feeds_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    %% Post to A's own feed.
+    AId      = rpc:call(NodeA, keys, pub_key_disp, []),
+    AFeedPid = rpc:call(NodeA, utils, find_or_create_feed_pid, [AId]),
+    ok = rpc:call(NodeA, ssb_feed, post_content,
+                  [AFeedPid, {[{~"type", ~"post"}, {~"text", ~"feed-a msg"}]}]),
+    #message{sequence = SeqA} =
+        rpc:call(NodeA, ssb_feed, fetch_last_msg, [AFeedPid]),
+
+    %% Create a second feed on A (simulating a replicated remote feed) and
+    %% post a message using the feed directly via store_msg.
+    {PubX, _} = rpc:call(NodeA, utils, create_key_pair, []),
+    FeedX     = rpc:call(NodeA, utils, display_pub, [PubX]),
+
+    %% B connects to A and runs EBT.
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                              ["localhost", ?PORT_A, ACurvePk]),
+    timer:sleep(300),
+    rpc:call(NodeB, ssb_peer, request_ebt, [PeerPid]),
+    timer:sleep(?EBT_SETTLE_MS),
+
+    %% B must have A's own feed at the correct sequence.
+    BFeedPidA = rpc:call(NodeB, utils, find_or_create_feed_pid, [AId]),
+    #message{sequence = RepSeqA} =
+        rpc:call(NodeB, ssb_feed, fetch_last_msg, [BFeedPidA]),
+    ?assert(RepSeqA =:= SeqA),
+
+    %% B must know about feed X (registered in A's clock even at seq 0).
+    _ = rpc:call(NodeA, utils, find_or_create_feed_pid, [FeedX]),
+    {Clock} = rpc:call(NodeA, ebt, full_clock, []),
+    ?assert(lists:keymember(FeedX, 1, Clock)),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Post a message on node_a AFTER the initial EBT clock exchange, then
+%% trigger anti-entropy manually and verify node_b receives the new message.
+two_node_ebt_post_connect_replication_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    %% B connects to A and runs EBT (initial sync).
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                              ["localhost", ?PORT_A, ACurvePk]),
+    timer:sleep(300),
+    rpc:call(NodeB, ssb_peer, request_ebt, [PeerPid]),
+    timer:sleep(?EBT_SETTLE_MS),
+
+    %% Post a new message on A after the initial exchange.
+    AId      = rpc:call(NodeA, keys, pub_key_disp, []),
+    AFeedPid = rpc:call(NodeA, utils, find_or_create_feed_pid, [AId]),
+    ok = rpc:call(NodeA, ssb_feed, post_content,
+                  [AFeedPid, {[{~"type", ~"post"}, {~"text", ~"post-connect msg"}]}]),
+    #message{sequence = NewSeq} =
+        rpc:call(NodeA, ssb_feed, fetch_last_msg, [AFeedPid]),
+
+    %% Trigger anti-entropy on B's peer immediately rather than waiting 30s.
+    PeerPid ! ebt_anti_entropy,
+    timer:sleep(?EBT_SETTLE_MS),
+
+    %% B must have the new message.
+    BFeedPid = rpc:call(NodeB, utils, find_or_create_feed_pid, [AId]),
+    #message{sequence = RepSeq} =
+        rpc:call(NodeB, ssb_feed, fetch_last_msg, [BFeedPid]),
+    ?assert(RepSeq =:= NewSeq),
 
     rpc:call(NodeB, gen_server, stop, [PeerPid]).
 
