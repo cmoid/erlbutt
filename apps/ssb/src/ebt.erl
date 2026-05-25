@@ -244,6 +244,9 @@ full_clock_test() ->
         ?assert(Seq >= 0)
     end, Clock),
 
+    process_flag(trap_exit, true),
+    exit(whereis(ssb_feed_sup), shutdown),
+    receive {'EXIT', _, _} -> ok after 1000 -> ok end,
     gen_server:stop(keys),
     gen_server:stop(config).
 
