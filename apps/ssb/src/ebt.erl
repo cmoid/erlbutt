@@ -212,3 +212,36 @@ check_feed_cnt(Cnt) when Cnt rem 1000 =:= 0 ->
     ?SSB_DEBUG("EBT: feeds processed: ~p~n", [Cnt]);
 check_feed_cnt(_) ->
     ok.
+
+-ifdef(TEST).
+
+full_clock_test() ->
+    config:start_link("test/ssb.cfg"),
+    keys:start_link(),
+    ssb_feed_sup:start_link(),
+
+    %% Register three feeds in the local registry.
+    {PubA, _} = utils:create_key_pair(),
+    {PubB, _} = utils:create_key_pair(),
+    FeedA = utils:display_pub(PubA),
+    FeedB = utils:display_pub(PubB),
+    OwnFeed = keys:pub_key_disp(),
+    _ = utils:find_or_create_feed_pid(FeedA),
+    _ = utils:find_or_create_feed_pid(FeedB),
+    _ = utils:find_or_create_feed_pid(OwnFeed),
+
+    {Clock} = full_clock(),
+    ?assert(is_list(Clock)),
+
+    %% All three feeds must appear in the clock.
+    ?assert(lists:keymember(FeedA, 1, Clock)),
+    ?assert(lists:keymember(FeedB, 1, Clock)),
+    ?assert(lists:keymember(OwnFeed, 1, Clock)),
+
+    %% Every entry must decode to {replicate=true, receive=true, seq>=0}.
+    lists:foreach(fun({_Id, Enc}) ->
+        {true, true, Seq} = ebt_vc:decode_clock_int(Enc),
+        ?assert(Seq >= 0)
+    end, Clock).
+
+-endif.
