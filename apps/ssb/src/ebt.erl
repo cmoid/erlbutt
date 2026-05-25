@@ -242,6 +242,9 @@ full_clock_test() ->
     lists:foreach(fun({_Id, Enc}) ->
         {true, true, Seq} = ebt_vc:decode_clock_int(Enc),
         ?assert(Seq >= 0)
-    end, Clock).
+    end, Clock),
+
+    gen_server:stop(keys),
+    gen_server:stop(config).
 
 -endif.
