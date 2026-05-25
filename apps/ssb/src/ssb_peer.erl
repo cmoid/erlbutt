@@ -503,16 +503,13 @@ build_outbound_state(Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce, PubKey) -
                 our_wants_req = WantsReqNo,
                 req_counter = WantsReqNo}.
 
-%% Build our initial vector clock, including the remote peer's feedId at seq 0
-%% so the server sends us everything it has for that feed.
+%% Build our initial vector clock from all locally known feeds, ensuring the
+%% remote peer's feed is included (at seq 0 if we have no messages from them yet).
 build_initial_clock(RemotePubKey) ->
     RemoteFeedId = <<"@", (base64:encode(RemotePubKey))/binary, ".ed25519">>,
-    Pid = utils:find_or_create_feed_pid(RemoteFeedId),
-    RemSeq = case ssb_feed:fetch_last_msg(Pid) of
-        #message{sequence = S} -> S;
-        _ -> 0
+    {FullClock} = ebt:full_clock(),
+    ClockWithRemote = case lists:keymember(RemoteFeedId, 1, FullClock) of
+        true  -> FullClock;
+        false -> [{RemoteFeedId, ebt_vc:encode_clock_int(true, true, 0)} | FullClock]
     end,
-    {OurFeeds} = ebt:initial_vector(),
-    AllFeeds = [{RemoteFeedId,
-        ebt_vc:encode_clock_int(true, true, RemSeq)} | OurFeeds],
-    utils:encode_rec({AllFeeds}).
+    utils:encode_rec({ClockWithRemote}).

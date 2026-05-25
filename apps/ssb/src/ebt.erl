@@ -15,6 +15,7 @@
 %% API
 -export([start_link/0,
          initial_vector/0,
+         full_clock/0,
          handle_data/3]).
 
 %% gen_server callbacks
@@ -34,18 +35,16 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
-%% We only advertise our own feed here because on connect we only know our
-%% own state.  Remote feeds we've replicated are discovered from the peer's
-%% clock response — their clock tells us which feeds they have, and we fill
-%% in the gaps from our local storage.
 initial_vector() ->
-    PeerKey = keys:pub_key_disp(),
-    Pid = utils:find_or_create_feed_pid(PeerKey),
-    Seq = case ssb_feed:fetch_last_msg(Pid) of
-              #message{sequence = S} -> S;
-              _ -> 0
-          end,
-    {[{PeerKey, ebt_vc:encode_clock_int(true, true, Seq)}]}.
+    full_clock().
+
+%% Build a full vector clock from all feeds in the local registry.
+%% Each entry is {FeedId, encoded_int} with receive=true so the peer will push us updates.
+full_clock() ->
+    Entries = ets:tab2list(ssb_feed_registry),
+    {[{FeedId, clock_entry_for(Pid)}
+      || {FeedId, Pid} <- Entries,
+         is_process_alive(Pid)]}.
 
 %% Called by rpc_processor for each subsequent message on an open EBT
 %% duplex stream (after the initial ebt.replicate handshake).
@@ -167,6 +166,13 @@ send_msg_data(MsgData, OutReqNo, Socket, Nonce, Key) ->
     Flags = rpc_processor:create_flags(1, 0, 2),
     Header = rpc_processor:create_header(Flags, size(SendData), OutReqNo),
     utils:send_data(utils:combine(Header, SendData), Socket, Nonce, Key).
+
+clock_entry_for(Pid) ->
+    Seq = case ssb_feed:fetch_last_msg(Pid) of
+              #message{sequence = S} -> S;
+              _ -> 0
+          end,
+    ebt_vc:encode_clock_int(true, true, Seq).
 
 %% Decode an incoming message and store it in the appropriate feed.
 %% Body is the value-only JSON (no key/timestamp wrapper), as sent by EBT
