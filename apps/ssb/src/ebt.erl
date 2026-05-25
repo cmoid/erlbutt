@@ -66,8 +66,12 @@ handle_data(ReqNo, Body, #ssb_conn{socket = Socket,
                     Nonce;
                 false ->
                     ?SSB_DEBUG("EBT: received message from peer ~p ~n", [Body]),
-                    store_message(Body),
-                    Nonce
+                    case store_message(Body) of
+                        {ok, FeedId, Seq} ->
+                            send_clock_ack(FeedId, Seq, -ReqNo, Socket, Nonce, Key);
+                        error ->
+                            Nonce
+                    end
             end
     end.
 
@@ -167,6 +171,14 @@ send_msg_data(MsgData, OutReqNo, Socket, Nonce, Key) ->
     Header = rpc_processor:create_header(Flags, size(SendData), OutReqNo),
     utils:send_data(utils:combine(Header, SendData), Socket, Nonce, Key).
 
+%% Send a single-feed clock acknowledgment back to the peer after storing a message.
+%% This tells the peer we have the feed up to Seq and still want to receive more.
+send_clock_ack(FeedId, Seq, OutReqNo, Socket, Nonce, Key) ->
+    Ack = utils:encode_rec({[{FeedId, ebt_vc:encode_clock_int(true, true, Seq)}]}),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(Ack), OutReqNo),
+    utils:send_data(utils:combine(Header, Ack), Socket, Nonce, Key).
+
 clock_entry_for(Pid) ->
     Seq = case ssb_feed:fetch_last_msg(Pid) of
               #message{sequence = S} -> S;
@@ -177,19 +189,23 @@ clock_entry_for(Pid) ->
 %% Decode an incoming message and store it in the appropriate feed.
 %% Body is the value-only JSON (no key/timestamp wrapper), as sent by EBT
 %% and createHistoryStream with keys:false.
+%% Returns {ok, FeedId, Seq} on success so the caller can send a clock ack.
 store_message(Body) ->
     try
         Msg = message:decode_value(Body, true),
         case utils:find_or_create_feed_pid(Msg#message.author) of
             bad ->
                 ?SSB_INFO("EBT: bad author in received message: ~p~n",
-                    [{Msg#message.author, Msg#message.id}]);
+                    [{Msg#message.author, Msg#message.id}]),
+                error;
             Pid ->
-                ssb_feed:store_msg(Pid, Msg)
+                ssb_feed:store_msg(Pid, Msg),
+                {ok, Msg#message.author, Msg#message.sequence}
         end
     catch
         _:Reason ->
-            ?SSB_INFO("EBT: failed to decode/store message: ~p~n", [Reason])
+            ?SSB_INFO("EBT: failed to decode/store message: ~p~n", [Reason]),
+            error
     end.
 
 check_feed_cnt(Cnt) when Cnt rem 1000 =:= 0 ->
