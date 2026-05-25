@@ -105,4 +105,9 @@
                 %% Set to true once an EBT duplex stream is active on this
                 %% connection (either we initiated or the peer did) so that
                 %% request_ebt/1 does not open a duplicate stream.
-                ebt_active = false}).
+                ebt_active = false,
+                %% erlang:system_time(second) of the last message processed
+                %% while ebt_active = true.  Used to detect stale connections.
+                ebt_last_rx = undefined,
+                %% Timer ref for the periodic staleness check (undefined if EBT not yet active).
+                ebt_stale_ref = undefined}).

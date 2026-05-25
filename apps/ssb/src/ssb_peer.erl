@@ -30,6 +30,9 @@
                 send_data/4,
                 size/1]).
 
+-define(EBT_STALE_CHECK_MS,    60_000).  %% check every 60s
+-define(EBT_STALE_THRESHOLD_S,    120).  %% stale if no activity for 2 minutes
+
 %% connect to another peer on the default port (ssb app env or 8008).
 start_link(Ip, PubKey) ->
     gen_server:start_link(?MODULE, [Ip, PubKey], []).
@@ -176,6 +179,20 @@ handle_info({has_collected, Ref, Result},
     gen_server:reply(From, {ok, Result}),
     {noreply, State#sbox_state{pending_has = undefined}};
 
+handle_info(check_ebt_stale, #sbox_state{ebt_active = true,
+                                          ebt_last_rx = LastRx} = State) ->
+    Elapsed = erlang:system_time(second) - LastRx,
+    case Elapsed >= ?EBT_STALE_THRESHOLD_S of
+        true ->
+            ?SSB_INFO("EBT: connection stale (~ps idle), closing~n", [Elapsed]),
+            {stop, {shutdown, ebt_stale}, State};
+        false ->
+            {noreply, State#sbox_state{ebt_stale_ref = schedule_ebt_stale_check()}}
+    end;
+
+handle_info(check_ebt_stale, State) ->
+    {noreply, State};
+
 handle_info(Info, State) ->
     ?SSB_INFO("Stopped presumably for normal reason: ~p ~n",[Info]),
     {stop, normal, State}.
@@ -278,12 +295,17 @@ handle_cast({request_ebt}, #sbox_state{socket = Socket,
     {ReqNo, State1} = next_req(State),
     ok = rpc_processor:register_stream(RpcProc, -ReqNo, ebt),
     NewEncNonce = initiate_ebt(Socket, EncBoxKey, EncNonce, PubKey, ReqNo),
-    {noreply, State1#sbox_state{enc_nonce = NewEncNonce, ebt_active = true}};
+    {noreply, State1#sbox_state{enc_nonce = NewEncNonce,
+                                ebt_active = true,
+                                ebt_last_rx = erlang:system_time(second),
+                                ebt_stale_ref = schedule_ebt_stale_check()}};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-terminate(_Reason, #sbox_state{rpc_proc = RpcProc}) when is_pid(RpcProc) ->
+terminate(_Reason, #sbox_state{rpc_proc = RpcProc,
+                               ebt_stale_ref = StaleRef}) when is_pid(RpcProc) ->
+    cancel_ebt_timer(StaleRef),
     gen_server:stop(RpcProc),
     ok;
 terminate(_Reason, _State) ->
@@ -295,6 +317,12 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+schedule_ebt_stale_check() ->
+    erlang:send_after(?EBT_STALE_CHECK_MS, self(), check_ebt_stale).
+
+cancel_ebt_timer(undefined) -> ok;
+cancel_ebt_timer(Ref)       -> erlang:cancel_timer(Ref), ok.
 
 next_req(#sbox_state{req_counter = N} = State) ->
     {N + 1, State#sbox_state{req_counter = N + 1}}.
@@ -362,9 +390,17 @@ rpc_parse(Data, #sbox_state{socket = Socket,
                                  rpc_rem_bytes = NewRpcLeftOver,
                                  response = NewResponse},
     NewState = case NewResponse of
-        {wants_stream, ReqNo} -> NewState0#sbox_state{remote_wants_req = ReqNo};
-        {ebt_stream,   _}     -> NewState0#sbox_state{ebt_active = true};
-        _                     -> NewState0
+        {wants_stream, ReqNo} ->
+            NewState0#sbox_state{remote_wants_req = ReqNo};
+        {ebt_stream, _} ->
+            NewState0#sbox_state{ebt_active = true,
+                                 ebt_last_rx = erlang:system_time(second),
+                                 ebt_stale_ref = schedule_ebt_stale_check()};
+        _ ->
+            case NewState0#sbox_state.ebt_active of
+                true  -> NewState0#sbox_state{ebt_last_rx = erlang:system_time(second)};
+                false -> NewState0
+            end
     end,
     case {size(NewRpcLeftOver) >= 9, Status} of
         {true, complete} ->
