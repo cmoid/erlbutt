@@ -1,0 +1,14 @@
+%% SPDX-License-Identifier: GPL-2.0-only
+%%
+%% Copyright (C) 2026 Charles Moid
+{application, plumtree,
+ [{description, "Plumtree epidemic broadcast for erlbutt"},
+  {vsn, {cmd, "echo 0.1-`git describe --always --tags`"}},
+  {registered, []},
+  {applications, [kernel, stdlib, sasl]},
+  {env, [
+    %% List of Erlang node names to eagerly push to on startup.
+    %% e.g. [erlbutt2@host, erlbutt3@host]
+    {initial_peers, []}
+  ]},
+  {mod, {plumtree_app, []}}]}.
