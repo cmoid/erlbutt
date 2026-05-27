@@ -101,6 +101,8 @@
                 pending_fetch = undefined,
                 %% Deferred reply for an in-flight has_blob call: {From, Ref}
                 pending_has = undefined,
+                %% In-flight sync RPC calls: #{Ref => From}
+                pending_rpc = #{},
                 %% ReqNo of our own outbound createWants source stream
                 our_wants_req = undefined,
                 %% ReqNo of the remote peer's createWants source stream (if seen)
