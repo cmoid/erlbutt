@@ -94,6 +94,18 @@ handle_call({rpc_process, {Header, Body}, #ssb_conn{
         [{ReqNo, noop}] ->
             %% Stream already ended or handled; silently ignore continuations.
             {Nonce, none};
+        [{ReqNo, {reply_to, Pid, Ref}}] ->
+            %% Sync RPC reply: deliver body directly to the waiting caller.
+            Pid ! {rpc_reply, Ref, Body},
+            {Nonce, none};
+        [{ReqNo, {stream_to, Pid, Ref}}] ->
+            %% Source stream reply: deliver data or signal end-of-stream.
+            {_, IsEnd, _} = parse_flags(Header),
+            case IsEnd of
+                1 -> Pid ! {stream_done, Ref};
+                0 -> Pid ! {stream_data, Ref, Body}
+            end,
+            {Nonce, none};
         [{ReqNo, {Mod, SinkPid}}] ->
             ?SSB_DEBUG("Stream continuation for req with pid: ~p ~n", [ReqNo]),
             NewNonce = Mod:handle_data(ReqNo, Body, Conn, SinkPid),
@@ -158,15 +170,100 @@ proc_response(ReqNo, RespBody) ->
     ?SSB_DEBUG("The response from ~p was ~p ~n", [ReqNo, RespBody]),
     RespBody.
 
-proc_request(_Calls, ReqNo, #ssb_rpc{name = [?createhistorystream],
-                             args = [{_Args}]}
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?createhistorystream],
+                             args = [{ArgProps}]}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
-    Flags = create_flags(1,1,2),
-    %% function not supported so just send true to end stream
-    TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
+    Id    = proplists:get_value(~"id",    ArgProps),
+    Seq   = proplists:get_value(~"seq",   ArgProps, 0),
+    Limit = proplists:get_value(~"limit", ArgProps, -1),
+    Keys  = proplists:get_value(~"keys",  ArgProps, true),
+    ets:insert(Calls, {ReqNo, noop}),
+    FeedPid = utils:find_or_create_feed_pid(Id),
+    {NewNonce, _} = ssb_feed:foldl(FeedPid,
+        fun(MsgData, {N, Count}) ->
+            case Limit >= 0 andalso Count >= Limit of
+                true -> {N, Count};
+                false ->
+                    try
+                        Msg = message:decode(MsgData, false),
+                        case Msg#message.sequence > Seq of
+                            true ->
+                                Body = case Keys of
+                                    true  -> message:encode(Msg);
+                                    false -> MsgData
+                                end,
+                                Flags  = create_flags(1, 0, 2),
+                                Header = create_header(Flags, size(Body), -ReqNo),
+                                N1 = utils:send_data(utils:combine(Header, Body),
+                                                     Socket, N, SecretBoxKey),
+                                {N1, Count + 1};
+                            false ->
+                                {N, Count}
+                        end
+                    catch _:_ -> {N, Count}
+                    end
+            end
+        end, {Nonce, 0}),
+    TrueEnd = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+    Flags  = create_flags(1, 1, 2),
     Header = create_header(Flags, size(TrueEnd), -ReqNo),
-    utils:send_data(utils:combine(Header, TrueEnd),
-                    Socket, Nonce, SecretBoxKey);
+    utils:send_data(utils:combine(Header, TrueEnd), Socket, NewNonce, SecretBoxKey);
+
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"publish"],
+                             args = [Content]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    OurId   = keys:pub_key_disp(),
+    FeedPid = utils:find_or_create_feed_pid(OurId),
+    ok = ssb_feed:post_content(FeedPid, Content),
+    Msg  = ssb_feed:fetch_last_msg(FeedPid),
+    Body = message:encode(Msg),
+    Flags  = create_flags(1, 1, 2),
+    Header = create_header(Flags, size(Body), -ReqNo),
+    utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"get"],
+                             args = [MsgId]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    case mess_auth:get(MsgId) of
+        not_found ->
+            ErrMsg = utils:error_msg(~"Error", ~"message not found"),
+            Flags  = create_flags(0, 1, 2),
+            Header = create_header(Flags, size(ErrMsg), -ReqNo),
+            utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey);
+        Author ->
+            FeedPid = utils:find_or_create_feed_pid(Author),
+            Msg  = ssb_feed:fetch_msg(FeedPid, MsgId),
+            Body = message:encode(Msg),
+            Flags  = create_flags(1, 1, 2),
+            Header = create_header(Flags, size(Body), -ReqNo),
+            utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey)
+    end;
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = Name}
+             = _ReqBody, Socket, Nonce, SecretBoxKey)
+  when Name =:= [~"createLogStream"] orelse Name =:= [~"createFeedStream"] ->
+    ets:insert(Calls, {ReqNo, noop}),
+    AllFeeds = case ets:info(ssb_feed_registry) of
+        undefined -> [];
+        _         -> ets:tab2list(ssb_feed_registry)
+    end,
+    NewNonce = lists:foldl(fun({_FeedId, FeedPid}, N) ->
+        ssb_feed:foldl(FeedPid,
+            fun(MsgData, N1) ->
+                try
+                    Msg  = message:decode(MsgData, false),
+                    Body = message:encode(Msg),
+                    Flags  = create_flags(1, 0, 2),
+                    Header = create_header(Flags, size(Body), -ReqNo),
+                    utils:send_data(utils:combine(Header, Body), Socket, N1, SecretBoxKey)
+                catch _:_ -> N1
+                end
+            end, N)
+    end, Nonce, AllFeeds),
+    TrueEnd = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+    Flags  = create_flags(1, 1, 2),
+    Header = create_header(Flags, size(TrueEnd), -ReqNo),
+    utils:send_data(utils:combine(Header, TrueEnd), Socket, NewNonce, SecretBoxKey);
 
 proc_request(Calls, ReqNo, #ssb_rpc{name = [?gossip, ?ping],
                              args = [{_Args}]}

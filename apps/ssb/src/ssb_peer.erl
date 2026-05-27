@@ -13,6 +13,9 @@
          start/2,
          start/3,
          send/2,
+         rpc_call/3,
+         rpc_call/4,
+         rpc_stream_call/3,
          request_ebt/1,
          request_blob_wants/3,
          fetch_blob/2,
@@ -57,6 +60,20 @@ start(Ip, Port, PubKey) when is_integer(Port) ->
 %% send data to another peer, asynchronously
 send(Pid, Data) ->
     gen_server:cast(Pid, {send, Data}).
+
+%% Send an RPC request and block until the response arrives (or timeout).
+%% Method is a list of binaries, e.g. [<<"whoami">>].
+%% Type is <<"async">>, <<"source">>, or <<"sync">>.
+rpc_call(Pid, Method, Type) ->
+    gen_server:call(Pid, {rpc_call, Method, Type, []}, 10000).
+
+rpc_call(Pid, Method, Type, Args) ->
+    gen_server:call(Pid, {rpc_call, Method, Type, Args}, 10000).
+
+%% Send a source RPC request and collect all response bodies until end-of-stream.
+%% Returns {ok, [Body]} in arrival order.
+rpc_stream_call(Pid, Method, Args) ->
+    gen_server:call(Pid, {rpc_stream_call, Method, Args}, 30000).
 
 request_ebt(Pid) ->
     gen_server:cast(Pid, {request_ebt}).
@@ -170,6 +187,36 @@ handle_info({'EXIT', Pid, Reason}, #sbox_state{rpc_proc = RpcProc} = State) ->
             {noreply, State}
     end;
 
+handle_info({rpc_reply, Ref, Body},
+            #sbox_state{pending_rpc = Pending} = State) ->
+    case maps:take(Ref, Pending) of
+        {From, Rest} ->
+            gen_server:reply(From, {ok, Body}),
+            {noreply, State#sbox_state{pending_rpc = Rest}};
+        error ->
+            {noreply, State}
+    end;
+
+handle_info({stream_data, Ref, Body},
+            #sbox_state{pending_rpc = Pending} = State) ->
+    case maps:find(Ref, Pending) of
+        {ok, {collecting, From, Acc}} ->
+            {noreply, State#sbox_state{
+                pending_rpc = Pending#{Ref := {collecting, From, [Body | Acc]}}}};
+        _ ->
+            {noreply, State}
+    end;
+
+handle_info({stream_done, Ref},
+            #sbox_state{pending_rpc = Pending} = State) ->
+    case maps:take(Ref, Pending) of
+        {{collecting, From, Acc}, Rest} ->
+            gen_server:reply(From, {ok, lists:reverse(Acc)}),
+            {noreply, State#sbox_state{pending_rpc = Rest}};
+        _ ->
+            {noreply, State}
+    end;
+
 handle_info({blob_collected, Ref, Data},
             #sbox_state{pending_fetch = {From, Ref}} = State) ->
     gen_server:reply(From, {ok, Data}),
@@ -237,6 +284,42 @@ drain_haves(Timeout, Acc) ->
     after Timeout ->
         lists:reverse(Acc)
     end.
+
+handle_call({rpc_call, Method, Type, Args}, From,
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc,
+                        pending_rpc = Pending} = State) ->
+    {ReqNo, State1} = next_req(State),
+    Ref = make_ref(),
+    ok = rpc_processor:register_stream(RpcProc, -ReqNo, {reply_to, self(), Ref}),
+    ReqBody = utils:encode_rec({[{~"name", Method},
+                                  {~"args", Args},
+                                  {~"type", Type}]}),
+    Flags = rpc_processor:create_flags(0, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(ReqBody), ReqNo),
+    NewNonce = utils:send_data(utils:combine(Header, ReqBody), Socket, EncNonce, EncBoxKey),
+    {noreply, State1#sbox_state{enc_nonce   = NewNonce,
+                                pending_rpc = Pending#{Ref => From}}};
+
+handle_call({rpc_stream_call, Method, Args}, From,
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc,
+                        pending_rpc = Pending} = State) ->
+    {ReqNo, State1} = next_req(State),
+    Ref = make_ref(),
+    ok = rpc_processor:register_stream(RpcProc, -ReqNo, {stream_to, self(), Ref}),
+    ReqBody = utils:encode_rec({[{~"name", Method},
+                                  {~"args", Args},
+                                  {~"type", ~"source"}]}),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(ReqBody), ReqNo),
+    NewNonce = utils:send_data(utils:combine(Header, ReqBody), Socket, EncNonce, EncBoxKey),
+    {noreply, State1#sbox_state{enc_nonce   = NewNonce,
+                                pending_rpc = Pending#{Ref => {collecting, From, []}}}};
 
 handle_call({fetch_blob, BlobId}, From,
             #sbox_state{socket = Socket,
