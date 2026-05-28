@@ -276,6 +276,7 @@ store(#message{id = Id, author = Auth} = Msg,
              profile = Profile} = State) ->
     mess_auth:put(Id, Auth),
     write_msg(Msg, Feed),
+    write_msg(Msg, <<(config:ssb_repo_loc())/binary, "log.offset">>),
     utils:update_refs(Msg),
     %% need to fix is_about to really look for profile changes
     IsAbout = social_msg:is_about(Msg),
