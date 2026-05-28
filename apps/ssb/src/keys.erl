@@ -98,30 +98,29 @@ fetch_key() ->
     end.
 
 extract_key(IoDevice) ->
+    Lines = read_non_comment_lines(IoDevice),
+    case json:decode(iolist_to_binary(Lines)) of
+        KeyMap when is_map(KeyMap) ->
+            {key_only(maps:get(~"public",  KeyMap)),
+             key_only(maps:get(~"private", KeyMap))};
+        _ ->
+            {~"nokey", ~"nokey"}
+    end.
+
+read_non_comment_lines(IoDevice) ->
     case file:read_line(IoDevice) of
         {ok, Data} ->
             DataStr = case Data of
-                          Bin when is_binary(Bin) -> binary_to_list(Bin);
-                          Str when is_list(Str) -> Str
-                      end,
-            FirstChar = string:sub_string(DataStr,1,1),
-            IsCommentOrNewLine = FirstChar == "%" orelse
-                FirstChar == "\n",
-            if IsCommentOrNewLine ->
-                    extract_key(IoDevice);
-               true ->
-                    DecodedValue = json:decode(iolist_to_binary(DataStr)),
-                    case DecodedValue of
-                        KeyMap when is_map(KeyMap) ->
-                            {PubKey, PrKey} = {maps:get(~"public", KeyMap),
-                                               maps:get(~"private", KeyMap)},
-                            {key_only(PubKey), key_only(PrKey)};
-                        _ ->
-                            {~"nokey",~"nokey"}
-                    end
+                Bin when is_binary(Bin) -> binary_to_list(Bin);
+                Str                     -> Str
+            end,
+            First = string:sub_string(DataStr, 1, 1),
+            case First == "%" orelse First == "#" orelse First == "\n" of
+                true  -> read_non_comment_lines(IoDevice);
+                false -> [DataStr | read_non_comment_lines(IoDevice)]
             end;
         eof ->
-            {~"nokey",~"nokey"}
+            []
     end.
 
 init_secret() ->
@@ -134,12 +133,17 @@ init_secret() ->
     {?l2b(base_64(Pub)), ?l2b(base_64(Priv))}.
 
     make_json({Pub, Priv}) ->
-        Doc = {[{~"curve", ~"ed25519"},
-                {~"public", ?l2b(base_64(Pub) ++ ".ed25519")},
-                {~"private", ?l2b(base_64(Priv) ++ ".ed25519")},
-                {~"id", ?l2b("@" ++ base_64(Pub) ++ ".ed25519")}
-               ]},
-        iolist_to_binary(message:ssb_encoder(Doc, fun message:ssb_encoder/3, [])).
+        PubEnc  = base_64(Pub)  ++ ".ed25519",
+        PrivEnc = base_64(Priv) ++ ".ed25519",
+        IdEnc   = "@" ++ base_64(Pub) ++ ".ed25519",
+        iolist_to_binary([
+            "{\n",
+            "  \"curve\": \"ed25519\",\n",
+            "  \"public\": \"",  PubEnc,  "\",\n",
+            "  \"private\": \"", PrivEnc, "\",\n",
+            "  \"id\": \"",      IdEnc,   "\"\n",
+            "}\n"
+        ]).
 
 check_secret_file() ->
     SSBDir = ?b2l(config:ssb_repo_loc()),
@@ -155,10 +159,18 @@ key_only(Key) ->
 
 
 prelude() ->
-    ~"%% this is your SECRET name.\n%% this name gives you magical powers.\n%% with it you can mark your messages so that your friends can verify\n%% that they really did come from you.%%\n%% if any one learns this name, they can use it to destroy your identity\n%% NEVER show this to anyone!!!\n\n".
+    "# this is your SECRET name.\n"
+    "# this name gives you magical powers.\n"
+    "# with it you can mark your messages so that your friends can verify\n"
+    "# that they really did come from you.\n"
+    "#\n"
+    "# if any one learns this name, they can use it to destroy your identity\n"
+    "# NEVER show this to anyone!!!\n\n".
 
 suffix(Pub) ->
-    ?l2b("\n\n%%WARNING! It's vital that you DO NOT edit OR share your secret name\n%%instead, share your public name\n%%your public name: " ++ ?b2l(utils:display_pub(Pub))).
+    ?l2b("\n# WARNING! It's vital that you DO NOT edit OR share your secret name\n"
+         "# instead, share your public name\n"
+         "# your public name: @" ++ base_64(Pub) ++ ".ed25519\n").
 
 %% hack to get Moid's key, the number one thing I seem to need in my REPL :)
 moid() ->
