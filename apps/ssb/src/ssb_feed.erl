@@ -171,27 +171,11 @@ handle_call({refs, MsgId, TangleId}, _From, #state{refs = Refs} = State) ->
                         [Targets | Acc]
                 end end,
 
-    Result =
-        case file:open(Refs, [read, binary]) of
-            {ok, IoDev} ->
-                int_foldr(Fun, [], IoDev);
-            {error, enoent} ->
-                ?LOG_INFO("Ill formed tangle arcs file ~n",[]),
-                done
-        end,
+    Result = utils:fold_log_file(Fun, [], Refs),
     {reply, Result, State};
 
 handle_call({foldl, Fun, Acc}, _From, #state{feed = Feed} = State) ->
-    Result =
-        case file:open(Feed, [read, binary]) of
-            {ok, IoDev} ->
-                int_foldr(Fun, Acc, IoDev);
-            {error, enoent} ->
-                %%?LOG_INFO("Ill formed feed ~p ~n",[Feed]),
-                Acc
-        end,
-
-    {reply, Result, State}.
+    {reply, utils:fold_log_file(Fun, Acc, Feed), State}.
 
 handle_cast({store_ref, Arrow}, #state{refs = Refs} = State) ->
     write_msg(Arrow, Refs),
@@ -411,15 +395,6 @@ scan(IoDev, Pos, Key) ->
             ?LOG_INFO("Error ~p scanning for key: ~p ~n",[Error, Key])
     end.
 
-int_foldr(Fun, Acc, IoDev) ->
-    case load_term(IoDev) of
-        {ok, Data} ->
-            file:read(IoDev, 4),
-            int_foldr(Fun, Fun(Data, Acc), IoDev);
-        {error, _Error} ->
-            file:close(IoDev),
-            Acc
-    end.
 
 has_target(Msg, Id, RootId) ->
     {DecProps} = utils:nat_decode(Msg),
