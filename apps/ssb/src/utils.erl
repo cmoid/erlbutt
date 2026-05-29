@@ -20,6 +20,7 @@
          combine/2,
          send_data/4,
          load_term/1,
+         fold_log_file/3,
          find_or_create_feed_pid/1,
          check_id/1,
          update_refs/1,
@@ -122,6 +123,29 @@ check_data(IoDev, Data, Len) ->
             end;
         {error, Reason} ->
             {error, Reason}
+    end.
+
+%% Fold over every message frame in an offset log file (the global log.offset
+%% or any per-feed log.offset).  Fun(MsgBinary, Acc) -> NewAcc.
+%% Returns Acc unchanged if the file does not exist.
+fold_log_file(Fun, Acc, FilePath) ->
+    case file:open(FilePath, [read, binary]) of
+        {ok, IoDev} ->
+            fold_log_loop(Fun, Acc, IoDev);
+        {error, enoent} ->
+            Acc;
+        {error, _} ->
+            Acc
+    end.
+
+fold_log_loop(Fun, Acc, IoDev) ->
+    case load_term(IoDev) of
+        {ok, Data} ->
+            file:read(IoDev, 4),          %% skip NextOffset field
+            fold_log_loop(Fun, Fun(Data, Acc), IoDev);
+        {error, _} ->
+            file:close(IoDev),
+            Acc
     end.
 
 find_or_create_feed_pid(Id) ->

@@ -243,23 +243,13 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = Name}
              = _ReqBody, Socket, Nonce, SecretBoxKey)
   when Name =:= [~"createLogStream"] orelse Name =:= [~"createFeedStream"] ->
     ets:insert(Calls, {ReqNo, noop}),
-    AllFeeds = case ets:info(ssb_feed_registry) of
-        undefined -> [];
-        _         -> ets:tab2list(ssb_feed_registry)
-    end,
-    NewNonce = lists:foldl(fun({_FeedId, FeedPid}, N) ->
-        ssb_feed:foldl(FeedPid,
-            fun(MsgData, N1) ->
-                try
-                    Msg  = message:decode(MsgData, false),
-                    Body = message:encode(Msg),
-                    Flags  = create_flags(1, 0, 2),
-                    Header = create_header(Flags, size(Body), -ReqNo),
-                    utils:send_data(utils:combine(Header, Body), Socket, N1, SecretBoxKey)
-                catch _:_ -> N1
-                end
-            end, N)
-    end, Nonce, AllFeeds),
+    LogFile = <<(config:ssb_repo_loc())/binary, "log.offset">>,
+    NewNonce = utils:fold_log_file(
+        fun(Body, N) ->
+            Flags  = create_flags(1, 0, 2),
+            Header = create_header(Flags, size(Body), -ReqNo),
+            utils:send_data(utils:combine(Header, Body), Socket, N, SecretBoxKey)
+        end, Nonce, LogFile),
     TrueEnd = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
     Flags  = create_flags(1, 1, 2),
     Header = create_header(Flags, size(TrueEnd), -ReqNo),
