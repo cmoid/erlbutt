@@ -31,43 +31,17 @@ deliver(MsgId, Payload) ->
 
 %% Look up a stored message payload to answer a GRAFT request.
 retrieve(MsgId) ->
-    case find_by_key(MsgId) of
-        {ok, MsgData} ->
-            {PropList} = utils:nat_decode(MsgData),
-            Value = proplists:get_value(~"value", PropList),
+    case mess_auth:get(MsgId) of
+        not_found ->
+            not_found;
+        Author ->
+            Pid     = utils:find_or_create_feed_pid(Author),
+            Msg     = ssb_feed:fetch_msg(Pid, MsgId),
+            Encoded = message:encode(Msg),
+            {PropList} = utils:nat_decode(Encoded),
+            Value   = proplists:get_value(~"value", PropList),
             Payload = iolist_to_binary(
                 message:ssb_encoder(Value, fun message:ssb_encoder/3,
                                     [pretty, use_nil])),
-            {ok, Payload};
-        not_found ->
-            not_found
-    end.
-
-%% Scan all feeds for the message with the given key.
-find_by_key(MsgId) ->
-    Entries = ets:tab2list(ssb_feed_registry),
-    find_in_feeds(MsgId, Entries).
-
-find_in_feeds(_MsgId, []) ->
-    not_found;
-find_in_feeds(MsgId, [{_FeedId, Pid} | Rest]) ->
-    case is_process_alive(Pid) of
-        false ->
-            find_in_feeds(MsgId, Rest);
-        true ->
-            Result = ssb_feed:foldl(Pid,
-                fun(MsgData, Acc) ->
-                    try
-                        #message{id = Key} = message:decode(MsgData, false),
-                        case Key =:= MsgId of
-                            true  -> {found, MsgData};
-                            false -> Acc
-                        end
-                    catch _:_ -> Acc
-                    end
-                end, not_found),
-            case Result of
-                {found, Data} -> {ok, Data};
-                not_found     -> find_in_feeds(MsgId, Rest)
-            end
+            {ok, Payload}
     end.

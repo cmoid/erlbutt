@@ -84,11 +84,10 @@ handle_call({close}, _From, #state{m_a = BitHand} = State) ->
     {reply, ok, State};
 
 handle_call({auths}, _From, #state{m_a = BitHand} = State) ->
-    Fun = fun({_Mess, Auth}) ->
-                  {continue, Auth}
-          end,
-    Auths = dets:traverse(BitHand, Fun),
-    {reply, Auths, State}.
+    Seen = dets:foldl(fun({_Msg, Auth}, Acc) ->
+                          Acc#{Auth => true}
+                      end, #{}, BitHand),
+    {reply, maps:keys(Seen), State}.
 
 handle_cast(_Request, State) ->
     {noreply, State}.
