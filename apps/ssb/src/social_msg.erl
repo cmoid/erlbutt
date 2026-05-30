@@ -134,6 +134,57 @@ check_contact(_Contact, _Following) ->
 -ifdef(TEST).
 
 
+dispatch_pub_test() ->
+    ConfigStarted = case whereis(config) of
+        undefined -> {ok, _} = config:start_link("test/ssb.cfg"), true;
+        _         -> false
+    end,
+    {ok, DbPid} = conn_db:start_link(),
+    Msg = #message{id = ~"%test.sha256", previous = null,
+                   author = ~"@author=.ed25519", sequence = 1,
+                   timestamp = 0, hash = ~"sha256", received = 0,
+                   validated = true, swapped = false, signature = ~"sig",
+                   content = {[{~"type",    ~"pub"},
+                                {~"address", {[{~"host", ~"pub.example.com"},
+                                               {~"port", 8008},
+                                               {~"key",  ~"@pubkey=.ed25519"}]}}]}},
+    ok = social_msg:dispatch(Msg),
+    All = conn_db:all(),
+    ExpAddr = ~"net:pub.example.com:8008~shs:pubkey=",
+    ?assert(maps:is_key(ExpAddr, All)),
+    gen_server:stop(DbPid),
+    file:delete(?b2l(config:ssb_repo_loc()) ++ "conn.json"),
+    case ConfigStarted of
+        true -> gen_server:stop(config);
+        false -> ok
+    end.
+
+dispatch_contact_test() ->
+    Msg = #message{id = ~"%c.sha256", previous = null,
+                   author = ~"@author=.ed25519", sequence = 2,
+                   timestamp = 0, hash = ~"sha256", received = 0,
+                   validated = true, swapped = false, signature = ~"sig",
+                   content = {[{~"type",      ~"contact"},
+                                {~"contact",   ~"@other=.ed25519"},
+                                {~"following", true}]}},
+    ?assertEqual(ok, social_msg:dispatch(Msg)).
+
+dispatch_unknown_type_test() ->
+    Msg = #message{id = ~"%p.sha256", previous = null,
+                   author = ~"@author=.ed25519", sequence = 3,
+                   timestamp = 0, hash = ~"sha256", received = 0,
+                   validated = true, swapped = false, signature = ~"sig",
+                   content = {[{~"type", ~"post"}, {~"text", ~"hello"}]}},
+    ?assertEqual(ok, social_msg:dispatch(Msg)).
+
+dispatch_private_test() ->
+    Msg = #message{id = ~"%priv.sha256", previous = null,
+                   author = ~"@author=.ed25519", sequence = 4,
+                   timestamp = 0, hash = ~"sha256", received = 0,
+                   validated = true, swapped = false, signature = ~"sig",
+                   content = ~"box.encrypted"},
+    ?assertEqual(ok, social_msg:dispatch(Msg)).
+
 is_about_test() ->
     {ok, Cwd} = file:get_cwd(),
     F = Cwd ++ "/testdata/" ++ "about.full",
