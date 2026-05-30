@@ -96,8 +96,39 @@ load(File) ->
     end.
 
 save(Peers, File) ->
-    Json = json:encode(Peers),
-    file:write_file(File, Json).
+    file:write_file(File, pretty_json(Peers)).
+
+pretty_json(Map) when is_map(Map) ->
+    case maps:size(Map) of
+        0 -> <<"{}">>;
+        _ ->
+            Entries = [peer_entry(K, V) || {K, V} <- lists:sort(maps:to_list(Map))],
+            iolist_to_binary(["{\n", lists:join(",\n", Entries), "\n}"])
+    end.
+
+peer_entry(K, V) ->
+    [<<"    \"">>, K, <<"\": ">>, peer_value(V)].
+
+peer_value(V) when is_map(V) ->
+    case maps:size(V) of
+        0 -> <<"{}">>;
+        _ ->
+            Entries = [field_entry(K, Val) || {K, Val} <- lists:sort(maps:to_list(V))],
+            iolist_to_binary(["{\n", lists:join(",\n", Entries), "\n    }"])
+    end;
+peer_value(V) ->
+    json:encode(V).
+
+field_entry(K, V) when is_map(V) ->
+    Inner = [inner_entry(IK, IV) || {IK, IV} <- lists:sort(maps:to_list(V))],
+    iolist_to_binary(["        \"", K, "\": {\n",
+                      lists:join(",\n", Inner),
+                      "\n        }"]);
+field_entry(K, V) ->
+    iolist_to_binary(["        \"", K, "\": ", json:encode(V)]).
+
+inner_entry(K, V) ->
+    iolist_to_binary(["            \"", K, "\": ", json:encode(V)]).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
