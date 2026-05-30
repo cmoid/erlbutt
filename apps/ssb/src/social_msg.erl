@@ -33,7 +33,10 @@ dispatch_type(~"pub", _Author, Props) ->
             Key  = ?pgv(~"key",  AddrProps),
             case is_binary(Host) andalso is_integer(Port) andalso is_binary(Key) of
                 true ->
-                    <<"@", KeyBody/binary>> = Key,
+                    KeyBody = case Key of
+                        <<"@", Rest/binary>> -> Rest;
+                        Rest                 -> Rest
+                    end,
                     KeyB64 = hd(string:replace(KeyBody, ".ed25519", "")),
                     Addr = iolist_to_binary([~"net:", Host, ~":",
                                              integer_to_binary(Port),
