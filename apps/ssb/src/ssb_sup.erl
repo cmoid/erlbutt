@@ -31,5 +31,6 @@ init([]) ->
             ?CHILD(blobs, worker),
             ?CHILD(mess_auth, worker),
             ?CHILD(invite_store, worker),
+            ?CHILD(conn_db, worker),
             ?CHILD(ssb_feed_sup, supervisor),
             ?CHILD(ebt, worker)]}}.

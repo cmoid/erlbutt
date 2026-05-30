@@ -11,12 +11,52 @@
 -import(message, [decode/2]).
 
 %% API
--export([
+-export([dispatch/1,
          is_follow/1,
          is_about/1,
          is_reply/1,
          is_branch/1,
          is_private_box/1]).
+
+%% Dispatch a stored message to application-layer handlers based on type.
+dispatch(#message{author = Author, content = {Props}}) ->
+    Type = ?pgv(~"type", Props),
+    dispatch_type(Type, Author, Props);
+dispatch(_) ->
+    ok.
+
+dispatch_type(~"pub", _Author, Props) ->
+    case ?pgv(~"address", Props) of
+        {AddrProps} ->
+            Host = ?pgv(~"host", AddrProps),
+            Port = ?pgv(~"port", AddrProps),
+            Key  = ?pgv(~"key",  AddrProps),
+            case is_binary(Host) andalso is_integer(Port) andalso is_binary(Key) of
+                true ->
+                    <<"@", KeyBody/binary>> = Key,
+                    KeyB64 = hd(string:replace(KeyBody, ".ed25519", "")),
+                    Addr = iolist_to_binary([~"net:", Host, ~":",
+                                             integer_to_binary(Port),
+                                             ~"~shs:", KeyB64]),
+                    Meta = #{~"host" => Host, ~"port" => Port,
+                             ~"key"  => Key,  ~"type" => ~"pub"},
+                    conn_db:remember(Addr, Meta, ~"pub");
+                false ->
+                    ok
+            end;
+        _ -> ok
+    end;
+
+dispatch_type(~"contact", Author, Props) ->
+    Contact   = ?pgv(~"contact",   Props),
+    Following = ?pgv(~"following", Props),
+    case check_contact(Contact, Following) of
+        {C, F} -> friends:update(Author, C, F);
+        nope   -> ok
+    end;
+
+dispatch_type(_, _, _) ->
+    ok.
 
 is_follow(#message{content = Val}) when is_binary(Val) ->
     nope;

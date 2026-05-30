@@ -262,15 +262,12 @@ store(#message{id = Id, author = Auth} = Msg,
     write_msg(Msg, Feed),
     write_msg(Msg, <<(config:ssb_repo_loc())/binary, "log.offset">>),
     utils:update_refs(Msg),
-    %% need to fix is_about to really look for profile changes
-    IsAbout = social_msg:is_about(Msg),
-    case IsAbout of
-        true ->
-            write_msg(Msg, Profile),
-            State;
-        _Else ->
-            State
-    end.
+    case social_msg:is_about(Msg) of
+        true -> write_msg(Msg, Profile);
+        _    -> ok
+    end,
+    social_msg:dispatch(Msg),
+    State.
 
 write_msg(#message{} = DecMsg, Store) ->
     Msg = message:encode(DecMsg),

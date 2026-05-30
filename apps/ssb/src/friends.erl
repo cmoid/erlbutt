@@ -8,7 +8,13 @@
 -endif.
 
 -export([direct_follows/1,
-         follows/2]).
+         follows/2,
+         update/3]).
+
+%% Placeholder — incremental social graph update on contact message arrival.
+%% Full implementation (ETS/DETS backed graph) to follow.
+update(_Author, _Contact, _Following) ->
+    ok.
 
 direct_follows(FeedPid) ->
     Fun = fun(Data, Acc) ->
