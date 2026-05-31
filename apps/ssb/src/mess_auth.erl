@@ -3,7 +3,10 @@
 %% Copyright (C) 2023 Charles Moid
 -module(mess_auth).
 
-%% A thin shell around dets store used as a simple message-author cache
+%% msg_id -> author cache.  ETS is the primary store for O(1) concurrent
+%% reads and writes with no gen_server serialisation on the hot path.
+%% Persistence uses ets:tab2file/file2tab — a single binary snapshot, no
+%% DETS overhead or temp files.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -13,7 +16,6 @@
 
 -behaviour(gen_server).
 
-%% API
 -export([start_link/0,
          put/2,
          get/1,
@@ -21,34 +23,45 @@
          sync/0,
          all_auths/0]).
 
-%% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
+-define(ETS_TAB, mess_auth_cache).
+-define(FLUSH_MS, 60000).
 
--record(state, {m_a}).
+-record(state, {file}).
 
-%%% API
+%%%===================================================================
+%%% API — hot path bypasses the gen_server entirely
+%%%===================================================================
 
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
+%% Direct ETS insert — no gen_server round-trip.
 put(Key, Val) ->
-    gen_server:call(?MODULE, {put, Key, Val}, infinity).
+    ets:insert(?ETS_TAB, {Key, Val}).
 
+%% Direct ETS lookup — no gen_server round-trip.
 get(Key) ->
-    gen_server:call(?MODULE, {get, Key}).
+    case ets:lookup(?ETS_TAB, Key) of
+        [{Key, Val}] -> Val;
+        []           -> not_found
+    end.
+
+%% All unique authors — ETS fold with map dedup.
+all_auths() ->
+    Seen = ets:foldl(fun({_Msg, Auth}, Acc) ->
+                         Acc#{Auth => true}
+                     end, #{}, ?ETS_TAB),
+    maps:keys(Seen).
 
 close() ->
-    gen_server:call(?MODULE, {close}).
+    gen_server:call(?MODULE, sync, infinity).
 
 sync() ->
-    gen_server:call(?MODULE, {sync}).
-
-all_auths() ->
-    gen_server:call(?MODULE, {auths}, infinity).
-
+    gen_server:call(?MODULE, sync, infinity).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -56,56 +69,44 @@ all_auths() ->
 
 init([]) ->
     process_flag(trap_exit, true),
-    TabName = ?b2l(config:ssb_repo_loc()) ++ "mess_auth",
-    {ok, DetsTab} = dets:open_file(mess, [{file, TabName}]),
-    {ok, #state{m_a = DetsTab}}.
+    File = ?b2l(config:ssb_repo_loc()) ++ "mess_auth.ets",
+    case ets:file2tab(File) of
+        {ok, ?ETS_TAB} ->
+            ok;
+        _ ->
+            ets:new(?ETS_TAB, [set, public, named_table])
+    end,
+    erlang:send_after(?FLUSH_MS, self(), flush),
+    {ok, #state{file = File}}.
 
-handle_call({put, Key, Val}, _From, #state{m_a = BitHand} = State) ->
-    Ok = dets:insert(BitHand, {Key, Val}),
-    {reply, Ok, State};
+handle_call(sync, _From, #state{file = File} = State) ->
+    save(File),
+    {reply, ok, State}.
 
-handle_call({get, Key}, _From, #state{m_a = BitHand} = State) ->
-    Res = dets:lookup(BitHand, Key),
-    case Res of
-        [{Key, Val}] ->
-            {reply, Val, State};
-        [] ->
-            {reply, not_found, State};
-        {error, Reason} ->
-            {reply, Reason, State}
-    end;
-
-handle_call({sync}, _From, #state{m_a = BitHand} = State) ->
-    ok = dets:sync(BitHand),
-    {reply, ok, State};
-
-handle_call({close}, _From, #state{m_a = BitHand} = State) ->
-    ok = dets:close(BitHand),
-    {reply, ok, State};
-
-handle_call({auths}, _From, #state{m_a = BitHand} = State) ->
-    Seen = dets:foldl(fun({_Msg, Auth}, Acc) ->
-                          Acc#{Auth => true}
-                      end, #{}, BitHand),
-    {reply, maps:keys(Seen), State}.
-
-handle_cast(_Request, State) ->
+handle_cast(_Msg, State) ->
     {noreply, State}.
+
+handle_info(flush, #state{file = File} = State) ->
+    save(File),
+    erlang:send_after(?FLUSH_MS, self(), flush),
+    {noreply, State};
 
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(Reason, #state{m_a = BitHand}) ->
-    ?LOG_INFO("Terminate called for reason: ~p ~n",[Reason]),
-    dets:close(BitHand).
+terminate(Reason, #state{file = File}) ->
+    ?LOG_INFO("Terminate called for reason: ~p ~n", [Reason]),
+    save(File).
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 %%%===================================================================
-%%% Internal functions
+%%% Internal
 %%%===================================================================
 
--ifdef(TEST).
+save(File) ->
+    ets:tab2file(?ETS_TAB, File, [{sync, true}]).
 
+-ifdef(TEST).
 -endif.
