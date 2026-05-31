@@ -14,13 +14,14 @@
 
 -export([start_link/0,
          remember/3,
-         all/0]).
+         all/0,
+         flush/0]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
--record(state, {peers = #{}, file}).
+-record(state, {peers = #{}, file, dirty = false}).
 
 %%%===================================================================
 %%% API
@@ -33,10 +34,13 @@ start_link() ->
 %% Addr is the multiserver address binary, Meta is a map of fields from
 %% the pub address object, Source is <<"pub">>.
 remember(Addr, Meta, Source) ->
-    gen_server:call(?MODULE, {remember, Addr, Meta, Source}).
+    gen_server:cast(?MODULE, {remember, Addr, Meta, Source}).
 
 all() ->
     gen_server:call(?MODULE, all).
+
+flush() ->
+    gen_server:call(?MODULE, flush).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -47,8 +51,15 @@ init([]) ->
     Peers = load(File),
     {ok, #state{peers = Peers, file = File}}.
 
-handle_call({remember, Addr, Meta, Source}, _From,
-            #state{peers = Peers, file = File} = State) ->
+handle_call(all, _From, #state{peers = Peers} = State) ->
+    {reply, Peers, State};
+
+handle_call(flush, _From, #state{peers = Peers, file = File} = State) ->
+    save(Peers, File),
+    {reply, ok, State#state{dirty = false}}.
+
+handle_cast({remember, Addr, Meta, Source},
+            #state{peers = Peers, dirty = WasDirty} = State) ->
     Now = erlang:system_time(millisecond),
     Existing = maps:get(Addr, Peers, #{
         <<"birth">>       => Now,
@@ -62,19 +73,24 @@ handle_call({remember, Addr, Meta, Source}, _From,
         <<"stateChange">> => Now,
         <<"announcers">>  => maps:get(<<"announcers">>, Existing, 0) + 1
     }),
-    NewPeers = Peers#{Addr => Updated},
-    save(NewPeers, File),
-    {reply, ok, State#state{peers = NewPeers}};
-
-handle_call(all, _From, #state{peers = Peers} = State) ->
-    {reply, Peers, State}.
+    case WasDirty of
+        false -> erlang:send_after(5000, self(), flush);
+        true  -> ok
+    end,
+    {noreply, State#state{peers = Peers#{Addr => Updated}, dirty = true}};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+handle_info(flush, #state{peers = Peers, file = File} = State) ->
+    save(Peers, File),
+    {noreply, State#state{dirty = false}};
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
+terminate(_Reason, #state{peers = Peers, file = File, dirty = true}) ->
+    save(Peers, File);
 terminate(_Reason, _State) ->
     ok.
 
@@ -163,8 +179,8 @@ remember_stores_peer({_Pid, _}) ->
         Addr = ~"net:ssb.example.com:8008~shs:abc123=",
         Meta = #{~"host" => ~"ssb.example.com", ~"port" => 8008,
                  ~"key"  => ~"@abc123=.ed25519", ~"type" => ~"pub"},
-        ok = conn_db:remember(Addr, Meta, ~"pub"),
-        All = conn_db:all(),
+        conn_db:remember(Addr, Meta, ~"pub"),
+        All = conn_db:all(),  %% call/0 acts as a sync barrier for the cast
         ?assert(maps:is_key(Addr, All)),
         Peer = maps:get(Addr, All),
         ?assertEqual(~"ssb.example.com", maps:get(~"host", Peer)),
@@ -177,8 +193,8 @@ announcers_increments({_Pid, _}) ->
         Addr = ~"net:ssb.test.com:8008~shs:xyz=",
         Meta = #{~"host" => ~"ssb.test.com", ~"port" => 8008,
                  ~"key"  => ~"@xyz=.ed25519", ~"type" => ~"pub"},
-        ok = conn_db:remember(Addr, Meta, ~"pub"),
-        ok = conn_db:remember(Addr, Meta, ~"pub"),
+        conn_db:remember(Addr, Meta, ~"pub"),
+        conn_db:remember(Addr, Meta, ~"pub"),
         Peer = maps:get(Addr, conn_db:all()),
         ?assertEqual(2, maps:get(~"announcers", Peer))
     end.
@@ -188,7 +204,7 @@ remember_sets_required_fields({_Pid, _}) ->
         Addr = ~"net:ssb.fields.com:8008~shs:f1=",
         Meta = #{~"host" => ~"ssb.fields.com", ~"port" => 8008,
                  ~"key"  => ~"@f1=.ed25519", ~"type" => ~"pub"},
-        ok = conn_db:remember(Addr, Meta, ~"pub"),
+        conn_db:remember(Addr, Meta, ~"pub"),
         Peer = maps:get(Addr, conn_db:all()),
         ?assert(is_integer(maps:get(~"birth",       Peer))),
         ?assert(is_integer(maps:get(~"stateChange", Peer))),
