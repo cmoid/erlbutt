@@ -76,6 +76,7 @@ conn_db_persists_across_restart(_Config) ->
     FeedPid = utils:find_or_create_feed_pid(OurId),
     ssb_feed:post_content(FeedPid, pub_content()),
     ?assert(maps:is_key(expected_addr(), conn_db:all())),
+    conn_db:flush(),
     supervisor:terminate_child(ssb_sup, conn_db),
     supervisor:restart_child(ssb_sup, conn_db),
     ?assert(maps:is_key(expected_addr(), conn_db:all())).
@@ -85,6 +86,7 @@ conn_json_has_correct_format(_Config) ->
     OurId   = keys:pub_key_disp(),
     FeedPid = utils:find_or_create_feed_pid(OurId),
     ssb_feed:post_content(FeedPid, pub_content()),
+    conn_db:flush(),
     ConnJson = binary_to_list(config:ssb_repo_loc()) ++ "conn.json",
     {ok, Bin} = file:read_file(ConnJson),
     Map = json:decode(Bin),
