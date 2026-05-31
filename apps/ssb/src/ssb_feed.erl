@@ -27,6 +27,7 @@
          store_ref/2,
          references/3,
          foldl/3,
+         profile_name/1,
          archive/1]).
 
 %% gen_server callbacks
@@ -85,6 +86,11 @@ references(FeedPid, MsgId, RootId) ->
 
 foldl(FeedPid, Fun, Acc) ->
     gen_server:call(FeedPid, {foldl, Fun, Acc}, infinity).
+
+%% Return the most recent self-chosen display name from the feed's profile,
+%% or undefined if none has been set.
+profile_name(FeedPid) ->
+    gen_server:call(FeedPid, profile_name, infinity).
 
 archive(FeedPid) ->
     gen_server:call(FeedPid, archive, infinity).
@@ -175,7 +181,21 @@ handle_call({refs, MsgId, TangleId}, _From, #state{refs = Refs} = State) ->
     {reply, Result, State};
 
 handle_call({foldl, Fun, Acc}, _From, #state{feed = Feed} = State) ->
-    {reply, utils:fold_log_file(Fun, Acc, Feed), State}.
+    {reply, utils:fold_log_file(Fun, Acc, Feed), State};
+
+handle_call(profile_name, _From, #state{id = Id, profile = Profile} = State) ->
+    Name = utils:fold_log_file(
+        fun(MsgData, Acc) ->
+            try
+                #message{content = {Props}} = message:decode(MsgData, false),
+                case {?pgv(~"about", Props), ?pgv(~"name", Props)} of
+                    {Id, N} when is_binary(N) -> N;
+                    _                         -> Acc
+                end
+            catch _:_ -> Acc
+            end
+        end, undefined, Profile),
+    {reply, Name, State}.
 
 handle_cast({store_ref, Arrow}, #state{refs = Refs} = State) ->
     write_msg(Arrow, Refs),
