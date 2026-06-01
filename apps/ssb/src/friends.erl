@@ -5,6 +5,7 @@
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("ssb/include/ssb.hrl").
 -endif.
 
 -export([direct_follows/1,
@@ -28,25 +29,18 @@ direct_follows(FeedPid) ->
                       {Id, false} -> lists:delete(Id, Acc)
                   end
           end,
-    ssb_feed:foldl(FeedPid, Fun, []).
+    ssb_feed:fold_contacts(FeedPid, Fun, []).
 
 follows(FeedPid, HopCount) ->
-    put(visited, [ssb_feed:whoami(FeedPid)]),
-    FinalFeeds = follows2(FeedPid, HopCount),
-    put(visited, []),
-    lists:foldl(fun(E, Acc) when is_list(Acc) ->
-                        Cf = lists:member(E, Acc),
-                        if Cf ->
-                                Acc;
-                           true ->
-                                [E | Acc]
-                        end
-                end, [], FinalFeeds).
+    Self = ssb_feed:whoami(FeedPid),
+    Visited0 = sets:from_list([Self]),
+    {AllFollows, _} = follows2(FeedPid, HopCount, Visited0),
+    lists:usort(AllFollows).
 
-follows2(_FeedPid, 0) ->
-    [];
+follows2(_FeedPid, 0, Visited) ->
+    {[], Visited};
 
-follows2(FeedPid, HopCount) ->
+follows2(FeedPid, HopCount, Visited0) ->
     DirectFollow = direct_follows(FeedPid),
     NewDirectFollow = lists:filter(fun(E) ->
                                            not lists:member(E, get(visited))

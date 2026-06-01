@@ -3,8 +3,9 @@
 %% Copyright (C) 2023 Charles Moid
 %%
 %% Per-feed gen_server.  Each SSB author gets one instance, managed by
-%% ssb_feed_sup.  Owns three append-only files: log.offset (all messages),
-%% profile (about messages only), and references (tangle arc records).
+%% ssb_feed_sup.  Owns four append-only files: log.offset (all messages),
+%% profile (about messages only), contacts (contact/follow messages only),
+%% and references (tangle arc records).
 -module(ssb_feed).
 
 -ifdef(TEST).
@@ -27,6 +28,7 @@
          store_ref/2,
          references/3,
          foldl/3,
+         fold_contacts/3,
          profile_name/1,
          archive/1]).
 
@@ -45,6 +47,7 @@
                 segment_start = 1,
                 feed,
                 profile,
+                contacts,
                 refs,
                 msg_cache}).
 %%%===================================================================
@@ -87,6 +90,9 @@ references(FeedPid, MsgId, RootId) ->
 foldl(FeedPid, Fun, Acc) ->
     gen_server:call(FeedPid, {foldl, Fun, Acc}, infinity).
 
+fold_contacts(FeedPid, Fun, Acc) ->
+    gen_server:call(FeedPid, {fold_contacts, Fun, Acc}, infinity).
+
 %% Return the most recent self-chosen display name from the feed's profile,
 %% or undefined if none has been set.
 profile_name(FeedPid) ->
@@ -102,10 +108,11 @@ archive(FeedPid) ->
 init([FeedId]) ->
     process_flag(trap_exit, true),
     DecodeId = utils:decode_id(FeedId),
-    {Feed, Profile, Refs} = init_directories(DecodeId),
+    {Feed, Profile, Contacts, Refs} = init_directories(DecodeId),
     State = #state{id = FeedId,
                    feed = Feed,
                    profile = Profile,
+                   contacts = Contacts,
                    refs = Refs,
                    msg_cache = ets:new(messages, [])},
     %% Register in the global feed registry when running under ssb_feed_sup.
@@ -182,6 +189,9 @@ handle_call({refs, MsgId, TangleId}, _From, #state{refs = Refs} = State) ->
 
 handle_call({foldl, Fun, Acc}, _From, #state{feed = Feed} = State) ->
     {reply, utils:fold_log_file(Fun, Acc, Feed), State};
+
+handle_call({fold_contacts, Fun, Acc}, _From, #state{contacts = Contacts} = State) ->
+    {reply, utils:fold_log_file(Fun, Acc, Contacts), State};
 
 handle_call(profile_name, _From, #state{id = Id, profile = Profile} = State) ->
     Name = utils:fold_log_file(
@@ -277,7 +287,8 @@ archive_filename(FeedFile, From, To) ->
 
 store(#message{id = Id, author = Auth} = Msg,
       #state{feed = Feed,
-             profile = Profile} = State) ->
+             profile = Profile,
+             contacts = Contacts} = State) ->
     mess_auth:put(Id, Auth),
     write_msg(Msg, Feed),
     write_msg(Msg, <<(config:ssb_repo_loc())/binary, "log.offset">>),
@@ -285,6 +296,10 @@ store(#message{id = Id, author = Auth} = Msg,
     case social_msg:is_about(Msg) of
         true -> write_msg(Msg, Profile);
         _    -> ok
+    end,
+    case social_msg:is_follow(Msg) of
+        nope -> ok;
+        _    -> write_msg(Msg, Contacts)
     end,
     social_msg:dispatch(Msg),
     State.
@@ -313,11 +328,13 @@ init_directories(AuthDir) ->
      FeedDir = <<Location/binary,Dir/binary,~"/"/binary,RestAuth/binary>>,
     Feed = <<FeedDir/binary,~"/"/binary,~"log.offset"/binary>>,
     Profile = <<FeedDir/binary,~"/"/binary,~"profile"/binary>>,
+    Contacts = <<FeedDir/binary,~"/"/binary,~"contacts"/binary>>,
     Refs = <<FeedDir/binary,~"/"/binary,~"references"/binary>>,
     filelib:ensure_dir(Feed),
     filelib:ensure_dir(Profile),
+    filelib:ensure_dir(Contacts),
     filelib:ensure_dir(Refs),
-    {Feed, Profile, Refs}.
+    {Feed, Profile, Contacts, Refs}.
 
 %% Only feed corresponding to the owner of the peer can post.
 %% All the other feeds are only meant to be read
