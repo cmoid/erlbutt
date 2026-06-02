@@ -21,7 +21,8 @@
          get/1,
          close/0,
          sync/0,
-         all_auths/0]).
+         all_auths/0,
+         rebuild/0]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
@@ -50,6 +51,21 @@ get(Key) ->
         []           -> not_found
     end.
 
+%% Rebuild the table by scanning the global log.offset.
+%% Useful after a DETS→ETS migration that lost old mappings, or after
+%% any restart where the .ets snapshot was incomplete.
+rebuild() ->
+    LogFile = ?b2l(config:ssb_repo_loc()) ++ "log.offset",
+    utils:fold_log_file(
+        fun(MsgData, _Acc) ->
+            try
+                #message{id = Id, author = Auth} = message:decode(MsgData, false),
+                ets:insert(?ETS_TAB, {Id, Auth})
+            catch _:_ -> ok
+            end
+        end, ok, LogFile),
+    ok.
+
 %% All unique authors — ETS fold with map dedup.
 all_auths() ->
     Seen = ets:foldl(fun({_Msg, Auth}, Acc) ->
@@ -74,7 +90,8 @@ init([]) ->
         {ok, ?ETS_TAB} ->
             ok;
         _ ->
-            ets:new(?ETS_TAB, [set, public, named_table])
+            ets:new(?ETS_TAB, [set, public, named_table]),
+            rebuild()
     end,
     erlang:send_after(?FLUSH_MS, self(), flush),
     {ok, #state{file = File}}.
