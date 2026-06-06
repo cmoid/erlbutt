@@ -199,13 +199,13 @@ handle_info({rpc_reply, Ref, Body},
 
 handle_info({stream_data, Ref, Body},
             #sbox_state{pending_rpc = Pending} = State) ->
-    case maps:find(Ref, Pending) of
-        {ok, {collecting, From, Acc}} ->
-            {noreply, State#sbox_state{
+    case Pending of
+       #{Ref := {collecting, From, Acc}} ->
+           {noreply, State#sbox_state{
                 pending_rpc = Pending#{Ref := {collecting, From, [Body | Acc]}}}};
-        _ ->
-            {noreply, State}
-    end;
+       #{} ->
+           {noreply, State}
+   end;
 
 handle_info({stream_done, Ref},
             #sbox_state{pending_rpc = Pending} = State) ->
