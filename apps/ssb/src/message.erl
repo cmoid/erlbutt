@@ -50,7 +50,11 @@ decode_value(ValueJson, CheckValid) ->
     {ValueProps} = utils:nat_decode(ValueJson),
     IsSwapped = is_swapped(ValueProps),
     IsValid   = validate(CheckValid, ValueProps),
-    Id        = compute_id(ValueJson),
+    %% Re-encode in canonical (pretty-printed) form before hashing.
+    %% EBT peers send compact JSON, but SSB IDs are SHA256 of the
+    %% pretty-printed canonical form (JS JSON.stringify(v, null, 2)).
+    CanonJson = iolist_to_binary(ssb_encoder({ValueProps}, fun ssb_encoder/3, [pretty, use_nil])),
+    Id        = compute_id(CanonJson),
     #message{id        = Id,
              previous  = ?pgv(~"previous",  ValueProps),
              author    = ?pgv(~"author",    ValueProps),
