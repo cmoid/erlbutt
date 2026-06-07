@@ -285,7 +285,11 @@ archive_filename(FeedFile, From, To) ->
       (integer_to_binary(From))/binary, "-",
       (integer_to_binary(To))/binary, ".gz">>.
 
-store(#message{id = Id, author = Auth} = Msg,
+store(#message{sequence = Seq} = Msg,
+      #state{last_seq = LastSeq} = State) when Seq =< LastSeq ->
+    %% Already have this sequence or earlier — skip silently.
+    State;
+store(#message{id = Id, sequence = Seq, author = Auth} = Msg,
       #state{feed = Feed,
              profile = Profile,
              contacts = Contacts} = State) ->
@@ -302,7 +306,7 @@ store(#message{id = Id, author = Auth} = Msg,
         _    -> write_msg(Msg, Contacts)
     end,
     social_msg:dispatch(Msg),
-    State.
+    State#state{last_msg = Id, last_seq = Seq}.
 
 write_msg(#message{} = DecMsg, Store) ->
     Msg = message:encode(DecMsg),
@@ -341,27 +345,23 @@ init_directories(AuthDir) ->
 check_owner_feed(#state{id = FeedId, feed = Feed,
                        msg_cache = Messages} = State) ->
     IsOwner = FeedId == keys:pub_key_disp(),
-    if IsOwner ->
-            Resp = feed_get_last(Feed),
-            case Resp of
-                no_file ->
-                    State;
-                done ->
-                    State;
-                {Pos, Msg, Key} ->
-                    ets:insert(Messages, {Key, Pos}),
-                    #message{sequence = Seq,
-                             previous = Prev} = message:decode(Msg, true),
-                    SegStart = case Prev of
-                        null when Seq > 1 -> Seq + 1;
-                        _                 -> 1
-                    end,
-                    State#state{last_msg      = Key,
-                                last_seq      = Seq,
-                                segment_start = SegStart}
-            end;
-       true ->
-            State
+    Resp = feed_get_last(Feed),
+    case Resp of
+        no_file ->
+            State;
+        done ->
+            State;
+        {Pos, Msg, Key} ->
+            ets:insert(Messages, {Key, Pos}),
+            #message{sequence = Seq,
+                     previous = Prev} = message:decode(Msg, false),
+            SegStart = case {IsOwner, Prev} of
+                {true, null} when Seq > 1 -> Seq + 1;
+                _                         -> 1
+            end,
+            State#state{last_msg      = Key,
+                        last_seq      = Seq,
+                        segment_start = SegStart}
     end.
 
 feed_get(Feed, [], Key) ->
