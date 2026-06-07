@@ -100,6 +100,7 @@ code_change(_OldVsn, State, _Extra) ->
 
 %% A vector clock's top-level keys all start with "@" (feed IDs).
 %% A message's keys are "key", "value", "timestamp".
+is_vector_clock({[]}) -> true;
 is_vector_clock({[{<<$@, _/binary>>, _} | _]}) -> true;
 is_vector_clock(_) -> false.
 
