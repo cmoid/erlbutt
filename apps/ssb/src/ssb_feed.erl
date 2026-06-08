@@ -285,7 +285,7 @@ archive_filename(FeedFile, From, To) ->
       (integer_to_binary(From))/binary, "-",
       (integer_to_binary(To))/binary, ".gz">>.
 
-store(#message{sequence = Seq} = Msg,
+store(#message{sequence = Seq},
       #state{last_seq = LastSeq} = State) when Seq =< LastSeq ->
     %% Already have this sequence or earlier — skip silently.
     State;

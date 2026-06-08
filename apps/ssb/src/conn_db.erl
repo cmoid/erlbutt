@@ -62,16 +62,16 @@ handle_cast({remember, Addr, Meta, Source},
             #state{peers = Peers, dirty = WasDirty} = State) ->
     Now = erlang:system_time(millisecond),
     Existing = maps:get(Addr, Peers, #{
-        <<"birth">>       => Now,
-        <<"announcers">>  => 0,
-        <<"duration">>    => #{<<"mean">>  => 0, <<"stdev">> => 0,
-                               <<"count">> => 0, <<"sum">>   => 0, <<"sqsum">> => 0},
-        <<"autoconnect">> => true
+        ~"birth"       => Now,
+        ~"announcers"  => 0,
+        ~"duration"    => #{~"mean"  => 0, ~"stdev" => 0,
+                               ~"count" => 0, ~"sum"   => 0, ~"sqsum" => 0},
+        ~"autoconnect" => true
     }),
     Updated = maps:merge(Existing, Meta#{
-        <<"source">>      => Source,
-        <<"stateChange">> => Now,
-        <<"announcers">>  => maps:get(<<"announcers">>, Existing, 0) + 1
+        ~"source"      => Source,
+        ~"stateChange" => Now,
+        ~"announcers"  => maps:get(~"announcers", Existing, 0) + 1
     }),
     case WasDirty of
         false -> erlang:send_after(5000, self(), flush);
@@ -127,7 +127,7 @@ peer_entry(K, V) ->
 
 peer_value(V) when is_map(V) ->
     case maps:size(V) of
-        0 -> <<"{}">>;
+        0 -> ~"{}";
         _ ->
             Entries = [field_entry(K, Val) || {K, Val} <- lists:sort(maps:to_list(V))],
             iolist_to_binary(["{\n", lists:join(",\n", Entries), "\n    }"])
