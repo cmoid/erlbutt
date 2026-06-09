@@ -134,7 +134,8 @@ record_peer(Ip, Data, _) ->
         false ->
             PubKey = extract_key(Data),
             ?LOG_INFO("Heartbeat received from ~p ~n",[{Ip, utils:display_pub(PubKey)}]),
-            ets:insert(ssb_peers, {Ip, PubKey});
+            ets:insert(ssb_peers, {Ip, PubKey}),
+            peer_dialer:trigger();
         _ ->
             nop
     end.
