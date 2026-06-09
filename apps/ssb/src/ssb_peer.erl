@@ -39,11 +39,30 @@
 
 %% connect to another peer on the default port (ssb app env or 8008).
 start_link(Ip, PubKey) ->
-    gen_server:start_link(?MODULE, [Ip, PubKey], []).
+    Port = application:get_env(ssb, port, 8008),
+    start_link(Ip, Port, PubKey).
 
 %% connect to another peer on an explicit port.
+%% Idempotent: if already connected (or if an inbound connection wins the
+%% registration race), returns {ok, ExistingPid} rather than crashing.
+%% init/1 returns `ignore` (not {stop,...}) so the child exits with normal
+%% and sends no propagating EXIT signal to the caller.
 start_link(Ip, Port, PubKey) when is_integer(Port) ->
-    gen_server:start_link(?MODULE, [Ip, Port, PubKey], []);
+    case peer_registry:find(PubKey) of
+        {ok, Pid} ->
+            {ok, Pid};
+        miss ->
+            case gen_server:start_link(?MODULE, [Ip, Port, PubKey], []) of
+                ignore ->
+                    %% Lost the registration race to an inbound connection.
+                    case peer_registry:find(PubKey) of
+                        {ok, Pid} -> {ok, Pid};
+                        miss      -> {error, already_connected}
+                    end;
+                Other ->
+                    Other
+            end
+    end;
 
 %% ranch 2.x protocol callback — accept a connection from another peer.
 %% Note: it no longer passes the socket in.
@@ -85,12 +104,33 @@ init([Ip, PubKey]) ->
 
 init([Ip, Port, PubKey]) ->
     process_flag(trap_exit, true),
-    try
-        {ok, State} = outbound_connect(Ip, Port, PubKey),
-        {ok, State}
-    catch
-        error:Reason ->
-            {stop, Reason}
+    %% Self-connections (used in tests) bypass the registry — both sides
+    %% must coexist or closing one kills the other via tcp_closed.
+    case (not is_self_pk(PubKey)) andalso peer_registry:is_connected(PubKey) of
+        true ->
+            ignore;
+        false ->
+            try
+                {ok, State} = outbound_connect(Ip, Port, PubKey),
+                RegResult = case is_self_pk(PubKey) of
+                    true  -> ok;
+                    false -> peer_registry:register(PubKey, self())
+                end,
+                case RegResult of
+                    ok ->
+                        {ok, State};
+                    {duplicate, _} ->
+                        %% Inbound connection won the race — clean up our socket
+                        %% and rpc_proc before returning ignore, so the inbound
+                        %% peer does not receive a spurious tcp_closed.
+                        gen_tcp:close(State#sbox_state.socket),
+                        gen_server:stop(State#sbox_state.rpc_proc),
+                        ignore
+                end
+            catch
+                error:Reason ->
+                    {stop, Reason}
+            end
     end;
 
 %% a 0 timeout on this init is need because the ranch handshake is blocking
@@ -107,33 +147,43 @@ handle_info({tcp, Socket, Data},
         {ok, {DecBoxKey, DecNonce, EncBoxKey, EncNonce, ClientPk, WinNetId}}
             = shs:server_shake_hands(Data, Socket, Transport),
         network_id_cache:record(ClientPk, WinNetId),
-        {ok, RpcProc} = rpc_processor:start_link(),
-        ok = rpc_processor:set_remote_pk(RpcProc, ClientPk),
-        Transport:setopts(Socket, [{active, once}]),
-        %% Skip createWants for invite connections — the peer expects invite.use
-        %% as the first message, not a createWants stream frame.
-        IsInvite = invite_store:is_invite(ClientPk),
-        {N1, WantsReqNo} = case IsInvite of
-            true ->
-                {EncNonce, undefined};
-            false ->
-                Req = 1,
-                Nonce1 = open_wants_stream(Socket, EncBoxKey, EncNonce, Req),
-                ok = rpc_processor:register_stream(RpcProc, -Req, blob_wants),
-                {Nonce1, Req}
+        RegResult = case is_self_pk(ClientPk) of
+            true  -> ok;
+            false -> peer_registry:register(ClientPk, self())
         end,
-        {noreply, State#sbox_state{dec_sbox_key = DecBoxKey,
-                                   enc_sbox_key = EncBoxKey,
-                                   dec_nonce = DecNonce,
-                                   enc_nonce = N1,
-                                   rpc_proc = RpcProc,
-                                   shook_hands = 1,
-                                   remote_pk = ClientPk,
-                                   our_wants_req = WantsReqNo,
-                                   req_counter = case WantsReqNo of
-                                                     undefined -> 0;
-                                                     _         -> WantsReqNo
-                                                 end}}
+        case RegResult of
+            {duplicate, _} ->
+                ?SSB_INFO("ssb_peer: duplicate inbound from known peer, dropping~n", []),
+                {stop, normal, State};
+            ok ->
+                {ok, RpcProc} = rpc_processor:start_link(),
+                ok = rpc_processor:set_remote_pk(RpcProc, ClientPk),
+                Transport:setopts(Socket, [{active, once}]),
+                %% Skip createWants for invite connections — the peer expects invite.use
+                %% as the first message, not a createWants stream frame.
+                IsInvite = invite_store:is_invite(ClientPk),
+                {N1, WantsReqNo} = case IsInvite of
+                    true ->
+                        {EncNonce, undefined};
+                    false ->
+                        Req = 1,
+                        Nonce1 = open_wants_stream(Socket, EncBoxKey, EncNonce, Req),
+                        ok = rpc_processor:register_stream(RpcProc, -Req, blob_wants),
+                        {Nonce1, Req}
+                end,
+                {noreply, State#sbox_state{dec_sbox_key = DecBoxKey,
+                                           enc_sbox_key = EncBoxKey,
+                                           dec_nonce = DecNonce,
+                                           enc_nonce = N1,
+                                           rpc_proc = RpcProc,
+                                           shook_hands = 1,
+                                           remote_pk = ClientPk,
+                                           our_wants_req = WantsReqNo,
+                                           req_counter = case WantsReqNo of
+                                                             undefined -> 0;
+                                                             _         -> WantsReqNo
+                                                         end}}
+        end
     catch
         error:Reason ->
             ?SSB_ERROR("Unable to shake hands with stranger ~p ~n",
@@ -406,11 +456,16 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 terminate(_Reason, #sbox_state{rpc_proc = RpcProc,
+                               remote_pk = RemotePk,
                                ebt_stale_ref = StaleRef,
                                ebt_entropy_ref = EntropyRef}) when is_pid(RpcProc) ->
     cancel_ebt_timer(StaleRef),
     cancel_ebt_timer(EntropyRef),
+    peer_registry:unregister(RemotePk),
     gen_server:stop(RpcProc),
+    ok;
+terminate(_Reason, #sbox_state{remote_pk = RemotePk}) ->
+    peer_registry:unregister(RemotePk),
     ok;
 terminate(_Reason, _State) ->
     ok.
@@ -658,3 +713,8 @@ build_initial_clock(RemotePubKey) ->
         false -> [{RemoteFeedId, ebt_vc:encode_clock_int(true, true, 0)} | FullClock]
     end,
     utils:encode_rec({ClockWithRemote}).
+
+is_self_pk(PubKey) ->
+    try PubKey =:= base64:decode(keys:pub_key())
+    catch _:_ -> false
+    end.
