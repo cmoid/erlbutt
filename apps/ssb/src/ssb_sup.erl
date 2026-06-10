@@ -33,6 +33,7 @@ init([]) ->
             ?CHILD(invite_store, worker),
             ?CHILD(conn_db, worker),
             ?CHILD(ssb_feed_sup, supervisor),
+            ?CHILD(friends, worker),
             ?CHILD(ebt, worker),
             ?CHILD(peer_registry, worker),
             ?CHILD(peer_dialer, worker)]}}.
