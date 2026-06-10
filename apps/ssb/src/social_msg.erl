@@ -58,6 +58,16 @@ dispatch_type(~"contact", Author, Props) ->
         nope   -> ok
     end;
 
+%% Self-assigned profile names feed the name index; abouts naming other
+%% feeds (or carrying only image/description) are ignored.
+dispatch_type(~"about", Author, Props) ->
+    case {?pgv(~"about", Props), ?pgv(~"name", Props)} of
+        {Author, Name} when is_binary(Name) ->
+            friends:update_name(Author, Name);
+        _ ->
+            ok
+    end;
+
 dispatch_type(_, _, _) ->
     ok.
 
