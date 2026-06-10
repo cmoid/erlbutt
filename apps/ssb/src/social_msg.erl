@@ -182,6 +182,43 @@ dispatch_contact_test() ->
                                 {~"following", true}]}},
     ?assertEqual(ok, social_msg:dispatch(Msg)).
 
+dispatch_about_test() ->
+    FriendsStarted = case whereis(friends) of
+        undefined -> {ok, _} = friends:start_link(), true;
+        _         -> false
+    end,
+    Self = #message{id = ~"%a1.sha256", previous = null,
+                    author = ~"@author=.ed25519", sequence = 3,
+                    timestamp = 0, hash = ~"sha256", received = 0,
+                    validated = true, swapped = false, signature = ~"sig",
+                    content = {[{~"type",  ~"about"},
+                                 {~"about", ~"@author=.ed25519"},
+                                 {~"name",  ~"zelda"}]}},
+    ok = social_msg:dispatch(Self),
+    ?assertEqual(~"zelda", friends:name(~"@author=.ed25519")),
+    %% An about naming a different feed must not set that feed's name.
+    Other = Self#message{id = ~"%a2.sha256", sequence = 4,
+                         content = {[{~"type",  ~"about"},
+                                      {~"about", ~"@other=.ed25519"},
+                                      {~"name",  ~"impostor"}]}},
+    ok = social_msg:dispatch(Other),
+    ?assertEqual(undefined, friends:name(~"@other=.ed25519")),
+    case FriendsStarted of
+        true  -> gen_server:stop(friends);
+        false -> ok
+    end.
+
+%% Without the friends server running, dispatch must still succeed.
+dispatch_about_no_friends_test() ->
+    Msg = #message{id = ~"%a3.sha256", previous = null,
+                   author = ~"@author=.ed25519", sequence = 5,
+                   timestamp = 0, hash = ~"sha256", received = 0,
+                   validated = true, swapped = false, signature = ~"sig",
+                   content = {[{~"type",  ~"about"},
+                                {~"about", ~"@author=.ed25519"},
+                                {~"name",  ~"zelda"}]}},
+    ?assertEqual(ok, social_msg:dispatch(Msg)).
+
 dispatch_unknown_type_test() ->
     Msg = #message{id = ~"%p.sha256", previous = null,
                    author = ~"@author=.ed25519", sequence = 3,
