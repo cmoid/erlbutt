@@ -580,6 +580,10 @@ network_error(Reason, State) ->
 stop(Reason, State) ->
     {stop, Reason, State}.
 
+%% Hosts from conn_db pub entries arrive as binaries (decoded JSON);
+%% gen_tcp:connect only accepts inet tuples, charlists, or atoms.
+connect(Host, Port) when is_binary(Host) ->
+    connect(binary_to_list(Host), Port);
 connect(Host, Port) ->
     {ok, Socket} =
         gen_tcp:connect(Host, Port,
