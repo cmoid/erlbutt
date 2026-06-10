@@ -21,6 +21,7 @@
          send_data/4,
          load_term/1,
          fold_log_file/3,
+         feed_dir/1,
          find_or_create_feed_pid/1,
          check_id/1,
          update_refs/1,
@@ -147,6 +148,15 @@ fold_log_loop(Fun, Acc, IoDev) ->
             file:close(IoDev),
             Acc
     end.
+
+%% On-disk directory holding a feed's log.offset, profile, contacts and
+%% references files.  Takes the display id (@...=.ed25519); raises on a
+%% malformed id (see decode_id/1).
+feed_dir(FeedId) ->
+    DecodeId = decode_id(FeedId),
+    Location = config:feed_loc(),
+    <<Dir:2/binary, RestAuth/binary>> = DecodeId,
+    <<Location/binary, Dir/binary, "/", RestAuth/binary>>.
 
 find_or_create_feed_pid(Id) ->
     case check_id(Id) of

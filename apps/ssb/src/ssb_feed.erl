@@ -107,8 +107,7 @@ archive(FeedPid) ->
 %%%===================================================================
 init([FeedId]) ->
     process_flag(trap_exit, true),
-    DecodeId = utils:decode_id(FeedId),
-    {Feed, Profile, Contacts, Refs} = init_directories(DecodeId),
+    {Feed, Profile, Contacts, Refs} = init_directories(FeedId),
     State = #state{id = FeedId,
                    feed = Feed,
                    profile = Profile,
@@ -325,11 +324,8 @@ write_msg(Msg, Store) ->
     ok = file:write(O, <<FileSize:32>>),
     close_file(O).
 
-init_directories(AuthDir) ->
-    Location = config:feed_loc(),
-    %% Author is already decoded as hex, use first two chars for directory
-    <<Dir:2/binary,RestAuth/binary>> = AuthDir,
-     FeedDir = <<Location/binary,Dir/binary,~"/"/binary,RestAuth/binary>>,
+init_directories(FeedId) ->
+    FeedDir = utils:feed_dir(FeedId),
     Feed = <<FeedDir/binary,~"/"/binary,~"log.offset"/binary>>,
     Profile = <<FeedDir/binary,~"/"/binary,~"profile"/binary>>,
     Contacts = <<FeedDir/binary,~"/"/binary,~"contacts"/binary>>,
