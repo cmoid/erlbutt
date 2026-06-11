@@ -45,13 +45,23 @@ handle_data(_ReqNo, Body, #ssb_conn{socket = Socket,
 
 maybe_forward_haves(_Props, undefined) ->
     ok;
-maybe_forward_haves(Props, SinkPid) ->
+maybe_forward_haves(Props, Sink) ->
     lists:foreach(fun({BlobId, Val}) when is_integer(Val), Val > 0 ->
-                        ?SSB_DEBUG("sending to pif: ~p ~p ~p~n", [SinkPid, BlobId, Val]),
-                        SinkPid ! {have, BlobId, Val};
+                        ?SSB_DEBUG("forwarding have to: ~p ~p ~p~n", [Sink, BlobId, Val]),
+                        forward_have(Sink, BlobId, Val);
                      (_) ->
                           ok
                   end, Props).
+
+%% A {Name, PeerPid} sink (used by blob_fetcher) receives haves tagged with
+%% the ssb_peer connection they arrived on, so it knows whom to fetch from.
+forward_have({Name, PeerPid}, BlobId, Val) when is_atom(Name) ->
+    case whereis(Name) of
+        undefined -> ok;
+        Pid       -> Pid ! {have, BlobId, Val, PeerPid}
+    end;
+forward_have(Pid, BlobId, Val) when is_pid(Pid) ->
+    Pid ! {have, BlobId, Val}.
 
 respond_to_wants(undefined, _Props, _Socket, Nonce, _Key) ->
     Nonce;
