@@ -229,6 +229,17 @@ dispatch_unknown_type_test() ->
                    content = {[{~"type", ~"post"}, {~"text", ~"hello"}]}},
     ?assertEqual(ok, social_msg:dispatch(Msg)).
 
+%% A post with a blob mention must dispatch fine without blob_fetcher running.
+dispatch_blob_mention_no_fetcher_test() ->
+    BlobId = <<"&", (base64:encode(crypto:hash(sha256, ~"pic")))/binary, ".sha256">>,
+    Msg = #message{id = ~"%m.sha256", previous = null,
+                   author = ~"@author=.ed25519", sequence = 6,
+                   timestamp = 0, hash = ~"sha256", received = 0,
+                   validated = true, swapped = false, signature = ~"sig",
+                   content = {[{~"type", ~"post"}, {~"text", ~"see pic"},
+                                {~"mentions", [{[{~"link", BlobId}]}]}]}},
+    ?assertEqual(ok, social_msg:dispatch(Msg)).
+
 dispatch_private_test() ->
     Msg = #message{id = ~"%priv.sha256", previous = null,
                    author = ~"@author=.ed25519", sequence = 4,

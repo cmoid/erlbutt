@@ -166,4 +166,21 @@ simple_blob_round_trip_test() ->
     gen_server:stop(Pid),
     gen_server:stop(Pid2).
 
+store_verified_test() ->
+    {ok, Pid} = config:start_link("test/ssb.cfg"),
+    {ok, Pid2} = blobs:start_link(),
+
+    Blob = ~"store verified test payload",
+    GoodId = list_to_binary("&" ++ utils:base_64(crypto:hash(sha256, Blob))
+                            ++ ".sha256"),
+    ?assertEqual(ok, blobs:store_verified(GoodId, Blob)),
+    ?assert(blobs:has(GoodId)),
+
+    BadId = list_to_binary("&" ++ utils:base_64(crypto:hash(sha256, ~"other"))
+                           ++ ".sha256"),
+    ?assertEqual({error, hash_mismatch}, blobs:store_verified(BadId, Blob)),
+    ?assertNot(blobs:has(BadId)),
+    gen_server:stop(Pid),
+    gen_server:stop(Pid2).
+
 -endif.

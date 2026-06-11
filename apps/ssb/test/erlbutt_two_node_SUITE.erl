@@ -24,7 +24,8 @@
          two_node_ebt_post_connect_replication_test/1,
          two_node_blob_wants_test/1,
          two_node_multiple_blob_wants_test/1,
-         two_node_blob_fetch_test/1]).
+         two_node_blob_fetch_test/1,
+         two_node_auto_blob_fetch_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -44,7 +45,8 @@ all() ->
      two_node_ebt_post_connect_replication_test,
      two_node_blob_wants_test,
      two_node_multiple_blob_wants_test,
-     two_node_blob_fetch_test].
+     two_node_blob_fetch_test,
+     two_node_auto_blob_fetch_test].
 
 init_per_suite(Config) ->
     %% peer:start/1 requires the calling node to be distributed.
@@ -315,4 +317,45 @@ two_node_blob_fetch_test(Config) ->
 
     rpc:call(NodeB, gen_server, stop, [PeerPid]).
 
+%% End-to-end automatic blob replication: node_a publishes a post that
+%% mentions a blob it holds; node_b replicates the feed via EBT, and its
+%% blob_fetcher notices the missing blob, wants it from node_a, and fetches
+%% it without any explicit request.
+two_node_auto_blob_fetch_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    %% A holds a blob and posts a message that mentions it.
+    BlobData = ~"erlbutt automatic blob replication payload",
+    BlobId   = rpc:call(NodeA, blobs, store, [BlobData]),
+    AId      = rpc:call(NodeA, keys, pub_key_disp, []),
+    AFeedPid = rpc:call(NodeA, utils, find_or_create_feed_pid, [AId]),
+    ok = rpc:call(NodeA, ssb_feed, post_content,
+                  [AFeedPid, {[{~"type", ~"post"},
+                                {~"text", ~"have a blob"},
+                                {~"mentions", [{[{~"link", BlobId}]}]}]}]),
+
+    %% B connects and replicates the feed via EBT.
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                              ["localhost", ?PORT_A, ACurvePk]),
+    timer:sleep(300),
+    rpc:call(NodeB, ssb_peer, request_ebt, [PeerPid]),
+
+    %% Storing the post on B triggers want → have → fetch on its own.
+    ?assert(wait_until(fun() ->
+        rpc:call(NodeB, blobs, has, [BlobId]) =:= true
+    end, 40)),
+    ?assertEqual({ok, BlobData}, rpc:call(NodeB, blobs, fetch, [BlobId])),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
 %%% Helpers -------------------------------------------------------------
+
+wait_until(_F, 0) -> false;
+wait_until(F, N) ->
+    case F() of
+        true  -> true;
+        false -> timer:sleep(250), wait_until(F, N - 1)
+    end.
