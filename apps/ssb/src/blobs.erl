@@ -16,6 +16,7 @@
 -export([start_link/0,
          fetch/1,
          store/1,
+         store_verified/2,
          has/1,
          size_of/1]).
 
@@ -41,6 +42,11 @@ fetch(BlobId) ->
 store(Blob) ->
     gen_server:call(?MODULE, {store, Blob}).
 
+%% Store Blob only if its hash matches BlobId; ok | {error, hash_mismatch}.
+%% Used when fetching blobs from remote peers.
+store_verified(BlobId, Blob) ->
+    gen_server:call(?MODULE, {store_verified, BlobId, Blob}).
+
 has(BlobId) ->
     gen_server:call(?MODULE, {has, BlobId}).
 
@@ -61,6 +67,13 @@ handle_call({fetch, BlobId}, _From, State) ->
 
 handle_call({store, Blob}, _From, State) ->
     {reply, insert(Blob), State};
+
+handle_call({store_verified, BlobId, Blob}, _From, State) ->
+    Reply = case hash_id(Blob) of
+        BlobId -> insert(Blob), ok;
+        _      -> {error, hash_mismatch}
+    end,
+    {reply, Reply, State};
 
 handle_call({has, BlobId}, _From, State) ->
     DecBId = utils:decode_id(BlobId),
@@ -107,11 +120,14 @@ lookup(DecBId) ->
         {error, _Reason} -> {error, not_found}
     end.
 
+hash_id(Blob) ->
+    list_to_binary("&" ++
+                       utils:base_64(crypto:hash(sha256, Blob))
+                   ++
+                       ".sha256").
+
 insert(Blob) ->
-    CodedBlob = list_to_binary("&" ++
-                                   utils:base_64(crypto:hash(sha256, Blob))
-                               ++
-                                   ".sha256"),
+    CodedBlob = hash_id(Blob),
     PathName = utils:decode_id(CodedBlob),
     BlobFile = blob_path(PathName),
     filelib:ensure_dir(BlobFile),
