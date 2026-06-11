@@ -118,6 +118,7 @@ init([Ip, Port, PubKey]) ->
                 end,
                 case RegResult of
                     ok ->
+                        blob_fetcher:peer_connected(self()),
                         {ok, State};
                     {duplicate, _} ->
                         %% Inbound connection won the race — clean up our socket
@@ -168,7 +169,9 @@ handle_info({tcp, Socket, Data},
                     false ->
                         Req = 1,
                         Nonce1 = open_wants_stream(Socket, EncBoxKey, EncNonce, Req),
-                        ok = rpc_processor:register_stream(RpcProc, -Req, blob_wants),
+                        ok = rpc_processor:register_stream(RpcProc, -Req,
+                                                           {blob_wants, {blob_fetcher, self()}}),
+                        blob_fetcher:peer_connected(self()),
                         {Nonce1, Req}
                 end,
                 {noreply, State#sbox_state{dec_sbox_key = DecBoxKey,
@@ -316,9 +319,10 @@ handle_info(Info, State) ->
 request_blob_wants(Pid, BlobIds, NotifyPid) ->
     gen_server:cast(Pid, {request_blob_wants, BlobIds, NotifyPid}).
 
-%% Fetch a blob from the remote peer via blobs.get.
+%% Fetch a blob from the remote peer via blobs.get.  Streaming a large
+%% blob can outlast the default 5s call timeout.
 fetch_blob(Pid, BlobId) ->
-    gen_server:call(Pid, {fetch_blob, BlobId}).
+    gen_server:call(Pid, {fetch_blob, BlobId}, 30000).
 
 %% Check whether the remote peer holds a blob. Returns {ok, true} or {ok, false}.
 has_blob(Pid, BlobId) ->
@@ -553,6 +557,10 @@ rpc_parse(Data, #sbox_state{socket = Socket,
                                  response = NewResponse},
     NewState = case NewResponse of
         {wants_stream, ReqNo} ->
+            %% Re-register the remote's createWants stream with a tagged sink
+            %% so haves arriving on it reach blob_fetcher with our pid.
+            ok = rpc_processor:register_stream(RpcProc, ReqNo,
+                                               {blob_wants, {blob_fetcher, self()}}),
             NewState0#sbox_state{remote_wants_req = ReqNo};
         {ebt_stream, ReqNo} ->
             NewState0#sbox_state{ebt_active = true,
@@ -694,7 +702,8 @@ build_outbound_state(Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce, PubKey) -
     ranch_tcp:setopts(Socket, [{active, once}]),
     WantsReqNo = 1,
     N1 = open_wants_stream(Socket, EncBoxKey, EncNonce, WantsReqNo),
-    ok = rpc_processor:register_stream(RpcProc, -WantsReqNo, blob_wants),
+    ok = rpc_processor:register_stream(RpcProc, -WantsReqNo,
+                                       {blob_wants, {blob_fetcher, self()}}),
     #sbox_state{socket = Socket,
                 transport = ranch_tcp,
                 dec_sbox_key = DecBoxKey,
