@@ -20,6 +20,8 @@
 
 %% Dispatch a stored message to application-layer handlers based on type.
 dispatch(#message{author = Author, content = {Props}}) ->
+    %% any blob referenced by the message gets requested from peers
+    blob_fetcher:want_refs({Props}),
     Type = ?pgv(~"type", Props),
     dispatch_type(Type, Author, Props);
 dispatch(_) ->
