@@ -13,7 +13,7 @@
 %%   ping            Ping the local node
 %%
 %% The escript connects to the local erlbutt node on port 8008 using the
-%% shared ~/.ssb/secret key (same approach as sbot in Node.js: two processes,
+%% shared ~/.ssberl/secret key (same approach as sbot in Node.js: two processes,
 %% one SHS connection, same identity on both sides).
 
 -define(INFO(Fmt, Args), io:format(Fmt, Args)).
