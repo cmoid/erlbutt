@@ -15,10 +15,17 @@
 -include_lib("ssb/include/ssb.hrl").
 
 -export([start_link/0,
-         trigger/0]).
+         trigger/0,
+         enable/0,
+         disable/0,
+         is_enabled/0]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
 
 -define(INITIAL_DELAY_MS, 5_000).
 -define(POLL_MS,         30_000).
@@ -36,21 +43,62 @@ trigger() ->
     ?MODULE ! poll,
     ok.
 
+%% Turn automatic dialing on (kicks an immediate pass) or off.  The poll
+%% timer keeps running while disabled; passes are skipped.
+enable() ->
+    gen_server:call(?MODULE, {set_enabled, true}).
+
+disable() ->
+    gen_server:call(?MODULE, {set_enabled, false}).
+
+is_enabled() ->
+    gen_server:call(?MODULE, is_enabled).
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
 init([]) ->
-    erlang:send_after(?INITIAL_DELAY_MS, self(), poll),
-    {ok, #{}}.
+    %% startup default comes from ssb.cfg ({peer_dialer, Bool}); on when
+    %% config is absent (tests)
+    Enabled = try config:dialer_enabled() catch _:_ -> true end,
+    Timer = erlang:send_after(?INITIAL_DELAY_MS, self(), poll),
+    {ok, #{enabled => Enabled, timer => Timer, dialing => undefined}}.
 
-handle_info(poll, State) ->
-    dial_candidates(),
-    erlang:send_after(?POLL_MS, self(), poll),
-    {noreply, State};
+%% Dial passes run in a monitored worker so the server stays responsive:
+%% dialing dead peers blocks for seconds per candidate (connect timeout,
+%% SHS network-id retries with backoff), which used to starve callers of
+%% enable/disable/is_enabled into gen_server timeouts.
+handle_info(poll, #{enabled := Enabled, timer := Timer, dialing := Dialing} = State) ->
+    %% Cancel the pending timer so an out-of-band poll (trigger/enable)
+    %% does not fork a second periodic chain.
+    cancel_timer(Timer),
+    NewDialing = case {Enabled, Dialing} of
+        {true, undefined} ->
+            spawn_monitor(fun dial_candidates/0);
+        _ ->
+            %% disabled, or the previous pass is still running
+            Dialing
+    end,
+    NewTimer = erlang:send_after(?POLL_MS, self(), poll),
+    {noreply, State#{timer := NewTimer, dialing := NewDialing}};
+
+handle_info({'DOWN', Ref, process, Pid, _Reason},
+            #{dialing := {Pid, Ref}} = State) ->
+    {noreply, State#{dialing := undefined}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
+
+handle_call({set_enabled, Bool}, _From, State) ->
+    case Bool of
+        true  -> self() ! poll;
+        false -> ok
+    end,
+    {reply, ok, State#{enabled := Bool}};
+
+handle_call(is_enabled, _From, #{enabled := Enabled} = State) ->
+    {reply, Enabled, State};
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
@@ -67,6 +115,9 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal
 %%%===================================================================
+
+cancel_timer(undefined) -> ok;
+cancel_timer(Ref)       -> erlang:cancel_timer(Ref), ok.
 
 dial_candidates() ->
     Candidates = dedup(lan_candidates() ++ known_candidates()),
@@ -130,7 +181,15 @@ dedup(Candidates) ->
         end, {[], sets:new()}, Candidates),
     lists:reverse(Uniq).
 
-maybe_dial({Host, Port, RawKey}) ->
+%% Re-check the flag before every candidate so disable/0 takes effect in
+%% the middle of a long pass, not just between passes.
+maybe_dial(Candidate) ->
+    case is_enabled() of
+        true  -> dial(Candidate);
+        false -> ok
+    end.
+
+dial({Host, Port, RawKey}) ->
     case length(peer_registry:all()) >= ?MAX_CONNS of
         true ->
             ?SSB_DEBUG("peer_dialer: at connection cap, skipping~n", []);

@@ -15,7 +15,8 @@
          network_ids/0,
          add_network_id/1,
          archive_length/0,
-         set_archive_length/1]).
+         set_archive_length/1,
+         dialer_enabled/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -29,7 +30,8 @@
                 blob_loc,
                 net_id,
                 extra_network_ids = [],
-                archive_length = ?DEFAULT_ARCHIVE_LENGTH}).
+                archive_length = ?DEFAULT_ARCHIVE_LENGTH,
+                dialer = true}).
 
 %%%===================================================================
 %%% API
@@ -55,6 +57,11 @@ add_network_id(NetId) when is_binary(NetId) ->
 
 archive_length() ->
     gen_server:call(?MODULE, archive_length, infinity).
+
+%% Whether peer_dialer should dial automatically at startup.
+%% Set {peer_dialer, false}. in ssb.cfg to start with dialing off.
+dialer_enabled() ->
+    gen_server:call(?MODULE, dialer_enabled, infinity).
 
 set_archive_length(undefined) ->
     gen_server:call(?MODULE, {set_archive_length, undefined}, infinity);
@@ -110,7 +117,10 @@ handle_call(archive_length, _From, #state{archive_length = Len}=State) ->
     {reply, Len, State};
 
 handle_call({set_archive_length, Len}, _From, State) ->
-    {reply, ok, State#state{archive_length = Len}}.
+    {reply, ok, State#state{archive_length = Len}};
+
+handle_call(dialer_enabled, _From, #state{dialer = Dialer}=State) ->
+    {reply, Dialer, State}.
 
 %% casts
 
@@ -156,6 +166,9 @@ parse({extra_network_ids, List}, State) when is_list(List) ->
 
 parse({archive_length, Len}, State) when is_integer(Len), Len > 0 ->
     State#state{archive_length = Len};
+
+parse({peer_dialer, Bool}, State) when is_boolean(Bool) ->
+    State#state{dialer = Bool};
 
 parse(_Any, State) ->
     %% ignore for now, this is an error technically
