@@ -35,6 +35,7 @@
 -export([start_link/0,
          want/1,
          want_refs/1,
+         extract_blob_refs/1,
          peer_connected/1,
          wanted/0]).
 
@@ -192,7 +193,7 @@ do_fetch(Parent, BlobId, PeerPid) ->
     Parent ! {fetched, BlobId, Result}.
 
 %% Collect every well-formed blob reference appearing anywhere in decoded
-%% JSON message content.
+%% JSON message content.  Also used by converter when importing a JS log.
 extract_blob_refs(Content) ->
     lists:usort(walk(Content, [])).
 
@@ -223,10 +224,10 @@ make_blob_id(Data) ->
 
 %% The test blob store (_build/test/blobs/) persists across runs, so blobs
 %% stored by a previous run would satisfy has/1 and break want tracking.
-%% Unique payloads keep each run independent.
+%% Random payloads keep each run independent (unique_integer is not enough —
+%% it restarts per VM run and can repeat values across runs).
 unique_payload(Tag) ->
-    <<Tag/binary, " ", (integer_to_binary(erlang:unique_integer([positive])))/binary,
-      " ", (integer_to_binary(os:system_time()))/binary>>.
+    <<Tag/binary, " ", (binary:encode_hex(crypto:strong_rand_bytes(8)))/binary>>.
 
 wait_until(_F, 0) -> false;
 wait_until(F, N) ->

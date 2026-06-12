@@ -208,3 +208,63 @@ dial({Host, Port, RawKey}) ->
                     end
             end
     end.
+
+-ifdef(TEST).
+
+%% Without config running the dialer defaults to enabled; enable/disable
+%% flip it at runtime.  The poll fired by enable/0 must not kill the
+%% server even though heartbeat/conn_db are absent here.
+enable_disable_test() ->
+    {ok, Pid} = peer_dialer:start_link(),
+    ?assert(peer_dialer:is_enabled()),
+    ok = peer_dialer:disable(),
+    ?assertNot(peer_dialer:is_enabled()),
+    ok = peer_dialer:enable(),
+    ?assert(peer_dialer:is_enabled()),
+    ?assert(is_process_alive(Pid)),
+    gen_server:stop(Pid).
+
+%% The server must answer calls while a dial pass is stuck — this is the
+%% maxbutt toggle-timeout regression.  A fake heartbeat that never replies
+%% hangs the worker pass in heartbeat:peers(); is_enabled/disable must
+%% still respond immediately.
+responsive_during_dial_test() ->
+    HbStarted = case whereis(heartbeat) of
+        undefined ->
+            Hb = spawn(fun() -> receive never -> ok end end),
+            register(heartbeat, Hb),
+            Hb;
+        _ ->
+            false
+    end,
+    {ok, Pid} = peer_dialer:start_link(),
+    peer_dialer:trigger(),
+    timer:sleep(50),
+    ?assert(peer_dialer:is_enabled()),
+    ok = peer_dialer:disable(),
+    ?assertNot(peer_dialer:is_enabled()),
+    gen_server:stop(Pid),
+    case HbStarted of
+        false -> ok;
+        HbPid -> exit(HbPid, kill)
+    end.
+
+%% {peer_dialer, false} in the config file starts the dialer disabled.
+config_startup_test() ->
+    Cfg = "test/dialer_test.cfg",
+    ok = file:write_file(Cfg, ~"{peer_dialer, false}.\n"),
+    ConfigStarted = case whereis(config) of
+        undefined -> {ok, _} = config:start_link(Cfg), true;
+        _         -> false
+    end,
+    ?assertNot(config:dialer_enabled()),
+    {ok, Pid} = peer_dialer:start_link(),
+    ?assertNot(peer_dialer:is_enabled()),
+    gen_server:stop(Pid),
+    case ConfigStarted of
+        true  -> gen_server:stop(config);
+        false -> ok
+    end,
+    file:delete(Cfg).
+
+-endif.
