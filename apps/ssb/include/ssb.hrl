@@ -14,6 +14,9 @@
 
 -define(KEEP_ALIVE_GRACE, 1500).
 
+%% Shown in place of message text for private content we cannot decrypt.
+-define(ENCRYPTED_PLACEHOLDER, <<"[encrypted]">>).
+
 %% This network id is almost the same
 -define(DEFAULT_NETWORK_ID, base64:decode("1KHLiKZvAvjbY1ziZEHMXawbCEIM6qwjCDm3VYnaR/s=")).
 -define(DEFAULT_ARCHIVE_LENGTH, 10000).

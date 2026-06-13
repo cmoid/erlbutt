@@ -55,9 +55,31 @@ get_msgs1(Nodes, Msgs) ->
 
 get_msg(Id, Auth) ->
     Feed = utils:find_or_create_feed_pid(Auth),
-    Msg = ssb_feed:fetch_msg(Feed, Id),
-    {Content} = Msg#message.content,
-    ?pgv(~"text", Content).
+    msg_text(ssb_feed:fetch_msg(Feed, Id)).
+
+%% Extract displayable text without crashing on the non-post and encrypted
+%% messages that legitimately appear in a tangle.  Cleartext content is a
+%% decoded JSON object ({Props}); private content is a "...box" binary that
+%% we decrypt when addressed to us and otherwise surface as a placeholder.
+msg_text(#message{content = {Content}}) ->
+    ?pgv(~"text", Content);
+msg_text(#message{content = Boxed}) when is_binary(Boxed) ->
+    case private_box:decrypt(Boxed) of
+        {ok, Plain} -> decrypted_text(Plain);
+        not_for_me  -> ?ENCRYPTED_PLACEHOLDER
+    end;
+msg_text(_) ->
+    undefined.
+
+%% Decrypted private content is the original plaintext: a JSON object in
+%% real SSB, but possibly a bare binary from erlbutt's own private_box.
+decrypted_text(Plain) ->
+    try utils:nat_decode(Plain) of
+        {Props} -> ?pgv(~"text", Props);
+        _       -> Plain
+    catch _:_ ->
+        Plain
+    end.
 
 children(MsgId, TangleId) ->
     %% retrieve tangle root author
