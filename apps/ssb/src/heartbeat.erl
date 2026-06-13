@@ -143,7 +143,7 @@ record_peer(Ip, Data, _) ->
 extract_key(Data) ->
     %% may be more that one connection string here, look for semicolon
     %% and truncate
-    CheckMatch = binary:match(Data, <<":8008~shs:">>),
+    CheckMatch = binary:match(Data, ~":8008~shs:"),
     if CheckMatch == nomatch ->
             nokey;
        true ->
