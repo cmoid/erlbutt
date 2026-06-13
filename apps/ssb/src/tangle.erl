@@ -227,6 +227,38 @@ tangle4_test() ->
                    [{Id4, Auth2, [{Id5, Auth2}]},
                     {Id3, Auth, [{Id5, Auth2}]}]}]} == tangle:get_tangle(Id)).
 
+%% get_msg/2 must tolerate every content shape a tangle can contain.
+get_msg_post_test() ->
+    {Auth, Priv, Feed} = init(),
+    Post = message:new_msg(nil, 1, {[{~"type", ~"post"},
+                                     {~"text", ~"hello tangle"}]}, {Auth, Priv}),
+    ssb_feed:store_msg(Feed, Post),
+    ?assertEqual(~"hello tangle", get_msg(Post#message.id, Auth)).
+
+%% A non-post object with no text field returns undefined, not a crash.
+get_msg_no_text_test() ->
+    {Auth, Priv, Feed} = init(),
+    Vote = message:new_msg(nil, 1, {[{~"type", ~"vote"}]}, {Auth, Priv}),
+    ssb_feed:store_msg(Feed, Vote),
+    ?assertEqual(undefined, get_msg(Vote#message.id, Auth)).
+
+%% Private content addressed to us is decrypted; content for someone else
+%% becomes a placeholder instead of badmatching the {Content} pattern.
+get_msg_private_test() ->
+    {Auth, Priv, Feed} = init(),
+    Me = keys:pub_key_disp(),
+    Mine = message:new_msg(nil, 1, private_box:encrypt(~"secret words", [Me]),
+                           {Auth, Priv}),
+    ssb_feed:store_msg(Feed, Mine),
+    ?assertEqual(~"secret words", get_msg(Mine#message.id, Auth)),
+
+    {OtherPub, _} = utils:create_key_pair(),
+    OtherId = utils:display_pub(OtherPub),
+    Theirs = message:new_msg(nil, 2, private_box:encrypt(~"not yours", [OtherId]),
+                             {Auth, Priv}),
+    ssb_feed:store_msg(Feed, Theirs),
+    ?assertEqual(?ENCRYPTED_PLACEHOLDER, get_msg(Theirs#message.id, Auth)).
+
 init() ->
     config:start_link("test/ssb.cfg"),
     keys:start_link(),
