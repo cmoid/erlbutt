@@ -1,0 +1,16 @@
+## erlbutt developer node.
+##
+## Distribution is enabled for distel/maxbutt and remote shells.  maxbutt
+## ships as a separate package; point SSB_EXTRA_PA at its ebin directory
+## (space-separated for several dirs) to load its bridge modules onto this
+## node's code path:
+##
+##   SSB_EXTRA_PA=/path/to/maxbutt/ebin bin/ssb console
+-name ${SSB_NODE:-erlbutt@localhost}
+-setcookie ${SSB_COOKIE:-erlbutt}
+
+## Extra code paths (e.g. the maxbutt package's ebin).  Harmless when unset.
+-pa ${SSB_EXTRA_PA:-.}
+
++K true
++A 16

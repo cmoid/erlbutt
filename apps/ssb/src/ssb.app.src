@@ -5,17 +5,14 @@
  [{description, "ssb"},
   {vsn, {cmd, "echo 0.1-`git describe --always --tags`"}},
   {registered, []},
+  %% Genuine runtime dependencies only.  GUI/tooling apps (observer, wx,
+  %% debugger, tools, syntax_tools) are not needed to run a node; the devpkg
+  %% release profile adds them back for development.
   {applications, [kernel,
                   sasl,
                   stdlib,
                   crypto,
-                  observer,
-                  wx,
                   ranch,
-                  enacl,
-                  compiler,
-                  debugger,
-                  syntax_tools,
-                  tools]},
+                  enacl]},
   {env, []},
   {mod, {ssb_app, [{ssb_log_level, notice}]}}]}.

@@ -9,6 +9,7 @@ ebin
 log
 Mnesia*
 _build
+dist
 *#*#
 .DS_Store
 foo

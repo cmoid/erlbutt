@@ -1,0 +1,18 @@
+## erlbutt production node.
+##
+## Distribution is enabled but bound to the loopback interface, so the node
+## is reachable for `bin/ssb remote_console|stop|ping` from the same host
+## while NOT accepting distribution connections from other machines.
+##
+## Change the cookie per install and treat it as a secret.  To take the node
+## fully off distribution (no remsh, and bin/ssb stop|ping|remote_console
+## stop working — you must then manage the OS process directly), comment out
+## the -name and -setcookie lines below.
+-name ${SSB_NODE:-ssb@127.0.0.1}
+-setcookie ${SSB_COOKIE:-change-me-in-production}
+
+## Bind the distribution listener to loopback only.
+-kernel inet_dist_use_interface {127,0,0,1}
+
++K true
++A 16
