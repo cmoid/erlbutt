@@ -1,4 +1,4 @@
-.PHONY: compile rel test ct clean distclean prod devpkg prodpkg packages release release-publish
+.PHONY: compile rel test ct clean distclean prod devpkg prodpkg packages release
 REBAR=./rebar3
 
 VSN  := $(shell git describe --always --tags)
@@ -60,12 +60,13 @@ prodpkg: compile
 
 packages: devpkg prodpkg
 
-## Build this host's packages and attach them to a DRAFT GitHub release for the
+## Build this host's packages and attach them to the GitHub release for the
 ## current tag.  Run on each build machine (e.g. Mac then Linux): the first call
-## creates the draft, later calls add their platform's assets (--clobber lets a
-## re-run replace them).  Publish with `make release-publish` once every
-## platform's assets are attached.  Requires the gh CLI (authenticated) and HEAD
-## checked out at a tag you have pushed.
+## creates the (published) release, later calls add their platform's assets
+## (--clobber lets a re-run replace them).  The release is published, not draft —
+## drafts can't be addressed by tag, so a per-machine create-or-upload flow can
+## only work against a published release.  Requires the gh CLI (authenticated)
+## and HEAD checked out at a tag you have pushed.
 release:
 	@git describe --exact-match --tags HEAD >/dev/null 2>&1 || { \
 	  echo "ERROR: HEAD is not at a tag. Tag and push first, e.g.:"; \
@@ -73,16 +74,10 @@ release:
 	  exit 1; }
 	$(MAKE) packages
 	@cd $(DIST) && \
-	  gh release create $(VSN) -R $(GH_REPO) --draft --generate-notes --title $(VSN) \
+	  gh release create $(VSN) -R $(GH_REPO) --generate-notes --title $(VSN) \
 	      $(DEV_PKG) $(PROD_PKG) \
 	  || gh release upload $(VSN) -R $(GH_REPO) --clobber \
 	      $(DEV_PKG) $(PROD_PKG)
-	@echo "==> $(PLATFORM) assets attached to draft release $(VSN)"
-
-## Flip the draft release for the current tag to public.  Run once, after every
-## platform's assets are attached.
-release-publish:
-	gh release edit $(VSN) -R $(GH_REPO) --draft=false
-	@echo "==> published release $(VSN)"
+	@echo "==> $(PLATFORM) assets attached to release $(VSN)"
 
 all:  clean compile test prod
