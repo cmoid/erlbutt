@@ -1,4 +1,4 @@
-.PHONY: compile rel test ct clean distclean prod devpkg prodpkg packages
+.PHONY: compile rel test ct clean distclean prod devpkg prodpkg packages release release-publish
 REBAR=./rebar3
 
 VSN  := $(shell git describe --always --tags)
@@ -13,6 +13,10 @@ PLATFORM := $(OS)-$(ARCH)
 
 DEV_PKG  := erlbutt-dev-$(VSN)-$(PLATFORM).tar.gz
 PROD_PKG := erlbutt-prod-$(VSN)-$(PLATFORM).tar.gz
+
+## Target repo for `gh` (passed as -R, so it works regardless of how the git
+## remote is named or whether its URL uses an SSH host alias).
+GH_REPO  ?= cmoid/erlbutt
 
 compile:
 	$(REBAR) compile
@@ -55,5 +59,30 @@ prodpkg: compile
 	@echo "==> $(DIST)/$(PROD_PKG)"
 
 packages: devpkg prodpkg
+
+## Build this host's packages and attach them to a DRAFT GitHub release for the
+## current tag.  Run on each build machine (e.g. Mac then Linux): the first call
+## creates the draft, later calls add their platform's assets (--clobber lets a
+## re-run replace them).  Publish with `make release-publish` once every
+## platform's assets are attached.  Requires the gh CLI (authenticated) and HEAD
+## checked out at a tag you have pushed.
+release:
+	@git describe --exact-match --tags HEAD >/dev/null 2>&1 || { \
+	  echo "ERROR: HEAD is not at a tag. Tag and push first, e.g.:"; \
+	  echo "  git tag -a v0.1.0 -m 'erlbutt v0.1.0' && git push gh v0.1.0"; \
+	  exit 1; }
+	$(MAKE) packages
+	@cd $(DIST) && \
+	  gh release create $(VSN) -R $(GH_REPO) --draft --generate-notes --title $(VSN) \
+	      $(DEV_PKG) $(PROD_PKG) \
+	  || gh release upload $(VSN) -R $(GH_REPO) --clobber \
+	      $(DEV_PKG) $(PROD_PKG)
+	@echo "==> $(PLATFORM) assets attached to draft release $(VSN)"
+
+## Flip the draft release for the current tag to public.  Run once, after every
+## platform's assets are attached.
+release-publish:
+	gh release edit $(VSN) -R $(GH_REPO) --draft=false
+	@echo "==> published release $(VSN)"
 
 all:  clean compile test prod
