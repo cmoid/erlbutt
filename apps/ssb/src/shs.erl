@@ -18,8 +18,10 @@
          create_long_pair/0,
          client_shake_hands/2,
          client_shake_hands/3,
+         client_shake_hands_tunnel/3,
          server_shake_hands/3,
-         server_shake_hands/4]).
+         server_shake_hands/4,
+         server_shake_hands_tunnel/4]).
 
 check_hello(BinData, NetId) ->
     case size(BinData) of
@@ -70,20 +72,35 @@ create_long_pair() ->
      maps:get(secret, KeyPair)}.
 
 client_shake_hands(Socket, RemotePubKey) ->
-    do_client_shake_hands(Socket, RemotePubKey, config:network_id(), long_pk(), long_sk()).
+    socket_client(Socket, RemotePubKey, config:network_id(), long_pk(), long_sk()).
 
 %% NetId as binary: retry-loop path in ssb_peer, uses default node keys.
 client_shake_hands(Socket, RemotePubKey, NetId) when is_binary(NetId) ->
-    do_client_shake_hands(Socket, RemotePubKey, NetId, long_pk(), long_sk());
+    socket_client(Socket, RemotePubKey, NetId, long_pk(), long_sk());
 
 %% Key-pair tuple: invite path, uses ephemeral invite keys with primary NetId.
 client_shake_hands(Socket, RemotePubKey, {OurPubKey, OurPrivKey}) ->
-    do_client_shake_hands(Socket, RemotePubKey, config:network_id(), OurPubKey, OurPrivKey).
+    socket_client(Socket, RemotePubKey, config:network_id(), OurPubKey, OurPrivKey).
 
-do_client_shake_hands(Socket, RemotePubKey, NetId, OurPubKey, OurPrivKey) ->
+%% Run the client handshake over a gen_tcp socket.
+socket_client(Socket, RemotePubKey, NetId, OurPubKey, OurPrivKey) ->
+    Send = fun(D) -> gen_tcp:send(Socket, D) end,
+    Recv = fun(N) -> gen_tcp:recv(Socket, N, 5000) end,
+    {ok, {DecBoxKey, DecNonce, EncBoxKey, EncNonce}} =
+        do_client_shake_hands(Send, Recv, RemotePubKey, NetId, OurPubKey, OurPrivKey),
+    {ok, {Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce}}.
+
+%% Run the client handshake over an arbitrary transport (e.g. a room tunnel).
+%% Send(Data) writes one handshake message; Recv(N) returns {ok, Bin} with the
+%% next message.  Returns the four box-stream keys/nonces (no socket).
+client_shake_hands_tunnel(Send, Recv, RemotePubKey) ->
+    do_client_shake_hands(Send, Recv, RemotePubKey, config:network_id(),
+                          long_pk(), long_sk()).
+
+do_client_shake_hands(Send, Recv, RemotePubKey, NetId, OurPubKey, OurPrivKey) ->
     {Eph_sk, Hmac, DecNonce} = gen_hello(NetId),
-    gen_tcp:send(Socket, Hmac),
-    {ok, ServerHmac} = gen_tcp:recv(Socket, 64, 5000),
+    Send(Hmac),
+    {ok, ServerHmac} = Recv(64),
     {true, ServEph_pk, EncNonce} = check_hello(ServerHmac, NetId),
     Shared_ab = mult(Eph_sk, ServEph_pk),
     Shared_aB = mult(Eph_sk, pk_to_curve25519(RemotePubKey)),
@@ -91,9 +108,9 @@ do_client_shake_hands(Socket, RemotePubKey, NetId, OurPubKey, OurPrivKey) ->
     DetSigA = enacl:sign_detached(concat([NetId, RemotePubKey, ShaSab]), OurPrivKey),
     Msg = concat([DetSigA, OurPubKey]),
     Box = create_box(Msg, concat([NetId, Shared_ab, Shared_aB])),
-    gen_tcp:send(Socket, Box),
+    Send(Box),
     Shared_Ab = mult(sk_to_curve25519(OurPrivKey), ServEph_pk),
-    {ok, ServData} = gen_tcp:recv(Socket, 80, 5000),
+    {ok, ServData} = Recv(80),
     DetSigB = open_box(ServData, ?SHS_NONCE,
                        crypto:hash(sha256, concat([NetId, Shared_ab, Shared_aB, Shared_Ab]))),
     M = concat([NetId, DetSigA, OurPubKey, ShaSab]),
@@ -103,14 +120,22 @@ do_client_shake_hands(Socket, RemotePubKey, NetId, OurPubKey, OurPrivKey) ->
                                         concat([NetId, Shared_ab, Shared_aB, Shared_Ab]))),
     DecBoxKey = crypto:hash(sha256, concat([SharedKey, OurPubKey])),
     EncBoxKey = crypto:hash(sha256, concat([SharedKey, RemotePubKey])),
-    {ok, {Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce}}.
+    {ok, {DecBoxKey, DecNonce, EncBoxKey, EncNonce}}.
 
 server_shake_hands(Data, Socket, Transport) ->
     server_shake_hands(Data, Socket, Transport, config:network_ids()).
 
 server_shake_hands(Data, Socket, Transport, NetIds) ->
     WinNetId = find_network_id(Data, NetIds),
-    do_server_shake_hands(Data, Socket, Transport, WinNetId).
+    Send = fun(D) -> Transport:send(Socket, D) end,
+    Recv = fun(N) -> Transport:recv(Socket, N, 5000) end,
+    do_server_shake_hands(Data, Send, Recv, WinNetId).
+
+%% Run the server handshake over an arbitrary transport (e.g. a room tunnel).
+%% Data is the already-received client hello; Send/Recv as in the client.
+server_shake_hands_tunnel(Data, Send, Recv, NetIds) ->
+    WinNetId = find_network_id(Data, NetIds),
+    do_server_shake_hands(Data, Send, Recv, WinNetId).
 
 find_network_id(_Data, []) ->
     error(no_matching_network_id);
@@ -120,13 +145,13 @@ find_network_id(Data, [NetId | Rest]) ->
         _            -> find_network_id(Data, Rest)
     end.
 
-do_server_shake_hands(Data, Socket, Transport, NetId) ->
+do_server_shake_hands(Data, Send, Recv, NetId) ->
     {true, ClEph_pk, EncNonce} = check_hello(Data, NetId),
     {Eph_sk, ServerHmac, DecNonce} = gen_hello(NetId),
-    Transport:send(Socket, ServerHmac),
+    Send(ServerHmac),
     Shared_ab = mult(Eph_sk, ClEph_pk),
     Shared_aB = mult(sk_to_curve25519(long_sk()), ClEph_pk),
-    {ok, ServData} = Transport:recv(Socket, 112, 5000),
+    {ok, ServData} = Recv(112),
     ShaSab = crypto:hash(sha256, Shared_ab),
     MsgPlain = open_box(ServData, ?SHS_NONCE,
                         crypto:hash(sha256, concat([NetId, Shared_ab, Shared_aB]))),
@@ -137,7 +162,7 @@ do_server_shake_hands(Data, Socket, Transport, NetId) ->
     Shared_Ab = mult(Eph_sk, pk_to_curve25519(ClLong_pk)),
     DetSigB = enacl:sign_detached(concat([NetId, DetSigA, ClLong_pk, ShaSab]), long_sk()),
     Box = create_box(DetSigB, concat([NetId, Shared_ab, Shared_aB, Shared_Ab])),
-    Transport:send(Socket, Box),
+    Send(Box),
     SharedKey = crypto:hash(sha256,
                             crypto:hash(sha256,
                                         concat([NetId, Shared_ab, Shared_aB, Shared_Ab]))),
