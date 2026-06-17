@@ -7,6 +7,7 @@
 
 -export([ensure_distributed/0,
          start_ssb_node/4,
+         start_ssb_node/5,
          pa_args/0,
          build_dir/0]).
 
@@ -20,11 +21,17 @@ ensure_distributed() ->
 
 %% Start a named peer BEAM node, load code paths, configure and start ssb.
 start_ssb_node(Name, DataDir, Port, PAs) ->
+    start_ssb_node(Name, DataDir, Port, PAs, []).
+
+%% As start_ssb_node/4, but sets extra {Key, Value} ssb application env
+%% entries (e.g. {room, true}) before starting the application.
+start_ssb_node(Name, DataDir, Port, PAs, Env) ->
     {ok, Peer, Node} = peer:start(#{name => Name, args => PAs}),
     rpc:call(Node, code, add_paths,
              [[filename:join([build_dir(), "lib", "enacl", "priv"])]]),
     rpc:call(Node, application, set_env, [ssb, ssb_home, DataDir]),
     rpc:call(Node, application, set_env, [ssb, port, Port]),
+    [rpc:call(Node, application, set_env, [ssb, K, V]) || {K, V} <- Env],
     {ok, _} = rpc:call(Node, application, ensure_all_started, [ssb]),
     {ok, Peer, Node}.
 

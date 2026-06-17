@@ -195,4 +195,59 @@ round_trip_test() ->
     {true, _Eph_pk, _} = check_hello(Hmac, NetId),
     gen_server:stop(Pid).
 
+%% Full client+server handshake over an in-memory transport: the two Send/Recv
+%% closures are wired together with message passing (no socket).  Proves the
+%% transport abstraction carries the handshake and that both sides derive the
+%% same box-stream keys/nonces, then round-trips a boxed message each way.
+inmem_handshake_test_() ->
+    {setup, fun setup_node/0, fun cleanup_node/1,
+     fun(_) -> ?_test(run_inmem_handshake()) end}.
+
+setup_node() ->
+    catch gen_server:stop(keys),
+    catch gen_server:stop(config),
+    Home = filename:join("/tmp", "shs_inmem_"
+                         ++ integer_to_list(erlang:system_time(microsecond))),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    application:set_env(ssb, ssb_home, Home),
+    {ok, _} = config:start_link("test/ssb.cfg"),
+    {ok, _} = keys:start_link(),
+    Home.
+
+cleanup_node(Home) ->
+    catch gen_server:stop(keys),
+    catch gen_server:stop(config),
+    os:cmd("rm -rf " ++ Home),
+    application:unset_env(ssb, ssb_home),
+    ok.
+
+run_inmem_handshake() ->
+    NetId    = config:network_id(),
+    ServerPk = base64:decode(keys:pub_key()),     %% server identity = node keys
+    {ClientPk, ClientSk} = create_long_pair(),    %% fresh client identity
+    Parent = self(),
+    Server = spawn(fun() ->
+        SSend = fun(D) -> Parent ! {s2c, D}, ok end,
+        SRecv = fun(_N) -> receive {c2s, D} -> {ok, D} end end,
+        {ok, Hello} = SRecv(64),
+        Parent ! {server_done, do_server_shake_hands(Hello, SSend, SRecv, NetId)}
+    end),
+    CSend = fun(D) -> Server ! {c2s, D}, ok end,
+    CRecv = fun(_N) -> receive {s2c, D} -> {ok, D} end end,
+    {ok, {CDec, CDecN, CEnc, CEncN}} =
+        do_client_shake_hands(CSend, CRecv, ServerPk, NetId, ClientPk, ClientSk),
+    {ok, {SDec, SDecN, SEnc, SEncN, ClLongPk, _NetId}} =
+        receive {server_done, R} -> R after 5000 -> error(server_timeout) end,
+    %% Each side's encrypt key/nonce matches the other's decrypt key/nonce.
+    ?assertEqual(CEnc,  SDec),
+    ?assertEqual(CDec,  SEnc),
+    ?assertEqual(CEncN, SDecN),
+    ?assertEqual(CDecN, SEncN),
+    ?assertEqual(ClientPk, ClLongPk),
+    %% A boxed message survives in both directions using the derived keys.
+    {B1, _} = boxstream:box(~"ping", CEncN, CEnc),
+    ?assertMatch({complete, ~"ping", _, _}, boxstream:unbox(SDec, SDecN, B1)),
+    {B2, _} = boxstream:box(~"pong", SEncN, SEnc),
+    ?assertMatch({complete, ~"pong", _, _}, boxstream:unbox(CDec, CDecN, B2)).
+
 -endif.

@@ -78,3 +78,42 @@ code_change(_OldVsn, State, _Extra) ->
 
 persist(#state{tab = Tab, file = File}) ->
     ets:tab2file(Tab, File).
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+room_store_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun(_) -> ?_test(membership()) end}.
+
+setup() ->
+    catch gen_server:stop(room_store),
+    catch gen_server:stop(config),
+    Home = filename:join("/tmp", "room_store_"
+                         ++ integer_to_list(erlang:system_time(microsecond))),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    application:set_env(ssb, ssb_home, Home),
+    {ok, _} = config:start_link("test/ssb.cfg"),
+    {ok, _} = room_store:start_link(),
+    Home.
+
+cleanup(Home) ->
+    catch gen_server:stop(room_store),
+    catch gen_server:stop(config),
+    os:cmd("rm -rf " ++ Home),
+    application:unset_env(ssb, ssb_home),
+    ok.
+
+membership() ->
+    Feed = ~"@abcdef.ed25519",
+    ?assertNot(is_member(Feed)),
+    ok = add_member(Feed),
+    ?assert(is_member(Feed)),
+    ?assert(lists:member(Feed, members())),
+    %% Survives a restart (persisted to disk).
+    ok = gen_server:stop(room_store),
+    {ok, _} = room_store:start_link(),
+    ?assert(is_member(Feed)),
+    ok = remove_member(Feed),
+    ?assertNot(is_member(Feed)).
+
+-endif.
