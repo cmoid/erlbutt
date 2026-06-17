@@ -46,6 +46,11 @@
 -define(blobs, <<"blobs">>).
 -define(ebt, <<"ebt">>).
 -define(tunnel, <<"tunnel">>).
+-define(isRoom, <<"isRoom">>).
+-define(room, <<"room">>).
+-define(metadata, <<"metadata">>).
+-define(attendants, <<"attendants">>).
+-define(connect, <<"connect">>).
 -define(createwants, <<"createWants">>).
 -define(blobsget, <<"get">>).
 -define(blobshas, <<"has">>).

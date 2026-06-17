@@ -16,7 +16,10 @@
          add_network_id/1,
          archive_length/0,
          set_archive_length/1,
-         dialer_enabled/0]).
+         dialer_enabled/0,
+         is_room/0,
+         room_name/0,
+         room_privacy/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -31,7 +34,10 @@
                 net_id,
                 extra_network_ids = [],
                 archive_length = ?DEFAULT_ARCHIVE_LENGTH,
-                dialer = true}).
+                dialer = true,
+                room = false,
+                room_name = <<"erlbutt room">>,
+                room_privacy = open}).
 
 %%%===================================================================
 %%% API
@@ -63,6 +69,17 @@ archive_length() ->
 dialer_enabled() ->
     gen_server:call(?MODULE, dialer_enabled, infinity).
 
+%% Whether this node acts as an SSB room (connection relay).
+is_room() ->
+    gen_server:call(?MODULE, is_room, infinity).
+
+room_name() ->
+    gen_server:call(?MODULE, room_name, infinity).
+
+%% Room privacy mode: open | community | restricted.
+room_privacy() ->
+    gen_server:call(?MODULE, room_privacy, infinity).
+
 set_archive_length(undefined) ->
     gen_server:call(?MODULE, {set_archive_length, undefined}, infinity);
 set_archive_length(Len) when is_integer(Len), Len > 0 ->
@@ -81,18 +98,20 @@ start_link(Config) ->
 init([Config]) ->
     process_flag(trap_exit, true),
     SSBHome = application:get_env(ssb, ssb_home, "."),
+    %% Room settings default from application env; a cfg-file entry overrides.
+    Base = #state{ssb_home = SSBHome,
+                  net_id = default_net_id(),
+                  room = application:get_env(ssb, room, false),
+                  room_name = application:get_env(ssb, room_name, <<"erlbutt room">>),
+                  room_privacy = application:get_env(ssb, room_privacy, open)},
     case filelib:is_file(Config) of
         true ->
-            {ok, load_and_parse(Config, #state{ssb_home = SSBHome,
-                                               repo_loc = default_repo(SSBHome),
-                                               net_id = default_net_id()})};
+            {ok, load_and_parse(Config, Base#state{repo_loc = default_repo(SSBHome)})};
         false ->
             %%?LOG_DEBUG("try to load the config from ~p ~n", []),
-            {ok, #state{ssb_home = SSBHome,
-                        repo_loc = default_repo(SSBHome),
-                        feed_loc = default_feed_store(SSBHome),
-                        blob_loc = default_blob_store(SSBHome),
-                        net_id = default_net_id()}}
+            {ok, Base#state{repo_loc = default_repo(SSBHome),
+                            feed_loc = default_feed_store(SSBHome),
+                            blob_loc = default_blob_store(SSBHome)}}
     end.
 
 handle_call(repo, _From, #state{repo_loc = RepLoc}=State) ->
@@ -120,7 +139,16 @@ handle_call({set_archive_length, Len}, _From, State) ->
     {reply, ok, State#state{archive_length = Len}};
 
 handle_call(dialer_enabled, _From, #state{dialer = Dialer}=State) ->
-    {reply, Dialer, State}.
+    {reply, Dialer, State};
+
+handle_call(is_room, _From, #state{room = Room}=State) ->
+    {reply, Room, State};
+
+handle_call(room_name, _From, #state{room_name = Name}=State) ->
+    {reply, Name, State};
+
+handle_call(room_privacy, _From, #state{room_privacy = Privacy}=State) ->
+    {reply, Privacy, State}.
 
 %% casts
 
@@ -169,6 +197,16 @@ parse({archive_length, Len}, State) when is_integer(Len), Len > 0 ->
 
 parse({peer_dialer, Bool}, State) when is_boolean(Bool) ->
     State#state{dialer = Bool};
+
+parse({room, Bool}, State) when is_boolean(Bool) ->
+    State#state{room = Bool};
+
+parse({room_name, Name}, State) when is_binary(Name) ->
+    State#state{room_name = Name};
+
+parse({room_privacy, Privacy}, State)
+  when Privacy =:= open; Privacy =:= community; Privacy =:= restricted ->
+    State#state{room_privacy = Privacy};
 
 parse(_Any, State) ->
     %% ignore for now, this is an error technically

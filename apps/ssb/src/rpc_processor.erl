@@ -313,13 +313,26 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobsget],
             send_blob_chunks(BlobData, -ReqNo, Socket, Nonce, SecretBoxKey)
     end;
 
-proc_request(_Calls, ReqNo, #ssb_rpc{name = [?tunnel, ~"isRoom"],
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [?tunnel, ?isRoom],
                              args = []}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     Flags = create_flags(1, 1, 2),
-    FalseEnd = message:ssb_encoder(false, fun message:ssb_encoder/3, [pretty]),
-    Header = create_header(Flags, size(FalseEnd), -ReqNo),
-    utils:send_data(utils:combine(Header, FalseEnd), Socket, Nonce, SecretBoxKey);
+    Body = iolist_to_binary(message:ssb_encoder(config:is_room(),
+                                                fun message:ssb_encoder/3, [pretty])),
+    Header = create_header(Flags, size(Body), -ReqNo),
+    utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [?room, ?metadata]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    %% Membership is trivially true for open rooms; community/restricted
+    %% rooms will consult the member registry once it exists (Phase 2b+).
+    IsMember = config:room_privacy() =:= open,
+    Body = utils:encode_rec({[{~"name", config:room_name()},
+                              {~"membership", IsMember},
+                              {~"features", [?tunnel, ~"room1", ~"room2"]}]}),
+    Flags = create_flags(1, 1, 2),
+    Header = create_header(Flags, size(Body), -ReqNo),
+    utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
 
 proc_request(Calls, ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"],
                              args = Args}
