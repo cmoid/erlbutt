@@ -84,6 +84,17 @@ combine(Bin1, Bin2) ->
     Bin1Len = utils:size(Bin1),
     <<Bin1:Bin1Len/binary, Bin2/binary>>.
 
+%% Tunnel transport: inner-box the data, then hand the ciphertext to the
+%% room-facing peer as one muxrpc frame (it applies the outer box-stream).
+%% The room only ever relays this opaque inner ciphertext.
+send_data(Data, {tunnel, OwnerPid, ReqNo}, Nonce, SecretBoxKey) ->
+    {EncBox, NewNonce} =
+        boxstream:box(Data, Nonce, SecretBoxKey),
+
+    ssb_peer:send_frame(OwnerPid, ReqNo, EncBox),
+
+    NewNonce;
+
 send_data(Data, Socket, Nonce, SecretBoxKey) ->
 
     {EncBox, NewNonce} =

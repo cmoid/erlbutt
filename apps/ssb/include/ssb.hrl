@@ -132,4 +132,7 @@
                 %% Positive ReqNo of a peer's room.attendants source stream
                 %% (when this node is a room).  Presence updates are pushed on
                 %% -attendants_req.  undefined when no such stream is open.
-                attendants_req = undefined}).
+                attendants_req = undefined,
+                %% Tunnel mode only: the ReqNo on which inner frames arrive as
+                %% {tunnel_data, recv_req, Body}.  undefined for socket peers.
+                recv_req = undefined}).

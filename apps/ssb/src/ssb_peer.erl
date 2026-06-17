@@ -19,6 +19,10 @@
          open_source/4,
          open_duplex/4,
          send_frame/3,
+         tunnel_connect/3,
+         start_tunnel_server/3,
+         tunnel_client_init/2,
+         tunnel_server_init/3,
          request_ebt/1,
          request_blob_wants/3,
          fetch_blob/2,
@@ -82,6 +86,77 @@ start(Ip, Port, PubKey) when is_integer(Port) ->
 %% send data to another peer, asynchronously
 send(Pid, Data) ->
     gen_server:cast(Pid, {send, Data}).
+
+%%%===================================================================
+%%% Tunnel mode — run a full peer over a room tunnel instead of a socket.
+%%% The inner Secret Handshake runs over the tunnel; afterwards the same
+%%% rpc/EBT/blob machinery operates with a {tunnel, OwnerPid, ReqNo} handle in
+%%% place of a gen_tcp socket (utils:send_data dispatches on it).
+%%%===================================================================
+
+%% Client: dial RemotePk through the room peer RoomPid and run a full peer over
+%% the resulting tunnel.  Returns {ok, PeerPid}.
+tunnel_connect(RoomPid, RemotePk, Args) ->
+    Pid = proc_lib:spawn(?MODULE, tunnel_client_init, [RoomPid, RemotePk]),
+    %% Register Pid as the stream sink before any relayed frame can arrive.
+    {ok, ReqNo} = open_duplex(RoomPid, [?tunnel, ?connect], Args, Pid),
+    Pid ! {go, ReqNo},
+    {ok, Pid}.
+
+%% Server: accept an incoming tunnel (spawned by tunnel_endpoint).  OwnerPid is
+%% the room-facing peer; the room sends us frames on +RecvReqNo and we reply on
+%% SendReqNo (= -RecvReqNo).
+start_tunnel_server(OwnerPid, RecvReqNo, SendReqNo) ->
+    proc_lib:spawn(?MODULE, tunnel_server_init, [OwnerPid, RecvReqNo, SendReqNo]).
+
+tunnel_client_init(RoomPid, RemotePk) ->
+    process_flag(trap_exit, true),
+    SendReqNo = receive {go, R} -> R after 10000 -> error(tunnel_no_reqno) end,
+    RecvReqNo = -SendReqNo,
+    Send = fun(D) -> send_frame(RoomPid, SendReqNo, D), ok end,
+    Recv = fun(_N) -> recv_tunnel(RecvReqNo) end,
+    {ok, {DecKey, DecNonce, EncKey, EncNonce}} =
+        shs:client_shake_hands_tunnel(Send, Recv, RemotePk),
+    enter_tunnel_loop(RoomPid, SendReqNo, RecvReqNo, RemotePk,
+                      DecKey, DecNonce, EncKey, EncNonce).
+
+tunnel_server_init(OwnerPid, RecvReqNo, SendReqNo) ->
+    process_flag(trap_exit, true),
+    Send = fun(D) -> send_frame(OwnerPid, SendReqNo, D), ok end,
+    Recv = fun(_N) -> recv_tunnel(RecvReqNo) end,
+    {ok, Hello} = recv_tunnel(RecvReqNo),
+    {ok, {DecKey, DecNonce, EncKey, EncNonce, ClLongPk, _NetId}} =
+        shs:server_shake_hands_tunnel(Hello, Send, Recv, config:network_ids()),
+    enter_tunnel_loop(OwnerPid, SendReqNo, RecvReqNo, ClLongPk,
+                      DecKey, DecNonce, EncKey, EncNonce).
+
+%% Build post-handshake state and hand off to the gen_server loop.  From here
+%% the peer is indistinguishable from a socket peer except that its "socket" is
+%% a tunnel handle and inbound frames arrive as {tunnel_data, RecvReqNo, Body}.
+enter_tunnel_loop(OwnerPid, SendReqNo, RecvReqNo, RemotePk,
+                  DecKey, DecNonce, EncKey, EncNonce) ->
+    {ok, RpcProc} = rpc_processor:start_link(),
+    ok = rpc_processor:set_remote_pk(RpcProc, RemotePk),
+    ok = rpc_processor:set_owner(RpcProc, self()),
+    State = #sbox_state{socket = {tunnel, OwnerPid, SendReqNo},
+                        transport = tunnel,
+                        dec_sbox_key = DecKey,
+                        enc_sbox_key = EncKey,
+                        dec_nonce = DecNonce,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc,
+                        remote_pk = RemotePk,
+                        shook_hands = 1,
+                        recv_req = RecvReqNo,
+                        req_counter = 0},
+    gen_server:enter_loop(?MODULE, [], State).
+
+recv_tunnel(ReqNo) ->
+    receive
+        {tunnel_data, ReqNo, Body} -> {ok, Body}
+    after 10000 ->
+        {error, timeout}
+    end.
 
 %% Send an RPC request and block until the response arrives (or timeout).
 %% Method is a list of binaries, e.g. [<<"whoami">>].
@@ -242,6 +317,18 @@ handle_info({tcp, Socket, Data},
             %%?LOG_DEBUG("Are we complete and need to wait? ~p ~n",[Done]),
             Transport:setopts(Socket, [{active, once}]),
             {noreply, NewState}
+    end;
+
+%% Tunnel mode: an inner frame arrived as one whole box-stream message.
+%% Unbox and dispatch exactly as the socket path; no active-mode to re-arm.
+handle_info({tunnel_data, RecvReqNo, Body},
+            #sbox_state{recv_req = RecvReqNo,
+                        box_rem_bytes = BoxLeftOver} = State) ->
+    BoxData = combine(BoxLeftOver, Body),
+    {Done, NewState} = unbox_and_parse(BoxData, State),
+    case Done of
+        done -> stop(done, NewState);
+        _    -> {noreply, NewState}
     end;
 
 handle_info({tcp_closed, _Socket}, State) ->
@@ -546,6 +633,20 @@ handle_cast({request_ebt}, #sbox_state{socket = Socket,
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+%% Tunnel peers never registered in peer_registry (they are not direct
+%% connections); unregistering here could evict a real connection to the same
+%% peer, so only tear down our own resources.
+terminate(_Reason, #sbox_state{transport = tunnel,
+                               rpc_proc = RpcProc,
+                               ebt_stale_ref = StaleRef,
+                               ebt_entropy_ref = EntropyRef}) ->
+    cancel_ebt_timer(StaleRef),
+    cancel_ebt_timer(EntropyRef),
+    case is_pid(RpcProc) of
+        true -> gen_server:stop(RpcProc);
+        false -> ok
+    end,
+    ok;
 terminate(_Reason, #sbox_state{rpc_proc = RpcProc,
                                remote_pk = RemotePk,
                                ebt_stale_ref = StaleRef,

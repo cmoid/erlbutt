@@ -473,14 +473,13 @@ tunnel_relay_connect(Calls, ReqNo, Args, Socket, Nonce, SecretBoxKey) ->
 %% accept an incoming tunnelled connection.  Hand it to the registered tunnel
 %% listener, which drives the inner protocol (Phase 2c: SHS over the tunnel).
 tunnel_accept_connect(Calls, ReqNo, _Args, Socket, Nonce, SecretBoxKey) ->
-    case tunnel_endpoint:listener() of
-        Listener when is_pid(Listener) ->
-            OwnerPid = owner(Calls),
-            ets:insert(Calls, {ReqNo, {tunnel_relay, Listener}}),
-            Listener ! {tunnel_open, ReqNo, OwnerPid},
+    OwnerPid = owner(Calls),
+    case tunnel_endpoint:accept(ReqNo, OwnerPid) of
+        {ok, SinkPid} ->
+            ets:insert(Calls, {ReqNo, {tunnel_relay, SinkPid}}),
             Nonce;
         _ ->
-            tunnel_error(ReqNo, ~"no tunnel listener", Socket, Nonce, SecretBoxKey)
+            tunnel_error(ReqNo, ~"tunnel not accepted", Socket, Nonce, SecretBoxKey)
     end.
 
 tunnel_target(Args) ->
