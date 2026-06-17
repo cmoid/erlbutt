@@ -334,11 +334,11 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [?tunnel, ?isRoom],
     Header = create_header(Flags, size(Body), -ReqNo),
     utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
 
-proc_request(_Calls, ReqNo, #ssb_rpc{name = [?room, ?metadata]}
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?room, ?metadata]}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
-    %% Membership is trivially true for open rooms; community/restricted
-    %% rooms will consult the member registry once it exists (Phase 2b+).
-    IsMember = config:room_privacy() =:= open,
+    %% Open rooms admit anyone; community/restricted rooms report whether the
+    %% caller has joined (redeemed an invite — see room_store / invite.use).
+    IsMember = room_caller_allowed(Calls),
     Body = utils:encode_rec({[{~"name", config:room_name()},
                               {~"membership", IsMember},
                               {~"features", [?tunnel, ~"room1", ~"room2"]}]}),
@@ -404,13 +404,20 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [~"invite", ~"use"],
     end,
     case invite:validate_and_consume(ClientPk) of
         ok ->
-            OurId   = keys:pub_key_disp(),
-            FeedPid = utils:find_or_create_feed_pid(OurId),
-            FollowContent = {[{~"type",      ~"contact"},
-                              {~"contact",   FeedId},
-                              {~"following", true},
-                              {~"pub",       true}]},
-            ok = ssb_feed:post_content(FeedPid, FollowContent),
+            %% A room grants membership (same invite bootstrap, different
+            %% post-handshake effect); a pub posts a follow of the new user.
+            case config:is_room() of
+                true ->
+                    ok = room_store:add_member(FeedId);
+                false ->
+                    OurId   = keys:pub_key_disp(),
+                    FeedPid = utils:find_or_create_feed_pid(OurId),
+                    FollowContent = {[{~"type",      ~"contact"},
+                                      {~"contact",   FeedId},
+                                      {~"following", true},
+                                      {~"pub",       true}]},
+                    ok = ssb_feed:post_content(FeedPid, FollowContent)
+            end,
             TrueBody = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
             Flags  = create_flags(0, 0, 2),
             Header = create_header(Flags, size(TrueBody), -ReqNo),
@@ -458,6 +465,12 @@ whoami() ->
 %% two connections.  ReqNo is the positive request number on this (the
 %% caller's) connection; bridge sends the caller's responses on -ReqNo.
 tunnel_relay_connect(Calls, ReqNo, Args, Socket, Nonce, SecretBoxKey) ->
+    case room_caller_allowed(Calls) of
+        true  -> tunnel_relay_member(Calls, ReqNo, Args, Socket, Nonce, SecretBoxKey);
+        false -> tunnel_error(ReqNo, ~"not a room member", Socket, Nonce, SecretBoxKey)
+    end.
+
+tunnel_relay_member(Calls, ReqNo, Args, Socket, Nonce, SecretBoxKey) ->
     Target = tunnel_target(Args),
     case Target =/= undefined andalso room_attendants:lookup(Target) of
         {ok, TargetPid} ->
@@ -492,6 +505,20 @@ owner(Calls) ->
     case ets:lookup(Calls, owner) of
         [{owner, Pid}] -> Pid;
         []             -> undefined
+    end.
+
+%% Whether the connection's peer may use this room: open rooms admit anyone;
+%% community/restricted rooms require the caller to be a registered member.
+room_caller_allowed(Calls) ->
+    case config:room_privacy() of
+        open -> true;
+        _    -> room_store:is_member(caller_feed_id(Calls))
+    end.
+
+caller_feed_id(Calls) ->
+    case ets:lookup(Calls, remote_pk) of
+        [{remote_pk, Pk}] -> <<"@", (base64:encode(Pk))/binary, ".ed25519">>;
+        []                -> undefined
     end.
 
 tunnel_error(ReqNo, Reason, Socket, Nonce, SecretBoxKey) ->

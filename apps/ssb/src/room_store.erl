@@ -1,0 +1,80 @@
+%% SPDX-License-Identifier: GPL-2.0-only
+%%
+%% Copyright (C) 2026 Charles Moid
+%%
+%% Member registry for a room.  Holds the feed ids of users who have joined
+%% (community/restricted rooms).  Membership is granted by redeeming a room
+%% invite — the same pub-invite mechanism, but invite.use adds a member here
+%% instead of posting a follow (see rpc_processor).  Persisted across restarts
+%% via ets:tab2file so a room does not forget its members.
+-module(room_store).
+
+-behaviour(gen_server).
+
+-include_lib("ssb/include/ssb.hrl").
+
+-export([start_link/0, add_member/1, remove_member/1, is_member/1, members/0]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2,
+         terminate/2, code_change/3]).
+
+-record(state, {tab, file}).
+
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+add_member(FeedId) when is_binary(FeedId) ->
+    gen_server:call(?MODULE, {add_member, FeedId}).
+
+remove_member(FeedId) when is_binary(FeedId) ->
+    gen_server:call(?MODULE, {remove_member, FeedId}).
+
+is_member(undefined) -> false;
+is_member(FeedId) when is_binary(FeedId) ->
+    gen_server:call(?MODULE, {is_member, FeedId}).
+
+members() ->
+    gen_server:call(?MODULE, members).
+
+init([]) ->
+    process_flag(trap_exit, true),
+    File = binary_to_list(config:ssb_repo_loc()) ++ "room_members.tab",
+    ok = filelib:ensure_dir(File),
+    Tab = case ets:file2tab(File) of
+        {ok, T}    -> T;
+        {error, _} -> ets:new(room_members, [set, private])
+    end,
+    {ok, #state{tab = Tab, file = File}}.
+
+handle_call({add_member, FeedId}, _From, #state{tab = Tab} = State) ->
+    ets:insert(Tab, {FeedId, true}),
+    persist(State),
+    {reply, ok, State};
+
+handle_call({remove_member, FeedId}, _From, #state{tab = Tab} = State) ->
+    ets:delete(Tab, FeedId),
+    persist(State),
+    {reply, ok, State};
+
+handle_call({is_member, FeedId}, _From, #state{tab = Tab} = State) ->
+    {reply, ets:member(Tab, FeedId), State};
+
+handle_call(members, _From, #state{tab = Tab} = State) ->
+    {reply, [K || {K, _} <- ets:tab2list(Tab)], State};
+
+handle_call(_Req, _From, State) ->
+    {reply, ok, State}.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+persist(#state{tab = Tab, file = File}) ->
+    ets:tab2file(Tab, File).
