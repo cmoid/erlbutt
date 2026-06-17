@@ -161,6 +161,7 @@ dispatch(Calls, ReqNo, Body, Socket, Nonce, SecretBoxKey) ->
     Tag = case Req of
         #ssb_rpc{name = [?blobs, ?createwants]} -> {wants_stream, ReqNo};
         #ssb_rpc{name = [?ebt,   ~"replicate"]} -> {ebt_stream,   ReqNo};
+        #ssb_rpc{name = [?room,  ?attendants]}  -> {attendants_stream, ReqNo};
         _                                        -> none
     end,
     {NewNonce, Tag}.
@@ -331,6 +332,17 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [?room, ?metadata]}
                               {~"membership", IsMember},
                               {~"features", [?tunnel, ~"room1", ~"room2"]}]}),
     Flags = create_flags(1, 1, 2),
+    Header = create_header(Flags, size(Body), -ReqNo),
+    utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?room, ?attendants]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    %% Send the current presence snapshot; subsequent joined/left updates are
+    %% pushed by ssb_peer (see the {attendants_stream, ReqNo} dispatch tag).
+    ets:insert(Calls, {ReqNo, noop}),
+    Ids = room_attendants:list(),
+    Body = utils:encode_rec({[{~"type", ~"state"}, {~"ids", Ids}]}),
+    Flags = create_flags(1, 0, 2),
     Header = create_header(Flags, size(Body), -ReqNo),
     utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
 

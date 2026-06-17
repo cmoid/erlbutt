@@ -36,5 +36,6 @@ init([]) ->
             ?CHILD(friends, worker),
             ?CHILD(ebt, worker),
             ?CHILD(peer_registry, worker),
+            ?CHILD(room_attendants, worker),
             ?CHILD(blob_fetcher, worker),
             ?CHILD(peer_dialer, worker)]}}.

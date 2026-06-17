@@ -16,6 +16,7 @@
          rpc_call/3,
          rpc_call/4,
          rpc_stream_call/3,
+         open_source/4,
          request_ebt/1,
          request_blob_wants/3,
          fetch_blob/2,
@@ -94,6 +95,13 @@ rpc_call(Pid, Method, Type, Args) ->
 rpc_stream_call(Pid, Method, Args) ->
     gen_server:call(Pid, {rpc_stream_call, Method, Args}, 30000).
 
+%% Open a source stream without collecting: each response frame is delivered
+%% to NotifyPid as {stream_data, Ref, Body}, end-of-stream as {stream_done, Ref}.
+%% Returns {ok, Ref} immediately.  Suited to long-lived streams (e.g.
+%% room.attendants) that never terminate.
+open_source(Pid, Method, Args, NotifyPid) ->
+    gen_server:call(Pid, {open_source, Method, Args, NotifyPid}).
+
 request_ebt(Pid) ->
     gen_server:cast(Pid, {request_ebt}).
 
@@ -159,6 +167,12 @@ handle_info({tcp, Socket, Data},
             ok ->
                 {ok, RpcProc} = rpc_processor:start_link(),
                 ok = rpc_processor:set_remote_pk(RpcProc, ClientPk),
+                %% If we are a room, register this inbound peer's presence.
+                %% room_attendants monitors us, so disconnect/crash emits `left`.
+                case config:is_room() of
+                    true  -> room_attendants:join(feed_id(ClientPk), self());
+                    false -> ok
+                end,
                 Transport:setopts(Socket, [{active, once}]),
                 %% Skip createWants for invite connections — the peer expects invite.use
                 %% as the first message, not a createWants stream frame.
@@ -310,6 +324,24 @@ handle_info(ebt_anti_entropy, #sbox_state{ebt_active = true,
 handle_info(ebt_anti_entropy, State) ->
     {noreply, State};
 
+%% A peer joined/left the room; push an update on this peer's room.attendants
+%% stream.  Sent on -attendants_req using our own enc_nonce.
+handle_info({room_event, Kind, FeedId},
+            #sbox_state{attendants_req = ReqNo,
+                        socket = Socket,
+                        enc_sbox_key = Key,
+                        enc_nonce = Nonce} = State)
+  when ReqNo =/= undefined ->
+    Body = utils:encode_rec({[{~"type", atom_to_binary(Kind, utf8)},
+                              {~"id", FeedId}]}),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(Body), -ReqNo),
+    NewNonce = send_data(combine(Header, Body), Socket, Nonce, Key),
+    {noreply, State#sbox_state{enc_nonce = NewNonce}};
+
+handle_info({room_event, _Kind, _FeedId}, State) ->
+    {noreply, State};
+
 handle_info(Info, State) ->
     ?SSB_INFO("Stopped presumably for normal reason: ~p ~n",[Info]),
     {stop, normal, State}.
@@ -374,6 +406,22 @@ handle_call({rpc_stream_call, Method, Args}, From,
     NewNonce = utils:send_data(utils:combine(Header, ReqBody), Socket, EncNonce, EncBoxKey),
     {noreply, State1#sbox_state{enc_nonce   = NewNonce,
                                 pending_rpc = Pending#{Ref => {collecting, From, []}}}};
+
+handle_call({open_source, Method, Args, NotifyPid}, _From,
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc} = State) ->
+    {ReqNo, State1} = next_req(State),
+    Ref = make_ref(),
+    ok = rpc_processor:register_stream(RpcProc, -ReqNo, {stream_to, NotifyPid, Ref}),
+    ReqBody = utils:encode_rec({[{~"name", Method},
+                                  {~"args", Args},
+                                  {~"type", ~"source"}]}),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(ReqBody), ReqNo),
+    NewNonce = utils:send_data(utils:combine(Header, ReqBody), Socket, EncNonce, EncBoxKey),
+    {reply, {ok, Ref}, State1#sbox_state{enc_nonce = NewNonce}};
 
 handle_call({fetch_blob, BlobId}, From,
             #sbox_state{socket = Socket,
@@ -568,6 +616,11 @@ rpc_parse(Data, #sbox_state{socket = Socket,
                                  ebt_last_rx = erlang:system_time(second),
                                  ebt_stale_ref = schedule_ebt_stale_check(),
                                  ebt_entropy_ref = schedule_ebt_entropy()};
+        {attendants_stream, ReqNo} ->
+            %% Peer opened room.attendants; subscribe so future join/leave
+            %% events are pushed on -ReqNo from our handle_info.
+            room_attendants:subscribe(self()),
+            NewState0#sbox_state{attendants_req = ReqNo};
         _ ->
             case NewState0#sbox_state.ebt_active of
                 true  -> NewState0#sbox_state{ebt_last_rx = erlang:system_time(second)};
@@ -731,3 +784,7 @@ is_self_pk(PubKey) ->
     try PubKey =:= base64:decode(keys:pub_key())
     catch _:_ -> false
     end.
+
+%% Canonical feed id for a raw ed25519 public key.
+feed_id(PubKey) ->
+    <<"@", (base64:encode(PubKey))/binary, ".ed25519">>.

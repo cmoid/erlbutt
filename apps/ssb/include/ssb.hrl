@@ -128,4 +128,8 @@
                 %% Positive when we initiated EBT (client), negative when the peer did (server).
                 ebt_out_req = undefined,
                 %% Timer ref for the periodic anti-entropy clock re-exchange.
-                ebt_entropy_ref = undefined}).
+                ebt_entropy_ref = undefined,
+                %% Positive ReqNo of a peer's room.attendants source stream
+                %% (when this node is a room).  Presence updates are pushed on
+                %% -attendants_req.  undefined when no such stream is open.
+                attendants_req = undefined}).
