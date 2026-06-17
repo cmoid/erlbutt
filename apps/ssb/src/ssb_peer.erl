@@ -17,6 +17,8 @@
          rpc_call/4,
          rpc_stream_call/3,
          open_source/4,
+         open_duplex/4,
+         send_frame/3,
          request_ebt/1,
          request_blob_wants/3,
          fetch_blob/2,
@@ -102,6 +104,18 @@ rpc_stream_call(Pid, Method, Args) ->
 open_source(Pid, Method, Args, NotifyPid) ->
     gen_server:call(Pid, {open_source, Method, Args, NotifyPid}).
 
+%% Open a duplex stream: send the request and route every response frame
+%% (negative ReqNo) to SinkPid via the tunnel_relay sink as
+%% {tunnel_data, -ReqNo, Body}.  Returns {ok, ReqNo} so the caller can push
+%% further frames with send_frame/3 on the same (positive) ReqNo.
+open_duplex(Pid, Method, Args, SinkPid) ->
+    gen_server:call(Pid, {open_duplex, Method, Args, SinkPid}).
+
+%% Send a single stream data frame (stream flag, no end) on ReqNo, using this
+%% connection's enc_nonce.  Async; ordering preserved per caller.
+send_frame(Pid, ReqNo, Body) ->
+    gen_server:cast(Pid, {send_frame, ReqNo, Body}).
+
 request_ebt(Pid) ->
     gen_server:cast(Pid, {request_ebt}).
 
@@ -167,6 +181,7 @@ handle_info({tcp, Socket, Data},
             ok ->
                 {ok, RpcProc} = rpc_processor:start_link(),
                 ok = rpc_processor:set_remote_pk(RpcProc, ClientPk),
+                ok = rpc_processor:set_owner(RpcProc, self()),
                 %% If we are a room, register this inbound peer's presence.
                 %% room_attendants monitors us, so disconnect/crash emits `left`.
                 case config:is_room() of
@@ -423,6 +438,21 @@ handle_call({open_source, Method, Args, NotifyPid}, _From,
     NewNonce = utils:send_data(utils:combine(Header, ReqBody), Socket, EncNonce, EncBoxKey),
     {reply, {ok, Ref}, State1#sbox_state{enc_nonce = NewNonce}};
 
+handle_call({open_duplex, Method, Args, SinkPid}, _From,
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc} = State) ->
+    {ReqNo, State1} = next_req(State),
+    ok = rpc_processor:register_stream(RpcProc, -ReqNo, {tunnel_relay, SinkPid}),
+    ReqBody = utils:encode_rec({[{~"name", Method},
+                                  {~"args", Args},
+                                  {~"type", ~"duplex"}]}),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(ReqBody), ReqNo),
+    NewNonce = utils:send_data(utils:combine(Header, ReqBody), Socket, EncNonce, EncBoxKey),
+    {reply, {ok, ReqNo}, State1#sbox_state{enc_nonce = NewNonce}};
+
 handle_call({fetch_blob, BlobId}, From,
             #sbox_state{socket = Socket,
                         enc_sbox_key = EncBoxKey,
@@ -485,6 +515,15 @@ handle_cast({request_blob_wants, BlobIds, NotifyPid},
     end,
     NewEncNonce = send_want_body(Socket, EncBoxKey, EncNonce, BlobIds, SendReqNo),
     {noreply, State#sbox_state{enc_nonce = NewEncNonce}};
+
+handle_cast({send_frame, ReqNo, Body},
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce} = State) ->
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(Body), ReqNo),
+    NewNonce = send_data(combine(Header, Body), Socket, EncNonce, EncBoxKey),
+    {noreply, State#sbox_state{enc_nonce = NewNonce}};
 
 handle_cast({request_ebt}, #sbox_state{ebt_active = true} = State) ->
     {noreply, State};
@@ -752,6 +791,7 @@ backoff(N) ->
 build_outbound_state(Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce, PubKey) ->
     ranch_tcp:setopts(Socket, [{active, false}]),
     {ok, RpcProc} = rpc_processor:start_link(),
+    ok = rpc_processor:set_owner(RpcProc, self()),
     ranch_tcp:setopts(Socket, [{active, once}]),
     WantsReqNo = 1,
     N1 = open_wants_stream(Socket, EncBoxKey, EncNonce, WantsReqNo),

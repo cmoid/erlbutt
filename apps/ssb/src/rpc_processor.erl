@@ -21,6 +21,7 @@
          process/3,
          register_stream/3,
          set_remote_pk/2,
+         set_owner/2,
          create_flags/3,
          create_header/3,
          parse_flags/1]).
@@ -46,6 +47,11 @@ register_stream(Pid, ReqNo, Module) ->
 %% Store the remote peer's public key so invite.use can validate it.
 set_remote_pk(Pid, RemotePk) ->
     gen_server:call(Pid, {set_remote_pk, RemotePk}).
+
+%% Store the owning ssb_peer pid so tunnel handlers can send frames back
+%% on this connection (writes must go through ssb_peer to keep nonce order).
+set_owner(Pid, OwnerPid) ->
+    gen_server:call(Pid, {set_owner, OwnerPid}).
 
 parse_flags(Header) ->
     <<Flags:1/binary, _Rest/binary>> = Header,
@@ -77,6 +83,11 @@ handle_call({register_stream, ReqNo, Module}, _From,
 handle_call({set_remote_pk, RemotePk}, _From,
             #rpc_state{calls = Calls} = State) ->
     ets:insert(Calls, {remote_pk, RemotePk}),
+    {reply, ok, State};
+
+handle_call({set_owner, OwnerPid}, _From,
+            #rpc_state{calls = Calls} = State) ->
+    ets:insert(Calls, {owner, OwnerPid}),
     {reply, ok, State};
 
 handle_call({rpc_process, {Header, Body}, #ssb_conn{
@@ -335,6 +346,13 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [?room, ?metadata]}
     Header = create_header(Flags, size(Body), -ReqNo),
     utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
 
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?tunnel, ?connect], args = Args}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    case config:is_room() of
+        true  -> tunnel_relay_connect(Calls, ReqNo, Args, Socket, Nonce, SecretBoxKey);
+        false -> tunnel_accept_connect(Calls, ReqNo, Args, Socket, Nonce, SecretBoxKey)
+    end;
+
 proc_request(Calls, ReqNo, #ssb_rpc{name = [?room, ?attendants]}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     %% Send the current presence snapshot; subsequent joined/left updates are
@@ -435,6 +453,53 @@ current_time() ->
 whoami() ->
     iolist_to_binary(message:ssb_encoder({[{~"id", keys:pub_key_disp()}]},
                        fun message:ssb_encoder/3, [])).
+
+%% Room side of tunnel.connect: look up the target attendant and bridge the
+%% two connections.  ReqNo is the positive request number on this (the
+%% caller's) connection; bridge sends the caller's responses on -ReqNo.
+tunnel_relay_connect(Calls, ReqNo, Args, Socket, Nonce, SecretBoxKey) ->
+    Target = tunnel_target(Args),
+    case Target =/= undefined andalso room_attendants:lookup(Target) of
+        {ok, TargetPid} ->
+            OwnerPid = owner(Calls),
+            {ok, Bridge} = tunnel_bridge:start(OwnerPid, ReqNo, TargetPid, Args),
+            ets:insert(Calls, {ReqNo, {tunnel_relay, Bridge}}),
+            Nonce;
+        _ ->
+            tunnel_error(ReqNo, ~"target not connected", Socket, Nonce, SecretBoxKey)
+    end.
+
+%% Endpoint side of tunnel.connect: a non-room node was asked (by a room) to
+%% accept an incoming tunnelled connection.  Hand it to the registered tunnel
+%% listener, which drives the inner protocol (Phase 2c: SHS over the tunnel).
+tunnel_accept_connect(Calls, ReqNo, _Args, Socket, Nonce, SecretBoxKey) ->
+    case tunnel_endpoint:listener() of
+        Listener when is_pid(Listener) ->
+            OwnerPid = owner(Calls),
+            ets:insert(Calls, {ReqNo, {tunnel_relay, Listener}}),
+            Listener ! {tunnel_open, ReqNo, OwnerPid},
+            Nonce;
+        _ ->
+            tunnel_error(ReqNo, ~"no tunnel listener", Socket, Nonce, SecretBoxKey)
+    end.
+
+tunnel_target(Args) ->
+    case Args of
+        [{Props}] -> proplists:get_value(~"target", Props);
+        _         -> undefined
+    end.
+
+owner(Calls) ->
+    case ets:lookup(Calls, owner) of
+        [{owner, Pid}] -> Pid;
+        []             -> undefined
+    end.
+
+tunnel_error(ReqNo, Reason, Socket, Nonce, SecretBoxKey) ->
+    ErrMsg = utils:error_msg(~"Error", Reason),
+    Flags  = create_flags(0, 1, 2),
+    Header = create_header(Flags, size(ErrMsg), -ReqNo),
+    utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey).
 
 -ifdef(TEST).
 
