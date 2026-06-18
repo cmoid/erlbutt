@@ -328,6 +328,7 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobsget],
 proc_request(_Calls, ReqNo, #ssb_rpc{name = [?tunnel, ?isRoom],
                              args = []}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    ?SSB_INFO("ROOMDBG peer probed tunnel.isRoom; answering ~p~n", [config:is_room()]),
     Flags = create_flags(1, 1, 2),
     Body = iolist_to_binary(message:ssb_encoder(config:is_room(),
                                                 fun message:ssb_encoder/3, [pretty])),
@@ -339,6 +340,8 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?room, ?metadata]}
     %% Open rooms admit anyone; community/restricted rooms report whether the
     %% caller has joined (redeemed an invite — see room_store / invite.use).
     IsMember = room_caller_allowed(Calls),
+    ?SSB_INFO("ROOMDBG peer requested room.metadata; membership=~p privacy=~p~n",
+              [IsMember, config:room_privacy()]),
     Body = utils:encode_rec({[{~"name", config:room_name()},
                               {~"membership", IsMember},
                               {~"features", [?tunnel, ~"room1", ~"room2"]}]}),
@@ -348,6 +351,8 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?room, ?metadata]}
 
 proc_request(Calls, ReqNo, #ssb_rpc{name = [?tunnel, ?connect], args = Args}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    ?SSB_INFO("ROOMDBG peer sent tunnel.connect (is_room=~p) args=~p~n",
+              [config:is_room(), Args]),
     case config:is_room() of
         true  -> tunnel_relay_connect(Calls, ReqNo, Args, Socket, Nonce, SecretBoxKey);
         false -> tunnel_accept_connect(Calls, ReqNo, Args, Socket, Nonce, SecretBoxKey)
@@ -357,6 +362,8 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?room, ?attendants]}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     %% Send the current presence snapshot; subsequent joined/left updates are
     %% pushed by ssb_peer (see the {attendants_stream, ReqNo} dispatch tag).
+    ?SSB_INFO("ROOMDBG peer subscribed to room.attendants; current=~p~n",
+              [room_attendants:list()]),
     ets:insert(Calls, {ReqNo, noop}),
     Ids = room_attendants:list(),
     Body = utils:encode_rec({[{~"type", ~"state"}, {~"ids", Ids}]}),
@@ -408,6 +415,7 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [~"invite", ~"use"],
             %% post-handshake effect); a pub posts a follow of the new user.
             case config:is_room() of
                 true ->
+                    ?SSB_INFO("ROOMDBG invite.use granted room membership to ~p~n", [FeedId]),
                     ok = room_store:add_member(FeedId);
                 false ->
                     OurId   = keys:pub_key_disp(),
@@ -430,7 +438,7 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [~"invite", ~"use"],
     end;
 
 proc_request(Calls, ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
-    ?SSB_DEBUG("Fall thru with ~p ~n", [ReqBody]),
+    ?SSB_INFO("ROOMDBG unhandled RPC (fall thru): ~p~n", [ReqBody]),
     ets:insert(Calls, {ReqNo, noop}),
     Flags = create_flags(1, 1, 2),
     TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
