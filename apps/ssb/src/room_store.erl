@@ -11,8 +11,6 @@
 
 -behaviour(gen_server).
 
--include_lib("ssb/include/ssb.hrl").
-
 -export([start_link/0, add_member/1, remove_member/1, is_member/1, members/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
