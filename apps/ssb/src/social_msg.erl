@@ -13,6 +13,7 @@
 %% API
 -export([dispatch/1,
          is_follow/1,
+         is_block/1,
          is_about/1,
          is_reply/1,
          is_branch/1,
@@ -52,13 +53,19 @@ dispatch_type(~"pub", _Author, Props) ->
         _ -> ok
     end;
 
+%% A contact message can carry `following` and/or `blocking`; apply each
+%% to its respective graph independently.
 dispatch_type(~"contact", Author, Props) ->
-    Contact   = ?pgv(~"contact",   Props),
-    Following = ?pgv(~"following", Props),
-    case check_contact(Contact, Following) of
+    Contact = ?pgv(~"contact", Props),
+    case check_contact(Contact, ?pgv(~"following", Props)) of
         {C, F} -> friends:update(Author, C, F);
         nope   -> ok
-    end;
+    end,
+    case check_block(Contact, ?pgv(~"blocking", Props)) of
+        {Cb, B} -> friends:update_block(Author, Cb, B);
+        nope    -> ok
+    end,
+    ok;
 
 %% Self-assigned profile names feed the name index; abouts naming other
 %% feeds (or carrying only image/description) are ignored.
@@ -82,6 +89,18 @@ is_follow(#message{content = {ContentProps}}) ->
         ~"contact" ->
             check_contact(?pgv(~"contact",ContentProps),
                           ?pgv(~"following", ContentProps));
+        _Else ->
+            nope
+    end.
+
+is_block(#message{content = Val}) when is_binary(Val) ->
+    nope;
+
+is_block(#message{content = {ContentProps}}) ->
+    case ?pgv(~"type", ContentProps) of
+        ~"contact" ->
+            check_block(?pgv(~"contact",  ContentProps),
+                        ?pgv(~"blocking", ContentProps));
         _Else ->
             nope
     end.
@@ -143,6 +162,17 @@ check_contact(Contact, true) ->
 check_contact(Contact, false) ->
     {Contact, false};
 check_contact(_Contact, _Following) ->
+    nope.
+
+check_block(undefined, _Blocking) ->
+    nope;
+check_block(<<>>, _Blocking) ->
+    nope;
+check_block(Contact, true) ->
+    {Contact, true};
+check_block(Contact, false) ->
+    {Contact, false};
+check_block(_Contact, _Blocking) ->
     nope.
 
 

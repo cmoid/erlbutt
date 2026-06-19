@@ -300,9 +300,12 @@ store(#message{id = Id, sequence = Seq, author = Auth} = Msg,
         true -> write_msg(Msg, Profile);
         _    -> ok
     end,
-    case social_msg:is_follow(Msg) of
-        nope -> ok;
-        _    -> write_msg(Msg, Contacts)
+    %% The contacts file holds all contact messages — follows and blocks —
+    %% so friends can lazily load both graphs from it on first query.
+    case social_msg:is_follow(Msg) =/= nope
+         orelse social_msg:is_block(Msg) =/= nope of
+        true  -> write_msg(Msg, Contacts);
+        false -> ok
     end,
     social_msg:dispatch(Msg),
     State#state{last_msg = Id, last_seq = Seq}.

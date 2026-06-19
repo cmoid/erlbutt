@@ -30,8 +30,10 @@
 -export([start_link/0,
          direct_follows/1,
          follows/2,
+         blocks/1,
          name/1,
          update/3,
+         update_block/3,
          update_name/2]).
 
 %% gen_server callbacks
@@ -40,6 +42,7 @@
 
 -define(GRAPH, ssb_follow_graph).
 -define(NAMES, ssb_profile_names).
+-define(BLOCKS, ssb_block_graph).
 
 %%%===================================================================
 %%% API
@@ -57,6 +60,14 @@ update(Author, Contact, Following) when is_binary(Contact),
     safe_call({update, Author, Contact, Following});
 update(_Author, _Contact, _Following) ->
     %% Legacy garbage: contact ids that are booleans or other non-binaries.
+    ok.
+
+%% Apply a contact message's `blocking` field to the block graph (same
+%% lazy/loaded-only semantics as update/3).
+update_block(Author, Contact, Blocking) when is_binary(Contact),
+                                             is_boolean(Blocking) ->
+    safe_call({update_block, Author, Contact, Blocking});
+update_block(_Author, _Contact, _Blocking) ->
     ok.
 
 %% Record Author's latest self-assigned profile name.  Contact and about
@@ -78,6 +89,22 @@ direct_follows(FeedId) ->
             case safe_call({load, FeedId}) of
                 Contacts when is_map(Contacts) ->
                     following_ids(Contacts);
+                _ ->
+                    []
+            end
+    end.
+
+%% Feeds the given feed blocks right now (mirror of direct_follows/1).
+blocks(FeedPid) when is_pid(FeedPid) ->
+    blocks(ssb_feed:whoami(FeedPid));
+blocks(FeedId) ->
+    case lookup(?BLOCKS, FeedId) of
+        {ok, Blocked} ->
+            blocking_ids(Blocked);
+        miss ->
+            case safe_call({load_blocks, FeedId}) of
+                Blocked when is_map(Blocked) ->
+                    blocking_ids(Blocked);
                 _ ->
                     []
             end
@@ -109,12 +136,22 @@ name(FeedId) ->
 init([]) ->
     ets:new(?GRAPH, [set, named_table, public]),
     ets:new(?NAMES, [set, named_table, public]),
+    ets:new(?BLOCKS, [set, named_table, public]),
     {ok, #{}}.
 
 handle_call({update, Author, Contact, Following}, _From, State) ->
     case ets:lookup(?GRAPH, Author) of
         [{Author, Contacts}] ->
             ets:insert(?GRAPH, {Author, Contacts#{Contact => Following}});
+        [] ->
+            ok
+    end,
+    {reply, ok, State};
+
+handle_call({update_block, Author, Contact, Blocking}, _From, State) ->
+    case ets:lookup(?BLOCKS, Author) of
+        [{Author, Blocked}] ->
+            ets:insert(?BLOCKS, {Author, Blocked#{Contact => Blocking}});
         [] ->
             ok
     end,
@@ -135,6 +172,18 @@ handle_call({load, FeedId}, _From, State) ->
                 Loaded
         end,
     {reply, Contacts, State};
+
+handle_call({load_blocks, FeedId}, _From, State) ->
+    Blocked =
+        case ets:lookup(?BLOCKS, FeedId) of
+            [{FeedId, Existing}] ->
+                Existing;
+            [] ->
+                Loaded = load_blocks(FeedId),
+                ets:insert(?BLOCKS, {FeedId, Loaded}),
+                Loaded
+        end,
+    {reply, Blocked, State};
 
 handle_call({load_name, FeedId}, _From, State) ->
     Name =
@@ -183,6 +232,9 @@ lookup(Tab, Key) ->
 following_ids(Contacts) ->
     [Id || Id := true <- Contacts].
 
+blocking_ids(Blocks) ->
+    [Id || Id := true <- Blocks].
+
 follows2(_FeedId, 0, Visited) ->
     {[], Visited};
 
@@ -209,6 +261,16 @@ load_contacts(FeedId) ->
         fun(Msg, Acc) ->
                 case social_msg:is_follow(Msg) of
                     {Id, F} when is_binary(Id) -> Acc#{Id => F};
+                    _                          -> Acc
+                end
+        end, #{}, #{}).
+
+%% Fold the on-disk contacts file into #{ContactId => Blocking}.
+load_blocks(FeedId) ->
+    fold_feed_file(FeedId, ~"contacts",
+        fun(Msg, Acc) ->
+                case social_msg:is_block(Msg) of
+                    {Id, B} when is_binary(Id) -> Acc#{Id => B};
                     _                          -> Acc
                 end
         end, #{}, #{}).
