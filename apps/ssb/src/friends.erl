@@ -317,6 +317,9 @@ friends_test_() ->
       fun follows_one_hop_test/1,
       fun follows_two_hop_test/1,
       fun follows_no_cycle_test/1,
+      fun blocks_block_test/1,
+      fun blocks_unblock_test/1,
+      fun blocks_independent_of_follow_test/1,
       fun name_updates_test/1,
       fun name_lazy_load_test/1,
       fun name_other_about_test/1]}.
@@ -364,6 +367,12 @@ store_about(FeedPid, AuthId, AuthPriv, Prev, Seq, AboutId, Name) ->
     Msg = message:new_msg(Prev, Seq, Content, {AuthId, AuthPriv}),
     ssb_feed:store_msg(FeedPid, Msg).
 
+%% Store a blocking contact message in FeedPid, signed by {AuthId, AuthPriv}.
+store_block(FeedPid, AuthId, AuthPriv, Prev, Seq, ContactId, Blocking) ->
+    Content = {[{~"type", ~"contact"}, {~"contact", ContactId}, {~"blocking", Blocking}]},
+    Msg = message:new_msg(Prev, Seq, Content, {AuthId, AuthPriv}),
+    ssb_feed:store_msg(FeedPid, Msg).
+
 direct_follows_empty_test(_) ->
     fun() ->
         {Pid, _Id, _Priv} = make_peer(),
@@ -376,6 +385,38 @@ direct_follows_follow_test(_) ->
         {_Pid2, Id2, _Priv2} = make_peer(),
         ok = store_contact(Pid, Id, Priv, null, 1, Id2, true),
         ?assertEqual([Id2], friends:direct_follows(Pid))
+    end.
+
+blocks_block_test(_) ->
+    fun() ->
+        {Pid, Id, Priv} = make_peer(),
+        {_Pid2, Id2, _Priv2} = make_peer(),
+        ?assertEqual([], friends:blocks(Pid)),
+        ok = store_block(Pid, Id, Priv, null, 1, Id2, true),
+        ?assertEqual([Id2], friends:blocks(Pid))
+    end.
+
+blocks_unblock_test(_) ->
+    fun() ->
+        {Pid, Id, Priv} = make_peer(),
+        {_Pid2, Id2, _Priv2} = make_peer(),
+        ok = store_block(Pid, Id, Priv, null, 1, Id2, true),
+        #message{id = Msg1Id} = ssb_feed:fetch_last_msg(Pid),
+        ok = store_block(Pid, Id, Priv, Msg1Id, 2, Id2, false),
+        ?assertEqual([], friends:blocks(Pid))
+    end.
+
+%% follow and block are tracked independently, even within the same feed.
+blocks_independent_of_follow_test(_) ->
+    fun() ->
+        {Pid, Id, Priv} = make_peer(),
+        {_P2, Id2, _Pr2} = make_peer(),
+        {_P3, Id3, _Pr3} = make_peer(),
+        ok = store_contact(Pid, Id, Priv, null, 1, Id2, true),
+        #message{id = Msg1Id} = ssb_feed:fetch_last_msg(Pid),
+        ok = store_block(Pid, Id, Priv, Msg1Id, 2, Id3, true),
+        ?assertEqual([Id2], friends:direct_follows(Pid)),
+        ?assertEqual([Id3], friends:blocks(Pid))
     end.
 
 direct_follows_unfollow_test(_) ->

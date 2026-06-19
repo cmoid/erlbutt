@@ -110,6 +110,7 @@ two_node_ebt_replication_test(Config) ->
     {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
                               ["localhost", ?PORT_A, ACurvePk]),
     timer:sleep(300),
+    ok = follow_feed(NodeB, AId),
     rpc:call(NodeB, ssb_peer, request_ebt, [PeerPid]),
     timer:sleep(300),
     ?assert(rpc:call(NodeB, erlang, is_process_alive, [PeerPid])),
@@ -166,15 +167,20 @@ two_node_ebt_multiple_feeds_test(Config) ->
     AFeedPid = rpc:call(NodeA, utils, find_or_create_feed_pid, [AId]),
     ok = rpc:call(NodeA, ssb_feed, post_content,
                   [AFeedPid, {[{~"type", ~"post"}, {~"text", ~"feed-a msg"}]}]),
+
+    %% A second feed that A follows, so it is within A's replication horizon
+    %% and appears in A's clock.
+    {PubX, _} = rpc:call(NodeA, utils, create_key_pair, []),
+    FeedX     = rpc:call(NodeA, utils, display_pub, [PubX]),
+    ok = follow_feed(NodeA, FeedX),
+    _ = rpc:call(NodeA, utils, find_or_create_feed_pid, [FeedX]),
+
+    %% A's last sequence now includes the contact message posted above.
     #message{sequence = SeqA} =
         rpc:call(NodeA, ssb_feed, fetch_last_msg, [AFeedPid]),
 
-    %% Create a second feed on A (simulating a replicated remote feed) and
-    %% post a message using the feed directly via store_msg.
-    {PubX, _} = rpc:call(NodeA, utils, create_key_pair, []),
-    FeedX     = rpc:call(NodeA, utils, display_pub, [PubX]),
-
-    %% B connects to A and runs EBT.
+    %% B follows A and runs EBT.
+    ok = follow_feed(NodeB, AId),
     APubKey  = rpc:call(NodeA, keys, pub_key, []),
     ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
     {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
@@ -201,6 +207,10 @@ two_node_ebt_multiple_feeds_test(Config) ->
 two_node_ebt_post_connect_replication_test(Config) ->
     NodeA = ?config(node_a, Config),
     NodeB = ?config(node_b, Config),
+
+    %% B follows A so A's feed is within B's replication horizon.
+    AId = rpc:call(NodeA, keys, pub_key_disp, []),
+    ok = follow_feed(NodeB, AId),
 
     %% B connects to A and runs EBT (initial sync).
     APubKey  = rpc:call(NodeA, keys, pub_key, []),
@@ -341,6 +351,7 @@ two_node_auto_blob_fetch_test(Config) ->
     {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
                               ["localhost", ?PORT_A, ACurvePk]),
     timer:sleep(300),
+    ok = follow_feed(NodeB, AId),
     rpc:call(NodeB, ssb_peer, request_ebt, [PeerPid]),
 
     %% Storing the post on B triggers want → have → fetch on its own.
@@ -352,6 +363,15 @@ two_node_auto_blob_fetch_test(Config) ->
     rpc:call(NodeB, gen_server, stop, [PeerPid]).
 
 %%% Helpers -------------------------------------------------------------
+
+%% Make Node follow TargetId (post a contact on Node's own feed) and refresh
+%% the EBT replication set, so TargetId falls within Node's replication horizon.
+follow_feed(Node, TargetId) ->
+    SelfId  = rpc:call(Node, keys, pub_key_disp, []),
+    SelfPid = rpc:call(Node, utils, find_or_create_feed_pid, [SelfId]),
+    Content = {[{~"type", ~"contact"}, {~"contact", TargetId}, {~"following", true}]},
+    ok = rpc:call(Node, ssb_feed, post_content, [SelfPid, Content]),
+    ok = rpc:call(Node, ebt, refresh_repl_set, []).
 
 wait_until(_F, 0) -> false;
 wait_until(F, N) ->

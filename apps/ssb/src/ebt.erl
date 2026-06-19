@@ -320,4 +320,61 @@ full_clock_test() ->
     gen_server:stop(keys),
     gen_server:stop(config).
 
+%% Gate logic: the replication set admits our own feed, direct follows and
+%% room members, rejects strangers, and lets a block win even over membership.
+repl_set_test_() ->
+    {setup, fun rs_setup/0, fun rs_cleanup/1, fun(_) -> ?_test(repl_set_logic()) end}.
+
+rs_setup() ->
+    catch gen_server:stop(ebt),
+    catch gen_server:stop(room_store),
+    catch gen_server:stop(friends),
+    catch gen_server:stop(keys),
+    catch gen_server:stop(config),
+    Home = filename:join("/tmp", "ebt_rs_"
+                         ++ integer_to_list(erlang:system_time(microsecond))),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    application:set_env(ssb, ssb_home, Home),
+    {ok, _} = config:start_link("test/ssb.cfg"),
+    {ok, _} = keys:start_link(),
+    {ok, _} = friends:start_link(),
+    {ok, _} = room_store:start_link(),
+    {ok, _} = ebt:start_link(),
+    Home.
+
+rs_cleanup(Home) ->
+    catch gen_server:stop(ebt),
+    catch gen_server:stop(room_store),
+    catch gen_server:stop(friends),
+    catch gen_server:stop(keys),
+    catch gen_server:stop(config),
+    os:cmd("rm -rf " ++ Home),
+    application:unset_env(ssb, ssb_home),
+    ok.
+
+rs_fresh_feed() ->
+    #{public := Pub} = enacl:sign_keypair(),
+    <<"@", (base64:encode(Pub))/binary, ".ed25519">>.
+
+repl_set_logic() ->
+    Self     = keys:pub_key_disp(),
+    Follow   = rs_fresh_feed(),
+    Member   = rs_fresh_feed(),
+    Blocked  = rs_fresh_feed(),
+    Stranger = rs_fresh_feed(),
+    %% Seed the follow/block graphs directly and add a room member.
+    ets:insert(ssb_follow_graph, {Self, #{Follow => true}}),
+    ets:insert(ssb_block_graph,  {Self, #{Blocked => true}}),
+    ok = room_store:add_member(Member),
+    ok = refresh_repl_set(),
+    ?assert(replicate_feed(Self)),         %% our own feed
+    ?assert(replicate_feed(Follow)),       %% a direct follow
+    ?assert(replicate_feed(Member)),       %% a room member
+    ?assertNot(replicate_feed(Blocked)),   %% blocked
+    ?assertNot(replicate_feed(Stranger)),  %% neither followed nor a member
+    %% A block wins even over membership.
+    ets:insert(ssb_block_graph, {Self, #{Blocked => true, Member => true}}),
+    ok = refresh_repl_set(),
+    ?assertNot(replicate_feed(Member)).
+
 -endif.
