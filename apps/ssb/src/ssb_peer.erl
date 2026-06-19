@@ -915,9 +915,13 @@ build_outbound_state(Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce, PubKey) -
 build_initial_clock(RemotePubKey) ->
     RemoteFeedId = <<"@", (base64:encode(RemotePubKey))/binary, ".ed25519">>,
     {FullClock} = ebt:full_clock(),
-    ClockWithRemote = case lists:keymember(RemoteFeedId, 1, FullClock) of
-        true  -> FullClock;
-        false -> [{RemoteFeedId, ebt_vc:encode_clock_int(true, true, 0)} | FullClock]
+    %% Only advertise wanting the remote peer's feed if it is within our
+    %% replication set — otherwise we'd ask for a feed we'd then refuse to store.
+    AddRemote = ebt:replicate_feed(RemoteFeedId)
+                andalso not lists:keymember(RemoteFeedId, 1, FullClock),
+    ClockWithRemote = case AddRemote of
+        true  -> [{RemoteFeedId, ebt_vc:encode_clock_int(true, true, 0)} | FullClock];
+        false -> FullClock
     end,
     utils:encode_rec({ClockWithRemote}).
 

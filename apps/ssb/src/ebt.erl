@@ -16,6 +16,8 @@
 -export([start_link/0,
          initial_vector/0,
          full_clock/0,
+         replicate_feed/1,
+         refresh_repl_set/0,
          handle_data/3]).
 
 %% gen_server callbacks
@@ -26,6 +28,11 @@
 -import(utils, [size/1]).
 
 -define(SERVER, ?MODULE).
+
+%% Cached replication set: the feeds we will store and serve.  Recomputed
+%% from the follow graph + room members − blocks, on a timer and on demand.
+-define(REPL_SET, ebt_repl_set).
+-define(REPL_REFRESH_MS, 20000).
 
 %% ebt is both a gen_server (supervised singleton in ssb_sup) and an
 %% rpc_behavior (callbacks invoked per-connection by each rpc_processor).
@@ -38,13 +45,29 @@ start_link() ->
 initial_vector() ->
     full_clock().
 
-%% Build a full vector clock from all feeds in the local registry.
-%% Each entry is {FeedId, encoded_int} with receive=true so the peer will push us updates.
+%% Build a full vector clock from the feeds we hold that are within our
+%% replication set.  Each entry is {FeedId, encoded_int} with receive=true so
+%% the peer pushes us updates.
 full_clock() ->
     Entries = ets:tab2list(ssb_feed_registry),
     {[{FeedId, clock_entry_for(Pid)}
       || {FeedId, Pid} <- Entries,
-         is_process_alive(Pid)]}.
+         is_process_alive(Pid),
+         replicate_feed(FeedId)]}.
+
+%% Whether we replicate (store/serve) FeedId: our own feed, anyone within our
+%% follow horizon, or an explicit room member — minus anyone we block.  Reads
+%% the cached set; if the table is absent (ebt not started, e.g. isolated
+%% eunit) it fails open so unrelated paths keep working.
+replicate_feed(FeedId) ->
+    try ets:member(?REPL_SET, FeedId)
+    catch error:badarg -> true
+    end.
+
+%% Recompute the cached replication set now (e.g. after a new follow/block or
+%% room member). Synchronous so callers/tests see the effect immediately.
+refresh_repl_set() ->
+    gen_server:call(?SERVER, refresh_repl_set).
 
 %% Called by rpc_processor for each subsequent message on an open EBT
 %% duplex stream (after the initial ebt.replicate handshake).
@@ -77,13 +100,25 @@ handle_data(ReqNo, Body, #ssb_conn{socket = Socket,
 
 init([]) ->
     process_flag(trap_exit, true),
+    ets:new(?REPL_SET, [set, named_table, public]),
+    recompute_repl_set(),
+    schedule_repl_refresh(),
     {ok, #state{}}.
+
+handle_call(refresh_repl_set, _From, State) ->
+    recompute_repl_set(),
+    {reply, ok, State};
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
 handle_cast(_Request, State) ->
     {noreply, State}.
+
+handle_info(refresh_repl_set, State) ->
+    recompute_repl_set(),
+    schedule_repl_refresh(),
+    {noreply, State};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -97,6 +132,27 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+schedule_repl_refresh() ->
+    erlang:send_after(?REPL_REFRESH_MS, self(), refresh_repl_set).
+
+%% Replication set = {self} ∪ follows(self, hops) ∪ room members − blocks(self).
+%% A block wins even over membership.
+recompute_repl_set() ->
+    try
+        Self    = keys:pub_key_disp(),
+        Follows = friends:follows(Self, config:replication_hops()),
+        Members = room_store:members(),
+        Blocked = friends:blocks(Self),
+        Combined = lists:usort([Self | Follows] ++ Members),
+        Set = [F || F <- Combined, not lists:member(F, Blocked)],
+        ets:delete_all_objects(?REPL_SET),
+        [ets:insert(?REPL_SET, {F}) || F <- Set],
+        ok
+    catch Class:Reason ->
+        ?SSB_INFO("EBT: repl set recompute failed: ~p~n", [{Class, Reason}]),
+        ok
+    end.
 
 %% A vector clock's top-level keys all start with "@" (feed IDs).
 %% A message's keys are "key", "value", "timestamp".
@@ -133,7 +189,13 @@ send_feed_msgs_after(_, {true, false, _}, _, _, Nonce, _) -> Nonce;
 %% Iterate through a feed and send all messages with sequence > AfterSeq.
 %% Each message is re-encoded: only the "value" field is sent, not the full
 %% {key, value, timestamp} envelope stored on disk.
-send_feed_msgs_after(FeedId, {true, true,AfterSeq}, OutReqNo, Socket, Nonce, Key) ->
+send_feed_msgs_after(FeedId, {true, true, AfterSeq}, OutReqNo, Socket, Nonce, Key) ->
+    case replicate_feed(FeedId) of
+        false -> Nonce;
+        true  -> send_feed_msgs_after_ok(FeedId, AfterSeq, OutReqNo, Socket, Nonce, Key)
+    end.
+
+send_feed_msgs_after_ok(FeedId, AfterSeq, OutReqNo, Socket, Nonce, Key) ->
     Pid = utils:find_or_create_feed_pid(FeedId),
     case Pid of
         bad ->
@@ -194,14 +256,21 @@ clock_entry_for(Pid) ->
 store_message(Body) ->
     try
         Msg = message:decode_value(Body, true),
-        case utils:find_or_create_feed_pid(Msg#message.author) of
-            bad ->
-                ?SSB_INFO("EBT: bad author in received message: ~p~n",
-                    [{Msg#message.author, Msg#message.id}]),
+        case replicate_feed(Msg#message.author) of
+            false ->
+                ?SSB_DEBUG("EBT: dropping msg for non-replicated feed ~p~n",
+                           [Msg#message.author]),
                 error;
-            Pid ->
-                ssb_feed:store_msg(Pid, Msg),
-                {ok, Msg#message.author, Msg#message.sequence}
+            true ->
+                case utils:find_or_create_feed_pid(Msg#message.author) of
+                    bad ->
+                        ?SSB_INFO("EBT: bad author in received message: ~p~n",
+                            [{Msg#message.author, Msg#message.id}]),
+                        error;
+                    Pid ->
+                        ssb_feed:store_msg(Pid, Msg),
+                        {ok, Msg#message.author, Msg#message.sequence}
+                end
         end
     catch
         _:Reason ->
