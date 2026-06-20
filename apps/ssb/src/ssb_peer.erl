@@ -751,11 +751,21 @@ rpc_parse(Data, #sbox_state{socket = Socket,
                                                {blob_wants, {blob_fetcher, self()}}),
             NewState0#sbox_state{remote_wants_req = ReqNo};
         {ebt_stream, ReqNo} ->
-            NewState0#sbox_state{ebt_active = true,
-                                 ebt_out_req = -ReqNo,
-                                 ebt_last_rx = erlang:system_time(second),
-                                 ebt_stale_ref = schedule_ebt_stale_check(),
-                                 ebt_entropy_ref = schedule_ebt_entropy()};
+            case NewState0#sbox_state.ebt_active of
+                true ->
+                    %% EBT is already running on this connection (we initiated
+                    %% via the dialer, or a prior ebt.replicate).  The peer's
+                    %% request is answered in proc_request, but do NOT start a
+                    %% second stream/entropy timer — that produced duplicate
+                    %% anti-entropy clocks and repeated message sends.
+                    NewState0#sbox_state{ebt_last_rx = erlang:system_time(second)};
+                false ->
+                    NewState0#sbox_state{ebt_active = true,
+                                         ebt_out_req = -ReqNo,
+                                         ebt_last_rx = erlang:system_time(second),
+                                         ebt_stale_ref = schedule_ebt_stale_check(),
+                                         ebt_entropy_ref = schedule_ebt_entropy()}
+            end;
         {attendants_stream, ReqNo} ->
             %% Peer opened room.attendants; subscribe so future join/leave
             %% events are pushed on -ReqNo from our handle_info.

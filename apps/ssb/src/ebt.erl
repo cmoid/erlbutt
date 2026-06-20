@@ -88,11 +88,12 @@ handle_data(ReqNo, Body, #ssb_conn{socket = Socket,
                 true ->
                     Nonce;
                 false ->
-                    ?SSB_DEBUG("EBT: received message from peer ~p ~n", [Body]),
+                    ?SSB_DEBUG("EBT: received message from peer ~n", []),
                     case store_message(Body) of
                         {ok, FeedId, Seq} ->
                             send_clock_ack(FeedId, Seq, -ReqNo, Socket, Nonce, Key);
-                        error ->
+                        _ ->
+                            %% skipped (duplicate) or error: no ack.
                             Nonce
                     end
             end
@@ -268,8 +269,14 @@ store_message(Body) ->
                             [{Msg#message.author, Msg#message.id}]),
                         error;
                     Pid ->
-                        ssb_feed:store_msg(Pid, Msg),
-                        {ok, Msg#message.author, Msg#message.sequence}
+                        case ssb_feed:store_msg(Pid, Msg) of
+                            stored ->
+                                {ok, Msg#message.author, Msg#message.sequence};
+                            _ ->
+                                %% Duplicate (already have this seq): don't ack,
+                                %% so we don't re-invite the peer to resend.
+                                skipped
+                        end
                 end
         end
     catch

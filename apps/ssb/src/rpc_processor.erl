@@ -426,6 +426,10 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [~"invite", ~"use"],
                                       {~"pub",       true}]},
                     ok = ssb_feed:post_content(FeedPid, FollowContent)
             end,
+            %% The new member/follow just changed our replication set; refresh
+            %% it now so we replicate their feed immediately rather than after
+            %% the next periodic (20s) recompute.
+            ok = ebt:refresh_repl_set(),
             TrueBody = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
             Flags  = create_flags(0, 0, 2),
             Header = create_header(Flags, size(TrueBody), -ReqNo),

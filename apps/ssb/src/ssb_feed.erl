@@ -144,9 +144,15 @@ handle_call({post, Content}, _From, #state{id = Id} = State) ->
             {reply, no_post, State}
     end;
 
-handle_call({store, Msg}, _From, State) ->
+handle_call({store, Msg}, _From, #state{last_seq = Before} = State) ->
     NewState = store(Msg, State),
-    {reply, ok, NewState};
+    %% store/2 skips sequences we already have; report which happened so EBT
+    %% only acks (and re-invites the peer) for genuinely new messages.
+    Status = case NewState#state.last_seq > Before of
+        true  -> stored;
+        false -> skipped
+    end,
+    {reply, Status, NewState};
 
 
 handle_call({fetch, Key}, _From, #state{feed = Feed,
@@ -467,6 +473,7 @@ feed_test_() ->
      [fun post_and_fetch_test/1,
       fun sequence_increments_test/1,
       fun fetch_last_msg_test/1,
+      fun store_msg_dedup_test/1,
       fun archive_manual_test/1,
       fun post_after_archive_test/1]}.
 
@@ -516,6 +523,16 @@ fetch_last_msg_test({Pid, _}) ->
         ok = ssb_feed:post_content(Pid, ~"b"),
         ok = ssb_feed:post_content(Pid, ~"c"),
         #message{content = ~"c"} = ssb_feed:fetch_last_msg(Pid)
+    end.
+
+%% store_msg reports `stored` for a new sequence and `skipped` for a
+%% duplicate, so EBT can avoid re-acking (and re-inviting) duplicates.
+store_msg_dedup_test({Pid, FeedId}) ->
+    fun() ->
+        Msg = message:new_msg(null, 1, {[{~"type", ~"post"}, {~"text", ~"once"}]},
+                              {FeedId, keys:priv_key()}),
+        ?assertEqual(stored,  ssb_feed:store_msg(Pid, Msg)),
+        ?assertEqual(skipped, ssb_feed:store_msg(Pid, Msg))
     end.
 
 archive_manual_test({Pid, _}) ->

@@ -359,19 +359,22 @@ make_peer() ->
 store_contact(FeedPid, AuthId, AuthPriv, Prev, Seq, ContactId, Following) ->
     Content = {[{~"type", ~"contact"}, {~"contact", ContactId}, {~"following", Following}]},
     Msg = message:new_msg(Prev, Seq, Content, {AuthId, AuthPriv}),
-    ssb_feed:store_msg(FeedPid, Msg).
+    _ = ssb_feed:store_msg(FeedPid, Msg),
+    ok.
 
 %% Store an about message in FeedPid naming AboutId, signed by {AuthId, AuthPriv}.
 store_about(FeedPid, AuthId, AuthPriv, Prev, Seq, AboutId, Name) ->
     Content = {[{~"type", ~"about"}, {~"about", AboutId}, {~"name", Name}]},
     Msg = message:new_msg(Prev, Seq, Content, {AuthId, AuthPriv}),
-    ssb_feed:store_msg(FeedPid, Msg).
+    _ = ssb_feed:store_msg(FeedPid, Msg),
+    ok.
 
 %% Store a blocking contact message in FeedPid, signed by {AuthId, AuthPriv}.
 store_block(FeedPid, AuthId, AuthPriv, Prev, Seq, ContactId, Blocking) ->
     Content = {[{~"type", ~"contact"}, {~"contact", ContactId}, {~"blocking", Blocking}]},
     Msg = message:new_msg(Prev, Seq, Content, {AuthId, AuthPriv}),
-    ssb_feed:store_msg(FeedPid, Msg).
+    _ = ssb_feed:store_msg(FeedPid, Msg),
+    ok.
 
 direct_follows_empty_test(_) ->
     fun() ->

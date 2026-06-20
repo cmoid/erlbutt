@@ -20,6 +20,7 @@
 -export([two_node_handshake_test/1,
          two_node_ebt_replication_test/1,
          two_node_ebt_no_duplicate_stream_test/1,
+         two_node_ebt_no_double_entropy_test/1,
          two_node_ebt_multiple_feeds_test/1,
          two_node_ebt_post_connect_replication_test/1,
          two_node_blob_wants_test/1,
@@ -41,6 +42,7 @@ all() ->
     [two_node_handshake_test,
      two_node_ebt_replication_test,
      two_node_ebt_no_duplicate_stream_test,
+     two_node_ebt_no_double_entropy_test,
      two_node_ebt_multiple_feeds_test,
      two_node_ebt_post_connect_replication_test,
      two_node_blob_wants_test,
@@ -153,6 +155,44 @@ two_node_ebt_no_duplicate_stream_test(Config) ->
     ?assert(State2#sbox_state.ebt_active),
 
     rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Regression: when EBT is already active on a connection, a second
+%% ebt.replicate from the peer must NOT schedule a second entropy timer.
+%% (Field bug: peer_dialer's request_ebt + the peer's ebt.replicate produced
+%% two anti-entropy timers, so the peer re-sent every message twice.)
+two_node_ebt_no_double_entropy_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+    AId   = rpc:call(NodeA, keys, pub_key_disp, []),
+    ok = follow_feed(NodeB, AId),
+    ACurvePk = rpc:call(NodeA, base64, decode, [rpc:call(NodeA, keys, pub_key, [])]),
+    {ok, PB} = rpc:call(NodeB, ssb_peer, start, ["localhost", ?PORT_A, ACurvePk]),
+    timer:sleep(300),
+
+    %% A's inbound peer serving B.
+    BPubRaw = rpc:call(NodeB, base64, decode, [rpc:call(NodeB, keys, pub_key, [])]),
+    {ok, PA} = rpc:call(NodeA, peer_registry, find, [BPubRaw]),
+
+    %% A initiates EBT first (as peer_dialer would on a heartbeat).
+    rpc:call(NodeA, ssb_peer, request_ebt, [PA]),
+    timer:sleep(200),
+    S1 = rpc:call(NodeA, sys, get_state, [PA]),
+    ?assert(S1#sbox_state.ebt_active),
+    E1 = S1#sbox_state.ebt_entropy_ref,
+
+    %% Force B to re-initiate so A receives a second ebt.replicate while
+    %% already active (B's own request_ebt is otherwise guarded).
+    rpc:call(NodeB, sys, replace_state,
+             [PB, fun(S) -> S#sbox_state{ebt_active = false} end]),
+    rpc:call(NodeB, ssb_peer, request_ebt, [PB]),
+    timer:sleep(300),
+
+    %% The guard kept a single entropy timer — same ref, still active.
+    S2 = rpc:call(NodeA, sys, get_state, [PA]),
+    ?assert(S2#sbox_state.ebt_active),
+    ?assertEqual(E1, S2#sbox_state.ebt_entropy_ref),
+
+    rpc:call(NodeB, gen_server, stop, [PB]).
 
 %% Post messages from two distinct feeds on node_a, have node_b connect and
 %% run EBT, then verify node_b replicates both feeds.  This exercises the
