@@ -311,18 +311,26 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobshas],
 proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobsget],
                              args = Args}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    %% blobs.get args are either the id string directly, or an object whose
+    %% blob id lives under "key" (ssb-blobs / PonchoWonky) or "hash".
+    %% this is missing in the protocol guide.
     BlobId = case Args of
         [Id] when is_binary(Id) -> Id;
-        [{Props}] -> proplists:get_value(~"hash", Props)
+        [{Props}] ->
+            case proplists:get_value(~"key", Props) of
+                undefined -> proplists:get_value(~"hash", Props);
+                Key       -> Key
+            end;
+        _ -> undefined
     end,
-    case blobs:fetch(BlobId) of
-        {error, not_found} ->
+    case BlobId =/= undefined andalso blobs:fetch(BlobId) of
+        {ok, BlobData} ->
+            send_blob_chunks(BlobData, -ReqNo, Socket, Nonce, SecretBoxKey);
+        _ ->
             ErrMsg = utils:error_msg(~"Error", ~"blob not found"),
             Flags  = create_flags(0, 1, 2),
             Header = create_header(Flags, size(ErrMsg), -ReqNo),
-            utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey);
-        {ok, BlobData} ->
-            send_blob_chunks(BlobData, -ReqNo, Socket, Nonce, SecretBoxKey)
+            utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey)
     end;
 
 proc_request(_Calls, ReqNo, #ssb_rpc{name = [?tunnel, ?isRoom],
