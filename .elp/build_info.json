@@ -3,16 +3,10 @@
     {
       "name": "ssb",
       "dir": "/Users/cmoid/code/erlbutt/apps/ssb",
-      "src_dirs": [
-        "src"
-      ],
+      "src_dirs": ["src"],
       "ebin": "/Users/cmoid/code/erlbutt/_build/test/lib/ssb/ebin",
       "extra_src_dirs": [],
-      "include_dirs": [
-        "include",
-        "src",
-        ""
-      ],
+      "include_dirs": ["include", "src", ""],
       "macros": {
         "TEST": "true"
       }
@@ -20,46 +14,36 @@
     {
       "name": "ranch",
       "dir": "/Users/cmoid/code/erlbutt/_build/default/lib/ranch",
-      "src_dirs": [
-        "src"
-      ],
+      "src_dirs": ["src"],
       "ebin": "/Users/cmoid/code/erlbutt/_build/default/lib/ranch/ebin",
       "extra_src_dirs": [],
-      "include_dirs": [
-        "include",
-        "src",
-        ""
-      ],
+      "include_dirs": ["include", "src", ""],
       "macros": {}
     },
     {
       "name": "enacl",
       "dir": "/Users/cmoid/code/erlbutt/_build/default/lib/enacl",
-      "src_dirs": [
-        "src"
-      ],
+      "src_dirs": ["src"],
       "ebin": "/Users/cmoid/code/erlbutt/_build/default/lib/enacl/ebin",
       "extra_src_dirs": [],
-      "include_dirs": [
-        "include",
-        "src",
-        ""
-      ],
+      "include_dirs": ["include", "src", ""],
       "macros": {}
     },
     {
       "name": "erlbutt_test",
       "dir": "/Users/cmoid/code/erlbutt",
-      "src_dirs": [
-        "test"
-      ],
+      "src_dirs": ["test"],
       "ebin": "/Users/cmoid/code/erlbutt/_build/test/lib/ssb/ebin",
       "extra_src_dirs": [],
-      "include_dirs": [
-        "apps/ssb/include",
-        "apps/ssb/src",
-        ""
-      ],
+      "include_dirs": ["apps/ssb/include", "apps/ssb/src", ""],
+      "macros": {
+        "TEST": "true"
+      }
+    },
+    {
+      "name": "erlbutt",
+      "dir": "/Users/cmoid/code/erlbutt",
+      "src_dirs": [],
       "macros": {
         "TEST": "true"
       }
