@@ -589,19 +589,30 @@ handle_cast({request_blob_wants, BlobIds, NotifyPid},
                         our_wants_req = OurWantsReq,
                         remote_wants_req = RemoteWantsReq} = State) ->
     %% Register on both channels so haves reach us regardless of peer style.
-    ok = rpc_processor:register_stream(RpcProc, -OurWantsReq, {blob_wants, NotifyPid}),
+    %% On invite connections we never opened our own createWants stream, so
+    %% our_wants_req is undefined; only register/send on the channel(s) we have.
+    case OurWantsReq of
+        undefined -> ok;
+        _         -> ok = rpc_processor:register_stream(RpcProc, -OurWantsReq, {blob_wants, NotifyPid})
+    end,
     case RemoteWantsReq of
         undefined -> ok;
         _         -> ok = rpc_processor:register_stream(RpcProc, RemoteWantsReq, {blob_wants, NotifyPid})
     end,
     %% Duplex-style peers (PW, TF) expect our wants on their response channel (-remote_wants_req).
     %% Peers that haven't opened createWants get wants on our own source stream.
-    SendReqNo = case RemoteWantsReq of
-        undefined -> OurWantsReq;
-        _         -> -RemoteWantsReq
+    SendReqNo = case {RemoteWantsReq, OurWantsReq} of
+        {undefined, _} -> OurWantsReq;
+        {_, _}         -> -RemoteWantsReq
     end,
-    NewEncNonce = send_want_body(Socket, EncBoxKey, EncNonce, BlobIds, SendReqNo),
-    {noreply, State#sbox_state{enc_nonce = NewEncNonce}};
+    case SendReqNo of
+        undefined ->
+            %% No wants channel available on this connection; nothing to send.
+            {noreply, State};
+        _ ->
+            NewEncNonce = send_want_body(Socket, EncBoxKey, EncNonce, BlobIds, SendReqNo),
+            {noreply, State#sbox_state{enc_nonce = NewEncNonce}}
+    end;
 
 handle_cast({send_frame, ReqNo, Body},
             #sbox_state{socket = Socket,
@@ -717,6 +728,7 @@ rpc_parse(Data, #sbox_state{socket = Socket,
                             enc_sbox_key = EncBoxKey,
                             rpc_proc = RpcProc,
                             our_wants_req = OurWantsReq,
+                            remote_wants_req = RemoteWantsReq,
                             response = Response} = State) ->
 
     Parsed = rpc_parse:parse(Data),
@@ -735,7 +747,8 @@ rpc_parse(Data, #sbox_state{socket = Socket,
                                              socket = Socket,
                                              nonce = EncNonce,
                                              secret_box = EncBoxKey,
-                                             our_wants_req = OurWantsReq}),
+                                             our_wants_req = OurWantsReq,
+                                             remote_wants_req = RemoteWantsReq}),
                 ?SSB_DEBUG("The rpc call returned ~p ~n",[Resp]),
                 {complete, Rest, ProcEncNonce, Resp}
         end,

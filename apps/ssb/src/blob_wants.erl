@@ -10,9 +10,13 @@
 %%   - Positive values are "have" signals whose value is the blob size
 %%     in bytes.
 %%
-%% Both peers open independent source streams. When a peer sends us wants
-%% we check local storage and respond with haves on OUR OWN stream
-%% (ssb_conn.our_wants_req), not on their response channel.
+%% Both peers open independent createWants source streams. The SSB blob
+%% protocol is two one-directional sources: each peer reads the other's
+%% wants/haves on the response channel of the createWants call IT made
+%% (-our_wants_req), and writes its own wants/haves on the response channel
+%% of the createWants call the PEER made (-remote_wants_req). So when a peer
+%% sends us wants we respond with haves on -remote_wants_req. (Only if the
+%% peer never opened its own createWants do we fall back to our_wants_req.)
 -module(blob_wants).
 
 -include_lib("ssb/include/ssb.hrl").
@@ -30,11 +34,13 @@ handle_data(ReqNo, Body, Conn) ->
 handle_data(_ReqNo, Body, #ssb_conn{socket = Socket,
                                     nonce = Nonce,
                                     secret_box = Key,
-                                    our_wants_req = OurWantsReq}, SinkPid) ->
+                                    our_wants_req = OurWantsReq,
+                                    remote_wants_req = RemoteWantsReq}, SinkPid) ->
     case utils:nat_decode(Body) of
         {Props} ->
             maybe_forward_haves(Props, SinkPid),
-            respond_to_wants(OurWantsReq, Props, Socket, Nonce, Key);
+            respond_to_wants(have_reqno(RemoteWantsReq, OurWantsReq),
+                             Props, Socket, Nonce, Key);
         _Other ->
             Nonce
     end.
@@ -62,6 +68,13 @@ forward_have({Name, PeerPid}, BlobId, Val) when is_atom(Name) ->
     end;
 forward_have(Pid, BlobId, Val) when is_pid(Pid) ->
     Pid ! {have, BlobId, Val}.
+
+%% Reply on the response channel of the peer's createWants call
+%% (-remote_wants_req) per standard SSB; only if the peer never opened its
+%% own createWants do we fall back to our own request channel.
+have_reqno(undefined, undefined) -> undefined;
+have_reqno(undefined, OurWantsReq) -> OurWantsReq;
+have_reqno(RemoteWantsReq, _OurWantsReq) -> -RemoteWantsReq.
 
 respond_to_wants(undefined, _Props, _Socket, Nonce, _Key) ->
     Nonce;

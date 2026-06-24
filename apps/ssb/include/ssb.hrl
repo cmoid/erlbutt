@@ -60,7 +60,8 @@
         { socket,
           nonce,
           secret_box,
-          our_wants_req
+          our_wants_req,
+          remote_wants_req
         }).
 
 -record(ssb_rpc,
