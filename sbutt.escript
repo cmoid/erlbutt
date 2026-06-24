@@ -11,6 +11,7 @@
 %%   whoami          Show the local node's SSB identity
 %%   id              Alias for whoami
 %%   ping            Ping the local node
+%%   about           Set own profile name/description/avatar image
 %%
 %% The escript connects to the local erlbutt node on port 8008 using the
 %% shared ~/.ssberl/secret key (same approach as sbot in Node.js: two processes,
@@ -23,6 +24,7 @@ main(["whoami"])          -> run(fun cmd_whoami/1);
 main(["id"])              -> run(fun cmd_whoami/1);
 main(["ping"])            -> run(fun cmd_ping/1);
 main(["publish" | Args])  -> run(fun(P) -> cmd_publish(P, Args) end);
+main(["about" | Args])    -> run(fun(P) -> cmd_about(P, Args) end);
 main(["get", Key])        -> run(fun(P) -> cmd_get(P, Key) end);
 main(["log"])             -> run(fun cmd_log/1);
 main(["feed"])            -> run(fun cmd_log/1);
@@ -108,6 +110,47 @@ cmd_publish(Peer, Args) ->
             io:format("Error: ~p~n", [Err])
     end.
 
+%% Publish an "about" message describing our own feed: name, description and
+%% an avatar image. The image is stored as a content-addressed blob (in the
+%% repo blob dir shared with the running node) and referenced by its hash.
+cmd_about(Peer, Args) ->
+    KVs    = parse_kv(Args, []),
+    Self   = keys:pub_key_disp(),
+    Base   = [{<<"type">>, <<"about">>}, {<<"about">>, Self}],
+    Fields = Base
+        ++ opt_field(<<"name">>, proplists:get_value(name, KVs))
+        ++ opt_field(<<"description">>, proplists:get_value(description, KVs))
+        ++ image_field(proplists:get_value(image, KVs)),
+    case Fields of
+        Base ->
+            io:format("Nothing to set: pass at least one of "
+                      "--name, --description, --image~n"),
+            erlang:halt(1);
+        _ ->
+            Content = {Fields},
+            case ssb_peer:rpc_call(Peer, [<<"publish">>], <<"async">>, [Content]) of
+                {ok, Body} -> io:format("~s~n", [Body]);
+                Err        -> io:format("Error: ~p~n", [Err])
+            end
+    end.
+
+opt_field(_Key, undefined) -> [];
+opt_field(Key, Value)      -> [{Key, list_to_binary(Value)}].
+
+%% Read the image file, store it as a blob, and return [{<<"image">>, Ref}].
+image_field(undefined) -> [];
+image_field(Path) ->
+    case file:read_file(Path) of
+        {ok, Data} ->
+            {ok, _} = blobs:start_link(),
+            BlobId  = blobs:store(Data),
+            io:format("stored avatar blob ~s~n", [BlobId]),
+            [{<<"image">>, BlobId}];
+        {error, Reason} ->
+            io:format("Cannot read image ~s: ~p~n", [Path, Reason]),
+            erlang:halt(1)
+    end.
+
 cmd_get(Peer, Key) ->
     case ssb_peer:rpc_call(Peer, [<<"get">>], <<"async">>, [list_to_binary(Key)]) of
         {ok, Body} ->
@@ -137,10 +180,13 @@ cmd_hist(Peer, Id, Limit) ->
 
 %%% Helpers ----------------------------------------------------------------
 
-parse_kv(["--type", V | Rest], Acc) -> parse_kv(Rest, [{type, V} | Acc]);
-parse_kv(["--text", V | Rest], Acc) -> parse_kv(Rest, [{text, V} | Acc]);
-parse_kv([_ | Rest], Acc)           -> parse_kv(Rest, Acc);
-parse_kv([], Acc)                   -> Acc.
+parse_kv(["--type", V | Rest], Acc)        -> parse_kv(Rest, [{type, V} | Acc]);
+parse_kv(["--text", V | Rest], Acc)        -> parse_kv(Rest, [{text, V} | Acc]);
+parse_kv(["--name", V | Rest], Acc)        -> parse_kv(Rest, [{name, V} | Acc]);
+parse_kv(["--description", V | Rest], Acc) -> parse_kv(Rest, [{description, V} | Acc]);
+parse_kv(["--image", V | Rest], Acc)       -> parse_kv(Rest, [{image, V} | Acc]);
+parse_kv([_ | Rest], Acc)                  -> parse_kv(Rest, Acc);
+parse_kv([], Acc)                          -> Acc.
 
 usage() ->
     io:format("Usage: sbot <command> [args...]~n~n"),
@@ -149,6 +195,8 @@ usage() ->
     io:format("  id                            Alias for whoami~n"),
     io:format("  ping                          Ping local erlbutt node~n"),
     io:format("  publish --type T --text TEXT  Publish a message~n"),
+    io:format("  about [--name N] [--description D] [--image PATH]~n"),
+    io:format("                                Set own profile name/description/avatar~n"),
     io:format("  get MSGKEY                    Fetch a message by key~n"),
     io:format("  log                           Stream all messages~n"),
     io:format("  feed                          Alias for log~n"),
