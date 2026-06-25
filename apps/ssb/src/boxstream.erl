@@ -17,11 +17,24 @@
 -export([box/3,
          unbox/3]).
 
+%% SSB box-stream packets carry at most 4096 bytes of body, and the 2-byte
+%% length field below cannot even represent 65536. Split larger payloads into
+%% successive boxes (threading the nonce) so callers may hand us a frame of any
+%% size — notably blob chunks, which previously overflowed the length field to 0
+%% and desynced the peer's stream.
+-define(MAX_BOX_BODY, 4096).
+
 box(?BOX_END, Nonce, SecretBoxKey) ->
     EndMsgBox = enacl:secretbox(?BOX_END,
                                 Nonce,
                                 SecretBoxKey),
     {EndMsgBox, incr(Nonce)};
+
+box(Data, Nonce, SecretBoxKey) when byte_size(Data) > ?MAX_BOX_BODY ->
+    <<Chunk:?MAX_BOX_BODY/binary, Rest/binary>> = Data,
+    {Box1, Nonce1} = box(Chunk, Nonce,  SecretBoxKey),
+    {Box2, Nonce2} = box(Rest,  Nonce1, SecretBoxKey),
+    {combine(Box1, Box2), Nonce2};
 
 box(Data, Nonce, SecretBoxKey) ->
 
@@ -134,6 +147,24 @@ multi_chunk_test() ->
     Combined = <<Boxed1/binary, Boxed2/binary>>,
     {complete, Data1, Nonce1, Rem}  = unbox(Key, Nonce,  Combined),
     {complete, Data2, Nonce2, <<>>} = unbox(Key, Nonce1, Rem).
+
+%% A payload larger than 4096 bytes is split into successive <=4096-byte
+%% boxes; unboxing them in turn reassembles the original and the nonce
+%% advances by 2 per box.  Guards against the 2-byte length-field overflow
+%% that silently truncated large blob chunks to length 0.
+large_payload_chunking_test() ->
+    Key    = test_key(),
+    Nonce  = test_nonce(),
+    Data   = crypto:strong_rand_bytes(10000),       %% 4096 + 4096 + 1808
+    {Boxed, EndNonce} = box(Data, Nonce, Key),
+    ?assert(EndNonce =:= incr(incr(incr(incr(incr(incr(Nonce))))))),  %% 3 boxes
+    Reassembled = unbox_all(Key, Nonce, Boxed, <<>>),
+    ?assert(Reassembled =:= Data).
+
+unbox_all(_Key, _Nonce, <<>>, Acc) -> Acc;
+unbox_all(Key, Nonce, Boxed, Acc) ->
+    {complete, Chunk, NextNonce, Rem} = unbox(Key, Nonce, Boxed),
+    unbox_all(Key, NextNonce, Rem, <<Acc/binary, Chunk/binary>>).
 
 %% nonce advances by 2 for regular data, by 1 for BOX_END.
 nonce_advance_test() ->

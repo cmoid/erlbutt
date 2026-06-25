@@ -457,7 +457,9 @@ proc_request(Calls, ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
     Header = create_header(Flags, size(TrueEnd), -ReqNo),
     utils:send_data(utils:combine(Header, TrueEnd), Socket, Nonce, SecretBoxKey).
 
-%% Stream BlobData in 65 536-byte binary chunks, then close with JSON true.
+%% Stream BlobData in 65 536-byte muxrpc frames, then close with JSON true.
+%% Each frame is further split into <=4096-byte box-stream packets by
+%% boxstream:box (the box-stream length field is only 2 bytes wide).
 send_blob_chunks(<<>>, ReqNo, Socket, Nonce, Key) ->
     TrueBody = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
     Flags    = create_flags(1, 1, 2),

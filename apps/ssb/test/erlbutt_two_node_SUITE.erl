@@ -346,13 +346,16 @@ two_node_multiple_blob_wants_test(Config) ->
     rpc:call(NodeB, gen_server, stop, [PeerPid]).
 
 %% Connect from node_b to node_a, request a blob via blobs.get, and verify
-%% that node_b receives the complete blob data.
+%% that node_b receives the complete blob data.  The payload is deliberately
+%% larger than both the 4096-byte box-stream packet limit and the 65536-byte
+%% muxrpc frame size so the transfer spans many boxes and frames — this is the
+%% case that overflowed the 2-byte box-stream length field to 0.
 two_node_blob_fetch_test(Config) ->
     NodeA = ?config(node_a, Config),
     NodeB = ?config(node_b, Config),
 
-    %% Store a blob on A
-    BlobData = ~"erlbutt two-node blob fetch test payload",
+    %% Store a large (multi-box, multi-frame) blob on A
+    BlobData = crypto:strong_rand_bytes(200000),
     BlobId   = rpc:call(NodeA, blobs, store, [BlobData]),
     ?assert(rpc:call(NodeA, blobs, has, [BlobId]) =:= true),
 
