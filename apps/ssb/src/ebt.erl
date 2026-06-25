@@ -50,10 +50,18 @@ initial_vector() ->
 %% the peer pushes us updates.
 full_clock() ->
     Entries = ets:tab2list(ssb_feed_registry),
-    {[{FeedId, clock_entry_for(Pid)}
-      || {FeedId, Pid} <- Entries,
-         is_process_alive(Pid),
-         replicate_feed(FeedId)]}.
+    {lists:filtermap(
+       fun({FeedId, Pid}) ->
+               case is_process_alive(Pid) andalso replicate_feed(FeedId) of
+                   true ->
+                       case clock_entry_for(FeedId, Pid) of
+                           skip  -> false;
+                           Entry -> {true, Entry}
+                       end;
+                   false ->
+                       false
+               end
+       end, Entries)}.
 
 %% Whether we replicate (store/serve) FeedId: our own feed, anyone within our
 %% follow horizon, or an explicit room member — minus anyone we block.  Reads
@@ -243,12 +251,21 @@ send_clock_ack(FeedId, Seq, OutReqNo, Socket, Nonce, Key) ->
     Header = rpc_processor:create_header(Flags, size(Ack), OutReqNo),
     utils:send_data(utils:combine(Header, Ack), Socket, Nonce, Key).
 
-clock_entry_for(Pid) ->
-    Seq = case ssb_feed:fetch_last_msg(Pid) of
-              #message{sequence = S} -> S;
-              _ -> 0
-          end,
-    ebt_vc:encode_clock_int(true, true, Seq).
+%% Build the {FeedId, encoded_int} clock entry for one feed, or `skip` if the
+%% feed process can't answer promptly.  During heavy replication a feed gen_server
+%% can be blocked for seconds inside a foldl (it does the socket sends for EBT),
+%% and a default 5s gen_server:call timeout here used to crash the whole
+%% connection (full DB → many busy feeds).  Skipping a momentarily busy feed just
+%% omits it from this clock; it is re-advertised on the next clock/anti-entropy.
+clock_entry_for(FeedId, Pid) ->
+    try ssb_feed:fetch_last_msg(Pid) of
+        #message{sequence = S} -> {FeedId, ebt_vc:encode_clock_int(true, true, S)};
+        _                      -> {FeedId, ebt_vc:encode_clock_int(true, true, 0)}
+    catch
+        _:_ ->
+            ?SSB_DEBUG("EBT: skipping busy/unavailable feed in clock: ~p~n", [FeedId]),
+            skip
+    end.
 
 %% Decode an incoming message and store it in the appropriate feed.
 %% Body is the value-only JSON (no key/timestamp wrapper), as sent by EBT
