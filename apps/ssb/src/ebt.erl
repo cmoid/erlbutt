@@ -49,19 +49,31 @@ initial_vector() ->
 %% replication set.  Each entry is {FeedId, encoded_int} with receive=true so
 %% the peer pushes us updates.
 full_clock() ->
-    Entries = ets:tab2list(ssb_feed_registry),
+    %% Build the clock from our replication set (the feeds we WANT), not just the
+    %% in-memory feed registry.  Feeds load lazily, so right after a restart the
+    %% registry is empty — advertising only registry feeds made us send an empty
+    %% clock `{}` and request nothing, so the peer pushed nothing and replication
+    %% (and therefore blob discovery) stalled until the registry happened to warm
+    %% up.  Loading each replication-set feed here also drives the bootstrap: we
+    %% advertise wanting it (at seq 0 when we hold nothing), the peer pushes it,
+    %% and the set grows as we learn follows-of-follows.
     {lists:filtermap(
-       fun({FeedId, Pid}) ->
-               case is_process_alive(Pid) andalso replicate_feed(FeedId) of
-                   true ->
+       fun(FeedId) ->
+               case utils:find_or_create_feed_pid(FeedId) of
+                   bad -> false;
+                   Pid ->
                        case clock_entry_for(FeedId, Pid) of
                            skip  -> false;
                            Entry -> {true, Entry}
-                       end;
-                   false ->
-                       false
+                       end
                end
-       end, Entries)}.
+       end, repl_set_feeds())}.
+
+%% Feed ids in our current replication set (see recompute_repl_set/0).
+repl_set_feeds() ->
+    try [FeedId || {FeedId} <- ets:tab2list(?REPL_SET)]
+    catch error:badarg -> []
+    end.
 
 %% Whether we replicate (store/serve) FeedId: our own feed, anyone within our
 %% follow horizon, or an explicit room member — minus anyone we block.  Reads
@@ -324,6 +336,14 @@ full_clock_test() ->
     _ = utils:find_or_create_feed_pid(FeedB),
     _ = utils:find_or_create_feed_pid(OwnFeed),
 
+    %% full_clock/0 builds from the replication set, so seed it directly here
+    %% (this unit test has no friends graph to drive recompute_repl_set/0).
+    case ets:info(?REPL_SET) of
+        undefined -> ets:new(?REPL_SET, [set, named_table, public]);
+        _         -> ets:delete_all_objects(?REPL_SET)
+    end,
+    [ets:insert(?REPL_SET, {F}) || F <- [FeedA, FeedB, OwnFeed]],
+
     {Clock} = full_clock(),
     ?assert(is_list(Clock)),
 
@@ -337,6 +357,10 @@ full_clock_test() ->
         {true, true, Seq} = ebt_vc:decode_clock_int(Enc),
         ?assert(Seq >= 0)
     end, Clock),
+
+    %% We created ?REPL_SET ourselves (ebt is not started in this test); drop it
+    %% so later tests' ebt:init/1 can create it fresh.
+    catch ets:delete(?REPL_SET),
 
     process_flag(trap_exit, true),
     exit(whereis(ssb_feed_sup), shutdown),
