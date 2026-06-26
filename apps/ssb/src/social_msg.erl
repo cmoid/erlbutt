@@ -25,6 +25,24 @@ dispatch(#message{author = Author, content = {Props}}) ->
     blob_fetcher:want_refs({Props}),
     Type = ?pgv(~"type", Props),
     dispatch_type(Type, Author, Props);
+%% Private (encrypted) messages addressed to us: the content is a ".box"
+%% string, so the clause above can't see inside it. Decrypt with our key and,
+%% if it is for us, request any blob the sender attached (e.g. an image in a
+%% DM). We only extract blob refs here — we do not run dispatch_type on
+%% private content.
+dispatch(#message{content = Content}) when is_binary(Content) ->
+    case private_box:decrypt(Content) of
+        {ok, Plain} ->
+            %% Decrypted content is normally a JSON object, but a DM body can be
+            %% any plaintext — nat_decode throws on non-JSON, so guard it.
+            try utils:nat_decode(Plain) of
+                {Props} -> blob_fetcher:want_refs({Props});
+                _       -> ok
+            catch _:_ -> ok
+            end;
+        _ ->
+            ok
+    end;
 dispatch(_) ->
     ok.
 
