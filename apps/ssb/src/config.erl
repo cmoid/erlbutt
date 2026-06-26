@@ -18,6 +18,7 @@
          set_archive_length/1,
          replication_hops/0,
          dialer_enabled/0,
+         blob_scan_enabled/0,
          is_room/0,
          room_name/0,
          room_privacy/0]).
@@ -37,6 +38,7 @@
                 archive_length = ?DEFAULT_ARCHIVE_LENGTH,
                 replication_hops = ?DEFAULT_REPLICATION_HOPS,
                 dialer = true,
+                blob_scan = false,
                 room = false,
                 room_name = <<"erlbutt room">>,
                 room_privacy = open}).
@@ -74,6 +76,12 @@ replication_hops() ->
 %% Set {peer_dialer, false}. in ssb.cfg to start with dialing off.
 dialer_enabled() ->
     gen_server:call(?MODULE, dialer_enabled, infinity).
+
+%% Whether to scan existing on-disk messages for blob references at startup
+%% and fetch any we don't already hold.  Off by default (it folds the whole
+%% log); enable with {blob_scan, true}. in ssb.cfg.
+blob_scan_enabled() ->
+    gen_server:call(?MODULE, blob_scan, infinity).
 
 %% Whether this node acts as an SSB room (connection relay).
 is_room() ->
@@ -152,6 +160,9 @@ handle_call({set_archive_length, Len}, _From, State) ->
 handle_call(dialer_enabled, _From, #state{dialer = Dialer}=State) ->
     {reply, Dialer, State};
 
+handle_call(blob_scan, _From, #state{blob_scan = Scan}=State) ->
+    {reply, Scan, State};
+
 handle_call(is_room, _From, #state{room = Room}=State) ->
     {reply, Room, State};
 
@@ -211,6 +222,9 @@ parse({replication_hops, Hops}, State) when is_integer(Hops), Hops >= 0 ->
 
 parse({peer_dialer, Bool}, State) when is_boolean(Bool) ->
     State#state{dialer = Bool};
+
+parse({blob_scan, Bool}, State) when is_boolean(Bool) ->
+    State#state{blob_scan = Bool};
 
 parse({room, Bool}, State) when is_boolean(Bool) ->
     State#state{room = Bool};
