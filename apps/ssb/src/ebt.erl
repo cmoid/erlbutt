@@ -196,8 +196,8 @@ handle_clock(ReqNo, {PeerClock}, Socket, Nonce, Key) ->
     lists:foldl(fun({FeedId, EncodedInt}, {NonceAcc, Fc}) ->
                         check_feed_cnt(Fc),
                         {Rep, Rec, PeerSeq} = ebt_vc:decode_clock_int(EncodedInt),
-                        ?SSB_DEBUG("EBT: decode vector to ~p for feed ~p ~n", [{Rep, Rec, PeerSeq},
-                            {FeedId, EncodedInt}]),
+                        %%?SSB_DEBUG("EBT: decode vector to ~p for feed ~p ~n", [{Rep, Rec, PeerSeq},
+                        %%    {FeedId, EncodedInt}]),
                         {send_feed_msgs_after(FeedId, {Rep, Rec,PeerSeq}, -ReqNo, Socket, NonceAcc, Key), Fc + 1}
                 end, {Nonce, 0}, PeerClock),
     ?SSB_DEBUG("EBT: handle_clock: processed ~p clocks ~n", [Cnt]),
@@ -250,7 +250,7 @@ send_msg_data(MsgData, OutReqNo, Socket, Nonce, Key) ->
     SendData = iolist_to_binary(
                    message:ssb_encoder(proplists:get_value(~"value", PropList),
                                        fun message:ssb_encoder/3, [pretty, use_nil])),
-    ?SSB_DEBUG("EBT: sending msg ~p to output req ~p~n", [SendData, OutReqNo]),
+    %%?SSB_DEBUG("EBT: sending msg ~p to output req ~p~n", [SendData, OutReqNo]),
     Flags = rpc_processor:create_flags(1, 0, 2),
     Header = rpc_processor:create_header(Flags, size(SendData), OutReqNo),
     utils:send_data(utils:combine(Header, SendData), Socket, Nonce, Key).
