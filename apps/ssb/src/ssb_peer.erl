@@ -227,7 +227,8 @@ init([Ip, Port, PubKey]) ->
                 end
             catch
                 error:Reason ->
-                    {stop, Reason}
+                    log_handshake_failure(outbound, Reason),
+                    {stop, normal}
             end
     end;
 
@@ -293,9 +294,10 @@ handle_info({tcp, Socket, Data},
         end
     catch
         error:Reason ->
-            ?SSB_ERROR("Unable to shake hands with stranger ~p ~n",
-                   [Reason]),
-            {stop, Reason}
+            log_handshake_failure(inbound, Reason),
+            %% A rejected handshake is routine; stop with a shutdown reason so
+            %% it doesn't emit a crash report / ranch error.
+            {stop, {shutdown, handshake_failed}, State}
     end;
 
 %% This function is called after the handshake is complete
@@ -808,6 +810,20 @@ rpc_parse(Data, #sbox_state{socket = Socket,
 network_error(Reason, State) ->
     ?SSB_ERROR("Network error ~p ~n",[Reason]),
     stop({shutdown, conn_closed}, State).
+
+%% Failed handshakes are routine — port scanners, peers on a different network,
+%% or a peer dialing a stale/wrong key for this node. Log one concise line
+%% rather than letting the raw exit produce a full crash report.
+%%   - no_matching_network_id : hello matched none of our network ids
+%%   - {badmatch, <<"bad">>}  : right network id, but the identity/signature box
+%%                              failed to verify (shs:open_box returns <<"bad">>)
+log_handshake_failure(Dir, no_matching_network_id) ->
+    ?SSB_INFO("~p handshake rejected: unknown network id~n", [Dir]);
+log_handshake_failure(Dir, {badmatch, <<"bad">>}) ->
+    ?SSB_INFO("~p handshake rejected: identity verification failed "
+              "(peer dialed a stale/wrong key, or bad handshake)~n", [Dir]);
+log_handshake_failure(Dir, Reason) ->
+    ?SSB_INFO("~p handshake failed: ~p~n", [Dir, Reason]).
 
 stop(Reason, State) ->
     {stop, Reason, State}.
