@@ -111,11 +111,20 @@ load_term(IoDev) ->
     case file:read(IoDev, 4) of
         {ok, <<TermLenInt:32/integer>>} ->
             case file:read(IoDev, TermLenInt) of
-                {ok, TermData} ->
+                {ok, TermData} when byte_size(TermData) == TermLenInt ->
                     check_data(IoDev, TermData, TermLenInt);
+                %% Short read: a torn final record (we no longer fsync each
+                %% write, so a record can be partially flushed). Stop cleanly.
+                {ok, _Partial} ->
+                    {error, truncated};
+                eof ->
+                    {error, truncated};
                 {error, Reason} ->
                     {error, Reason}
             end;
+        %% Fewer than 4 bytes left: a torn length prefix — treat as end.
+        {ok, _Partial} ->
+            {error, truncated};
         eof ->
             {error, eof};
         {error, Reason} ->
@@ -123,16 +132,18 @@ load_term(IoDev) ->
     end.
 
 check_data(IoDev, Data, Len) ->
+    %% The term length is repeated after the term as an integrity check.
+    %% file:read returns the bare atom `eof` (not {error,eof}) at end of file;
+    %% a torn record with no trailing length must end the fold, not crash.
     case file:read(IoDev, 4) of
-        {ok, TermLen} ->
-            <<TermLenInt:32/integer>> = TermLen,
-            %% the length of the term is also stored at the end of the term
-            %% and can be used to check
-            if TermLenInt == Len ->
-                    {ok, Data};
-               true ->
-                    {error, data_size_no_match}
-            end;
+        {ok, <<Len:32/integer>>} ->
+            {ok, Data};
+        {ok, <<_:32/integer>>} ->
+            {error, data_size_no_match};
+        {ok, _Partial} ->
+            {error, truncated};
+        eof ->
+            {error, truncated};
         {error, Reason} ->
             {error, Reason}
     end.
@@ -262,6 +273,20 @@ log(Info) ->
 combine_test() ->
     ~"foo" = combine(nil, ~"foo"),
     ~"foobar" = combine(~"foo",~"bar").
+
+%% fold_log_file must return the complete records and stop cleanly when the
+%% file ends in a torn record (possible now that writes are not fsync'd),
+%% rather than crashing on the bare `eof` from file:read.
+fold_log_truncated_test() ->
+    File = "test/fold_torn.offset",
+    Rec  = fun(M) -> L = byte_size(M), <<L:32, M/binary, L:32, 0:32>> end,
+    Torn = fun(M) -> L = byte_size(M), <<L:32, M/binary>> end,  %% no trailing len
+    ok = file:write_file(File, <<(Rec(~"one"))/binary,
+                                 (Rec(~"two"))/binary,
+                                 (Torn(~"three"))/binary>>),
+    Got = fold_log_file(fun(D, Acc) -> [D | Acc] end, [], File),
+    ?assertEqual([~"one", ~"two"], lists:reverse(Got)),
+    file:delete(File).
 
 create_pid_test() ->
     config:start_link("test/ssb.cfg"),
