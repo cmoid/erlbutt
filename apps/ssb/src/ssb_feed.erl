@@ -452,7 +452,16 @@ has_target(Msg, Id, RootId) ->
     end.
 
 open_file(File) ->
-    Open = file:open(File, [append, sync]),
+    %% NOTE: do NOT use the `sync` flag here. It forces an fsync on every
+    %% file:write, and write_msg does two writes per call for both the
+    %% per-feed and the global log.offset (plus profile/contacts) — i.e.
+    %% several fsyncs per stored message. On Linux that is ~60ms each, which
+    %% throttled EBT replication to ~4 msgs/sec and left peers stuck in
+    %% "Downloading new messages"/"Scuttling…" during a full-DB sync. Plain
+    %% [append] still writes through to the OS (so filelib:file_size and the
+    %% on-disk frame layout stay correct); the OS flushes lazily, and any
+    %% messages lost in a crash are recovered by re-replication.
+    Open = file:open(File, [append]),
     case Open of
         {ok, F} ->
             F;
