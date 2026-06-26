@@ -387,9 +387,16 @@ handle_info({stream_done, Ref},
     end;
 
 handle_info({blob_collected, Ref, Data},
-            #sbox_state{pending_fetch = {From, Ref}} = State) ->
-    gen_server:reply(From, {ok, Data}),
-    {noreply, State#sbox_state{pending_fetch = undefined}};
+            #sbox_state{pending_fetch = PendingFetch} = State) ->
+    %% pending_fetch is keyed by Ref so concurrent fetch_blob calls (e.g. the
+    %% startup blob scan firing many at once) each get their own reply.
+    case maps:take(Ref, PendingFetch) of
+        {From, Rest} ->
+            gen_server:reply(From, {ok, Data}),
+            {noreply, State#sbox_state{pending_fetch = Rest}};
+        error ->
+            {noreply, State}
+    end;
 
 handle_info({has_collected, Ref, Result},
             #sbox_state{pending_has = {From, Ref}} = State) ->
@@ -544,7 +551,8 @@ handle_call({fetch_blob, BlobId}, From,
             #sbox_state{socket = Socket,
                         enc_sbox_key = EncBoxKey,
                         enc_nonce = EncNonce,
-                        rpc_proc = RpcProc} = State) ->
+                        rpc_proc = RpcProc,
+                        pending_fetch = PendingFetch} = State) ->
     {ReqNo, State1} = next_req(State),
     Ref = make_ref(),
     SelfPid = self(),
@@ -552,7 +560,7 @@ handle_call({fetch_blob, BlobId}, From,
     ok = rpc_processor:register_stream(RpcProc, -ReqNo, {blob_get_client, SinkPid}),
     NewEncNonce = send_blob_get(Socket, EncBoxKey, EncNonce, BlobId, ReqNo),
     {noreply, State1#sbox_state{enc_nonce = NewEncNonce,
-                                pending_fetch = {From, Ref}}};
+                                pending_fetch = PendingFetch#{Ref => From}}};
 
 
 handle_call({has_blob, BlobId}, From,

@@ -108,7 +108,7 @@
                 %% Monotonically increasing counter for outbound RPC request numbers.
                 req_counter = 0,
                 %% Deferred reply for an in-flight fetch_blob call: {From, Ref}
-                pending_fetch = undefined,
+                pending_fetch = #{},
                 %% Deferred reply for an in-flight has_blob call: {From, Ref}
                 pending_has = undefined,
                 %% In-flight sync RPC calls: #{Ref => From}
