@@ -531,8 +531,16 @@ tunnel_relay_member(Calls, ReqNo, Args, Socket, Nonce, SecretBoxKey) ->
             OwnerPid = owner(Calls),
             {ok, Bridge} = tunnel_bridge:start(OwnerPid, ReqNo, TargetPid, Args),
             ets:insert(Calls, {ReqNo, {tunnel_relay, Bridge}}),
+            %% PROBE: relay accepted — target was found and a bridge spawned.
+            ?SSB_INFO("ROOMDBG relay target=~p FOUND pid=~p bridge=~p reqno=~p~n",
+                      [Target, TargetPid, Bridge, ReqNo]),
             Nonce;
         _ ->
+            %% PROBE: relay rejected — target not in room_attendants. If you see
+            %% this, the attendant disconnected (or never registered) between the
+            %% snapshot and the connect; manyverse will unstage it.
+            ?SSB_INFO("ROOMDBG relay target=~p NOT connected; sending error~n",
+                      [Target]),
             tunnel_error(ReqNo, ~"target not connected", Socket, Nonce, SecretBoxKey)
     end.
 

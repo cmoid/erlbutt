@@ -33,19 +33,31 @@ init(PidB, ReqNoB, PidA, Args) ->
     {ok, ReqNoA} = ssb_peer:open_duplex(PidA, [?tunnel, ?connect], Args, self()),
     erlang:monitor(process, PidA),
     erlang:monitor(process, PidB),
+    %% PROBE: bridge is up. ReqNoB=caller(B) side, ReqNoA=target(A=poncho) side.
+    %% Watch for B->A (caller's inner-SHS bytes reaching the target) and A->B
+    %% (target answering). B->A but never A->B means poncho isn't engaging the
+    %% relayed tunnel.connect.
+    ?SSB_INFO("ROOMDBG bridge up reqB=~p reqA=~p (B=~p A=~p)~n",
+              [ReqNoB, ReqNoA, PidB, PidA]),
     loop(PidB, ReqNoB, PidA, ReqNoA).
 
 loop(PidB, ReqNoB, PidA, ReqNoA) ->
     receive
         %% Frame from the caller (B → A): forward on A's outbound (+ReqNoA).
         {tunnel_data, ReqNoB, Body} ->
+            ?SSB_INFO("ROOMDBG bridge B->A ~p bytes (reqA=~p)~n",
+                      [byte_size(Body), ReqNoA]),
             ssb_peer:send_frame(PidA, ReqNoA, Body),
             loop(PidB, ReqNoB, PidA, ReqNoA);
         %% Frame from the target (A → B): forward on B's response (-ReqNoB).
         {tunnel_data, NegReqNoA, Body} when NegReqNoA =:= -ReqNoA ->
+            ?SSB_INFO("ROOMDBG bridge A->B ~p bytes (reqB=~p)~n",
+                      [byte_size(Body), ReqNoB]),
             ssb_peer:send_frame(PidB, -ReqNoB, Body),
             loop(PidB, ReqNoB, PidA, ReqNoA);
         {'DOWN', _Ref, process, _Pid, _Reason} ->
+            ?SSB_INFO("ROOMDBG bridge DOWN, tearing down reqB=~p reqA=~p~n",
+                      [ReqNoB, ReqNoA]),
             ok;
         _Other ->
             loop(PidB, ReqNoB, PidA, ReqNoA)
