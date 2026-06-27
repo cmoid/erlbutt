@@ -51,6 +51,7 @@
 -define(room, <<"room">>).
 -define(metadata, <<"metadata">>).
 -define(attendants, <<"attendants">>).
+-define(endpoints, <<"endpoints">>).
 -define(connect, <<"connect">>).
 -define(createwants, <<"createWants">>).
 -define(blobsget, <<"get">>).
@@ -135,6 +136,10 @@
                 %% (when this node is a room).  Presence updates are pushed on
                 %% -attendants_req.  undefined when no such stream is open.
                 attendants_req = undefined,
+                %% Positive ReqNo of a peer's tunnel.endpoints source stream
+                %% (rooms 1.0 analogue of room.attendants).  The full id array
+                %% is re-emitted on -endpoints_req on every join/leave.
+                endpoints_req = undefined,
                 %% Tunnel mode only: the ReqNo on which inner frames arrive as
                 %% {tunnel_data, recv_req, Body}.  undefined for socket peers.
                 recv_req = undefined}).

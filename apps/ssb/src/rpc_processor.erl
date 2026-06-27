@@ -173,6 +173,7 @@ dispatch(Calls, ReqNo, Body, Socket, Nonce, SecretBoxKey) ->
         #ssb_rpc{name = [?blobs, ?createwants]} -> {wants_stream, ReqNo};
         #ssb_rpc{name = [?ebt,   ~"replicate"]} -> {ebt_stream,   ReqNo};
         #ssb_rpc{name = [?room,  ?attendants]}  -> {attendants_stream, ReqNo};
+        #ssb_rpc{name = [?tunnel, ?endpoints]}  -> {endpoints_stream, ReqNo};
         _                                        -> none
     end,
     {NewNonce, Tag}.
@@ -397,6 +398,20 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?room, ?attendants]}
     ?SSB_INFO("ROOMDBG room.attendants subscribe from=~p snapshot_ids=~p~n",
               [caller_feed_id(Calls), Ids]),
     Body = utils:encode_rec({[{~"type", ~"state"}, {~"ids", Ids}]}),
+    Flags = create_flags(1, 0, 2),
+    Header = create_header(Flags, size(Body), -ReqNo),
+    utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?tunnel, ?endpoints]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    %% Rooms 1.0 presence: a source stream whose values are the full array of
+    %% attendant ids (vs room.attendants' {type,id} deltas).  ssb_peer re-emits
+    %% the updated array on every join/leave (see {endpoints_stream, ReqNo}).
+    ets:insert(Calls, {ReqNo, noop}),
+    Ids = room_attendants:list(),
+    ?SSB_INFO("ROOMDBG tunnel.endpoints subscribe from=~p snapshot_ids=~p~n",
+              [caller_feed_id(Calls), Ids]),
+    Body = utils:encode_rec(Ids),
     Flags = create_flags(1, 0, 2),
     Header = create_header(Flags, size(Body), -ReqNo),
     utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);

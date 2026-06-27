@@ -435,25 +435,41 @@ handle_info(ebt_anti_entropy, #sbox_state{ebt_active = true,
 handle_info(ebt_anti_entropy, State) ->
     {noreply, State};
 
-%% A peer joined/left the room; push an update on this peer's room.attendants
-%% stream.  Sent on -attendants_req using our own enc_nonce.
+%% A peer joined/left the room; push presence updates on whichever stream(s)
+%% this peer opened: room.attendants (2.0, {type,id} deltas) and/or
+%% tunnel.endpoints (1.0, the full id array).  Sends use our own enc_nonce,
+%% chained across both so the box-stream nonce stays ordered.
 handle_info({room_event, Kind, FeedId},
-            #sbox_state{attendants_req = ReqNo,
+            #sbox_state{attendants_req = AReq,
+                        endpoints_req = EReq,
                         socket = Socket,
                         enc_sbox_key = Key,
                         enc_nonce = Nonce} = State)
-  when ReqNo =/= undefined ->
-    Body = utils:encode_rec({[{~"type", atom_to_binary(Kind, utf8)},
-                              {~"id", FeedId}]}),
+  when AReq =/= undefined orelse EReq =/= undefined ->
     Flags = rpc_processor:create_flags(1, 0, 2),
-    %% PROBE: a joined/left event being pushed on an open room.attendants
-    %% stream (-ReqNo). Pairs with the room.attendants snapshot log; if you see
-    %% the snapshot but never these, late joiners won't appear in the client.
-    ?SSB_INFO("ROOMDBG push room_event ~p id=~p on attendants_req=~p~n",
-              [Kind, FeedId, ReqNo]),
-    Header = rpc_processor:create_header(Flags, size(Body), -ReqNo),
-    NewNonce = send_data(combine(Header, Body), Socket, Nonce, Key),
-    {noreply, State#sbox_state{enc_nonce = NewNonce}};
+    %% room.attendants (2.0): the {type,id} delta on -AReq.
+    Nonce1 = case AReq of
+        undefined -> Nonce;
+        _ ->
+            ABody = utils:encode_rec({[{~"type", atom_to_binary(Kind, utf8)},
+                                       {~"id", FeedId}]}),
+            ?SSB_INFO("ROOMDBG push room_event ~p id=~p on attendants_req=~p~n",
+                      [Kind, FeedId, AReq]),
+            AHeader = rpc_processor:create_header(Flags, size(ABody), -AReq),
+            send_data(combine(AHeader, ABody), Socket, Nonce, Key)
+    end,
+    %% tunnel.endpoints (1.0): re-emit the full attendant id array on -EReq.
+    Nonce2 = case EReq of
+        undefined -> Nonce1;
+        _ ->
+            Ids = room_attendants:list(),
+            EBody = utils:encode_rec(Ids),
+            ?SSB_INFO("ROOMDBG push endpoints ~p ids on endpoints_req=~p~n",
+                      [length(Ids), EReq]),
+            EHeader = rpc_processor:create_header(Flags, size(EBody), -EReq),
+            send_data(combine(EHeader, EBody), Socket, Nonce1, Key)
+    end,
+    {noreply, State#sbox_state{enc_nonce = Nonce2}};
 
 handle_info({room_event, _Kind, _FeedId}, State) ->
     {noreply, State};
@@ -799,6 +815,11 @@ rpc_parse(Data, #sbox_state{socket = Socket,
             %% events are pushed on -ReqNo from our handle_info.
             room_attendants:subscribe(self()),
             NewState0#sbox_state{attendants_req = ReqNo};
+        {endpoints_stream, ReqNo} ->
+            %% Peer opened tunnel.endpoints (rooms 1.0); subscribe so each
+            %% join/leave re-emits the full id array on -ReqNo.
+            room_attendants:subscribe(self()),
+            NewState0#sbox_state{endpoints_req = ReqNo};
         _ ->
             case NewState0#sbox_state.ebt_active of
                 true  -> NewState0#sbox_state{ebt_last_rx = erlang:system_time(second)};
