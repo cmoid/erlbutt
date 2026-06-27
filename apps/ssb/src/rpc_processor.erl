@@ -357,12 +357,19 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?tunnel, ?isRoom],
 
 proc_request(Calls, ReqNo, #ssb_rpc{name = [?room, ?metadata]}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
-    %% Open rooms admit anyone; community/restricted rooms report whether the
-    %% caller has joined (redeemed an invite — see room_store / invite.use).
+    %% When not configured as a room, answer plain `false` so clients don't
+    %% treat us as one (matches tildefriends/go-ssb-room).  Otherwise: open
+    %% rooms admit anyone; community/restricted rooms report whether the caller
+    %% has joined (redeemed an invite — see room_store / invite.use).
     IsMember = room_caller_allowed(Calls),
-    Body = utils:encode_rec({[{~"name", config:room_name()},
-                              {~"membership", IsMember},
-                              {~"features", [?tunnel, ~"room1", ~"room2"]}]}),
+    Body = case config:is_room() of
+        false ->
+            iolist_to_binary(message:ssb_encoder(false, fun message:ssb_encoder/3, [pretty]));
+        true ->
+            utils:encode_rec({[{~"name", config:room_name()},
+                               {~"membership", IsMember},
+                               {~"features", [?tunnel, ~"room1", ~"room2"]}]})
+    end,
     %% async reply: stream=0,end=0 (see tunnel.isRoom note). With stream/end set,
     %% the client's room.metadata() promise never resolves and it never goes on
     %% to subscribe room.attendants.

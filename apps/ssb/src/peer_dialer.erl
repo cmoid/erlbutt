@@ -39,9 +39,15 @@ start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 %% Kick an immediate dial pass — call when a new peer is discovered.
+%% Safe before peer_dialer has started (it is one of the last children to
+%% boot, while heartbeat — which calls this on every LAN broadcast — is one of
+%% the first): a bare `!` to an unregistered name is a badarg that would crash
+%% the caller, so guard on whereis/1.
 trigger() ->
-    ?MODULE ! poll,
-    ok.
+    case whereis(?MODULE) of
+        undefined -> ok;
+        Pid       -> Pid ! poll, ok
+    end.
 
 %% Turn automatic dialing on (kicks an immediate pass) or off.  The poll
 %% timer keeps running while disabled; passes are skipped.
