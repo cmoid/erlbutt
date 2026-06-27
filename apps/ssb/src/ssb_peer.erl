@@ -446,6 +446,11 @@ handle_info({room_event, Kind, FeedId},
     Body = utils:encode_rec({[{~"type", atom_to_binary(Kind, utf8)},
                               {~"id", FeedId}]}),
     Flags = rpc_processor:create_flags(1, 0, 2),
+    %% PROBE: a joined/left event being pushed on an open room.attendants
+    %% stream (-ReqNo). Pairs with the room.attendants snapshot log; if you see
+    %% the snapshot but never these, late joiners won't appear in the client.
+    ?SSB_INFO("ROOMDBG push room_event ~p id=~p on attendants_req=~p~n",
+              [Kind, FeedId, ReqNo]),
     Header = rpc_processor:create_header(Flags, size(Body), -ReqNo),
     NewNonce = send_data(combine(Header, Body), Socket, Nonce, Key),
     {noreply, State#sbox_state{enc_nonce = NewNonce}};

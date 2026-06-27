@@ -333,10 +333,14 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobsget],
             utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey)
     end;
 
-proc_request(_Calls, ReqNo, #ssb_rpc{name = [?tunnel, ?isRoom],
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?tunnel, ?isRoom],
                              args = []}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
-    ?SSB_INFO("ROOMDBG peer probed tunnel.isRoom; answering ~p~n", [config:is_room()]),
+    %% PROBE: a rooms-2.0 client (manyverse) only calls this when room.metadata
+    %% came back as "method missing"; poncho (1.0) always calls it. So seeing
+    %% this from manyverse means it rejected our metadata reply above.
+    ?SSB_INFO("ROOMDBG tunnel.isRoom (1.0 path) from=~p answering ~p~n",
+              [caller_feed_id(Calls), config:is_room()]),
     Flags = create_flags(1, 1, 2),
     Body = iolist_to_binary(message:ssb_encoder(config:is_room(),
                                                 fun message:ssb_encoder/3, [pretty])),
@@ -348,19 +352,27 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?room, ?metadata]}
     %% Open rooms admit anyone; community/restricted rooms report whether the
     %% caller has joined (redeemed an invite — see room_store / invite.use).
     IsMember = room_caller_allowed(Calls),
-    ?SSB_INFO("ROOMDBG peer requested room.metadata; membership=~p privacy=~p~n",
-              [IsMember, config:room_privacy()]),
     Body = utils:encode_rec({[{~"name", config:room_name()},
                               {~"membership", IsMember},
                               {~"features", [?tunnel, ~"room1", ~"room2"]}]}),
     Flags = create_flags(1, 1, 2),
+    %% PROBE: caller, what we report, and the exact reply bytes. If manyverse
+    %% stays on the 2.0 path you should see this (and NOT tunnel.isRoom) per
+    %% connection; the body here is what feeds room-observer's features.
+    ?SSB_INFO("ROOMDBG room.metadata from=~p membership=~p privacy=~p "
+              "flags=~p reply=~s~n",
+              [caller_feed_id(Calls), IsMember, config:room_privacy(),
+               Flags, Body]),
     Header = create_header(Flags, size(Body), -ReqNo),
     utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
 
 proc_request(Calls, ReqNo, #ssb_rpc{name = [?tunnel, ?connect], args = Args}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
-    ?SSB_INFO("ROOMDBG peer sent tunnel.connect (is_room=~p) args=~p~n",
-              [config:is_room(), Args]),
+    %% PROBE: this is the payoff — a peer asking us to relay to `target`. If you
+    %% never see this when tapping an attendant in manyverse, the client never
+    %% got a usable attendant from the steps above.
+    ?SSB_INFO("ROOMDBG tunnel.connect from=~p (is_room=~p) args=~p~n",
+              [caller_feed_id(Calls), config:is_room(), Args]),
     case config:is_room() of
         true  -> tunnel_relay_connect(Calls, ReqNo, Args, Socket, Nonce, SecretBoxKey);
         false -> tunnel_accept_connect(Calls, ReqNo, Args, Socket, Nonce, SecretBoxKey)
@@ -370,10 +382,14 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?room, ?attendants]}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     %% Send the current presence snapshot; subsequent joined/left updates are
     %% pushed by ssb_peer (see the {attendants_stream, ReqNo} dispatch tag).
-    ?SSB_INFO("ROOMDBG peer subscribed to room.attendants; current=~p~n",
-              [room_attendants:list()]),
     ets:insert(Calls, {ReqNo, noop}),
     Ids = room_attendants:list(),
+    %% PROBE: who subscribed and the snapshot they get. If `ids` here excludes
+    %% the other clients you expect (or is just the subscriber), there is
+    %% nobody for manyverse to tunnel to — that's a presence problem, not a
+    %% detection one. Watch for follow-up "room_event joined" pushes too.
+    ?SSB_INFO("ROOMDBG room.attendants subscribe from=~p snapshot_ids=~p~n",
+              [caller_feed_id(Calls), Ids]),
     Body = utils:encode_rec({[{~"type", ~"state"}, {~"ids", Ids}]}),
     Flags = create_flags(1, 0, 2),
     Header = create_header(Flags, size(Body), -ReqNo),
