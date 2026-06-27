@@ -271,7 +271,10 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = Name}
 proc_request(Calls, ReqNo, #ssb_rpc{name = [?gossip, ?ping],
                              args = [{_Args}]}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
-    ets:insert(Calls, {ReqNo, noop}),
+    %% gossip.ping is a long-lived liveness duplex: answer this frame AND
+    %% register the stream so every later ping frame is answered too (see
+    %% gossip_ping:handle_data).
+    ets:insert(Calls, {ReqNo, gossip_ping}),
     Flags = create_flags(1,0,2),
     TimeStamp = iolist_to_binary(message:ssb_encoder(integer_to_binary(current_time()),
                                     fun message:ssb_encoder/3, [pretty])),
