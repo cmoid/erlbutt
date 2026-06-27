@@ -200,7 +200,7 @@ handle_clock(ReqNo, {PeerClock}, Socket, Nonce, Key) ->
                         %%    {FeedId, EncodedInt}]),
                         {send_feed_msgs_after(FeedId, {Rep, Rec,PeerSeq}, -ReqNo, Socket, NonceAcc, Key), Fc + 1}
                 end, {Nonce, 0}, PeerClock),
-    ?SSB_DEBUG("EBT: handle_clock: processed ~p clocks ~n", [Cnt]),
+    ?SSB_INFO("EBT: handle_clock: processed ~p clocks ~n", [Cnt]),
     NewNonce.
 
 send_feed_msgs_after(_, {false, _, _}, _, _, Nonce, _) -> Nonce;
