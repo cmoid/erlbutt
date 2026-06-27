@@ -271,10 +271,11 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = Name}
 proc_request(Calls, ReqNo, #ssb_rpc{name = [?gossip, ?ping],
                              args = [{_Args}]}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
-    %% gossip.ping is a long-lived liveness duplex: answer this frame AND
-    %% register the stream so every later ping frame is answered too (see
-    %% gossip_ping:handle_data).
-    ets:insert(Calls, {ReqNo, gossip_ping}),
+    %% gossip.ping is pull-ping: a 5-minute keepalive volley, NOT a 30s liveness
+    %% check.  Answer the opening frame once and mark the stream noop.  Do NOT
+    %% volley every frame: combined with this unprompted reply it desyncs
+    %% pull-ping's serve/volley alternation into a tight RTT-speed loop.
+    ets:insert(Calls, {ReqNo, noop}),
     Flags = create_flags(1,0,2),
     TimeStamp = iolist_to_binary(message:ssb_encoder(integer_to_binary(current_time()),
                                     fun message:ssb_encoder/3, [pretty])),
@@ -393,11 +394,10 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?room, ?attendants]}
     %% Send the current presence snapshot; subsequent joined/left updates are
     %% pushed by ssb_peer (see the {attendants_stream, ReqNo} dispatch tag).
     ets:insert(Calls, {ReqNo, noop}),
-    Ids = room_attendants:list(),
-    %% PROBE: who subscribed and the snapshot they get. If `ids` here excludes
-    %% the other clients you expect (or is just the subscriber), there is
-    %% nobody for manyverse to tunnel to — that's a presence problem, not a
-    %% detection one. Watch for follow-up "room_event joined" pushes too.
+    Ids = other_attendants(Calls),
+    %% PROBE: who subscribed and the snapshot they get. An empty/short list when
+    %% you expect peers is a presence problem, not a detection one. Watch for
+    %% follow-up "room_event joined" pushes too.
     ?SSB_INFO("ROOMDBG room.attendants subscribe from=~p snapshot_ids=~p~n",
               [caller_feed_id(Calls), Ids]),
     Body = utils:encode_rec({[{~"type", ~"state"}, {~"ids", Ids}]}),
@@ -411,7 +411,7 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?tunnel, ?endpoints]}
     %% attendant ids (vs room.attendants' {type,id} deltas).  ssb_peer re-emits
     %% the updated array on every join/leave (see {endpoints_stream, ReqNo}).
     ets:insert(Calls, {ReqNo, noop}),
-    Ids = room_attendants:list(),
+    Ids = other_attendants(Calls),
     ?SSB_INFO("ROOMDBG tunnel.endpoints subscribe from=~p snapshot_ids=~p~n",
               [caller_feed_id(Calls), Ids]),
     Body = utils:encode_rec(Ids),
@@ -600,6 +600,12 @@ caller_feed_id(Calls) ->
         [{remote_pk, Pk}] -> <<"@", (base64:encode(Pk))/binary, ".ed25519">>;
         []                -> undefined
     end.
+
+%% Current attendants minus the caller: a client should not see itself in its
+%% own presence snapshot (room.attendants / tunnel.endpoints).
+other_attendants(Calls) ->
+    Self = caller_feed_id(Calls),
+    [Id || Id <- room_attendants:list(), Id =/= Self].
 
 tunnel_error(ReqNo, Reason, Socket, Nonce, SecretBoxKey) ->
     ErrMsg = utils:error_msg(~"Error", Reason),

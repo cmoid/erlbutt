@@ -442,15 +442,18 @@ handle_info(ebt_anti_entropy, State) ->
 handle_info({room_event, Kind, FeedId},
             #sbox_state{attendants_req = AReq,
                         endpoints_req = EReq,
+                        remote_pk = RemotePk,
                         socket = Socket,
                         enc_sbox_key = Key,
                         enc_nonce = Nonce} = State)
   when AReq =/= undefined orelse EReq =/= undefined ->
     Flags = rpc_processor:create_flags(1, 0, 2),
-    %% room.attendants (2.0): the {type,id} delta on -AReq.
-    Nonce1 = case AReq of
-        undefined -> Nonce;
-        _ ->
+    %% room.attendants (2.0): the {type,id} delta on -AReq.  An event about the
+    %% subscriber itself is suppressed; a client doesn't list itself.
+    Self = feed_id(RemotePk),
+    Nonce1 = case AReq =/= undefined andalso FeedId =/= Self of
+        false -> Nonce;
+        true ->
             ABody = utils:encode_rec({[{~"type", atom_to_binary(Kind, utf8)},
                                        {~"id", FeedId}]}),
             ?SSB_INFO("ROOMDBG push room_event ~p id=~p on attendants_req=~p~n",
@@ -458,11 +461,12 @@ handle_info({room_event, Kind, FeedId},
             AHeader = rpc_processor:create_header(Flags, size(ABody), -AReq),
             send_data(combine(AHeader, ABody), Socket, Nonce, Key)
     end,
-    %% tunnel.endpoints (1.0): re-emit the full attendant id array on -EReq.
+    %% tunnel.endpoints (1.0): re-emit the full attendant id array (minus the
+    %% subscriber) on -EReq.
     Nonce2 = case EReq of
         undefined -> Nonce1;
         _ ->
-            Ids = room_attendants:list(),
+            Ids = [Id || Id <- room_attendants:list(), Id =/= Self],
             EBody = utils:encode_rec(Ids),
             ?SSB_INFO("ROOMDBG push endpoints ~p ids on endpoints_req=~p~n",
                       [length(Ids), EReq]),
