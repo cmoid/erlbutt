@@ -26,6 +26,8 @@ main(["ping"])            -> run(fun cmd_ping/1);
 main(["publish" | Args])  -> run(fun(P) -> cmd_publish(P, Args) end);
 main(["about" | Args])    -> run(fun(P) -> cmd_about(P, Args) end);
 main(["get", Key])        -> run(fun(P) -> cmd_get(P, Key) end);
+main(["invite", "create", Host, PortStr]) ->
+    run(fun(P) -> cmd_invite_create(P, Host, list_to_integer(PortStr)) end);
 main(["log"])             -> run(fun cmd_log/1);
 main(["feed"])            -> run(fun cmd_log/1);
 main(["hist", "--id", Id | Rest]) ->
@@ -159,6 +161,19 @@ cmd_get(Peer, Key) ->
             io:format("Error: ~p~n", [Err])
     end.
 
+%% Ask the running node to mint a pub invite code for clients reaching us at
+%% Host:Port. The node stores the invite keypair in its own invite_store so it
+%% can later validate the redemption (invite.use); creating it in this escript's
+%% process would store it in a store the node never sees.
+cmd_invite_create(Peer, Host, Port) ->
+    Args = [list_to_binary(Host), Port],
+    case ssb_peer:rpc_call(Peer, [<<"invite">>, <<"create">>], <<"async">>, Args) of
+        {ok, Body} ->
+            io:format("~s~n", [Body]);
+        Err ->
+            io:format("Error: ~p~n", [Err])
+    end.
+
 cmd_log(Peer) ->
     case ssb_peer:rpc_stream_call(Peer, [<<"createLogStream">>], []) of
         {ok, Bodies} ->
@@ -198,6 +213,7 @@ usage() ->
     io:format("  about [--name N] [--description D] [--image PATH]~n"),
     io:format("                                Set own profile name/description/avatar~n"),
     io:format("  get MSGKEY                    Fetch a message by key~n"),
+    io:format("  invite create HOST PORT       Mint a pub invite code~n"),
     io:format("  log                           Stream all messages~n"),
     io:format("  feed                          Alias for log~n"),
     io:format("  hist --id FEEDID [--limit N]  Stream one feed's history~n").

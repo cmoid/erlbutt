@@ -409,6 +409,16 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"],
             utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey)
     end;
 
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"invite", ~"create"],
+                             args = [Host, Port]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    {ok, Code} = invite:create(binary_to_list(Host), Port),
+    Body = iolist_to_binary(message:ssb_encoder({[{~"invite", Code}]},
+                              fun message:ssb_encoder/3, [])),
+    Flags  = create_flags(1, 1, 2),
+    Header = create_header(Flags, size(Body), -ReqNo),
+    utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+
 proc_request(Calls, ReqNo, #ssb_rpc{name = [~"invite", ~"use"],
                              args = [{ArgProps}]}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
