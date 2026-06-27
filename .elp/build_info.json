@@ -39,14 +39,6 @@
       "macros": {
         "TEST": "true"
       }
-    },
-    {
-      "name": "erlbutt",
-      "dir": "/Users/cmoid/code/erlbutt",
-      "src_dirs": [],
-      "macros": {
-        "TEST": "true"
-      }
     }
   ],
   "deps": []
