@@ -341,7 +341,10 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?tunnel, ?isRoom],
     %% this from manyverse means it rejected our metadata reply above.
     ?SSB_INFO("ROOMDBG tunnel.isRoom (1.0 path) from=~p answering ~p~n",
               [caller_feed_id(Calls), config:is_room()]),
-    Flags = create_flags(1, 1, 2),
+    %% async reply: stream=0,end=0. A stream/end-flagged reply is routed by the
+    %% caller's packet-stream to _onstream (no matching outstream) and dropped,
+    %% so the client's isRoom() promise never resolves.
+    Flags = create_flags(0, 0, 2),
     Body = iolist_to_binary(message:ssb_encoder(config:is_room(),
                                                 fun message:ssb_encoder/3, [pretty])),
     Header = create_header(Flags, size(Body), -ReqNo),
@@ -355,7 +358,10 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?room, ?metadata]}
     Body = utils:encode_rec({[{~"name", config:room_name()},
                               {~"membership", IsMember},
                               {~"features", [?tunnel, ~"room1", ~"room2"]}]}),
-    Flags = create_flags(1, 1, 2),
+    %% async reply: stream=0,end=0 (see tunnel.isRoom note). With stream/end set,
+    %% the client's room.metadata() promise never resolves and it never goes on
+    %% to subscribe room.attendants.
+    Flags = create_flags(0, 0, 2),
     %% PROBE: caller, what we report, and the exact reply bytes. If manyverse
     %% stays on the 2.0 path you should see this (and NOT tunnel.isRoom) per
     %% connection; the body here is what feeds room-observer's features.
