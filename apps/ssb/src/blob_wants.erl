@@ -79,7 +79,7 @@ have_reqno(RemoteWantsReq, _OurWantsReq) -> -RemoteWantsReq.
 respond_to_wants(undefined, _Props, _Socket, Nonce, _Key) ->
     Nonce;
 respond_to_wants(OurWantsReq, Props, Socket, Nonce, Key) ->
-    ?SSB_DEBUG("respond to wants: ~p for req: ~p~n", [Props, OurWantsReq]),
+    %%?SSB_DEBUG("respond to wants: ~p for req: ~p~n", [Props, OurWantsReq]),
     Haves = [{BlobId, BlobSize}
              || {BlobId, Val} <- Props,
                 Val < 0,
@@ -88,7 +88,7 @@ respond_to_wants(OurWantsReq, Props, Socket, Nonce, Key) ->
         [] ->
             Nonce;
         _ ->
-            ?SSB_DEBUG("blob_wants: ~p have ~p~n", [self(), Haves]),
+            %%?SSB_DEBUG("blob_wants: ~p have ~p~n", [self(), Haves]),
             HaveMsg = utils:encode_rec({Haves}),
             Flags   = rpc_processor:create_flags(1, 0, 2),
             Header  = rpc_processor:create_header(Flags, size(HaveMsg), OurWantsReq),
