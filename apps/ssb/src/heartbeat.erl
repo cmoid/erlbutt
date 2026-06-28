@@ -87,7 +87,13 @@ handle_info({udp, _PeerSocket, Ip, _Port, Data},
             #state{socket =_Socket}=State) ->
     %% don't talk to yourself, unless you want complete agreement
     IsSelf = local_ip_v4() == Ip,
-    record_peer(Ip, Data, IsSelf),
+    %% UDP broadcasts are untrusted input; never let a malformed one crash
+    %% heartbeat (it would cascade to a node restart via the supervisor).
+    try record_peer(Ip, Data, IsSelf)
+    catch Class:Reason ->
+        ?LOG_INFO("heartbeat: ignoring bad broadcast from ~p: ~p~n",
+                  [Ip, {Class, Reason}])
+    end,
     {noreply, State};
 
 handle_info(beat, #state{socket=Socket}=State) ->
@@ -132,31 +138,33 @@ record_peer(Ip, Data, _) ->
     PeerExists = ets:member(ssb_peers, Ip),
     case PeerExists of
         false ->
-            PubKey = extract_key(Data),
-            ?LOG_INFO("Heartbeat received from ~p ~n",[{Ip, utils:display_pub(PubKey)}]),
-            ets:insert(ssb_peers, {Ip, PubKey}),
-            peer_dialer:trigger();
+            case extract_key(Data) of
+                nokey ->
+                    %% Broadcast without a parseable shs key — ignore it rather
+                    %% than crash (a non-key value would blow up display_pub).
+                    ?LOG_INFO("Heartbeat from ~p had no shs key; ignoring ~n", [Ip]);
+                PubKey ->
+                    ?LOG_INFO("Heartbeat received from ~p ~n",[{Ip, utils:display_pub(PubKey)}]),
+                    ets:insert(ssb_peers, {Ip, PubKey}),
+                    peer_dialer:trigger()
+            end;
         _ ->
             nop
     end.
 
+%% Pull the shs public key out of a broadcast.  A broadcast holds one or more
+%% connection strings ("...~shs:<base64key>", separated by ';'); the key is the
+%% same in each.  Match on "~shs:" rather than a fixed ":8008~shs:" so peers on
+%% any port (and IPv6/ws addresses) are handled.
 extract_key(Data) ->
-    %% may be more that one connection string here, look for semicolon
-    %% and truncate
-    CheckMatch = binary:match(Data, ~":8008~shs:"),
-    if CheckMatch == nomatch ->
+    case binary:match(Data, ~"~shs:") of
+        nomatch ->
             nokey;
-       true ->
-            {Pos, Len} = CheckMatch,
-            CheckSemicolon = binary:match(Data, <<";">>),
-            End = case CheckSemicolon of
-                      nomatch ->
-                          size(Data);
-                      {Pos1, _} ->
-                          Pos1
-                  end,
-            %%base64:decode(binary_to_list(
-            binary:part(Data,
-                        (Pos + Len),
-                        End - (Pos + Len))
+        {Pos, Len} ->
+            KeyStart = Pos + Len,
+            Rest = binary:part(Data, KeyStart, size(Data) - KeyStart),
+            case binary:match(Rest, <<";">>) of
+                nomatch      -> Rest;
+                {SemiPos, _} -> binary:part(Rest, 0, SemiPos)
+            end
     end.
