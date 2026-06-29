@@ -236,8 +236,12 @@ parse({room_privacy, Privacy}, State)
   when Privacy =:= open; Privacy =:= community; Privacy =:= restricted ->
     State#state{room_privacy = Privacy};
 
-parse(_Any, State) ->
-    %% ignore for now, this is an error technically
+parse(Any, State) ->
+    %% Unrecognised config term: either an unknown key or a known key whose
+    %% value failed its guard (e.g. {peer_dialer, "false"} — a string instead
+    %% of the atom false, as produced by a mis-quoted ssb.cfg template). Warn
+    %% rather than silently drop it, so the setting being ignored is visible.
+    ?SSB_ERROR("config: ignoring unrecognised term ~p", [Any]),
     State.
 
 default_repo(SSBHome) ->
