@@ -33,7 +33,7 @@ test: compile
 	rm -Rf testdata
 
 ct:  compile
-	$(REBAR) ct
+	$(REBAR) ct --sname erlbutt_ct
 
 rel: compile
 	$(REBAR) release
