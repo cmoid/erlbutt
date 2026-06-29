@@ -74,8 +74,14 @@ decode_id1(RawId) ->
 concat(ListOfBins) ->
     iolist_to_binary(ListOfBins).
 
+%% Increment a box-stream nonce, preserving its width. binary:encode_unsigned/1
+%% strips leading zero bytes, so a nonce whose high-order byte became 0x00 would
+%% shrink below 24 bytes and make the next secretbox call crash with badarg.
+%% Keep the original byte width and wrap at 2^(Size*8), matching SSB's
+%% big-endian nonce semantics (all-0xFF wraps back to 0).
 incr(Nonce) ->
-    binary:encode_unsigned(binary:decode_unsigned(Nonce) + 1).
+    Size = byte_size(Nonce),
+    <<(binary:decode_unsigned(Nonce) + 1):Size/big-integer-unit:8>>.
 
 combine(nil, Bin) ->
     Bin;
@@ -327,11 +333,33 @@ simple_blob_decode_test() ->
                          ".sha256"),
     ?assert(CompCoded == Coded).
 
+%% incr/1 preserves the nonce width even when the result has leading zero
+%% bytes — regression test for the 23-byte-nonce secretbox badarg crash.
+incr_preserves_width_test() ->
+    %% leading high-order byte is zero: must stay 24 bytes, not shrink to 23
+    LeadingZero = <<0, 1, (binary:copy(<<0>>, 22))/binary>>,
+    24 = byte_size(LeadingZero),
+    Bumped = utils:incr(LeadingZero),
+    ?assertEqual(24, byte_size(Bumped)),
+    ?assertEqual(<<0, 1, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1>>, Bumped).
 
+%% a plain low value increments correctly and keeps its width.
+incr_basic_test() ->
+    Nonce = <<0:184, 41>>,
+    24 = byte_size(Nonce),
+    ?assertEqual(<<0:184, 42>>, utils:incr(Nonce)).
 
+%% all-0xFF wraps back to zero rather than growing to 25 bytes.
+incr_wraps_at_max_test() ->
+    MaxNonce = binary:copy(<<255>>, 24),
+    Bumped = utils:incr(MaxNonce),
+    ?assertEqual(24, byte_size(Bumped)),
+    ?assertEqual(<<0:192>>, Bumped).
 
-
-
-
+%% incrementing is width-agnostic (works for any size binary).
+incr_arbitrary_width_test() ->
+    ?assertEqual(<<1>>, utils:incr(<<0>>)),
+    ?assertEqual(<<0>>, utils:incr(<<255>>)),
+    ?assertEqual(<<1, 0>>, utils:incr(<<0, 255>>)).
 
 -endif.
