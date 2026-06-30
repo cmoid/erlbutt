@@ -227,7 +227,9 @@ init([Ip, Port, PubKey]) ->
                 end
             catch
                 error:Reason ->
-                    log_handshake_failure(outbound, Reason),
+                    log_handshake_failure(outbound, Reason,
+                                          io_lib:format("to ~p:~p dialing key ~p",
+                                                        [Ip, Port, PubKey])),
                     {stop, normal}
             end
     end;
@@ -294,7 +296,8 @@ handle_info({tcp, Socket, Data},
         end
     catch
         error:Reason ->
-            log_handshake_failure(inbound, Reason),
+            log_handshake_failure(inbound, Reason,
+                                  ["from ", peer_endpoint(Transport, Socket)]),
             %% A rejected handshake is routine; stop with a shutdown reason so
             %% it doesn't emit a crash report / ranch error.
             {stop, {shutdown, handshake_failed}, State}
@@ -847,13 +850,29 @@ network_error(Reason, State) ->
 %%   - no_matching_network_id : hello matched none of our network ids
 %%   - {badmatch, <<"bad">>}  : right network id, but the identity/signature box
 %%                              failed to verify (shs:open_box returns <<"bad">>)
-log_handshake_failure(Dir, no_matching_network_id) ->
-    ?SSB_INFO("~p handshake rejected: unknown network id~n", [Dir]);
-log_handshake_failure(Dir, {badmatch, <<"bad">>}) ->
+%%
+%% Who is an iodata fragment identifying the remote end. For inbound failures the
+%% key the peer dialed for us is unrecoverable — SHS folds it into a DH secret and
+%% never sends it on the wire — so the peer's IP:port is the only handle we have
+%% on who keeps dialing a stale key. For outbound we log the key we dialed.
+log_handshake_failure(Dir, no_matching_network_id, Who) ->
+    ?SSB_INFO("~p handshake rejected: unknown network id (~s)~n", [Dir, Who]);
+log_handshake_failure(Dir, {badmatch, <<"bad">>}, Who) ->
     ?SSB_INFO("~p handshake rejected: identity verification failed "
-              "(peer dialed a stale/wrong key, or bad handshake)~n", [Dir]);
-log_handshake_failure(Dir, Reason) ->
-    ?SSB_INFO("~p handshake failed: ~p~n", [Dir, Reason]).
+              "(~s; peer dialed a stale/wrong key, or bad handshake)~n",
+              [Dir, Who]);
+log_handshake_failure(Dir, Reason, Who) ->
+    ?SSB_INFO("~p handshake failed: ~p (~s)~n", [Dir, Reason, Who]).
+
+%% Best-effort "ip:port" for a peer socket; never throws (the socket may already
+%% be closed by the time we log a rejected handshake).
+peer_endpoint(Transport, Socket) ->
+    try Transport:peername(Socket) of
+        {ok, {Addr, Port}} -> [inet:ntoa(Addr), $:, integer_to_list(Port)];
+        _                  -> "unknown peer"
+    catch
+        _:_ -> "unknown peer"
+    end.
 
 stop(Reason, State) ->
     {stop, Reason, State}.
