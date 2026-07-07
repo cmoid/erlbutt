@@ -168,15 +168,45 @@ dispatch(_Calls, ReqNo, Body, _Socket, Nonce, _SecretBoxKey) when ReqNo < 0 ->
     {Nonce, proc_response(ReqNo, Body)};
 dispatch(Calls, ReqNo, Body, Socket, Nonce, SecretBoxKey) ->
     Req = create_req(Body),
-    NewNonce = proc_request(Calls, ReqNo, Req, Socket, Nonce, SecretBoxKey),
-    Tag = case Req of
-        #ssb_rpc{name = [?blobs, ?createwants]} -> {wants_stream, ReqNo};
-        #ssb_rpc{name = [?ebt,   ~"replicate"]} -> {ebt_stream,   ReqNo};
-        #ssb_rpc{name = [?room,  ?attendants]}  -> {attendants_stream, ReqNo};
-        #ssb_rpc{name = [?tunnel, ?endpoints]}  -> {endpoints_stream, ReqNo};
-        _                                        -> none
+    case permitted(Calls, Req) of
+        true ->
+            NewNonce = proc_request(Calls, ReqNo, Req, Socket, Nonce, SecretBoxKey),
+            Tag = case Req of
+                #ssb_rpc{name = [?blobs, ?createwants]} -> {wants_stream, ReqNo};
+                #ssb_rpc{name = [?ebt,   ~"replicate"]} -> {ebt_stream,   ReqNo};
+                #ssb_rpc{name = [?room,  ?attendants]}  -> {attendants_stream, ReqNo};
+                #ssb_rpc{name = [?tunnel, ?endpoints]}  -> {endpoints_stream, ReqNo};
+                _                                        -> none
+            end,
+            {NewNonce, Tag};
+        {denied, Name, Class, Perm} ->
+            ?SSB_INFO("rpc ~p denied for ~p (class ~p, needs ~p)",
+                      [Name, caller_feed_id(Calls), Class, Perm]),
+            ets:insert(Calls, {ReqNo, noop}),
+            {rpc_error(ReqNo, ~"method not allowed", Socket, Nonce, SecretBoxKey),
+             none}
+    end.
+
+%% Single permission choke point for every incoming request, builtin or
+%% plugin.  Methods the registry does not know keep the old fall-through
+%% behavior (answered with true), so unknown-method handling is unchanged.
+permitted(Calls, #ssb_rpc{name = Name}) when is_list(Name) ->
+    Perm = case plugin_registry:lookup(Name) of
+        {ok, {_Mod, _Kind, P}}  -> P;
+        {builtin, _Kind, P}     -> P;
+        unknown                 -> anyone
     end,
-    {NewNonce, Tag}.
+    case Perm of
+        anyone -> true;
+        _ ->
+            Class = maps:get(class, caller_info(Calls)),
+            case plugin_registry:allowed(Class, Perm) of
+                true  -> true;
+                false -> {denied, Name, Class, Perm}
+            end
+    end;
+permitted(_Calls, _Req) ->
+    true.
 
 
 proc_response(ReqNo, RespBody) ->
@@ -509,20 +539,11 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [~"invite", ~"use"],
 proc_request(Calls, ReqNo, #ssb_rpc{name = Name, args = Args} = ReqBody,
              Socket, Nonce, SecretBoxKey) when is_list(Name) ->
     %% Not handled above: consult the plugin registry before giving up.
+    %% Permission was already checked at the dispatch/6 choke point.
     case plugin_registry:lookup(Name) of
-        {ok, {Mod, Kind, Perm}} ->
-            Caller = caller_info(Calls),
-            case plugin_registry:allowed(maps:get(class, Caller), Perm) of
-                true ->
-                    plugin_dispatch(Mod, Kind, Name, Args, Caller, Calls,
-                                    ReqNo, Socket, Nonce, SecretBoxKey);
-                false ->
-                    ?SSB_INFO("plugin ~p denied for ~p (class ~p, needs ~p)",
-                              [Name, maps:get(feed_id, Caller),
-                               maps:get(class, Caller), Perm]),
-                    rpc_error(ReqNo, ~"method not allowed",
-                              Socket, Nonce, SecretBoxKey)
-            end;
+        {ok, {Mod, Kind, _Perm}} ->
+            plugin_dispatch(Mod, Kind, Name, Args, caller_info(Calls), Calls,
+                            ReqNo, Socket, Nonce, SecretBoxKey);
         _ ->  %% unknown, or a builtin whose args didn't match its clause
             unhandled_request(Calls, ReqNo, ReqBody, Socket, Nonce, SecretBoxKey)
     end;

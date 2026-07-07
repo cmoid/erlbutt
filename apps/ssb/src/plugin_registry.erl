@@ -42,11 +42,15 @@
 %% Methods implemented directly by rpc_processor.  Listed here so the
 %% served manifest covers the full RPC surface; lookup/1 reports them
 %% as builtin and dispatch stays where it is.  The perm column controls
-%% manifest visibility only — builtin dispatch is not yet gated.
+%% both manifest visibility and dispatch: rpc_processor checks it
+%% before running any request (see dispatch/6 there).  Local-client
+%% methods (publish, the full-log streams, invite.create) are
+%% owner-only; the replication/rooms surface stays open to any
+%% authenticated peer, matching what remote clients actually call.
 -define(BUILTINS,
         [{[?createhistorystream],       source, anyone},
-         {[~"createLogStream"],         source, anyone},
-         {[~"createFeedStream"],        source, anyone},
+         {[~"createLogStream"],         source, owner},
+         {[~"createFeedStream"],        source, owner},
          {[?whoami],                    sync,   anyone},
          {[~"publish"],                 async,  owner},
          {[~"get"],                     async,  anyone},
@@ -79,14 +83,14 @@ unregister_plugin(Mod) when is_atom(Mod) ->
     gen_server:call(?MODULE, {unregister_plugin, Mod}, infinity).
 
 %% {ok, {Mod, Kind, Perm}} for a registered plugin method,
-%% builtin for a method rpc_processor handles itself,
+%% {builtin, Kind, Perm} for a method rpc_processor handles itself,
 %% unknown otherwise (including when the registry is not running —
 %% callers fall back to the pre-registry behavior).
 lookup(Name) ->
     try ets:lookup(?TABLE, Name) of
-        [{Name, builtin, _Kind, _Perm}] -> builtin;
-        [{Name, Mod, Kind, Perm}]       -> {ok, {Mod, Kind, Perm}};
-        []                              -> unknown
+        [{Name, builtin, Kind, Perm}] -> {builtin, Kind, Perm};
+        [{Name, Mod, Kind, Perm}]     -> {ok, {Mod, Kind, Perm}};
+        []                            -> unknown
     catch
         error:badarg -> unknown
     end.
@@ -245,8 +249,11 @@ registry_test_() ->
      end}.
 
 builtin_lookup() ->
-    ?assertEqual(builtin, lookup([?whoami])),
-    ?assertEqual(builtin, lookup([?blobs, ?blobshas])).
+    ?assertEqual({builtin, sync, anyone},  lookup([?whoami])),
+    ?assertEqual({builtin, async, anyone}, lookup([?blobs, ?blobshas])),
+    %% local-client methods are owner-gated
+    ?assertEqual({builtin, async, owner},  lookup([~"publish"])),
+    ?assertEqual({builtin, source, owner}, lookup([~"createLogStream"])).
 
 unknown_lookup() ->
     ?assertEqual(unknown, lookup([~"noSuch", ~"method"])).
