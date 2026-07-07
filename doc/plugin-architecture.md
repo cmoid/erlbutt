@@ -98,16 +98,45 @@ substrate itself.
    existing tests and exercises checkpoint, rebuild, and live-tail.
 3. **Feed views one at a time**, starting with `publicFeed.roots`.
 
-## The open design question
+## The settled design question (July 2026)
 
 Is a view a fold over **SSB messages**, or over **log entries generally**?
 
-If the other intended use cases still ride on signed SSB feeds (sensor
-data, package metadata, wiki edits as message types), the message-level
-abstraction is right, and content-type dispatch belongs in the view API.
-If non-SSB logs are in scope (e.g. plumtree as a transport for arbitrary
-payloads), the view manager should sit below message semantics and take
-opaque entries, with SSB decoding as a layer on top.
+**Decision: opaque entries, decode-once at ingest.** All use cases ride
+signed SSB feeds, so every entry has a `(feed, seq)` identity and passes
+through verification (which forces a decode) exactly once, at ingest.
+Views receive `{FeedId, Seq, Raw, Decoded}` — content-agnostic views
+ignore `Decoded`; content-aware views (friends, abouts, tangles) use it
+without re-parsing.
 
-This choice is cheap now and expensive later, so it should be settled
-before the view manager is built.
+Content-aware replication is not a counterexample to opacity: as in the
+JS stack (where ssb-friends is itself a flumeview that ssb-ebt consults),
+"replication looks inside messages" means **one view** (friends) decodes
+contact messages, and the replication machinery consumes that view's
+*output* and change events. The substrate stays dumb; EBT's repl-set
+becomes a subscriber of the friends view, which also removes the
+refresh-timer lag class of bugs by construction.
+
+### Storage substrate: per-feed logs, not a global log
+
+The per-feed `ssb_feed` + `log.offset` design is the flume substitute.
+Almost every SSB view needs only **per-author order** (only my messages
+assert my follows/abouts/sequence), so folds interleave feeds freely and
+a view checkpoint is a small **vector clock** (`feed → seq` consumed) —
+the same shape as an EBT clock. This buys partial rebuilds (re-fold one
+feed) and parallel replay.
+
+Two things want a global order before the legacy global `log.offset`
+(now just a converter convenience) can be retired: `createLogStream`
+and cheap "everything since I last looked" live-tail resume. Replace it
+with a tiny **ingest journal** — append-only `{feed_id, seq}` refs, no
+bodies — giving a stable arrival order and single-integer checkpoints
+to the views that want them, without duplicating the data.
+
+### Ingest pipeline
+
+entry arrives (EBT / plumtree / CHS / publish) → verify + decode once →
+append to per-feed log → append ref to ingest journal → view manager
+fans out `{FeedId, Seq, Raw, Decoded}` to subscribed views → views
+update state and emit change events (replication, muxrpc live streams,
+and the UI are all just subscribers).
