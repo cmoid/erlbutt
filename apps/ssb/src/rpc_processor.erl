@@ -506,13 +506,107 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [~"invite", ~"use"],
             utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey)
     end;
 
+proc_request(Calls, ReqNo, #ssb_rpc{name = Name, args = Args} = ReqBody,
+             Socket, Nonce, SecretBoxKey) when is_list(Name) ->
+    %% Not handled above: consult the plugin registry before giving up.
+    case plugin_registry:lookup(Name) of
+        {ok, {Mod, Kind, Perm}} ->
+            Caller = caller_info(Calls),
+            case plugin_registry:allowed(maps:get(class, Caller), Perm) of
+                true ->
+                    plugin_dispatch(Mod, Kind, Name, Args, Caller, Calls,
+                                    ReqNo, Socket, Nonce, SecretBoxKey);
+                false ->
+                    ?SSB_INFO("plugin ~p denied for ~p (class ~p, needs ~p)",
+                              [Name, maps:get(feed_id, Caller),
+                               maps:get(class, Caller), Perm]),
+                    rpc_error(ReqNo, ~"method not allowed",
+                              Socket, Nonce, SecretBoxKey)
+            end;
+        _ ->  %% unknown, or a builtin whose args didn't match its clause
+            unhandled_request(Calls, ReqNo, ReqBody, Socket, Nonce, SecretBoxKey)
+    end;
+
 proc_request(Calls, ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
+    unhandled_request(Calls, ReqNo, ReqBody, Socket, Nonce, SecretBoxKey).
+
+unhandled_request(Calls, ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
     ?SSB_INFO("ROOMDBG unhandled RPC (fall thru): ~p~n", [ReqBody]),
     ets:insert(Calls, {ReqNo, noop}),
     Flags = create_flags(1, 1, 2),
     TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
     Header = create_header(Flags, size(TrueEnd), -ReqNo),
     utils:send_data(utils:combine(Header, TrueEnd), Socket, Nonce, SecretBoxKey).
+
+%% Dispatch to a registered plugin and frame its result.  sync/async
+%% methods answer one JSON value (stream=0); source methods emit one
+%% frame per item then close with JSON true, like createHistoryStream.
+%% A crashing plugin answers an error frame instead of killing the
+%% connection's rpc_processor.
+plugin_dispatch(Mod, Kind, Name, Args, Caller, Calls,
+                ReqNo, Socket, Nonce, SecretBoxKey) ->
+    Result = try Mod:handle_rpc(Name, Args, Caller)
+             catch C:R:Stack ->
+                     ?SSB_ERROR("plugin ~p crashed on ~p: ~p:~p ~p",
+                                [Mod, Name, C, R, Stack]),
+                     {error, ~"internal error"}
+             end,
+    case {Kind, Result} of
+        {source, {source, Items}} ->
+            ets:insert(Calls, {ReqNo, noop}),
+            N1 = lists:foldl(
+                   fun(Item, N) ->
+                           Body = encode_json(Item),
+                           Header = create_header(create_flags(1, 0, 2),
+                                                  size(Body), -ReqNo),
+                           utils:send_data(utils:combine(Header, Body),
+                                           Socket, N, SecretBoxKey)
+                   end, Nonce, Items),
+            TrueEnd = encode_json(true),
+            Header = create_header(create_flags(1, 1, 2), size(TrueEnd), -ReqNo),
+            utils:send_data(utils:combine(Header, TrueEnd), Socket, N1, SecretBoxKey);
+        {_, {reply, Term}} when Kind =:= sync; Kind =:= async ->
+            Body = encode_json(Term),
+            Header = create_header(create_flags(0, 0, 2), size(Body), -ReqNo),
+            utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+        {_, {error, Reason}} when is_binary(Reason) ->
+            rpc_error(ReqNo, Reason, Socket, Nonce, SecretBoxKey);
+        {_, Other} ->
+            ?SSB_ERROR("plugin ~p returned ~p for ~p method ~p",
+                       [Mod, Other, Kind, Name]),
+            rpc_error(ReqNo, ~"internal error", Socket, Nonce, SecretBoxKey)
+    end.
+
+rpc_error(ReqNo, Reason, Socket, Nonce, SecretBoxKey) ->
+    ErrMsg = utils:error_msg(~"Error", Reason),
+    Flags  = create_flags(0, 1, 2),
+    Header = create_header(Flags, size(ErrMsg), -ReqNo),
+    utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey).
+
+encode_json(Term) ->
+    iolist_to_binary(message:ssb_encoder(Term, fun message:ssb_encoder/3, [pretty])).
+
+%% The caller's identity and permission class, from the remote key the
+%% handshake authenticated: the node's own key = a local client (owner);
+%% a registered room member = member; anyone else = peer.  Computed per
+%% dispatch because membership can change mid-connection (invite.use).
+caller_info(Calls) ->
+    FeedId = caller_feed_id(Calls),
+    Class = case ets:lookup(Calls, remote_pk) of
+        [{remote_pk, Pk}] ->
+            %% keys:pub_key() is base64 text; remote_pk is the raw key
+            %% the handshake authenticated.
+            case base64:decode(keys:pub_key()) of
+                Pk -> owner;
+                _  ->
+                    case room_store:is_member(FeedId) of
+                        true  -> member;
+                        false -> peer
+                    end
+            end;
+        [] -> peer
+    end,
+    #{feed_id => FeedId, class => Class}.
 
 %% Stream BlobData in 65 536-byte muxrpc frames, then close with JSON true.
 %% Each frame is further split into <=4096-byte box-stream packets by

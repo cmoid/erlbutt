@@ -25,6 +25,7 @@ start_link() ->
 init([]) ->
     {ok, { {one_for_one, 5, 10},
            [?CHILD(config, worker),
+            ?CHILD(plugin_registry, worker),
             ?CHILD(network_id_cache, worker),
             ?CHILD(heartbeat, worker),
             ?CHILD(keys, worker),
