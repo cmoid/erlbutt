@@ -314,6 +314,7 @@ store(#message{id = Id, sequence = Seq, author = Auth} = Msg,
         false -> ok
     end,
     social_msg:dispatch(Msg),
+    view_manager:ingest(Msg),
     State#state{last_msg = Id, last_seq = Seq}.
 
 write_msg(#message{} = DecMsg, Store) ->

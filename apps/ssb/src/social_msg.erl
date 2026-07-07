@@ -71,30 +71,8 @@ dispatch_type(~"pub", _Author, Props) ->
         _ -> ok
     end;
 
-%% A contact message can carry `following` and/or `blocking`; apply each
-%% to its respective graph independently.
-dispatch_type(~"contact", Author, Props) ->
-    Contact = ?pgv(~"contact", Props),
-    case check_contact(Contact, ?pgv(~"following", Props)) of
-        {C, F} -> friends:update(Author, C, F);
-        nope   -> ok
-    end,
-    case check_block(Contact, ?pgv(~"blocking", Props)) of
-        {Cb, B} -> friends:update_block(Author, Cb, B);
-        nope    -> ok
-    end,
-    ok;
-
-%% Self-assigned profile names feed the name index; abouts naming other
-%% feeds (or carrying only image/description) are ignored.
-dispatch_type(~"about", Author, Props) ->
-    case {?pgv(~"about", Props), ?pgv(~"name", Props)} of
-        {Author, Name} when is_binary(Name) ->
-            friends:update_name(Author, Name);
-        _ ->
-            ok
-    end;
-
+%% contact and about messages are folded into the friends view by
+%% view_manager:ingest/1 (see friends:view_entry/1), not dispatched here.
 dispatch_type(_, _, _) ->
     ok.
 
@@ -231,32 +209,6 @@ dispatch_contact_test() ->
                                 {~"contact",   ~"@other=.ed25519"},
                                 {~"following", true}]}},
     ?assertEqual(ok, social_msg:dispatch(Msg)).
-
-dispatch_about_test() ->
-    FriendsStarted = case whereis(friends) of
-        undefined -> {ok, _} = friends:start_link(), true;
-        _         -> false
-    end,
-    Self = #message{id = ~"%a1.sha256", previous = null,
-                    author = ~"@author=.ed25519", sequence = 3,
-                    timestamp = 0, hash = ~"sha256", received = 0,
-                    validated = true, swapped = false, signature = ~"sig",
-                    content = {[{~"type",  ~"about"},
-                                 {~"about", ~"@author=.ed25519"},
-                                 {~"name",  ~"zelda"}]}},
-    ok = social_msg:dispatch(Self),
-    ?assertEqual(~"zelda", friends:name(~"@author=.ed25519")),
-    %% An about naming a different feed must not set that feed's name.
-    Other = Self#message{id = ~"%a2.sha256", sequence = 4,
-                         content = {[{~"type",  ~"about"},
-                                      {~"about", ~"@other=.ed25519"},
-                                      {~"name",  ~"impostor"}]}},
-    ok = social_msg:dispatch(Other),
-    ?assertEqual(undefined, friends:name(~"@other=.ed25519")),
-    case FriendsStarted of
-        true  -> gen_server:stop(friends);
-        false -> ok
-    end.
 
 %% Without the friends server running, dispatch must still succeed.
 dispatch_about_no_friends_test() ->

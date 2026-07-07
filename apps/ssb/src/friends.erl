@@ -2,23 +2,25 @@
 %%
 %% Copyright (C) 2023 Charles Moid
 %%
-%% Maintained social index: a follow graph and a profile-name cache, kept
-%% in named public ETS tables owned by this gen_server.  Entries are
-%% loaded lazily from the per-feed contacts/profile files and then kept
-%% current incrementally by social_msg:dispatch/1 at message ingest.
+%% Maintained social index: a follow graph, a block graph and a
+%% profile-name cache, kept in named public ETS tables owned by this
+%% gen_server and populated exclusively by view_manager (this module is
+%% an ssb_view — see ssb_view.erl).  The manager guarantees the tables
+%% are complete: it replays anything missed at registration, rebuilds
+%% from the log when view_version/0 bumps, and folds every newly stored
+%% message in synchronously — so reads are plain ETS lookups and a miss
+%% simply means "no data for that feed".
 %%
-%% Invariant: a follow-graph entry exists only when it is complete (built
-%% by folding the full contacts file).  update/3 therefore drops contacts
-%% for authors that have never been loaded — the message is already on
-%% disk and will be folded in when the author is first queried.
-%%
-%% Lazy loads read the on-disk files directly rather than calling into the
-%% owning ssb_feed process: update/3 and update_name/2 are synchronous
-%% calls made from inside ssb_feed:store/2, so calling back into a feed
-%% from here could deadlock.
+%% The view callbacks (view_entry/1 etc.) run in the view_manager
+%% process, never in this server; they are plain functions over the
+%% public tables.  Durable state is ets:tab2file snapshots under
+%% <repo>/views/, restored (or created fresh) in init; view_save/0
+%% stamps a completeness marker so view_load/0 can tell a restored
+%% snapshot from a fresh table.
 -module(friends).
 
 -behaviour(gen_server).
+-behaviour(ssb_view).
 
 -include_lib("ssb/include/ssb.hrl").
 
@@ -31,18 +33,32 @@
          direct_follows/1,
          follows/2,
          blocks/1,
-         name/1,
-         update/3,
-         update_block/3,
-         update_name/2]).
+         name/1]).
+
+%% ssb_view callbacks
+-export([view_version/0,
+         view_load/0,
+         view_reset/0,
+         view_save/0,
+         view_entry/1]).
 
 %% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2,
-         terminate/2, code_change/3]).
+-export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
+         handle_info/2, terminate/2, code_change/3]).
 
 -define(GRAPH, ssb_follow_graph).
 -define(NAMES, ssb_profile_names).
 -define(BLOCKS, ssb_block_graph).
+
+%% Written by view_save/0 before each snapshot; its presence after a
+%% file2tab restore is how view_load/0 knows the state is complete up to
+%% the manager's checkpoints.
+-define(COMPLETE, '$complete').
+
+-define(TABLES,
+        [{?GRAPH,  ~"friends_graph.tab"},
+         {?NAMES,  ~"friends_names.tab"},
+         {?BLOCKS, ~"friends_blocks.tab"}]).
 
 %%%===================================================================
 %%% API
@@ -51,63 +67,22 @@
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
-%% Apply a contact message to the follow graph.  Called from
-%% social_msg:dispatch/1 at ingest; synchronous so the graph is already
-%% current when ssb_feed:store_msg/2 returns.  A no-op when the server
-%% is down or the author has not been loaded yet.
-update(Author, Contact, Following) when is_binary(Contact),
-                                        is_boolean(Following) ->
-    safe_call({update, Author, Contact, Following});
-update(_Author, _Contact, _Following) ->
-    %% Legacy garbage: contact ids that are booleans or other non-binaries.
-    ok.
-
-%% Apply a contact message's `blocking` field to the block graph (same
-%% lazy/loaded-only semantics as update/3).
-update_block(Author, Contact, Blocking) when is_binary(Contact),
-                                             is_boolean(Blocking) ->
-    safe_call({update_block, Author, Contact, Blocking});
-update_block(_Author, _Contact, _Blocking) ->
-    ok.
-
-%% Record Author's latest self-assigned profile name.  Contact and about
-%% messages arrive in sequence order, so the last write is the newest.
-update_name(Author, Name) when is_binary(Name) ->
-    safe_call({update_name, Author, Name});
-update_name(_Author, _Name) ->
-    ok.
-
-%% Feeds the given feed follows right now.  Reads ETS directly on a hit;
-%% folds the contacts file once on a miss.
+%% Feeds the given feed follows right now.
 direct_follows(FeedPid) when is_pid(FeedPid) ->
     direct_follows(ssb_feed:whoami(FeedPid));
 direct_follows(FeedId) ->
     case lookup(?GRAPH, FeedId) of
-        {ok, Contacts} ->
-            following_ids(Contacts);
-        miss ->
-            case safe_call({load, FeedId}) of
-                Contacts when is_map(Contacts) ->
-                    following_ids(Contacts);
-                _ ->
-                    []
-            end
+        {ok, Contacts} -> following_ids(Contacts);
+        miss           -> []
     end.
 
-%% Feeds the given feed blocks right now (mirror of direct_follows/1).
+%% Feeds the given feed blocks right now.
 blocks(FeedPid) when is_pid(FeedPid) ->
     blocks(ssb_feed:whoami(FeedPid));
 blocks(FeedId) ->
     case lookup(?BLOCKS, FeedId) of
-        {ok, Blocked} ->
-            blocking_ids(Blocked);
-        miss ->
-            case safe_call({load_blocks, FeedId}) of
-                Blocked when is_map(Blocked) ->
-                    blocking_ids(Blocked);
-                _ ->
-                    []
-            end
+        {ok, Blocked} -> blocking_ids(Blocked);
+        miss          -> []
     end.
 
 %% Transitive follows out to HopCount hops, excluding the start feed.
@@ -120,13 +95,58 @@ follows(FeedId, HopCount) ->
 %% Latest self-assigned display name for FeedId, or undefined.
 name(FeedId) ->
     case lookup(?NAMES, FeedId) of
-        {ok, Name} ->
-            Name;
-        miss ->
-            case safe_call({load_name, FeedId}) of
-                ok   -> undefined;          %% server not running
-                Name -> Name
-            end
+        {ok, Name} -> Name;
+        miss       -> undefined
+    end.
+
+%%%===================================================================
+%%% ssb_view callbacks (run in the view_manager process)
+%%%===================================================================
+
+view_version() -> 1.
+
+view_load() ->
+    case lists:all(fun({Tab, _}) -> has_marker(Tab) end, ?TABLES) of
+        true  -> ok;
+        false -> empty
+    end.
+
+view_reset() ->
+    [ets:delete_all_objects(Tab) || {Tab, _} <- ?TABLES],
+    ok.
+
+view_save() ->
+    [begin
+         ets:insert(Tab, {?COMPLETE, true}),
+         File = table_file(FileName),
+         filelib:ensure_dir(File),
+         ok = ets:tab2file(Tab, ?b2l(File))
+     end || {Tab, FileName} <- ?TABLES],
+    ok.
+
+%% Fold one stored message into the index.  A contact message can carry
+%% `following` and/or `blocking`; each applies to its own graph and is
+%% announced to subscribers (ebt keeps its replication set current from
+%% these events).  Self-assigned abouts update the name cache.
+view_entry(#message{author = Author} = Msg) ->
+    FollowEvents =
+        case social_msg:is_follow(Msg) of
+            {C, F} when is_binary(C) ->
+                apply_edge(?GRAPH, Author, C, F),
+                [{contact, Author, C, F}];
+            _ -> []
+        end,
+    BlockEvents =
+        case social_msg:is_block(Msg) of
+            {Cb, B} when is_binary(Cb) ->
+                apply_edge(?BLOCKS, Author, Cb, B),
+                [{block, Author, Cb, B}];
+            _ -> []
+        end,
+    apply_name(Msg),
+    case FollowEvents ++ BlockEvents of
+        []     -> ok;
+        Events -> {events, Events}
     end.
 
 %%%===================================================================
@@ -134,68 +154,17 @@ name(FeedId) ->
 %%%===================================================================
 
 init([]) ->
-    ets:new(?GRAPH, [set, named_table, public]),
-    ets:new(?NAMES, [set, named_table, public]),
-    ets:new(?BLOCKS, [set, named_table, public]),
-    {ok, #{}}.
+    [restore_or_create(Tab, FileName) || {Tab, FileName} <- ?TABLES],
+    {ok, #{}, {continue, register_view}}.
 
-handle_call({update, Author, Contact, Following}, _From, State) ->
-    case ets:lookup(?GRAPH, Author) of
-        [{Author, Contacts}] ->
-            ets:insert(?GRAPH, {Author, Contacts#{Contact => Following}});
-        [] ->
-            ok
+handle_continue(register_view, State) ->
+    try view_manager:register_view(?MODULE)
+    catch exit:{noproc, _} ->
+            %% No view_manager (some eunit setups): the tables stay as
+            %% restored/empty and nothing feeds them.
+            ?SSB_INFO("friends: running without view_manager", [])
     end,
-    {reply, ok, State};
-
-handle_call({update_block, Author, Contact, Blocking}, _From, State) ->
-    case ets:lookup(?BLOCKS, Author) of
-        [{Author, Blocked}] ->
-            ets:insert(?BLOCKS, {Author, Blocked#{Contact => Blocking}});
-        [] ->
-            ok
-    end,
-    {reply, ok, State};
-
-handle_call({update_name, Author, Name}, _From, State) ->
-    ets:insert(?NAMES, {Author, Name}),
-    {reply, ok, State};
-
-handle_call({load, FeedId}, _From, State) ->
-    Contacts =
-        case ets:lookup(?GRAPH, FeedId) of
-            [{FeedId, Existing}] ->
-                Existing;
-            [] ->
-                Loaded = load_contacts(FeedId),
-                ets:insert(?GRAPH, {FeedId, Loaded}),
-                Loaded
-        end,
-    {reply, Contacts, State};
-
-handle_call({load_blocks, FeedId}, _From, State) ->
-    Blocked =
-        case ets:lookup(?BLOCKS, FeedId) of
-            [{FeedId, Existing}] ->
-                Existing;
-            [] ->
-                Loaded = load_blocks(FeedId),
-                ets:insert(?BLOCKS, {FeedId, Loaded}),
-                Loaded
-        end,
-    {reply, Blocked, State};
-
-handle_call({load_name, FeedId}, _From, State) ->
-    Name =
-        case ets:lookup(?NAMES, FeedId) of
-            [{FeedId, Existing}] ->
-                Existing;
-            [] ->
-                Loaded = load_profile_name(FeedId),
-                ets:insert(?NAMES, {FeedId, Loaded}),
-                Loaded
-        end,
-    {reply, Name, State};
+    {noreply, State}.
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
@@ -207,6 +176,10 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, _State) ->
+    %% Snapshot before the tables die with this process.  At shutdown we
+    %% stop before view_manager (reverse start order), so the manager's
+    %% own final save of this view cannot succeed — this one can.
+    catch view_save(),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -216,10 +189,45 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-safe_call(Req) ->
-    try gen_server:call(?MODULE, Req, infinity)
-    catch exit:{noproc, _} -> ok
+restore_or_create(Tab, FileName) ->
+    %% table_file needs config; without it (bare eunit setups) start with
+    %% fresh tables — view_load() then reports empty and the manager
+    %% rebuilds if/when one is running.
+    Restored = try ets:file2tab(?b2l(table_file(FileName)))
+               catch _:_ -> {error, no_config}
+               end,
+    case Restored of
+        {ok, Tab} -> ok;
+        _         -> ets:new(Tab, [set, named_table, public])
     end.
+
+table_file(FileName) ->
+    <<(config:ssb_repo_loc())/binary, "views/", FileName/binary>>.
+
+has_marker(Tab) ->
+    try ets:lookup(Tab, ?COMPLETE) =/= []
+    catch error:badarg -> false
+    end.
+
+apply_edge(Tab, Author, Contact, Bool) ->
+    Cur = case ets:lookup(Tab, Author) of
+              [{Author, Map}] -> Map;
+              []              -> #{}
+          end,
+    ets:insert(Tab, {Author, Cur#{Contact => Bool}}).
+
+apply_name(#message{author = Author, content = {Props}} = Msg) ->
+    case social_msg:is_about(Msg) of
+        true ->
+            case {?pgv(~"about", Props), ?pgv(~"name", Props)} of
+                {Author, Name} when is_binary(Name) ->
+                    ets:insert(?NAMES, {Author, Name});
+                _ -> ok
+            end;
+        false -> ok
+    end;
+apply_name(_) ->
+    ok.
 
 lookup(Tab, Key) ->
     try ets:lookup(Tab, Key) of
@@ -255,53 +263,6 @@ follows2(FeedId, HopCount, Visited0) ->
           end, {[], Visited0}, NewDirect),
     {lists:append(NewDirect, Deeper), Visited1}.
 
-%% Fold the on-disk contacts file into #{ContactId => Following}.
-load_contacts(FeedId) ->
-    fold_feed_file(FeedId, ~"contacts",
-        fun(Msg, Acc) ->
-                case social_msg:is_follow(Msg) of
-                    {Id, F} when is_binary(Id) -> Acc#{Id => F};
-                    _                          -> Acc
-                end
-        end, #{}, #{}).
-
-%% Fold the on-disk contacts file into #{ContactId => Blocking}.
-load_blocks(FeedId) ->
-    fold_feed_file(FeedId, ~"contacts",
-        fun(Msg, Acc) ->
-                case social_msg:is_block(Msg) of
-                    {Id, B} when is_binary(Id) -> Acc#{Id => B};
-                    _                          -> Acc
-                end
-        end, #{}, #{}).
-
-%% Fold the on-disk profile file for the newest self-assigned name.
-load_profile_name(FeedId) ->
-    fold_feed_file(FeedId, ~"profile",
-        fun(#message{content = {Props}}, Acc) ->
-                case {?pgv(~"about", Props), ?pgv(~"name", Props)} of
-                    {FeedId, N} when is_binary(N) -> N;
-                    _                             -> Acc
-                end;
-           (_, Acc) ->
-                Acc
-        end, undefined, undefined).
-
-%% Decode each record of a per-feed file and fold Fun over the messages.
-%% Returns Acc0 if the file does not exist, Default on a malformed feed id.
-fold_feed_file(FeedId, File, Fun, Acc0, Default) ->
-    try
-        Path = <<(utils:feed_dir(FeedId))/binary, "/", File/binary>>,
-        utils:fold_log_file(
-          fun(Data, Acc) ->
-                  try Fun(message:decode(Data, false), Acc)
-                  catch _:_ -> Acc
-                  end
-          end, Acc0, Path)
-    catch _:_ ->
-            Default
-    end.
-
 -ifdef(TEST).
 
 friends_test_() ->
@@ -311,7 +272,7 @@ friends_test_() ->
      [fun direct_follows_empty_test/1,
       fun direct_follows_follow_test/1,
       fun direct_follows_unfollow_test/1,
-      fun update_after_load_test/1,
+      fun incremental_update_test/1,
       fun garbage_contact_test/1,
       fun follows_zero_hops_test/1,
       fun follows_one_hop_test/1,
@@ -321,8 +282,9 @@ friends_test_() ->
       fun blocks_unblock_test/1,
       fun blocks_independent_of_follow_test/1,
       fun name_updates_test/1,
-      fun name_lazy_load_test/1,
-      fun name_other_about_test/1]}.
+      fun name_other_about_test/1,
+      fun contact_event_test/1,
+      fun rebuild_from_log_test/1]}.
 
 setup() ->
     Started = lists:filtermap(
@@ -340,11 +302,15 @@ setup() ->
          {mess_auth,    fun() -> mess_auth:start_link() end},
          {blobs,        fun() -> blobs:start_link() end},
          {ssb_feed_sup, fun() -> ssb_feed_sup:start_link() end},
+         {view_manager, fun() -> view_manager:start_link() end},
          {friends,      fun() -> friends:start_link() end}]),
     Started.
 
 teardown(Pids) ->
-    lists:foreach(fun(Pid) -> gen_server:stop(Pid) end, Pids).
+    %% reverse start order, so view_manager/friends go down before the
+    %% services their shutdown paths use (config)
+    lists:foreach(fun(Pid) -> catch gen_server:stop(Pid) end,
+                  lists:reverse(Pids)).
 
 %% Create a fresh feed backed by a generated key pair.
 %% Returns {FeedPid, FeedId, PrivKey}.
@@ -432,9 +398,9 @@ direct_follows_unfollow_test(_) ->
         ?assertEqual([], friends:direct_follows(Pid))
     end.
 
-%% Contacts stored after the graph entry is loaded must be applied
-%% incrementally via update/3 — no rescan happens on the second read.
-update_after_load_test(_) ->
+%% Contacts stored after the first read are applied incrementally by the
+%% view manager's synchronous ingest — reads always see the latest store.
+incremental_update_test(_) ->
     fun() ->
         {Pid, Id, Priv} = make_peer(),
         {_Pid2, Id2, _Priv2} = make_peer(),
@@ -500,8 +466,7 @@ follows_no_cycle_test(_) ->
         ?assertNot(lists:member(OwnerId, Result))
     end.
 
-%% A cached undefined must be overwritten when a self-about arrives,
-%% and a newer self-about wins over an older one.
+%% A newer self-about wins over an older one.
 name_updates_test(_) ->
     fun() ->
         {Pid, Id, Priv} = make_peer(),
@@ -513,16 +478,6 @@ name_updates_test(_) ->
         ?assertEqual(~"alice the great", friends:name(Id))
     end.
 
-%% Names of feeds ingested before the index existed are recovered by
-%% folding the profile file on first lookup.
-name_lazy_load_test(_) ->
-    fun() ->
-        {Pid, Id, Priv} = make_peer(),
-        ok = store_about(Pid, Id, Priv, null, 1, Id, ~"bob"),
-        ets:delete(ssb_profile_names, Id),
-        ?assertEqual(~"bob", friends:name(Id))
-    end.
-
 %% An about message naming someone else must not set that feed's name.
 name_other_about_test(_) ->
     fun() ->
@@ -531,6 +486,35 @@ name_other_about_test(_) ->
         ok = store_about(Pid, Id, Priv, null, 1, Id2, ~"impostor"),
         ?assertEqual(undefined, friends:name(Id2)),
         ?assertEqual(undefined, friends:name(Id))
+    end.
+
+%% Follow changes are announced to view subscribers.
+contact_event_test(_) ->
+    fun() ->
+        ok = view_manager:subscribe(friends),
+        {Pid, Id, Priv} = make_peer(),
+        {_Pid2, Id2, _Priv2} = make_peer(),
+        ok = store_contact(Pid, Id, Priv, null, 1, Id2, true),
+        receive
+            {view_event, friends, {contact, Id, Id2, true}} -> ok
+        after 1000 ->
+            error(no_contact_event)
+        end,
+        ok = view_manager:unsubscribe(friends)
+    end.
+
+%% Wiping the derived state and rebuilding refolds it from the log.
+rebuild_from_log_test(_) ->
+    fun() ->
+        {Pid, Id, Priv} = make_peer(),
+        {_Pid2, Id2, _Priv2} = make_peer(),
+        ok = store_contact(Pid, Id, Priv, null, 1, Id2, true),
+        ?assertEqual([Id2], friends:direct_follows(Id)),
+        %% simulate lost derived state, then refold from the log
+        ok = view_reset(),
+        ?assertEqual([], friends:direct_follows(Id)),
+        ok = view_manager:rebuild(friends),
+        ?assertEqual([Id2], friends:direct_follows(Id))
     end.
 
 -endif.

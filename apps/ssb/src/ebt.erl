@@ -37,7 +37,9 @@
 %% ebt is both a gen_server (supervised singleton in ssb_sup) and an
 %% rpc_behavior (callbacks invoked per-connection by each rpc_processor).
 %% The gen_server carries no state; all connection context arrives via args.
--record(state, {}).
+%% debounce is the timer ref for a pending event-triggered repl-set
+%% refresh (undefined when none is queued).
+-record(state, {debounce}).
 
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
@@ -124,6 +126,10 @@ init([]) ->
     ets:new(?REPL_SET, [set, named_table, public]),
     recompute_repl_set(),
     schedule_repl_refresh(),
+    %% Follow/block changes land in the friends view; refresh the
+    %% replication set when they do instead of waiting for the periodic
+    %% timer (kept as anti-entropy).  No manager in some eunit setups.
+    catch view_manager:subscribe(friends),
     {ok, #state{}}.
 
 handle_call(refresh_repl_set, _From, State) ->
@@ -140,6 +146,19 @@ handle_info(refresh_repl_set, State) ->
     recompute_repl_set(),
     schedule_repl_refresh(),
     {noreply, State};
+
+%% A follow or block changed in the friends view.  Debounce: one
+%% recompute per second no matter how many contact messages land in a
+%% replication burst.
+handle_info({view_event, friends, _Event}, #state{debounce = undefined} = State) ->
+    Ref = erlang:send_after(1000, self(), debounced_refresh),
+    {noreply, State#state{debounce = Ref}};
+handle_info({view_event, friends, _Event}, State) ->
+    {noreply, State};
+
+handle_info(debounced_refresh, State) ->
+    recompute_repl_set(),
+    {noreply, State#state{debounce = undefined}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
