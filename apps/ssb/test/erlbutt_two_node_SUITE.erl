@@ -26,7 +26,8 @@
          two_node_blob_wants_test/1,
          two_node_multiple_blob_wants_test/1,
          two_node_blob_fetch_test/1,
-         two_node_auto_blob_fetch_test/1]).
+         two_node_auto_blob_fetch_test/1,
+         two_node_rpc_permissions_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -48,7 +49,8 @@ all() ->
      two_node_blob_wants_test,
      two_node_multiple_blob_wants_test,
      two_node_blob_fetch_test,
-     two_node_auto_blob_fetch_test].
+     two_node_auto_blob_fetch_test,
+     two_node_rpc_permissions_test].
 
 init_per_suite(Config) ->
     %% peer:start/1 requires the calling node to be distributed.
@@ -404,6 +406,56 @@ two_node_auto_blob_fetch_test(Config) ->
     ?assertEqual({ok, BlobData}, rpc:call(NodeB, blobs, fetch, [BlobId])),
 
     rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% node_b authenticates with its own key, so on node_a it is an ordinary
+%% peer: owner-only methods (publish) must be refused, the open surface
+%% (whoami) must still answer, and the manifest node_a serves it must
+%% not advertise owner-only methods.
+two_node_rpc_permissions_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                             ["localhost", ?PORT_A, ACurvePk]),
+
+    %% owner-only builtin refused for a peer
+    {ok, Denied} = rpc:call(NodeB, ssb_peer, rpc_call,
+                            [PeerPid, [~"publish"], ~"async",
+                             [{[{~"type", ~"post"}, {~"text", ~"intrusion"}]}]]),
+    {DeniedProps} = rpc:call(NodeB, utils, nat_decode, [Denied]),
+    ?assertEqual(~"Error", proplists:get_value(~"name", DeniedProps)),
+    ?assertEqual(~"method not allowed",
+                 proplists:get_value(~"message", DeniedProps)),
+
+    %% nothing was published on node_a's own feed
+    AId      = rpc:call(NodeA, keys, pub_key_disp, []),
+    AFeedPid = rpc:call(NodeA, utils, find_or_create_feed_pid, [AId]),
+    LastMsg  = rpc:call(NodeA, ssb_feed, fetch_last_msg, [AFeedPid]),
+    case LastMsg of
+        #message{content = Content} ->
+            ?assertNotEqual(~"intrusion", msg_text(Content));
+        _ -> ok
+    end,
+
+    %% the open surface still answers
+    {ok, WhoBody} = rpc:call(NodeB, ssb_peer, rpc_call,
+                             [PeerPid, [?whoami], ~"async"]),
+    {WhoProps} = rpc:call(NodeB, utils, nat_decode, [WhoBody]),
+    ?assertEqual(AId, proplists:get_value(~"id", WhoProps)),
+
+    %% the manifest served to a peer hides owner-only methods
+    {ok, ManBody} = rpc:call(NodeB, ssb_peer, rpc_call,
+                             [PeerPid, [~"manifest"], ~"sync"]),
+    {ManProps} = rpc:call(NodeB, utils, nat_decode, [ManBody]),
+    ?assertEqual(undefined, proplists:get_value(~"publish", ManProps)),
+    ?assertEqual(undefined, proplists:get_value(~"createLogStream", ManProps)),
+    ?assertEqual(~"source", proplists:get_value(?createhistorystream, ManProps)),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+msg_text({Props}) -> proplists:get_value(~"text", Props);
+msg_text(_)       -> undefined.
 
 %%% Helpers -------------------------------------------------------------
 
