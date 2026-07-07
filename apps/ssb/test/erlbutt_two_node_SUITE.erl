@@ -27,7 +27,8 @@
          two_node_multiple_blob_wants_test/1,
          two_node_blob_fetch_test/1,
          two_node_auto_blob_fetch_test/1,
-         two_node_rpc_permissions_test/1]).
+         two_node_rpc_permissions_test/1,
+         two_node_repl_set_event_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -50,7 +51,8 @@ all() ->
      two_node_multiple_blob_wants_test,
      two_node_blob_fetch_test,
      two_node_auto_blob_fetch_test,
-     two_node_rpc_permissions_test].
+     two_node_rpc_permissions_test,
+     two_node_repl_set_event_test].
 
 init_per_suite(Config) ->
     %% peer:start/1 requires the calling node to be distributed.
@@ -456,6 +458,26 @@ two_node_rpc_permissions_test(Config) ->
 
 msg_text({Props}) -> proplists:get_value(~"text", Props);
 msg_text(_)       -> undefined.
+
+%% Posting a follow updates the EBT replication set via the friends
+%% view's change events (debounced ~1s) — no explicit
+%% ebt:refresh_repl_set/0 and no waiting for the periodic timer.
+two_node_repl_set_event_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    Target = rpc:call(NodeA, keys, pub_key_disp, []),
+    NewFeed = fresh_feed_id(),
+    ?assertNot(rpc:call(NodeA, ebt, replicate_feed, [NewFeed])),
+    SelfPid = rpc:call(NodeA, utils, find_or_create_feed_pid, [Target]),
+    Content = {[{~"type", ~"contact"}, {~"contact", NewFeed},
+                {~"following", true}]},
+    ok = rpc:call(NodeA, ssb_feed, post_content, [SelfPid, Content]),
+    ?assert(wait_until(
+              fun() -> rpc:call(NodeA, ebt, replicate_feed, [NewFeed]) end,
+              20)).
+
+fresh_feed_id() ->
+    #{public := Pub} = enacl:sign_keypair(),
+    <<"@", (base64:encode(Pub))/binary, ".ed25519">>.
 
 %%% Helpers -------------------------------------------------------------
 
