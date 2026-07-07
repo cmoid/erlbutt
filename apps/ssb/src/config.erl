@@ -28,71 +28,81 @@
          terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
+-define(TABLE, ssb_config).
 
--record(state, {ssb_home,
-                repo_loc,
-                feed_loc,
-                blob_loc,
-                net_id,
-                extra_network_ids = [],
-                archive_length = ?DEFAULT_ARCHIVE_LENGTH,
-                replication_hops = ?DEFAULT_REPLICATION_HOPS,
-                dialer = true,
-                blob_scan = false,
-                room = false,
-                room_name = <<"erlbutt room">>,
-                room_privacy = open}).
+%% The whole configuration lives in one record, kept private to this
+%% module: callers go through the accessor functions below, so the record
+%% can change shape without touching (or recompiling) any other module.
+-record(config, {ssb_home,
+                 repo_loc,
+                 feed_loc,
+                 blob_loc,
+                 net_id,
+                 extra_network_ids = [],
+                 archive_length = ?DEFAULT_ARCHIVE_LENGTH,
+                 replication_hops = ?DEFAULT_REPLICATION_HOPS,
+                 dialer = true,
+                 blob_scan = false,
+                 room = false,
+                 room_name = <<"erlbutt room">>,
+                 room_privacy = open}).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 
+%% Reads never touch the gen_server: the current #config{} is published
+%% to a protected ETS table owned by it (same read-mostly pattern as
+%% ebt_repl_set / network_id_cache), so hot paths like the SHS handshake
+%% don't serialize through this process's mailbox.
+
 ssb_repo_loc() ->
-    gen_server:call(?MODULE, repo, infinity).
+    (get_config())#config.repo_loc.
 
 feed_loc() ->
-    gen_server:call(?MODULE, feeds, infinity).
+    (get_config())#config.feed_loc.
 
 blob_loc() ->
-    gen_server:call(?MODULE, blobs, infinity).
+    (get_config())#config.blob_loc.
 
 network_id() ->
-    gen_server:call(?MODULE, netid, infinity).
+    (get_config())#config.net_id.
 
 network_ids() ->
-    gen_server:call(?MODULE, network_ids, infinity).
-
-add_network_id(NetId) when is_binary(NetId) ->
-    gen_server:call(?MODULE, {add_network_id, NetId}, infinity).
+    Cfg = get_config(),
+    [Cfg#config.net_id | Cfg#config.extra_network_ids].
 
 archive_length() ->
-    gen_server:call(?MODULE, archive_length, infinity).
+    (get_config())#config.archive_length.
 
 %% Max hops from our own feed for EBT replication (the follow horizon).
 replication_hops() ->
-    gen_server:call(?MODULE, replication_hops, infinity).
+    (get_config())#config.replication_hops.
 
 %% Whether peer_dialer should dial automatically at startup.
 %% Set {peer_dialer, false}. in ssb.cfg to start with dialing off.
 dialer_enabled() ->
-    gen_server:call(?MODULE, dialer_enabled, infinity).
+    (get_config())#config.dialer.
 
 %% Whether to scan existing on-disk messages for blob references at startup
 %% and fetch any we don't already hold.  Off by default (it folds the whole
 %% log); enable with {blob_scan, true}. in ssb.cfg.
 blob_scan_enabled() ->
-    gen_server:call(?MODULE, blob_scan, infinity).
+    (get_config())#config.blob_scan.
 
 %% Whether this node acts as an SSB room (connection relay).
 is_room() ->
-    gen_server:call(?MODULE, is_room, infinity).
+    (get_config())#config.room.
 
 room_name() ->
-    gen_server:call(?MODULE, room_name, infinity).
+    (get_config())#config.room_name.
 
 %% Room privacy mode: open | community | restricted.
 room_privacy() ->
-    gen_server:call(?MODULE, room_privacy, infinity).
+    (get_config())#config.room_privacy.
+
+add_network_id(NetId) when is_binary(NetId) ->
+    gen_server:call(?MODULE, {add_network_id, NetId}, infinity).
 
 set_archive_length(undefined) ->
     gen_server:call(?MODULE, {set_archive_length, undefined}, infinity);
@@ -111,138 +121,115 @@ start_link(Config) ->
 
 init([Config]) ->
     process_flag(trap_exit, true),
+    ets:new(?TABLE, [named_table, protected, set, {read_concurrency, true}]),
     SSBHome = application:get_env(ssb, ssb_home, "."),
     %% Room settings default from application env; a cfg-file entry overrides.
-    Base = #state{ssb_home = SSBHome,
-                  net_id = default_net_id(),
-                  room = application:get_env(ssb, room, false),
-                  room_name = application:get_env(ssb, room_name, <<"erlbutt room">>),
-                  room_privacy = application:get_env(ssb, room_privacy, open),
-                  replication_hops = application:get_env(ssb, replication_hops,
-                                                         ?DEFAULT_REPLICATION_HOPS)},
-    case filelib:is_file(Config) of
-        true ->
-            {ok, load_and_parse(Config, Base#state{repo_loc = default_repo(SSBHome)})};
-        false ->
-            %%?LOG_DEBUG("try to load the config from ~p ~n", []),
-            {ok, Base#state{repo_loc = default_repo(SSBHome),
-                            feed_loc = default_feed_store(SSBHome),
-                            blob_loc = default_blob_store(SSBHome)}}
-    end.
+    Base = #config{ssb_home = SSBHome,
+                   net_id = default_net_id(),
+                   room = application:get_env(ssb, room, false),
+                   room_name = application:get_env(ssb, room_name, <<"erlbutt room">>),
+                   room_privacy = application:get_env(ssb, room_privacy, open),
+                   replication_hops = application:get_env(ssb, replication_hops,
+                                                          ?DEFAULT_REPLICATION_HOPS)},
+    Cfg = case filelib:is_file(Config) of
+              true ->
+                  load_and_parse(Config, Base#config{repo_loc = default_repo(SSBHome)});
+              false ->
+                  Base#config{repo_loc = default_repo(SSBHome),
+                              feed_loc = default_feed_store(SSBHome),
+                              blob_loc = default_blob_store(SSBHome)}
+          end,
+    {ok, publish(Cfg)}.
 
-handle_call(repo, _From, #state{repo_loc = RepLoc}=State) ->
-    {reply, RepLoc, State};
+handle_call({add_network_id, NetId}, _From, #config{extra_network_ids = Extras}=Cfg) ->
+    {reply, ok, publish(Cfg#config{extra_network_ids = Extras ++ [NetId]})};
 
-handle_call(feeds, _From, #state{feed_loc = FeedLoc}=State) ->
-    {reply, FeedLoc, State};
-
-handle_call(blobs, _From, #state{blob_loc = BlobLoc}=State) ->
-    {reply, BlobLoc, State};
-
-handle_call(netid, _From, #state{net_id = NetId}=State) ->
-    {reply, NetId, State};
-
-handle_call(network_ids, _From, #state{net_id = NetId, extra_network_ids = Extras}=State) ->
-    {reply, [NetId | Extras], State};
-
-handle_call({add_network_id, NetId}, _From, #state{extra_network_ids = Extras}=State) ->
-    {reply, ok, State#state{extra_network_ids = Extras ++ [NetId]}};
-
-handle_call(archive_length, _From, #state{archive_length = Len}=State) ->
-    {reply, Len, State};
-
-handle_call(replication_hops, _From, #state{replication_hops = Hops}=State) ->
-    {reply, Hops, State};
-
-handle_call({set_archive_length, Len}, _From, State) ->
-    {reply, ok, State#state{archive_length = Len}};
-
-handle_call(dialer_enabled, _From, #state{dialer = Dialer}=State) ->
-    {reply, Dialer, State};
-
-handle_call(blob_scan, _From, #state{blob_scan = Scan}=State) ->
-    {reply, Scan, State};
-
-handle_call(is_room, _From, #state{room = Room}=State) ->
-    {reply, Room, State};
-
-handle_call(room_name, _From, #state{room_name = Name}=State) ->
-    {reply, Name, State};
-
-handle_call(room_privacy, _From, #state{room_privacy = Privacy}=State) ->
-    {reply, Privacy, State}.
+handle_call({set_archive_length, Len}, _From, Cfg) ->
+    {reply, ok, publish(Cfg#config{archive_length = Len})}.
 
 %% casts
 
-handle_cast(_Msg, State) ->
-    {noreply, State}.
+handle_cast(_Msg, Cfg) ->
+    {noreply, Cfg}.
 
 %% info
 
-handle_info(_Info, State) ->
-    {noreply, State}.
+handle_info(_Info, Cfg) ->
+    {noreply, Cfg}.
 
 
-terminate(_Reason, _State) ->
+terminate(_Reason, _Cfg) ->
     ok.
 
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
+code_change(_OldVsn, Cfg, _Extra) ->
+    {ok, Cfg}.
 
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
-load_and_parse(CfgFile, #state{} = State) ->
+
+%% The ETS copy is the read path; the gen_server state is the write path.
+%% The table is owned by this process, so it disappears (and reads start
+%% failing loudly) if the config server goes down.
+publish(#config{} = Cfg) ->
+    ets:insert(?TABLE, {config, Cfg}),
+    Cfg.
+
+get_config() ->
+    [{config, Cfg}] = ets:lookup(?TABLE, config),
+    Cfg.
+
+load_and_parse(CfgFile, #config{} = Cfg) ->
     {ok, CfgTerms} = file:consult(CfgFile),
-    lists:foldl(fun(CfgTerm, StateIn) ->
-                        parse(CfgTerm, StateIn)
-                end, State, CfgTerms).
+    lists:foldl(fun(CfgTerm, CfgIn) ->
+                        parse(CfgTerm, CfgIn)
+                end, Cfg, CfgTerms).
 
-parse({feed_store_location, Loc}, #state{repo_loc = RepLoc} = State) ->
+parse({feed_store_location, Loc}, #config{repo_loc = RepLoc} = Cfg) ->
     Store = ?l2b(?b2l(RepLoc) ++ Loc),
     filelib:ensure_dir(Store),
-    State#state{feed_loc = Store};
+    Cfg#config{feed_loc = Store};
 
-parse({blob_store_location, Loc}, #state{repo_loc = RepLoc} = State) ->
+parse({blob_store_location, Loc}, #config{repo_loc = RepLoc} = Cfg) ->
     Store = ?l2b(?b2l(RepLoc) ++ Loc),
     filelib:ensure_dir(Store),
-    State#state{blob_loc = Store};
+    Cfg#config{blob_loc = Store};
 
-parse({network_id, NetId}, State) ->
-    State#state{net_id = base64:decode(NetId)};
+parse({network_id, NetId}, Cfg) ->
+    Cfg#config{net_id = base64:decode(NetId)};
 
-parse({extra_network_ids, List}, State) when is_list(List) ->
-    State#state{extra_network_ids = [base64:decode(Id) || Id <- List]};
+parse({extra_network_ids, List}, Cfg) when is_list(List) ->
+    Cfg#config{extra_network_ids = [base64:decode(Id) || Id <- List]};
 
-parse({archive_length, Len}, State) when is_integer(Len), Len > 0 ->
-    State#state{archive_length = Len};
+parse({archive_length, Len}, Cfg) when is_integer(Len), Len > 0 ->
+    Cfg#config{archive_length = Len};
 
-parse({replication_hops, Hops}, State) when is_integer(Hops), Hops >= 0 ->
-    State#state{replication_hops = Hops};
+parse({replication_hops, Hops}, Cfg) when is_integer(Hops), Hops >= 0 ->
+    Cfg#config{replication_hops = Hops};
 
-parse({peer_dialer, Bool}, State) when is_boolean(Bool) ->
-    State#state{dialer = Bool};
+parse({peer_dialer, Bool}, Cfg) when is_boolean(Bool) ->
+    Cfg#config{dialer = Bool};
 
-parse({blob_scan, Bool}, State) when is_boolean(Bool) ->
-    State#state{blob_scan = Bool};
+parse({blob_scan, Bool}, Cfg) when is_boolean(Bool) ->
+    Cfg#config{blob_scan = Bool};
 
-parse({room, Bool}, State) when is_boolean(Bool) ->
-    State#state{room = Bool};
+parse({room, Bool}, Cfg) when is_boolean(Bool) ->
+    Cfg#config{room = Bool};
 
-parse({room_name, Name}, State) when is_binary(Name) ->
-    State#state{room_name = Name};
+parse({room_name, Name}, Cfg) when is_binary(Name) ->
+    Cfg#config{room_name = Name};
 
-parse({room_privacy, Privacy}, State)
+parse({room_privacy, Privacy}, Cfg)
   when Privacy =:= open; Privacy =:= community; Privacy =:= restricted ->
-    State#state{room_privacy = Privacy};
+    Cfg#config{room_privacy = Privacy};
 
-parse(Any, State) ->
+parse(Any, Cfg) ->
     %% Unrecognised config term: either an unknown key or a known key whose
     %% value failed its guard (e.g. {peer_dialer, "false"} — a string instead
     %% of the atom false, as produced by a mis-quoted ssb.cfg template). Warn
     %% rather than silently drop it, so the setting being ignored is visible.
     ?SSB_ERROR("config: ignoring unrecognised term ~p", [Any]),
-    State.
+    Cfg.
 
 default_repo(SSBHome) ->
     ?l2b(SSBHome ++ "/.ssberl/").
