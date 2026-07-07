@@ -14,7 +14,9 @@
 
 -export([handshake_test/1,
          post_and_fetch_test/1,
-         ebt_path_test/1]).
+         ebt_path_test/1,
+         plugin_rpc_test/1,
+         manifest_rpc_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -27,7 +29,9 @@
 all() ->
     [handshake_test,
      post_and_fetch_test,
-     ebt_path_test].
+     ebt_path_test,
+     plugin_rpc_test,
+     manifest_rpc_test].
 
 init_per_suite(Config) ->
     DataDir = ?config(priv_dir, Config),
@@ -78,6 +82,49 @@ ebt_path_test(_Config) ->
     ?assert(Seq >= 1),
     {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
     ?assert(is_process_alive(Peer)),
+    gen_server:stop(Peer).
+
+%% Register a plugin and call its methods over a real loopback
+%% connection.  The loopback client authenticates with the node's own
+%% keypair, so its permission class is owner.
+plugin_rpc_test(_Config) ->
+    ok = plugin_registry:register_plugin(test_echo_plugin),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+
+    %% async method: args come back verbatim
+    {ok, Body} = ssb_peer:rpc_call(Peer, [~"echo", ~"hello"], ~"async",
+                                   [~"hi there"]),
+    ?assertEqual([~"hi there"], utils:nat_decode(Body)),
+
+    %% the plugin sees the authenticated caller identity and class
+    {ok, Body2} = ssb_peer:rpc_call(Peer, [~"echo", ~"whoAmI"], ~"async"),
+    {Props} = utils:nat_decode(Body2),
+    ?assertEqual(keys:pub_key_disp(), proplists:get_value(~"feed", Props)),
+    ?assertEqual(~"owner", proplists:get_value(~"class", Props)),
+
+    %% owner-only method is callable by the owner
+    {ok, Body3} = ssb_peer:rpc_call(Peer, [~"echo", ~"secrets"], ~"async"),
+    ?assertEqual(~"the owner's secrets", utils:nat_decode(Body3)),
+
+    %% source method: one frame per item, then a clean end-of-stream
+    {ok, Frames} = ssb_peer:rpc_stream_call(Peer, [~"echo", ~"count"], [3]),
+    ?assertEqual([1, 2, 3], [utils:nat_decode(F) || F <- Frames]),
+
+    ok = plugin_registry:unregister_plugin(test_echo_plugin),
+    gen_server:stop(Peer).
+
+%% The manifest method serves the node's RPC surface (builtins included),
+%% filtered by the caller's class.
+manifest_rpc_test(_Config) ->
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, Body} = ssb_peer:rpc_call(Peer, [~"manifest"], ~"sync"),
+    {Props} = utils:nat_decode(Body),
+    ?assertEqual(~"source", proplists:get_value(~"createHistoryStream", Props)),
+    ?assertEqual(~"sync",   proplists:get_value(~"manifest", Props)),
+    {Blobs} = proplists:get_value(~"blobs", Props),
+    ?assertEqual(~"async", proplists:get_value(~"has", Blobs)),
+    %% the loopback caller is the owner, so owner-only methods are visible
+    ?assertEqual(~"async", proplists:get_value(~"publish", Props)),
     gen_server:stop(Peer).
 
 %%% Helpers -------------------------------------------------------------
