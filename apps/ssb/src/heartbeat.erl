@@ -163,7 +163,7 @@ extract_key(Data) ->
         {Pos, Len} ->
             KeyStart = Pos + Len,
             Rest = binary:part(Data, KeyStart, size(Data) - KeyStart),
-            case binary:match(Rest, <<";">>) of
+            case binary:match(Rest, ~";") of
                 nomatch      -> Rest;
                 {SemiPos, _} -> binary:part(Rest, 0, SemiPos)
             end
