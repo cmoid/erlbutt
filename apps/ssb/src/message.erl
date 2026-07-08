@@ -12,6 +12,7 @@
 -export([decode/2,
          decode_value/2,
          encode/1,
+         encode_value/1,
          ssb_encoder/3,
          new_msg/4]).
 
@@ -42,6 +43,13 @@ encode(#message{id = Key, received = Received, swapped = Swapped} = Msg) ->
     iolist_to_binary(ssb_encoder({[{~"key", Key},
                                    {~"value", {EncMsg}},
                                    {~"timestamp", Received}]}, fun ssb_encoder/3, [use_nil])).
+
+%% Just the signed message value ({previous, author, sequence, content,
+%% signature, ...}), without the {key, value, timestamp} envelope — the
+%% shape ssb-db `get` returns.
+encode_value(#message{swapped = Swapped} = Msg) ->
+    EncMsg = build_props(msg_to_proplist(Msg), Swapped),
+    iolist_to_binary(ssb_encoder({EncMsg}, fun ssb_encoder/3, [use_nil])).
 
 %% Decode a value-only JSON binary (as sent by EBT / createHistoryStream keys:false).
 %% The message ID is computed by hashing the canonical (pretty) JSON, matching

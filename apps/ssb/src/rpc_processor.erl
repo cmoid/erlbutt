@@ -299,7 +299,10 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"get"],
         Author when is_binary(Author) ->
             FeedPid = utils:find_or_create_feed_pid(Author),
             Msg  = ssb_feed:fetch_msg(FeedPid, MsgId),
-            Body = message:encode(Msg),
+            %% ssb-db get returns the bare message value, not the
+            %% {key, value, timestamp} envelope (the renderer reads
+            %% value.content directly).
+            Body = message:encode_value(Msg),
             Flags  = create_flags(0, 0, 2),   %% async reply: stream=0
             Header = create_header(Flags, size(Body), -ReqNo),
             utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
