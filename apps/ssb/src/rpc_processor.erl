@@ -270,7 +270,9 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"publish"],
     ok = ssb_feed:post_content(FeedPid, Content),
     Msg  = ssb_feed:fetch_last_msg(FeedPid),
     Body = message:encode(Msg),
-    Flags  = create_flags(1, 1, 2),
+    %% async reply: stream=0.  A stream/end-flagged frame is rejected by
+    %% a standard muxrpc async caller ("no stream for incoming msg").
+    Flags  = create_flags(0, 0, 2),
     Header = create_header(Flags, size(Body), -ReqNo),
     utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
 
@@ -287,7 +289,7 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"get"],
             FeedPid = utils:find_or_create_feed_pid(Author),
             Msg  = ssb_feed:fetch_msg(FeedPid, MsgId),
             Body = message:encode(Msg),
-            Flags  = create_flags(1, 1, 2),
+            Flags  = create_flags(0, 0, 2),   %% async reply: stream=0
             Header = create_header(Flags, size(Body), -ReqNo),
             utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey)
     end;
@@ -326,9 +328,11 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?gossip, ?ping],
 proc_request(_Calls, ReqNo, #ssb_rpc{name = [?whoami],
                              args = []}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
-    %% stream+end+json closes only this call; never send ?RPC_END/?BOX_END
-    %% while other streams (e.g. EBT) may be active.
-    Flags = create_flags(1, 1, 2),
+    %% sync reply: stream=0.  (A stream/end-flagged frame is rejected by
+    %% a standard muxrpc sync/async caller as "no stream for incoming
+    %% msg".)  This is a single reply on this req, so it does not touch
+    %% other open streams (e.g. EBT).
+    Flags = create_flags(0, 0, 2),
     Body = whoami(),
     ?SSB_DEBUG("rpc_processor: whoami:  ~p~n", [Body]),
     Header = create_header(Flags, size(Body), -ReqNo),
@@ -502,7 +506,7 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"invite", ~"create"],
     {ok, Code} = invite:create(binary_to_list(Host), Port),
     Body = iolist_to_binary(message:ssb_encoder({[{~"invite", Code}]},
                               fun message:ssb_encoder/3, [])),
-    Flags  = create_flags(1, 1, 2),
+    Flags  = create_flags(0, 0, 2),   %% async reply: stream=0
     Header = create_header(Flags, size(Body), -ReqNo),
     utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
 
