@@ -161,7 +161,7 @@ public_feed_roots_test(_Config) ->
                                          {~"root", RootId}]}),
 
     {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
-    {ok, Frames} = ssb_peer:rpc_stream_call(Peer, [~"publicFeed", ~"roots"],
+    {ok, Frames} = ssb_peer:rpc_stream_call(Peer, [~"patchwork", ~"publicFeed", ~"roots"],
                                             [{[{~"limit", 20}]}]),
     Items = [utils:nat_decode(F) || F <- Frames],
     Match = [P || {P} <- Items, proplists:get_value(~"key", P) =:= RootId],
@@ -176,7 +176,7 @@ public_feed_roots_test(_Config) ->
 public_feed_latest_test(_Config) ->
     OwnPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
     {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
-    {ok, _Ref} = ssb_peer:open_source(Peer, [~"publicFeed", ~"latest"],
+    {ok, _Ref} = ssb_peer:open_source(Peer, [~"patchwork", ~"publicFeed", ~"latest"],
                                       [{[]}], self()),
     Marker = base64:encode(crypto:strong_rand_bytes(9)),
     ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", Marker}]}),

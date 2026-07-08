@@ -107,10 +107,10 @@ view_entry(_) ->
 %%%===================================================================
 
 manifest() ->
-    [{[~"publicFeed", ~"roots"],  source, owner},
-     {[~"publicFeed", ~"latest"], source, owner}].
+    [{[~"patchwork", ~"publicFeed", ~"roots"],  source, owner},
+     {[~"patchwork", ~"publicFeed", ~"latest"], source, owner}].
 
-handle_rpc([~"publicFeed", ~"roots"], Args, _Caller) ->
+handle_rpc([~"patchwork", ~"publicFeed", ~"roots"], Args, _Caller) ->
     Opts    = opts(Args),
     Reverse = maps:get(reverse, Opts, true),
     Limit   = maps:get(limit, Opts, undefined),
@@ -126,7 +126,7 @@ handle_rpc([~"publicFeed", ~"roots"], Args, _Caller) ->
 %% The live prepend to the public feed: no snapshot, then a root item
 %% each time a thread gains activity (new root or new reply bumping it),
 %% dropping blocked authors and not-yet-seen roots.
-handle_rpc([~"publicFeed", ~"latest"], _Args, _Caller) ->
+handle_rpc([~"patchwork", ~"publicFeed", ~"latest"], _Args, _Caller) ->
     EventFun =
         fun({thread, RootId}) ->
                 Blocked = blocked_set(),
@@ -391,7 +391,7 @@ post(Pid, Content) ->
 
 roots() ->
     {source, Items} =
-        handle_rpc([~"publicFeed", ~"roots"], [{[]}],
+        handle_rpc([~"patchwork", ~"publicFeed", ~"roots"], [{[]}],
                    #{class => owner, feed_id => keys:pub_key_disp()}),
     [utils:nat_decode(B) || {json, B} <- Items].
 
