@@ -14,6 +14,7 @@
 -export([backlinks_read_test/1,
          get_latest_test/1,
          messages_by_type_test/1,
+         live_backlinks_test/1,
          manifest_includes_silkpurse_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
@@ -26,6 +27,7 @@ all() ->
     [backlinks_read_test,
      get_latest_test,
      messages_by_type_test,
+     live_backlinks_test,
      manifest_includes_silkpurse_test].
 
 init_per_suite(Config) ->
@@ -101,6 +103,39 @@ messages_by_type_test(_Config) ->
     ?assertNot(lists:member(ContactId,
                             [begin #message{id = I} = message:decode(F, false), I end
                              || F <- PostFrames])),
+    gen_server:stop(Peer).
+
+%% {live: true}: open the stream first, post the reply afterwards, and
+%% receive it as a pushed frame — the view-event -> view_stream ->
+%% send_frame path end to end.
+live_backlinks_test(_Config) ->
+    OwnPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"},
+                                         {~"text", ~"live root"}]}),
+    #message{id = RootId} = ssb_feed:fetch_last_msg(OwnPid),
+
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    Args = [{[{~"query", [{[{~"$filter", {[{~"dest", RootId}]}}]}]},
+              {~"live", true}, {~"old", false}]}],
+    {ok, _Ref} = ssb_peer:open_source(Peer, [~"backlinks", ~"read"],
+                                      Args, self()),
+
+    %% nothing yet: old=false and no replies exist
+    receive {stream_data, _, Early} -> error({unexpected_early, Early})
+    after 300 -> ok
+    end,
+
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"},
+                                         {~"text", ~"live reply"},
+                                         {~"root", RootId}]}),
+    #message{id = ReplyId} = ssb_feed:fetch_last_msg(OwnPid),
+    receive
+        {stream_data, _, Frame} ->
+            #message{id = GotId} = message:decode(Frame, false),
+            ?assertEqual(ReplyId, GotId)
+    after 3000 ->
+        error(no_live_frame)
+    end,
     gen_server:stop(Peer).
 
 fresh_feed_id() ->
