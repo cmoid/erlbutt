@@ -103,7 +103,11 @@ name(FeedId) ->
 %%% ssb_view callbacks (run in the view_manager process)
 %%%===================================================================
 
-view_version() -> 1.
+%% 2: the fold source changed from the (hole-ridden) global log.offset
+%% to the per-feed logs.  Checkpoints recorded against the old source
+%% claim coverage they don't have, so upgrading nodes must rebuild —
+%% which is exactly what a version bump forces.
+view_version() -> 2.
 
 view_load() ->
     case lists:all(fun({Tab, _}) -> has_marker(Tab) end, ?TABLES) of
