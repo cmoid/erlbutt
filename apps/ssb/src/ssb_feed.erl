@@ -44,7 +44,6 @@
 -record(state, {id,
                 last_msg = null,
                 last_seq = 0,
-                segment_start = 1,
                 feed,
                 profile,
                 contacts,
@@ -266,8 +265,13 @@ archive_length() ->
     config:archive_length().
 
 do_archive(#state{id = FeedId, last_seq = LastSeq,
-                  segment_start = From, feed = FeedFile} = State) ->
+                  feed = FeedFile} = State) ->
     {ok, LogData} = file:read_file(FeedFile),
+    %% The segment's range comes from its own content: the first record
+    %% of the live log.  (A tracked segment_start used to be guessed at
+    %% restart and produced archives whose filenames lied about their
+    %% ranges — content cannot.)
+    From = first_seq(LogData),
     GzData = zlib:gzip(LogData),
     ArchiveFile = archive_filename(FeedFile, From, LastSeq),
     ok = file:write_file(ArchiveFile, GzData),
@@ -281,9 +285,12 @@ do_archive(#state{id = FeedId, last_seq = LastSeq,
     #message{id = NewId} = Msg =
         message:new_msg(null, NewSeq, Content, {FeedId, keys:priv_key()}),
     State1 = store(Msg, State),
-    {State1#state{last_msg      = NewId,
-                  last_seq      = NewSeq,
-                  segment_start = NewSeq + 1}, BlobId}.
+    {State1#state{last_msg = NewId,
+                  last_seq = NewSeq}, BlobId}.
+
+first_seq(<<Len:32, Msg:Len/binary, _/binary>>) ->
+    #message{sequence = Seq} = message:decode(Msg, false),
+    Seq.
 
 archive_filename(FeedFile, From, To) ->
     <<FeedFile/binary, ".",
@@ -349,26 +356,46 @@ init_directories(FeedId) ->
 
 %% Only feed corresponding to the owner of the peer can post.
 %% All the other feeds are only meant to be read
-check_owner_feed(#state{id = FeedId, feed = Feed,
+check_owner_feed(#state{feed = Feed,
                        msg_cache = Messages} = State) ->
-    IsOwner = FeedId == keys:pub_key_disp(),
     Resp = feed_get_last(Feed),
     case Resp of
         no_file ->
-            State;
+            %% No live log.  Normally a brand-new feed — but if archives
+            %% exist, this is the crash window in do_archive (old log
+            %% deleted, genesis not yet stored): recover last_seq from
+            %% the newest archive's content so we do not restart at 0
+            %% and re-store duplicate sequences.
+            recover_from_archives(State);
         done ->
             State;
         {Pos, Msg, Key} ->
             ets:insert(Messages, {Key, Pos}),
-            #message{sequence = Seq,
-                     previous = Prev} = message:decode(Msg, false),
-            SegStart = case {IsOwner, Prev} of
-                {true, null} when Seq > 1 -> Seq + 1;
-                _                         -> 1
-            end,
-            State#state{last_msg      = Key,
-                        last_seq      = Seq,
-                        segment_start = SegStart}
+            #message{sequence = Seq} = message:decode(Msg, false),
+            State#state{last_msg = Key,
+                        last_seq = Seq}
+    end.
+
+recover_from_archives(#state{id = FeedId, feed = Feed} = State) ->
+    Dir = filename:dirname(?b2l(Feed)),
+    case filelib:wildcard(filename:join(Dir, "log.offset.*.gz")) of
+        [] ->
+            State;
+        _Archives ->
+            %% Content-derived (filenames of old archives can lie):
+            %% the highest sequence anywhere in the archived history.
+            {LastSeq, LastId} = feed_store:fold_feed(
+                fun(Data, {SeqAcc, IdAcc}) ->
+                        try message:decode(Data, false) of
+                            #message{sequence = S, id = Id} when S > SeqAcc ->
+                                {S, Id};
+                            _ -> {SeqAcc, IdAcc}
+                        catch _:_ -> {SeqAcc, IdAcc}
+                        end
+                end, {0, null}, Dir),
+            ?SSB_INFO("feed ~s: no live log but archives present; "
+                      "recovered last_seq ~p", [FeedId, LastSeq]),
+            State#state{last_seq = LastSeq, last_msg = LastId}
     end.
 
 feed_get(Feed, [], Key) ->
@@ -486,26 +513,39 @@ feed_test_() ->
       fun fetch_last_msg_test/1,
       fun store_msg_dedup_test/1,
       fun archive_manual_test/1,
-      fun post_after_archive_test/1]}.
+      fun post_after_archive_test/1,
+      fun second_archive_naming_test/1,
+      fun restart_then_archive_naming_test/1,
+      fun crash_window_recovery_test/1]}.
 
+%% Fully isolated home per test: these tests archive and restart the
+%% own feed, and a home shared across eunit runs accumulates
+%% overlapping archives (the old setup deleted only the live log,
+%% which is exactly the do_archive crash window).
 setup() ->
-    ensure_started(config,    fun() -> config:start_link("test/ssb.cfg") end),
-    ensure_started(keys,      fun() -> keys:start_link() end),
-    ensure_started(mess_auth, fun() -> mess_auth:start_link() end),
-    ensure_started(blobs,     fun() -> blobs:start_link() end),
+    teardown(ignore),
+    Home = filename:join("/tmp", "feed_" ++
+                          integer_to_list(erlang:system_time(microsecond))),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    application:set_env(ssb, ssb_home, Home),
+    {ok, _} = config:start_link("no-such-cfg"),
+    {ok, _} = keys:start_link(),
+    {ok, _} = mess_auth:start_link(),
+    {ok, _} = blobs:start_link(),
     FeedId = keys:pub_key_disp(),
-    file:delete(feed_file(FeedId)),
     {ok, Pid} = ssb_feed:start_link(FeedId),
-    {Pid, FeedId}.
+    {Pid, FeedId, Home}.
 
-teardown({Pid, _}) ->
-    gen_server:stop(Pid).
-
-ensure_started(Name, StartFun) ->
-    case whereis(Name) of
-        undefined -> StartFun();
-        _         -> ok
-    end.
+teardown(ignore) ->
+    [catch gen_server:stop(Name)
+     || Name <- [blobs, mess_auth, keys, config]],
+    ok;
+teardown({Pid, _, Home}) ->
+    catch gen_server:stop(Pid),
+    teardown(ignore),
+    os:cmd("rm -rf " ++ Home),
+    application:unset_env(ssb, ssb_home),
+    ok.
 
 feed_file(FeedId) ->
     Location = config:feed_loc(),
@@ -513,14 +553,14 @@ feed_file(FeedId) ->
     <<Dir:2/binary, Rest/binary>> = DecId,
     <<Location/binary, Dir/binary, "/", Rest/binary, "/log.offset">>.
 
-post_and_fetch_test({Pid, _}) ->
+post_and_fetch_test({Pid, _, _}) ->
     fun() ->
         ok = ssb_feed:post_content(Pid, ~"hello world"),
         #message{id = Key, sequence = 1} = ssb_feed:fetch_last_msg(Pid),
         #message{content = ~"hello world"} = ssb_feed:fetch_msg(Pid, Key)
     end.
 
-sequence_increments_test({Pid, _}) ->
+sequence_increments_test({Pid, _, _}) ->
     fun() ->
         ok = ssb_feed:post_content(Pid, ~"first"),
         ok = ssb_feed:post_content(Pid, ~"second"),
@@ -528,7 +568,7 @@ sequence_increments_test({Pid, _}) ->
         #message{sequence = 3} = ssb_feed:fetch_last_msg(Pid)
     end.
 
-fetch_last_msg_test({Pid, _}) ->
+fetch_last_msg_test({Pid, _, _}) ->
     fun() ->
         ok = ssb_feed:post_content(Pid, ~"a"),
         ok = ssb_feed:post_content(Pid, ~"b"),
@@ -538,7 +578,7 @@ fetch_last_msg_test({Pid, _}) ->
 
 %% store_msg reports `stored` for a new sequence and `skipped` for a
 %% duplicate, so EBT can avoid re-acking (and re-inviting) duplicates.
-store_msg_dedup_test({Pid, FeedId}) ->
+store_msg_dedup_test({Pid, FeedId, _}) ->
     fun() ->
         Msg = message:new_msg(null, 1, {[{~"type", ~"post"}, {~"text", ~"once"}]},
                               {FeedId, keys:priv_key()}),
@@ -546,7 +586,7 @@ store_msg_dedup_test({Pid, FeedId}) ->
         ?assertEqual(skipped, ssb_feed:store_msg(Pid, Msg))
     end.
 
-archive_manual_test({Pid, _}) ->
+archive_manual_test({Pid, _, _}) ->
     fun() ->
         ok = ssb_feed:post_content(Pid, ~"x"),
         ok = ssb_feed:post_content(Pid, ~"y"),
@@ -559,7 +599,7 @@ archive_manual_test({Pid, _}) ->
         ?assert(proplists:get_value(~"to_sequence", Props) =:= 2)
     end.
 
-post_after_archive_test({Pid, _}) ->
+post_after_archive_test({Pid, _, _}) ->
     fun() ->
         ok = ssb_feed:post_content(Pid, ~"before"),
         {ok, _} = ssb_feed:archive(Pid),
@@ -567,6 +607,60 @@ post_after_archive_test({Pid, _}) ->
         ok = ssb_feed:post_content(Pid, ~"after"),
         #message{previous = GenesisId, sequence = AfterSeq} = ssb_feed:fetch_last_msg(Pid),
         ?assert(AfterSeq =:= GenesisSeq + 1)
+    end.
+
+archive_files(FeedId) ->
+    Dir = filename:dirname(?b2l(feed_file(FeedId))),
+    lists:sort([filename:basename(F)
+                || F <- filelib:wildcard(filename:join(Dir, "log.offset.*.gz"))]).
+
+%% The second archive's range comes from its content (its first record
+%% is the previous archive-genesis message), not from a tracked counter.
+second_archive_naming_test({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"x"),          %% 1
+        ok = ssb_feed:post_content(Pid, ~"y"),          %% 2
+        {ok, _} = ssb_feed:archive(Pid),                %% genesis = 3
+        ok = ssb_feed:post_content(Pid, ~"z"),          %% 4
+        {ok, _} = ssb_feed:archive(Pid),                %% genesis = 5
+        ?assertEqual(["log.offset.1-2.gz", "log.offset.3-4.gz"],
+                     archive_files(FeedId))
+    end.
+
+%% A restart between archives must not reset the range bookkeeping
+%% (the old segment_start guess produced a second archive named 1-N).
+restart_then_archive_naming_test({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"a"),          %% 1
+        {ok, _} = ssb_feed:archive(Pid),                %% genesis = 2
+        ok = ssb_feed:post_content(Pid, ~"b"),          %% 3
+        ok = gen_server:stop(Pid),
+        {ok, Pid2} = ssb_feed:start_link(FeedId),
+        ok = ssb_feed:post_content(Pid2, ~"c"),         %% 4
+        {ok, _} = ssb_feed:archive(Pid2),               %% genesis = 5
+        ?assertEqual(["log.offset.1-1.gz", "log.offset.2-4.gz"],
+                     archive_files(FeedId)),
+        ok = gen_server:stop(Pid2)
+    end.
+
+%% Crash window in do_archive: old live log deleted, genesis not yet
+%% stored.  Recovery must take last_seq from the archives' content, not
+%% restart the feed at sequence 0 and re-store duplicates.
+crash_window_recovery_test({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"one"),        %% 1
+        ok = ssb_feed:post_content(Pid, ~"two"),        %% 2
+        #message{id = LastId} = ssb_feed:fetch_last_msg(Pid),
+        {ok, _} = ssb_feed:archive(Pid),                %% genesis = 3
+        %% simulate the crash: live log (holding only the genesis) gone
+        ok = gen_server:stop(Pid),
+        ok = file:delete(?b2l(feed_file(FeedId))),
+        {ok, Pid2} = ssb_feed:start_link(FeedId),
+        %% recovered from archive content: next post continues the chain
+        ok = ssb_feed:post_content(Pid2, ~"three"),
+        #message{sequence = 3, previous = Prev} = ssb_feed:fetch_last_msg(Pid2),
+        ?assertEqual(LastId, Prev),
+        ok = gen_server:stop(Pid2)
     end.
 
 -endif.
