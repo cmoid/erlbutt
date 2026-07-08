@@ -11,8 +11,9 @@
 %% and an ssb_plugin serving `backlinks.read` (source, owner-only) with
 %% the flumeview-query argument shape the JS client sends:
 %%   {query: [{$filter: {dest: Target}}], ...}
-%% Results are full stored messages in ingest order.  live/reverse/old
-%% flags are not yet honoured.
+%% Results are full stored messages in ingest order.  live and old are
+%% honoured ({live: true} keeps the stream open, fed by view events via
+%% view_stream); reverse is not yet.
 -module(silkpurse_backlinks).
 
 -ifdef(TEST).
@@ -76,9 +77,12 @@ view_save() ->
     ok.
 
 view_entry(#message{id = MsgId, content = Content}) ->
-    [ets:insert(?TAB, {Target, MsgId})
-     || Target <- collect_links(Content), Target =/= MsgId],
-    ok.
+    case [T || T <- collect_links(Content), T =/= MsgId] of
+        [] -> ok;
+        Targets ->
+            [ets:insert(?TAB, {Target, MsgId}) || Target <- Targets],
+            {events, [{link, Target, MsgId} || Target <- Targets]}
+    end.
 
 %%%===================================================================
 %%% ssb_plugin callbacks (run in each connection's rpc_processor)
@@ -93,8 +97,26 @@ handle_rpc([~"backlinks", ~"read"], Args, _Caller) ->
             {error, ~"backlinks.read: no $filter dest in query"};
         Target ->
             Ids = [Id || {_T, Id} <- ets:lookup(?TAB, Target), is_binary(Id)],
-            {source, [{json, Bin} || Id <- Ids,
-                                     (Bin = fetch_encoded(Id)) =/= undefined]}
+            Pairs = [{Id, Bin} || Id <- Ids,
+                                  (Bin = fetch_encoded(Id)) =/= undefined],
+            case flag_of(~"live", Args, false) of
+                false ->
+                    {source, [{json, B} || {_, B} <- Pairs]};
+                true ->
+                    Snapshot = case flag_of(~"old", Args, true) of
+                                   false -> [];
+                                   _     -> Pairs
+                               end,
+                    EventFun =
+                        fun({link, T, MsgId}) when T =:= Target ->
+                                case fetch_encoded(MsgId) of
+                                    undefined -> skip;
+                                    Bin       -> {send, MsgId, Bin}
+                                end;
+                           (_) -> skip
+                        end,
+                    {live_source, Snapshot, ?MODULE, EventFun}
+            end
     end.
 
 %%%===================================================================
@@ -184,6 +206,15 @@ fetch_encoded(MsgId) ->
             catch _:_ -> undefined
             end
     end.
+
+%% Boolean option (live, old) from the request's option object.
+flag_of(Key, [{Props}], Default) ->
+    case ?pgv(Key, Props) of
+        B when is_boolean(B) -> B;
+        _                    -> Default
+    end;
+flag_of(_Key, _Args, Default) ->
+    Default.
 
 %% {query: [{$filter: {dest: Target}}], ...} — the shape ssb-backlinks
 %% clients send.  Anything else -> undefined.

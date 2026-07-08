@@ -74,10 +74,12 @@ view_save() ->
 
 view_entry(#message{id = MsgId, content = {Props}}) ->
     case ?pgv(~"type", Props) of
-        Type when is_binary(Type) -> ets:insert(?TAB, {Type, MsgId});
-        _                         -> ok
-    end,
-    ok;
+        Type when is_binary(Type) ->
+            ets:insert(?TAB, {Type, MsgId}),
+            {events, [{typed, Type, MsgId}]};
+        _ ->
+            ok
+    end;
 view_entry(_) ->
     ok.
 
@@ -94,8 +96,26 @@ handle_rpc([~"messagesByType"], Args, _Caller) ->
             {error, ~"messagesByType takes a type"};
         Type ->
             Ids = [Id || {_T, Id} <- ets:lookup(?TAB, Type), is_binary(Id)],
-            {source, [{json, Bin} || Id <- Ids,
-                                     (Bin = fetch_encoded(Id)) =/= undefined]}
+            Pairs = [{Id, Bin} || Id <- Ids,
+                                  (Bin = fetch_encoded(Id)) =/= undefined],
+            case flag_of(~"live", Args, false) of
+                false ->
+                    {source, [{json, B} || {_, B} <- Pairs]};
+                true ->
+                    Snapshot = case flag_of(~"old", Args, true) of
+                                   false -> [];
+                                   _     -> Pairs
+                               end,
+                    EventFun =
+                        fun({typed, T, MsgId}) when T =:= Type ->
+                                case fetch_encoded(MsgId) of
+                                    undefined -> skip;
+                                    Bin       -> {send, MsgId, Bin}
+                                end;
+                           (_) -> skip
+                        end,
+                    {live_source, Snapshot, ?MODULE, EventFun}
+            end
     end.
 
 %%%===================================================================
@@ -143,6 +163,15 @@ code_change(_OldVsn, State, _Extra) ->
 
 table_file() ->
     <<(config:ssb_repo_loc())/binary, "views/by_type.tab">>.
+
+%% Boolean option (live, old) from the request's option object.
+flag_of(Key, [{Props}], Default) ->
+    case ?pgv(Key, Props) of
+        B when is_boolean(B) -> B;
+        _                    -> Default
+    end;
+flag_of(_Key, _Args, Default) ->
+    Default.
 
 %% JS accepts a bare type string or {type: T, live, ...}.
 type_of([Type]) when is_binary(Type) ->
