@@ -286,21 +286,28 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"publish"],
     utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
 
 proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"get"],
-                             args = [MsgId]}
+                             args = [Arg]}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
-    case mess_auth:get(MsgId) of
-        not_found ->
-            ErrMsg = utils:error_msg(~"Error", ~"message not found"),
-            Flags  = create_flags(0, 1, 2),
-            Header = create_header(Flags, size(ErrMsg), -ReqNo),
-            utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey);
-        Author ->
+    %% ssb-db get accepts either a bare message id or an options object
+    %% {id, private, ...}; the silkpurse renderer sends the object form.
+    MsgId = case Arg of
+        {Props} when is_list(Props) -> proplists:get_value(~"id", Props);
+        Id when is_binary(Id)       -> Id;
+        _                           -> undefined
+    end,
+    case MsgId =/= undefined andalso mess_auth:get(MsgId) of
+        Author when is_binary(Author) ->
             FeedPid = utils:find_or_create_feed_pid(Author),
             Msg  = ssb_feed:fetch_msg(FeedPid, MsgId),
             Body = message:encode(Msg),
             Flags  = create_flags(0, 0, 2),   %% async reply: stream=0
             Header = create_header(Flags, size(Body), -ReqNo),
-            utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey)
+            utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+        _ ->
+            ErrMsg = utils:error_msg(~"Error", ~"message not found"),
+            Flags  = create_flags(0, 1, 2),
+            Header = create_header(Flags, size(ErrMsg), -ReqNo),
+            utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey)
     end;
 
 proc_request(Calls, ReqNo, #ssb_rpc{name = Name}
