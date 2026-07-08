@@ -16,7 +16,8 @@
          post_and_fetch_test/1,
          ebt_path_test/1,
          plugin_rpc_test/1,
-         manifest_rpc_test/1]).
+         manifest_rpc_test/1,
+         log_stream_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -31,7 +32,8 @@ all() ->
      post_and_fetch_test,
      ebt_path_test,
      plugin_rpc_test,
-     manifest_rpc_test].
+     manifest_rpc_test,
+     log_stream_test].
 
 init_per_suite(Config) ->
     DataDir = ?config(priv_dir, Config),
@@ -125,6 +127,19 @@ manifest_rpc_test(_Config) ->
     ?assertEqual(~"async", proplists:get_value(~"has", Blobs)),
     %% the loopback caller is the owner, so owner-only methods are visible
     ?assertEqual(~"async", proplists:get_value(~"publish", Props)),
+    gen_server:stop(Peer).
+
+%% createLogStream serves arrival order from the ingest journal, with
+%% bodies resolved from the per-feed store.  The loopback caller is the
+%% owner, so the (owner-gated) method is callable.
+log_stream_test(_Config) ->
+    FeedPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    Marker = base64:encode(crypto:strong_rand_bytes(12)),
+    ok = ssb_feed:post_content(FeedPid, Marker),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, Frames} = ssb_peer:rpc_stream_call(Peer, [~"createLogStream"], []),
+    ?assert(lists:any(fun(F) -> binary:match(F, Marker) =/= nomatch end,
+                      Frames)),
     gen_server:stop(Peer).
 
 %%% Helpers -------------------------------------------------------------
