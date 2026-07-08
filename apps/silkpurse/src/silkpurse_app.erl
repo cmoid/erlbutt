@@ -13,8 +13,10 @@ start(_StartType, _StartArgs) ->
     %% that own state (silkpurse_backlinks) register themselves from
     %% their own init/handle_continue.
     ok = plugin_registry:register_plugin(silkpurse_db),
+    ok = plugin_registry:register_plugin(silkpurse_conn),
     {ok, Pid}.
 
 stop(_State) ->
     plugin_registry:unregister_plugin(silkpurse_db),
+    plugin_registry:unregister_plugin(silkpurse_conn),
     ok.

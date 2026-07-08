@@ -19,6 +19,7 @@
 
 manifest() ->
     [{[~"getLatest"], async, owner},
+     {[~"latestSequence"], async, owner},
      {[~"friends", ~"get"], async, owner}].
 
 %% getLatest(feedId) -> {id, sequence, ts} of the feed's newest message
@@ -39,6 +40,21 @@ handle_rpc([~"getLatest"], [FeedId], _Caller) when is_binary(FeedId) ->
     end;
 handle_rpc([~"getLatest"], _Args, _Caller) ->
     {error, ~"getLatest takes a feed id"};
+
+%% latestSequence(feedId) -> the sequence number of the feed's newest
+%% message (ssb-db), or 0 for an empty/unknown feed.
+handle_rpc([~"latestSequence"], [FeedId], _Caller) when is_binary(FeedId) ->
+    try
+        Pid = utils:find_or_create_feed_pid(FeedId),
+        case ssb_feed:fetch_last_msg(Pid) of
+            #message{sequence = Seq} -> {reply, Seq};
+            _                        -> {reply, 0}
+        end
+    catch _:_ ->
+            {reply, 0}
+    end;
+handle_rpc([~"latestSequence"], _Args, _Caller) ->
+    {error, ~"latestSequence takes a feed id"};
 
 %% friends.get(opts) -> the follow/block relationship in ssb-friends
 %% legacy terms (true following, false blocking, null neither):
