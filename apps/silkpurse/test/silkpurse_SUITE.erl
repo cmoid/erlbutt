@@ -13,6 +13,7 @@
 
 -export([backlinks_read_test/1,
          get_latest_test/1,
+         messages_by_type_test/1,
          manifest_includes_silkpurse_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
@@ -24,6 +25,7 @@
 all() ->
     [backlinks_read_test,
      get_latest_test,
+     messages_by_type_test,
      manifest_includes_silkpurse_test].
 
 init_per_suite(Config) ->
@@ -76,6 +78,34 @@ get_latest_test(_Config) ->
     ?assertEqual(LastId,  proplists:get_value(~"id", Props)),
     ?assertEqual(LastSeq, proplists:get_value(~"sequence", Props)),
     gen_server:stop(Peer).
+
+%% Type-scoped scan over the wire: post a contact, read it back via
+%% messagesByType while a differently-typed message stays out.
+messages_by_type_test(_Config) ->
+    OwnPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    Target = fresh_feed_id(),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"contact"},
+                                         {~"contact", Target},
+                                         {~"following", true}]}),
+    #message{id = ContactId} = ssb_feed:fetch_last_msg(OwnPid),
+
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, Frames} = ssb_peer:rpc_stream_call(Peer, [~"messagesByType"],
+                                            [~"contact"]),
+    Ids = [begin #message{id = Id} = message:decode(F, false), Id end
+           || F <- Frames],
+    ?assert(lists:member(ContactId, Ids)),
+    %% the ct-root/ct-reply posts from backlinks_read_test are type post
+    {ok, PostFrames} = ssb_peer:rpc_stream_call(Peer, [~"messagesByType"],
+                                                [~"post"]),
+    ?assertNot(lists:member(ContactId,
+                            [begin #message{id = I} = message:decode(F, false), I end
+                             || F <- PostFrames])),
+    gen_server:stop(Peer).
+
+fresh_feed_id() ->
+    #{public := Pub} = enacl:sign_keypair(),
+    <<"@", (base64:encode(Pub))/binary, ".ed25519">>.
 
 %% The silkpurse app's methods appear in the manifest erlbutt serves.
 manifest_includes_silkpurse_test(_Config) ->
