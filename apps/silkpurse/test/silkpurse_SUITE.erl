@@ -18,6 +18,7 @@
          about_social_value_test/1,
          live_about_test/1,
          friends_get_test/1,
+         public_feed_roots_test/1,
          manifest_includes_silkpurse_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
@@ -34,6 +35,7 @@ all() ->
      about_social_value_test,
      live_about_test,
      friends_get_test,
+     public_feed_roots_test,
      manifest_includes_silkpurse_test].
 
 init_per_suite(Config) ->
@@ -142,6 +144,29 @@ live_backlinks_test(_Config) ->
     after 3000 ->
         error(no_live_frame)
     end,
+    gen_server:stop(Peer).
+
+%% publicFeed.roots returns each thread root once, carrying its reply
+%% count and recent replies, ordered by activity.
+public_feed_roots_test(_Config) ->
+    OwnPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    Marker = base64:encode(crypto:strong_rand_bytes(9)),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", Marker}]}),
+    #message{id = RootId} = ssb_feed:fetch_last_msg(OwnPid),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", ~"reply one"},
+                                         {~"root", RootId}]}),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", ~"reply two"},
+                                         {~"root", RootId}]}),
+
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, Frames} = ssb_peer:rpc_stream_call(Peer, [~"publicFeed", ~"roots"],
+                                            [{[{~"limit", 20}]}]),
+    Items = [utils:nat_decode(F) || F <- Frames],
+    Match = [P || {P} <- Items, proplists:get_value(~"key", P) =:= RootId],
+    ?assertEqual(1, length(Match)),      %% the root appears exactly once
+    [{Props}] = [{P} || {P} <- Items, proplists:get_value(~"key", P) =:= RootId],
+    ?assertEqual(2, proplists:get_value(~"totalReplies", Props)),
+    ?assertEqual(2, length(proplists:get_value(~"latestReplies", Props))),
     gen_server:stop(Peer).
 
 %% friends.get({source, dest}) returns the follow relationship the
