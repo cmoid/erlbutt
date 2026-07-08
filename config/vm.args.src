@@ -15,9 +15,10 @@
 -pa ${HOME}/code/erlbutt/_build/test/extras/test
 -pa ${HOME}/code/maxbutt/ebin
 
-## Cross-machine distribution behind a firewall: the dist listener port is
-## random by default, so a remote maxbutt can reach epmd (4369) but not the
-## node.  Uncomment to pin it to a single port, then open that port (and 4369)
-## on this host's firewall.  min == max pins one port; widen the range if you
-## run several nodes.
-#-kernel inet_dist_listen_min 9100 inet_dist_listen_max 9100
+## Cross-machine distribution (maxbutt over an ssh tunnel or LAN): the dist
+## listener port is random by default, so a remote node can reach epmd (4369)
+## but not this node.  Pinned by default so a fresh release never silently
+## breaks the tunnel again; override with SSB_DIST_PORT, and forward/open
+## both 4369 and this port (e.g. ssh -L 4369:localhost:4369 -L 9100:localhost:9100).
+-kernel inet_dist_listen_min ${SSB_DIST_PORT:-9100}
+-kernel inet_dist_listen_max ${SSB_DIST_PORT:-9100}
