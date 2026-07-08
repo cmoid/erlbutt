@@ -18,6 +18,7 @@
          about_social_value_test/1,
          live_about_test/1,
          friends_get_test/1,
+         contacts_state_stream_test/1,
          public_feed_roots_test/1,
          public_feed_latest_test/1,
          manifest_includes_silkpurse_test/1]).
@@ -36,6 +37,7 @@ all() ->
      about_social_value_test,
      live_about_test,
      friends_get_test,
+     contacts_state_stream_test,
      public_feed_roots_test,
      public_feed_latest_test,
      manifest_includes_silkpurse_test].
@@ -146,6 +148,23 @@ live_backlinks_test(_Config) ->
     after 3000 ->
         error(no_live_frame)
     end,
+    gen_server:stop(Peer).
+
+%% contacts.stateStream (non-live) returns a feed's follow/block dict:
+%% after following a target, the owner's forward state includes it as true.
+contacts_state_stream_test(_Config) ->
+    OwnId  = keys:pub_key_disp(),
+    OwnPid = utils:find_or_create_feed_pid(OwnId),
+    Target = fresh_feed_id(),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"contact"},
+                                         {~"contact", Target},
+                                         {~"following", true}]}),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    Args = [{[{~"feedId", OwnId}]}],
+    {ok, Frames} = ssb_peer:rpc_stream_call(
+                     Peer, [~"patchwork", ~"contacts", ~"stateStream"], Args),
+    {Dict} = utils:nat_decode(hd(Frames)),
+    ?assertEqual(true, proplists:get_value(Target, Dict)),
     gen_server:stop(Peer).
 
 %% publicFeed.roots returns each thread root once, carrying its reply

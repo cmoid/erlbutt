@@ -231,9 +231,10 @@ proc_response(ReqNo, RespBody) ->
     ?SSB_DEBUG("The response from ~p was ~p ~n", [ReqNo, RespBody]),
     RespBody.
 
-proc_request(Calls, ReqNo, #ssb_rpc{name = [?createhistorystream],
+proc_request(Calls, ReqNo, #ssb_rpc{name = [Method],
                              args = [{ArgProps}]}
-             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+             = _ReqBody, Socket, Nonce, SecretBoxKey)
+  when Method =:= ?createhistorystream orelse Method =:= ~"createUserStream" ->
     Id    = proplists:get_value(~"id",    ArgProps),
     Seq   = proplists:get_value(~"seq",   ArgProps, 0),
     Limit = proplists:get_value(~"limit", ArgProps, -1),

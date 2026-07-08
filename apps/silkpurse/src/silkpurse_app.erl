@@ -14,9 +14,13 @@ start(_StartType, _StartArgs) ->
     %% their own init/handle_continue.
     ok = plugin_registry:register_plugin(silkpurse_db),
     ok = plugin_registry:register_plugin(silkpurse_conn),
+    ok = plugin_registry:register_plugin(silkpurse_contacts),
+    ok = plugin_registry:register_plugin(silkpurse_patchwork),
     {ok, Pid}.
 
 stop(_State) ->
     plugin_registry:unregister_plugin(silkpurse_db),
     plugin_registry:unregister_plugin(silkpurse_conn),
+    plugin_registry:unregister_plugin(silkpurse_contacts),
+    plugin_registry:unregister_plugin(silkpurse_patchwork),
     ok.

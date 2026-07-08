@@ -49,6 +49,7 @@
 %% authenticated peer, matching what remote clients actually call.
 -define(BUILTINS,
         [{[?createhistorystream],       source, anyone},
+         {[~"createUserStream"],        source, owner},
          {[~"createLogStream"],         source, owner},
          {[~"createFeedStream"],        source, owner},
          {[?whoami],                    sync,   anyone},

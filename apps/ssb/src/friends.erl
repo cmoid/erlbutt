@@ -35,6 +35,7 @@
          blocks/1,
          edge/2,
          edges/1,
+         reverse_edges/1,
          name/1]).
 
 %% ssb_view callbacks
@@ -113,6 +114,25 @@ edges(Source) ->
     Follows = maps:from_list([{D, true}  || D <- direct_follows(Source)]),
     Blocks  = maps:from_list([{D, false} || D <- blocks(Source)]),
     maps:merge(Follows, Blocks).
+
+%% All edges pointing AT Dest as #{Source => true | false}: who follows
+%% or blocks Dest (block wins).  Scans the graphs, so O(feeds).
+reverse_edges(Dest) ->
+    F = reverse_fold(?GRAPH, Dest, true, #{}),
+    reverse_fold(?BLOCKS, Dest, false, F).
+
+reverse_fold(Tab, Dest, Value, Acc0) ->
+    try
+        ets:foldl(
+          fun({Source, Map}, Acc) when is_map(Map) ->
+                  case maps:get(Dest, Map, undefined) of
+                      true -> Acc#{Source => Value};
+                      _    -> Acc
+                  end;
+             (_, Acc) -> Acc          %% skip the completeness marker row
+          end, Acc0, Tab)
+    catch error:badarg -> Acc0        %% table absent
+    end.
 
 %% Latest self-assigned display name for FeedId, or undefined.
 name(FeedId) ->
