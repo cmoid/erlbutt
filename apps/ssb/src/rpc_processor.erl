@@ -604,6 +604,10 @@ rpc_error(ReqNo, Reason, Socket, Nonce, SecretBoxKey) ->
     Header = create_header(Flags, size(ErrMsg), -ReqNo),
     utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey).
 
+%% {json, Bin} is pre-encoded JSON passed through untouched — used by
+%% plugins that serve stored message bytes (see ssb_plugin).
+encode_json({json, Bin}) when is_binary(Bin) ->
+    Bin;
 encode_json(Term) ->
     iolist_to_binary(message:ssb_encoder(Term, fun message:ssb_encoder/3, [pretty])).
 

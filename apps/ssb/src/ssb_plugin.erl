@@ -28,6 +28,10 @@
 %%   {source, [Term]}  for source methods: each Term is one stream
 %%                     item; the stream is closed after the last
 %%   {error, Reason}   Reason :: binary(), sent as a muxrpc error frame
+%%
+%% A reply or stream item may also be {json, Bin}: pre-encoded JSON
+%% sent as-is, for plugins that serve stored message bytes without a
+%% decode/re-encode round trip.
 -module(ssb_plugin).
 
 -callback manifest() ->
