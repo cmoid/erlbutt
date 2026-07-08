@@ -32,6 +32,14 @@
 %% A reply or stream item may also be {json, Bin}: pre-encoded JSON
 %% sent as-is, for plugins that serve stored message bytes without a
 %% decode/re-encode round trip.
+%%
+%% A source method may instead return
+%%   {live_source, [{MsgId, Bin}], ViewMod, EventFun}
+%% to honour {live: true}: the snapshot pairs are sent, then the
+%% stream stays open and a view_stream process pushes every later
+%% match — EventFun(ViewEvent) -> {send, MsgId, Bin} | skip, run in
+%% the stream process, deduplicated against the snapshot ids.  The
+%% stream ends when the client cancels or the connection closes.
 -module(ssb_plugin).
 
 -callback manifest() ->

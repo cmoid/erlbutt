@@ -117,6 +117,16 @@ handle_call({rpc_process, {Header, Body}, #ssb_conn{
                 0 -> Pid ! {stream_data, Ref, Body}
             end,
             {Nonce, none};
+        [{ReqNo, {live_source, StreamPid}}] ->
+            %% only the client's end/cancel matters on a live source
+            {_, IsEnd, _} = parse_flags(Header),
+            case IsEnd of
+                1 ->
+                    view_stream:stop(StreamPid),
+                    ets:insert(Calls, {ReqNo, noop});
+                0 -> ok
+            end,
+            {Nonce, none};
         [{ReqNo, {Mod, SinkPid}}] ->
             ?SSB_DEBUG("Stream continuation for req with pid: ~p ~n", [ReqNo]),
             NewNonce = Mod:handle_data(ReqNo, Body, Conn, SinkPid),
@@ -575,17 +585,33 @@ plugin_dispatch(Mod, Kind, Name, Args, Caller, Calls,
     case {Kind, Result} of
         {source, {source, Items}} ->
             ets:insert(Calls, {ReqNo, noop}),
-            N1 = lists:foldl(
-                   fun(Item, N) ->
-                           Body = encode_json(Item),
-                           Header = create_header(create_flags(1, 0, 2),
-                                                  size(Body), -ReqNo),
-                           utils:send_data(utils:combine(Header, Body),
-                                           Socket, N, SecretBoxKey)
-                   end, Nonce, Items),
+            N1 = send_source_items(Items, ReqNo, Socket, Nonce, SecretBoxKey),
             TrueEnd = encode_json(true),
             Header = create_header(create_flags(1, 1, 2), size(TrueEnd), -ReqNo),
             utils:send_data(utils:combine(Header, TrueEnd), Socket, N1, SecretBoxKey);
+        {source, {live_source, Pairs, ViewMod, EventFun}} ->
+            %% snapshot now, then keep the stream open: a view_stream
+            %% pushes later matches via the connection's ordered writes
+            case owner(Calls) of
+                undefined ->
+                    %% no owning ssb_peer (e.g. unit tests): finite fallback
+                    ets:insert(Calls, {ReqNo, noop}),
+                    N0 = send_source_items([{json, B} || {_, B} <- Pairs],
+                                           ReqNo, Socket, Nonce, SecretBoxKey),
+                    TrueEnd = encode_json(true),
+                    Header = create_header(create_flags(1, 1, 2),
+                                           size(TrueEnd), -ReqNo),
+                    utils:send_data(utils:combine(Header, TrueEnd),
+                                    Socket, N0, SecretBoxKey);
+                OwnerPid ->
+                    {ok, Stream} = view_stream:start(OwnerPid, -ReqNo,
+                                                     ViewMod, EventFun),
+                    ets:insert(Calls, {ReqNo, {live_source, Stream}}),
+                    N1 = send_source_items([{json, B} || {_, B} <- Pairs],
+                                           ReqNo, Socket, Nonce, SecretBoxKey),
+                    ok = view_stream:release(Stream, [Id || {Id, _} <- Pairs]),
+                    N1
+            end;
         {_, {reply, Term}} when Kind =:= sync; Kind =:= async ->
             Body = encode_json(Term),
             Header = create_header(create_flags(0, 0, 2), size(Body), -ReqNo),
@@ -597,6 +623,16 @@ plugin_dispatch(Mod, Kind, Name, Args, Caller, Calls,
                        [Mod, Other, Kind, Name]),
             rpc_error(ReqNo, ~"internal error", Socket, Nonce, SecretBoxKey)
     end.
+
+send_source_items(Items, ReqNo, Socket, Nonce, SecretBoxKey) ->
+    lists:foldl(
+      fun(Item, N) ->
+              Body = encode_json(Item),
+              Header = create_header(create_flags(1, 0, 2),
+                                     size(Body), -ReqNo),
+              utils:send_data(utils:combine(Header, Body),
+                              Socket, N, SecretBoxKey)
+      end, Nonce, Items).
 
 rpc_error(ReqNo, Reason, Socket, Nonce, SecretBoxKey) ->
     ErrMsg = utils:error_msg(~"Error", Reason),
