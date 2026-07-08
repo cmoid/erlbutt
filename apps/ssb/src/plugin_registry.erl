@@ -60,10 +60,10 @@
          {[?blobs, ?createwants],       source, anyone},
          {[?ebt, ~"replicate"],         duplex, anyone},
          {[?tunnel, ?isRoom],           sync,   anyone},
-         {[?tunnel, ?connect],          duplex, anyone},
-         {[?tunnel, ?endpoints],        source, anyone},
+         {[?tunnel, ?connect],          duplex, room},
+         {[?tunnel, ?endpoints],        source, room},
          {[?room, ?metadata],           async,  anyone},
-         {[?room, ?attendants],         source, anyone},
+         {[?room, ?attendants],         source, room},
          {[~"invite", ~"create"],       async,  owner},
          {[~"invite", ~"use"],          async,  anyone}]).
 
@@ -103,12 +103,22 @@ manifest(Class) ->
                                allowed(Class, Perm)],
     nest_manifest(Visible).
 
-%% Permission lattice: owner > member > peer.
+%% Permission lattice: owner > member > peer.  The `room` perm is
+%% dynamic: it resolves against the node's room configuration at check
+%% time — open rooms (and non-room nodes, which accept relayed
+%% tunnel.connect as plain endpoints) admit any authenticated peer;
+%% community/restricted rooms require membership.
+allowed(Class, room) ->
+    room_allowed(Class, config:is_room(), config:room_privacy());
 allowed(owner, _Perm)        -> true;
 allowed(member, owner)       -> false;
 allowed(member, _Perm)       -> true;
 allowed(peer, anyone)        -> true;
 allowed(peer, _Perm)         -> false.
+
+room_allowed(_Class, false, _Privacy) -> true;
+room_allowed(_Class, true, open)      -> true;
+room_allowed(Class, true, _MembersOnly) -> allowed(Class, member).
 
 %%%===================================================================
 %%% ssb_plugin callbacks (the registry serves `manifest` itself)
@@ -173,7 +183,7 @@ validate(Mod, Manifest) ->
                   true = is_list(Name) andalso Name =/= []
                       andalso lists:all(fun is_binary/1, Name),
                   true = lists:member(Kind, [sync, async, source]),
-                  true = lists:member(Perm, [anyone, member, owner]),
+                  true = lists:member(Perm, [anyone, member, owner, room]),
                   case ets:lookup(?TABLE, Name) of
                       []                        -> ok;
                       [{Name, Mod, _, _}]       -> ok;  %% re-register
@@ -222,13 +232,20 @@ kind_bin(duplex) -> ~"duplex".
 -ifdef(TEST).
 
 setup_registry() ->
+    %% resolving the `room` perm reads the node's room config
+    case whereis(config) of
+        undefined -> {ok, _} = config:start_link("test/ssb.cfg");
+        _         -> ok
+    end,
     {ok, Pid} = start_link(),
     Pid.
 
 cleanup(Pid) ->
     unlink(Pid),
     exit(Pid, shutdown),
-    wait_down(Pid).
+    wait_down(Pid),
+    catch gen_server:stop(config),
+    ok.
 
 wait_down(Pid) ->
     case is_process_alive(Pid) of
@@ -243,6 +260,7 @@ registry_test_() ->
               ?_test(unknown_lookup()),
               ?_test(manifest_method()),
               ?_test(perm_matrix()),
+              ?_test(room_perm_matrix()),
               ?_test(manifest_filtering()),
               ?_test(register_and_dispatch()),
               ?_test(method_conflict())]
@@ -275,6 +293,20 @@ perm_matrix() ->
     ?assertNot(allowed(peer, owner)),
     ?assertNot(allowed(peer, member)),
     ?assert(allowed(peer, anyone)).
+
+%% The room perm's resolution across node modes (pure logic, no config).
+room_perm_matrix() ->
+    %% not a room: relayed tunnel.connect must be accepted from anyone
+    ?assert(room_allowed(peer,   false, open)),
+    ?assert(room_allowed(peer,   false, restricted)),
+    %% open room: any authenticated peer
+    ?assert(room_allowed(peer,   true, open)),
+    %% community/restricted: members (and the owner) only
+    ?assertNot(room_allowed(peer, true, community)),
+    ?assertNot(room_allowed(peer, true, restricted)),
+    ?assert(room_allowed(member,  true, community)),
+    ?assert(room_allowed(member,  true, restricted)),
+    ?assert(room_allowed(owner,   true, restricted)).
 
 manifest_filtering() ->
     {PeerProps}  = manifest(peer),

@@ -658,13 +658,9 @@ whoami() ->
 %% Room side of tunnel.connect: look up the target attendant and bridge the
 %% two connections.  ReqNo is the positive request number on this (the
 %% caller's) connection; bridge sends the caller's responses on -ReqNo.
+%% Membership gating happens at the dispatch choke point (the method's
+%% registry perm is `room`), not here.
 tunnel_relay_connect(Calls, ReqNo, Args, Socket, Nonce, SecretBoxKey) ->
-    case room_caller_allowed(Calls) of
-        true  -> tunnel_relay_member(Calls, ReqNo, Args, Socket, Nonce, SecretBoxKey);
-        false -> tunnel_error(ReqNo, ~"not a room member", Socket, Nonce, SecretBoxKey)
-    end.
-
-tunnel_relay_member(Calls, ReqNo, Args, Socket, Nonce, SecretBoxKey) ->
     Target = tunnel_target(Args),
     case Target =/= undefined andalso room_attendants:lookup(Target) of
         {ok, TargetPid} ->
