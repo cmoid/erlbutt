@@ -17,6 +17,7 @@
          live_backlinks_test/1,
          about_social_value_test/1,
          live_about_test/1,
+         friends_get_test/1,
          manifest_includes_silkpurse_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
@@ -32,6 +33,7 @@ all() ->
      live_backlinks_test,
      about_social_value_test,
      live_about_test,
+     friends_get_test,
      manifest_includes_silkpurse_test].
 
 init_per_suite(Config) ->
@@ -141,6 +143,31 @@ live_backlinks_test(_Config) ->
         error(no_live_frame)
     end,
     gen_server:stop(Peer).
+
+%% friends.get({source, dest}) returns the follow relationship the
+%% owner published: true after following the target over the wire.
+friends_get_test(_Config) ->
+    OwnId  = keys:pub_key_disp(),
+    OwnPid = utils:find_or_create_feed_pid(OwnId),
+    Target = fresh_feed_id(),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"contact"},
+                                         {~"contact", Target},
+                                         {~"following", true}]}),
+    ok = rpc_refresh_friends(),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    Args = [{[{~"source", OwnId}, {~"dest", Target}]}],
+    {ok, Body} = ssb_peer:rpc_call(Peer, [~"friends", ~"get"], ~"async", Args),
+    ?assertEqual(true, utils:nat_decode(Body)),
+    %% a stranger relationship is null
+    StrangerArgs = [{[{~"source", OwnId}, {~"dest", fresh_feed_id()}]}],
+    {ok, Body2} = ssb_peer:rpc_call(Peer, [~"friends", ~"get"], ~"async",
+                                    StrangerArgs),
+    ?assertEqual(null, utils:nat_decode(Body2)),
+    gen_server:stop(Peer).
+
+%% friends folds contact messages via the view manager synchronously,
+%% so the edge is visible immediately; nothing to wait for.
+rpc_refresh_friends() -> ok.
 
 %% about.socialValue resolves a feed's name from the owner's own
 %% assignment (yourId priority) over the wire.
