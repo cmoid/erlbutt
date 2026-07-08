@@ -19,6 +19,7 @@
          live_about_test/1,
          friends_get_test/1,
          contacts_state_stream_test/1,
+         likes_test/1,
          public_feed_roots_test/1,
          public_feed_latest_test/1,
          manifest_includes_silkpurse_test/1]).
@@ -38,6 +39,7 @@ all() ->
      live_about_test,
      friends_get_test,
      contacts_state_stream_test,
+     likes_test,
      public_feed_roots_test,
      public_feed_latest_test,
      manifest_includes_silkpurse_test].
@@ -147,6 +149,32 @@ live_backlinks_test(_Config) ->
             ?assertEqual(ReplyId, GotId)
     after 3000 ->
         error(no_live_frame)
+    end,
+    gen_server:stop(Peer).
+
+%% likes.get returns the likers of a message, and countStream its live
+%% count, after a vote is posted over the wire.
+likes_test(_Config) ->
+    OwnId  = keys:pub_key_disp(),
+    OwnPid = utils:find_or_create_feed_pid(OwnId),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", ~"like me"}]}),
+    #message{id = Target} = ssb_feed:fetch_last_msg(OwnPid),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"vote"},
+                                         {~"vote", {[{~"link", Target},
+                                                     {~"value", 1}]}}]}),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, GetBody} = ssb_peer:rpc_call(Peer, [~"patchwork", ~"likes", ~"get"],
+                                      ~"async", [{[{~"dest", Target}]}]),
+    ?assert(lists:member(OwnId, utils:nat_decode(GetBody))),
+    %% countStream is a live stream (never ends); read its first frame
+    {ok, _Ref} = ssb_peer:open_source(
+                   Peer, [~"patchwork", ~"likes", ~"countStream"],
+                   [{[{~"dest", Target}]}], self()),
+    receive
+        {stream_data, _, CountFrame} ->
+            ?assertEqual(1, utils:nat_decode(CountFrame))
+    after 3000 ->
+        error(no_count_frame)
     end,
     gen_server:stop(Peer).
 

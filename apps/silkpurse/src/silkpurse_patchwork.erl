@@ -39,10 +39,7 @@ manifest() ->
      {[~"patchwork", ~"channels", ~"recentStream"],    source, owner},
      {[~"patchwork", ~"subscriptions"],                source, owner},
      {[~"patchwork", ~"suggest", ~"profile"],          async,  owner},
-     %% Message rendering.
-     {[~"patchwork", ~"likes", ~"get"],                async,  owner},
-     {[~"patchwork", ~"likes", ~"countStream"],        source, owner},
-     {[~"patchwork", ~"likes", ~"feedLikesMsgStream"], source, owner},
+     %% Message rendering.  (patchwork.likes.* is real — silkpurse_likes.)
      {[~"patchwork", ~"backlinks", ~"referencesStream"], source, owner},
      {[~"patchwork", ~"backlinks", ~"forksStream"],    source, owner},
      {[~"patchwork", ~"liveBacklinks", ~"stream"],     source, owner},
