@@ -63,7 +63,10 @@ start_link() ->
 %%% ssb_view callbacks (run in the view_manager process)
 %%%===================================================================
 
-view_version() -> 1.
+%% 2: summaries gained participants/mentions/channel for the feed
+%% rollups (participating/mentions/profile/channel), so upgrading nodes
+%% must refold.
+view_version() -> 2.
 
 view_load() ->
     Loaded = try ets:lookup(?TAB, ?MARKER) =/= []
@@ -91,10 +94,10 @@ view_entry(#message{id = Id, author = Author, timestamp = Ts,
     Root = ?pgv(~"root", Props),
     case classify(Type, Root) of
         root ->
-            set_root(Id, Author, Ts),    %% the root's own id keys the thread
+            set_root(Id, Author, Ts, Props),  %% the root's own id keys the thread
             {events, [{thread, Id}]};
         {reply, RootId} ->
-            add_reply(RootId, Id, Ts),
+            add_reply(RootId, Author, Id, Ts, Props),
             {events, [{thread, RootId}]};
         ignore ->
             ok
@@ -106,44 +109,75 @@ view_entry(_) ->
 %%% ssb_plugin callbacks (run in each connection's rpc_processor)
 %%%===================================================================
 
+%% Every feed tab is thread roots matching a predicate, ordered by
+%% activity — publicFeed with a filter.  roots is the paginated history,
+%% latest the live prepend.
 manifest() ->
-    [{[~"patchwork", ~"publicFeed", ~"roots"],  source, owner},
-     {[~"patchwork", ~"publicFeed", ~"latest"], source, owner}].
+    lists:flatten(
+      [[{[~"patchwork", Feed, ~"roots"],  source, owner},
+        {[~"patchwork", Feed, ~"latest"], source, owner}]
+       || Feed <- [~"publicFeed", ~"networkFeed", ~"participatingFeed",
+                   ~"mentionsFeed", ~"profile", ~"channelFeed"]]).
 
-handle_rpc([~"patchwork", ~"publicFeed", ~"roots"], Args, _Caller) ->
+handle_rpc([~"patchwork", Feed, ~"roots"], Args, _Caller) ->
+    roots(feed_filter(Feed, Args), Args);
+handle_rpc([~"patchwork", Feed, ~"latest"], Args, _Caller) ->
+    latest(feed_filter(Feed, Args)).
+
+%% Paginated thread roots passing Filter, newest activity first.
+roots(Filter, Args) ->
     Opts    = opts(Args),
     Reverse = maps:get(reverse, Opts, true),
     Limit   = maps:get(limit, Opts, undefined),
     Resume  = maps:get(resume, Opts, undefined),
-    Blocked = blocked_set(),
-    Threads = gather(Blocked),
+    Threads = [T || {_Id, S} = T <- gather(blocked_set()), Filter(S)],
     Ordered = order(Threads, Reverse, Resume),
     Limited = take(Ordered, Limit),
     {source, [{json, encode_json(Item)}
               || {RootId, Summary} <- Limited,
-                 (Item = item(RootId, Summary)) =/= undefined]};
+                 (Item = item(RootId, Summary)) =/= undefined]}.
 
-%% The live prepend to the public feed: no snapshot, then a root item
-%% each time a thread gains activity (new root or new reply bumping it),
-%% dropping blocked authors and not-yet-seen roots.
-handle_rpc([~"patchwork", ~"publicFeed", ~"latest"], _Args, _Caller) ->
+%% Live prepend: a root item each time a passing thread gains activity.
+latest(Filter) ->
     EventFun =
         fun({thread, RootId}) ->
                 Blocked = blocked_set(),
                 case ets:lookup(?TAB, RootId) of
                     [{RootId, #{author := A} = Summary}] when is_binary(A) ->
-                        case sets:is_element(A, Blocked) of
-                            true  -> skip;
-                            false ->
+                        case (not sets:is_element(A, Blocked))
+                             andalso Filter(Summary) of
+                            true ->
                                 case item(RootId, Summary) of
                                     undefined -> skip;
                                     Item      -> {send, encode_json(Item)}
-                                end
+                                end;
+                            false -> skip
                         end;
                     _ -> skip
                 end
         end,
     {live_source, [], ?MODULE, EventFun}.
+
+%% The predicate for each feed tab.  owner-relative feeds use the node's
+%% own id; profile/channel take their target from the request options.
+feed_filter(Feed, _Args) when Feed =:= ~"publicFeed";
+                              Feed =:= ~"networkFeed" ->
+    fun(_S) -> true end;
+feed_filter(~"participatingFeed", _Args) ->
+    Owner = keys:pub_key_disp(),
+    fun(S) -> maps:is_key(Owner, maps:get(participants, S, #{})) end;
+feed_filter(~"mentionsFeed", _Args) ->
+    Owner = keys:pub_key_disp(),
+    fun(S) -> maps:is_key(Owner, maps:get(mentions, S, #{})) end;
+feed_filter(~"profile", Args) ->
+    Id = arg(~"id", Args),
+    fun(S) -> maps:get(author, S) =:= Id end;
+feed_filter(~"channelFeed", Args) ->
+    Ch = arg(~"channel", Args),
+    fun(S) -> maps:get(channel, S, undefined) =:= Ch end.
+
+arg(Key, [{Props}]) -> ?pgv(Key, Props);
+arg(_Key, _)        -> undefined.
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -200,27 +234,62 @@ classify(~"about", Root) when is_binary(Root) ->
 classify(_, _) ->
     ignore.
 
-%% A root message: record its author/ts and bump last activity.  A
-%% reply may have created the thread first, so preserve total/recent.
-set_root(RootId, Author, Ts) ->
+%% A root message: record its author/ts/channel, bump last activity,
+%% and add the author + its mentions to the thread's participants /
+%% mentions.  A reply may have created the thread first, so preserve
+%% total/recent/participants/mentions.
+set_root(RootId, Author, Ts, Props) ->
     Cur = current(RootId),
-    New = Cur#{author => Author, ts => Ts,
-               last => max_ts(maps:get(last, Cur), Ts)},
+    New = Cur#{author  => Author,
+               ts      => Ts,
+               last    => max_ts(maps:get(last, Cur), Ts),
+               channel => channel_of(Props),
+               participants => add(Author, maps:get(participants, Cur)),
+               mentions     => add_all(mentions_of(Props),
+                                       maps:get(mentions, Cur))},
     ets:insert(?TAB, {RootId, New}).
 
-add_reply(RootId, ReplyId, Ts) ->
+add_reply(RootId, ReplyAuthor, ReplyId, Ts, Props) ->
     Cur = current(RootId),
     Recent = insert_recent({ReplyId, Ts}, maps:get(recent, Cur)),
-    New = Cur#{total => maps:get(total, Cur) + 1,
+    New = Cur#{total  => maps:get(total, Cur) + 1,
                recent => Recent,
-               last => max_ts(maps:get(last, Cur), Ts)},
+               last   => max_ts(maps:get(last, Cur), Ts),
+               participants => add(ReplyAuthor, maps:get(participants, Cur)),
+               mentions     => add_all(mentions_of(Props),
+                                       maps:get(mentions, Cur))},
     ets:insert(?TAB, {RootId, New}).
 
 current(RootId) ->
     case ets:lookup(?TAB, RootId) of
         [{RootId, Summary}] -> Summary;
         []                  -> #{author => undefined, ts => undefined,
-                                 total => 0, recent => [], last => 0}
+                                 total => 0, recent => [], last => 0,
+                                 participants => #{}, mentions => #{},
+                                 channel => undefined}
+    end.
+
+add(FeedId, Map) when is_binary(FeedId) -> Map#{FeedId => true};
+add(_, Map)                             -> Map.
+
+add_all(Ids, Map) -> lists:foldl(fun add/2, Map, Ids).
+
+%% content.channel, when a plain string.
+channel_of(Props) ->
+    case ?pgv(~"channel", Props) of
+        Ch when is_binary(Ch) -> Ch;
+        _                     -> undefined
+    end.
+
+%% Feed ids named in content.mentions ([{link, "@..."}]).
+mentions_of(Props) ->
+    case ?pgv(~"mentions", Props) of
+        Ms when is_list(Ms) ->
+            [Link || {MProps} <- Ms,
+                     (Link = ?pgv(~"link", MProps)) =/= undefined,
+                     is_binary(Link),
+                     binary:part(Link, 0, 1) =:= ~"@"];
+        _ -> []
     end.
 
 %% Keep recent replies newest-first by timestamp, capped.
@@ -416,10 +485,10 @@ rollup_counts_and_recent() ->
 reply_before_root() ->
     Fake  = ~"%unseenrootxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=.sha256",
     Reply = ~"%replyaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=.sha256",
-    add_reply(Fake, Reply, 100),
+    add_reply(Fake, ~"@replier=.ed25519", Reply, 100, []),
     %% reply-only thread: author unknown, so not surfaced
     ?assertEqual([], gather(sets:new())),
-    set_root(Fake, keys:pub_key_disp(), 50),
+    set_root(Fake, keys:pub_key_disp(), 50, []),
     %% now complete, with the earlier reply counted and activity bumped
     [{Fake, Summary}] = gather(sets:new()),
     ?assertEqual(1, maps:get(total, Summary)),
@@ -432,7 +501,7 @@ block_filtering() ->
                                              {~"text", ~"mine"}]}),
     %% a root from another author, whom we block
     Other = ~"@blockedauthorrrrrrrrrrrrrrrrrrrrrrrrrrrrr=.ed25519",
-    set_root(~"%theirroot0000000000000000000000000000000=.sha256", Other, 999),
+    set_root(~"%theirroot0000000000000000000000000000000=.sha256", Other, 999, []),
     ets:insert(ssb_block_graph, {OwnId, #{Other => true}}),
     Keys = [proplists:get_value(~"key", P) || {P} <- roots()],
     ?assert(lists:member(MineRoot, Keys)),

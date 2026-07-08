@@ -23,6 +23,8 @@
          thread_sorted_test/1,
          public_feed_roots_test/1,
          public_feed_latest_test/1,
+         profile_roots_test/1,
+         mentions_feed_test/1,
          manifest_includes_silkpurse_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
@@ -44,6 +46,8 @@ all() ->
      thread_sorted_test,
      public_feed_roots_test,
      public_feed_latest_test,
+     profile_roots_test,
+     mentions_feed_test,
      manifest_includes_silkpurse_test].
 
 init_per_suite(Config) ->
@@ -242,6 +246,45 @@ public_feed_roots_test(_Config) ->
     ?assertEqual(2, proplists:get_value(~"totalReplies", Props)),
     ?assertEqual(2, length(proplists:get_value(~"latestReplies", Props))),
     gen_server:stop(Peer).
+
+%% profile.roots is publicFeed filtered to one author.
+profile_roots_test(_Config) ->
+    OwnId  = keys:pub_key_disp(),
+    OwnPid = utils:find_or_create_feed_pid(OwnId),
+    Marker = base64:encode(crypto:strong_rand_bytes(9)),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", Marker}]}),
+    #message{id = RootId} = ssb_feed:fetch_last_msg(OwnPid),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, Mine} = ssb_peer:rpc_stream_call(
+                   Peer, [~"patchwork", ~"profile", ~"roots"],
+                   [{[{~"id", OwnId}, {~"limit", 50}]}]),
+    ?assert(lists:member(RootId, root_keys(Mine))),
+    %% a different author's profile does not include our root
+    {ok, Other} = ssb_peer:rpc_stream_call(
+                    Peer, [~"patchwork", ~"profile", ~"roots"],
+                    [{[{~"id", fresh_feed_id()}, {~"limit", 50}]}]),
+    ?assertNot(lists:member(RootId, root_keys(Other))),
+    gen_server:stop(Peer).
+
+%% mentionsFeed is publicFeed filtered to threads mentioning the owner.
+mentions_feed_test(_Config) ->
+    OwnId  = keys:pub_key_disp(),
+    OwnPid = utils:find_or_create_feed_pid(OwnId),
+    ok = ssb_feed:post_content(
+           OwnPid, {[{~"type", ~"post"}, {~"text", ~"hey @you"},
+                     {~"mentions", [{[{~"link", OwnId}]}]}]}),
+    #message{id = RootId} = ssb_feed:fetch_last_msg(OwnPid),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, Frames} = ssb_peer:rpc_stream_call(
+                     Peer, [~"patchwork", ~"mentionsFeed", ~"roots"],
+                     [{[{~"limit", 50}]}]),
+    ?assert(lists:member(RootId, root_keys(Frames))),
+    gen_server:stop(Peer).
+
+root_keys(Frames) ->
+    [proplists:get_value(~"key", P)
+     || F <- Frames, {P} <- [utils:nat_decode(F)],
+        proplists:is_defined(~"key", P)].
 
 %% publicFeed.latest pushes a root item when a new post creates a
 %% thread while the stream is open.

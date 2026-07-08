@@ -17,19 +17,10 @@
 -export([manifest/0, handle_rpc/3]).
 
 manifest() ->
-    %% Feed rollups (each roots + latest, like publicFeed).
-    [{[~"patchwork", ~"participatingFeed", ~"roots"],  source, owner},
-     {[~"patchwork", ~"participatingFeed", ~"latest"], source, owner},
-     {[~"patchwork", ~"mentionsFeed", ~"roots"],       source, owner},
-     {[~"patchwork", ~"mentionsFeed", ~"latest"],      source, owner},
-     {[~"patchwork", ~"privateFeed", ~"roots"],        source, owner},
+    %% Feed rollups live in silkpurse_threads now, EXCEPT privateFeed
+    %% (needs private unboxing) which stays stubbed here.
+    [{[~"patchwork", ~"privateFeed", ~"roots"],        source, owner},
      {[~"patchwork", ~"privateFeed", ~"latest"],       source, owner},
-     {[~"patchwork", ~"networkFeed", ~"roots"],        source, owner},
-     {[~"patchwork", ~"networkFeed", ~"latest"],       source, owner},
-     {[~"patchwork", ~"channelFeed", ~"roots"],        source, owner},
-     {[~"patchwork", ~"channelFeed", ~"latest"],       source, owner},
-     {[~"patchwork", ~"profile", ~"roots"],            source, owner},
-     {[~"patchwork", ~"profile", ~"latest"],           source, owner},
      {[~"patchwork", ~"profile", ~"avatar"],           async,  owner},
      %% Discovery / sidebar.
      {[~"patchwork", ~"recentFeeds"],                  source, owner},
