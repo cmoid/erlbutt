@@ -15,6 +15,8 @@
          get_latest_test/1,
          messages_by_type_test/1,
          live_backlinks_test/1,
+         about_social_value_test/1,
+         live_about_test/1,
          manifest_includes_silkpurse_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
@@ -28,6 +30,8 @@ all() ->
      get_latest_test,
      messages_by_type_test,
      live_backlinks_test,
+     about_social_value_test,
+     live_about_test,
      manifest_includes_silkpurse_test].
 
 init_per_suite(Config) ->
@@ -135,6 +139,45 @@ live_backlinks_test(_Config) ->
             ?assertEqual(ReplyId, GotId)
     after 3000 ->
         error(no_live_frame)
+    end,
+    gen_server:stop(Peer).
+
+%% about.socialValue resolves a feed's name from the owner's own
+%% assignment (yourId priority) over the wire.
+about_social_value_test(_Config) ->
+    OwnPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    Target = fresh_feed_id(),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"about"},
+                                         {~"about", Target},
+                                         {~"name", ~"Bob"}]}),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    Args = [{[{~"dest", Target}, {~"key", ~"name"}]}],
+    {ok, Body} = ssb_peer:rpc_call(Peer, [~"about", ~"socialValue"],
+                                   ~"async", Args),
+    ?assertEqual(~"Bob", utils:nat_decode(Body)),
+    gen_server:stop(Peer).
+
+%% about.socialValueStream pushes the updated resolved value when a new
+%% about arrives while the stream is open.
+live_about_test(_Config) ->
+    OwnId  = keys:pub_key_disp(),
+    OwnPid = utils:find_or_create_feed_pid(OwnId),
+    Target = fresh_feed_id(),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    Args = [{[{~"dest", Target}, {~"key", ~"name"}]}],
+    {ok, _Ref} = ssb_peer:open_source(Peer, [~"about", ~"socialValueStream"],
+                                      Args, self()),
+    %% drain the initial (null) snapshot value
+    receive {stream_data, _, _Initial} -> ok after 2000 -> error(no_snapshot) end,
+
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"about"},
+                                         {~"about", Target},
+                                         {~"name", ~"Carol"}]}),
+    receive
+        {stream_data, _, Frame} ->
+            ?assertEqual(~"Carol", utils:nat_decode(Frame))
+    after 3000 ->
+        error(no_live_about)
     end,
     gen_server:stop(Peer).
 
