@@ -6,7 +6,7 @@
                 "itself never depends on this app."},
   {vsn, "0.0.1"},
   {registered, [silkpurse_sup, silkpurse_backlinks, silkpurse_by_type,
-                silkpurse_about]},
+                silkpurse_about, silkpurse_threads]},
   {mod, {silkpurse_app, []}},
   {applications, [kernel, stdlib, ssb]},
   {env, []},

@@ -17,4 +17,5 @@ init([]) ->
     {ok, {{one_for_one, 5, 10},
           [?CHILD(silkpurse_backlinks, worker),
            ?CHILD(silkpurse_by_type, worker),
-           ?CHILD(silkpurse_about, worker)]}}.
+           ?CHILD(silkpurse_about, worker),
+           ?CHILD(silkpurse_threads, worker)]}}.
