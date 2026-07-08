@@ -1,0 +1,13 @@
+%% SPDX-License-Identifier: GPL-2.0-only
+{application, silkpurse,
+ [{description, "Client-serving plugins: the muxrpc surface and derived "
+                "indexes a silkpurse/patchwork-family UI needs, layered on "
+                "erlbutt's plugin registry and view manager.  The node "
+                "itself never depends on this app."},
+  {vsn, "0.0.1"},
+  {registered, [silkpurse_sup, silkpurse_backlinks]},
+  {mod, {silkpurse_app, []}},
+  {applications, [kernel, stdlib, ssb]},
+  {env, []},
+  {licenses, ["GPL-2.0-only"]}
+ ]}.
