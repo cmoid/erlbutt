@@ -33,6 +33,8 @@
          direct_follows/1,
          follows/2,
          blocks/1,
+         edge/2,
+         edges/1,
          name/1]).
 
 %% ssb_view callbacks
@@ -91,6 +93,26 @@ follows(FeedPid, HopCount) when is_pid(FeedPid) ->
 follows(FeedId, HopCount) ->
     {AllFollows, _} = follows2(FeedId, HopCount, sets:from_list([FeedId])),
     lists:usort(AllFollows).
+
+%% The relationship Source holds toward Dest in ssb-friends legacy
+%% terms: true = following, false = blocking, null = neither.  Block
+%% wins (consistent with EBT replication gating).
+edge(Source, Dest) ->
+    case lists:member(Dest, blocks(Source)) of
+        true  -> false;
+        false ->
+            case lists:member(Dest, direct_follows(Source)) of
+                true  -> true;
+                false -> null
+            end
+    end.
+
+%% All of Source's outgoing edges as #{Dest => true | false}
+%% (following or blocking; block wins).
+edges(Source) ->
+    Follows = maps:from_list([{D, true}  || D <- direct_follows(Source)]),
+    Blocks  = maps:from_list([{D, false} || D <- blocks(Source)]),
+    maps:merge(Follows, Blocks).
 
 %% Latest self-assigned display name for FeedId, or undefined.
 name(FeedId) ->
@@ -285,6 +307,8 @@ friends_test_() ->
       fun blocks_block_test/1,
       fun blocks_unblock_test/1,
       fun blocks_independent_of_follow_test/1,
+      fun edge_test/1,
+      fun edges_test/1,
       fun name_updates_test/1,
       fun name_other_about_test/1,
       fun contact_event_test/1,
@@ -400,6 +424,35 @@ direct_follows_unfollow_test(_) ->
         #message{id = Msg1Id} = ssb_feed:fetch_last_msg(Pid),
         ok = store_contact(Pid, Id, Priv, Msg1Id, 2, Id2, false),
         ?assertEqual([], friends:direct_follows(Pid))
+    end.
+
+%% edge/2: following -> true, blocking -> false (block wins), else null.
+edge_test(_) ->
+    fun() ->
+        {Pid, Id, Priv}      = make_peer(),
+        {_P2, Followed, _}   = make_peer(),
+        {_P3, Blocked, _}    = make_peer(),
+        {_P4, Stranger, _}   = make_peer(),
+        ok = store_contact(Pid, Id, Priv, null, 1, Followed, true),
+        #message{id = M1} = ssb_feed:fetch_last_msg(Pid),
+        ok = store_block(Pid, Id, Priv, M1, 2, Blocked, true),
+        ?assertEqual(true,  friends:edge(Id, Followed)),
+        ?assertEqual(false, friends:edge(Id, Blocked)),
+        ?assertEqual(null,  friends:edge(Id, Stranger))
+    end.
+
+edges_test(_) ->
+    fun() ->
+        {Pid, Id, Priv}    = make_peer(),
+        {_P2, Followed, _} = make_peer(),
+        {_P3, Blocked, _}  = make_peer(),
+        ok = store_contact(Pid, Id, Priv, null, 1, Followed, true),
+        #message{id = M1} = ssb_feed:fetch_last_msg(Pid),
+        ok = store_block(Pid, Id, Priv, M1, 2, Blocked, true),
+        Edges = friends:edges(Id),
+        ?assertEqual(true,  maps:get(Followed, Edges)),
+        ?assertEqual(false, maps:get(Blocked, Edges)),
+        ?assertEqual(2, maps:size(Edges))
     end.
 
 %% Contacts stored after the first read are applied incrementally by the
