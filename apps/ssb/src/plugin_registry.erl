@@ -127,7 +127,9 @@ room_allowed(Class, true, _MembersOnly) -> allowed(Class, member).
 manifest() ->
     [{[~"manifest"], sync, anyone}].
 
-handle_rpc([~"manifest"], _Args, #{class := Class}) ->
+handle_rpc([~"manifest"], _Args, #{class := Class} = Caller) ->
+    ?SSB_INFO("manifest requested by ~p (class ~p)",
+              [maps:get(feed_id, Caller, undefined), Class]),
     {reply, manifest(Class)}.
 
 %%%===================================================================
@@ -204,22 +206,27 @@ validate(Mod, Manifest) ->
 
 %% [{[~"blobs",~"has"], async}, {[~"whoami"], sync}] ->
 %% {[{~"blobs", {[{~"has", ~"async"}]}}, {~"whoami", ~"sync"}]}
+%% Builds a nested EJSON tree of arbitrary depth (e.g.
+%% patchwork.publicFeed.roots), merging siblings at every level.
 nest_manifest(Visible) ->
-    Grouped = lists:foldr(
-                fun({[Method], Kind}, Acc) ->
-                        [{Method, kind_bin(Kind)} | Acc];
-                   ({[Ns | Rest], Kind}, Acc) ->
-                        case lists:keytake(Ns, 1, Acc) of
-                            {value, {Ns, {Sub}}, Acc1} ->
-                                [{Ns, {[nested(Rest, Kind) | Sub]}} | Acc1];
-                            false ->
-                                [{Ns, {[nested(Rest, Kind)]}} | Acc]
-                        end
-                end, [], Visible),
-    {Grouped}.
+    Tree = lists:foldl(
+             fun({Path, Kind}, Acc) -> insert_path(Path, kind_bin(Kind), Acc) end,
+             #{}, Visible),
+    tree_to_ejson(Tree).
 
-nested([Method], Kind) ->
-    {Method, kind_bin(Kind)}.
+insert_path([Leaf], Kind, Tree) ->
+    Tree#{Leaf => Kind};
+insert_path([Ns | Rest], Kind, Tree) ->
+    Sub = case Tree of
+              #{Ns := M} when is_map(M) -> M;
+              _                         -> #{}
+          end,
+    Tree#{Ns => insert_path(Rest, Kind, Sub)}.
+
+tree_to_ejson(Kind) when is_binary(Kind) ->
+    Kind;
+tree_to_ejson(Tree) when is_map(Tree) ->
+    {lists:sort([{K, tree_to_ejson(V)} || K := V <- Tree])}.
 
 kind_bin(sync)   -> ~"sync";
 kind_bin(async)  -> ~"async";
