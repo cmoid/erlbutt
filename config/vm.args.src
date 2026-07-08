@@ -21,4 +21,3 @@
 ## breaks the tunnel again; override with SSB_DIST_PORT, and forward/open
 ## both 4369 and this port (e.g. ssh -L 4369:localhost:4369 -L 9100:localhost:9100).
 -kernel inet_dist_listen_min ${SSB_DIST_PORT:-9100}
--kernel inet_dist_listen_max ${SSB_DIST_PORT:-9100}
