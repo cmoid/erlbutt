@@ -20,6 +20,7 @@
          friends_get_test/1,
          contacts_state_stream_test/1,
          likes_test/1,
+         thread_sorted_test/1,
          public_feed_roots_test/1,
          public_feed_latest_test/1,
          manifest_includes_silkpurse_test/1]).
@@ -40,6 +41,7 @@ all() ->
      friends_get_test,
      contacts_state_stream_test,
      likes_test,
+     thread_sorted_test,
      public_feed_roots_test,
      public_feed_latest_test,
      manifest_includes_silkpurse_test].
@@ -150,6 +152,29 @@ live_backlinks_test(_Config) ->
     after 3000 ->
         error(no_live_frame)
     end,
+    gen_server:stop(Peer).
+
+%% thread.sorted streams the root, its replies, and a sync sentinel.
+thread_sorted_test(_Config) ->
+    OwnPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", ~"thread root"}]}),
+    #message{id = RootId} = ssb_feed:fetch_last_msg(OwnPid),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", ~"a reply"},
+                                         {~"root", RootId}]}),
+    #message{id = ReplyId} = ssb_feed:fetch_last_msg(OwnPid),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    %% old-only (non-live) so the stream ends and we can collect it
+    Args = [{[{~"dest", RootId}, {~"live", false}, {~"old", true},
+              {~"types", [~"post"]}]}],
+    {ok, Frames} = ssb_peer:rpc_stream_call(
+                     Peer, [~"patchwork", ~"thread", ~"sorted"], Args),
+    Decoded = [utils:nat_decode(F) || F <- Frames],
+    Keys = [proplists:get_value(~"key", P) || {P} <- Decoded,
+                                              proplists:is_defined(~"key", P)],
+    ?assert(lists:member(RootId, Keys)),   %% root present
+    ?assert(lists:member(ReplyId, Keys)),  %% reply present
+    ?assert(lists:any(fun({P}) -> proplists:get_value(~"sync", P) =:= true;
+                         (_) -> false end, Decoded)),   %% sync sentinel
     gen_server:stop(Peer).
 
 %% likes.get returns the likers of a message, and countStream its live

@@ -27,7 +27,7 @@
 -include_lib("ssb/include/ssb.hrl").
 
 %% API
--export([start_link/0]).
+-export([start_link/0, refs/1]).
 
 %% ssb_view callbacks
 -export([view_version/0, view_load/0, view_reset/0, view_save/0,
@@ -49,6 +49,13 @@
 
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+%% Message ids that reference Target anywhere in their content.  Used by
+%% silkpurse_thread to find a thread's replies.
+refs(Target) ->
+    try [Id || {_T, Id} <- ets:lookup(?TAB, Target), is_binary(Id)]
+    catch error:badarg -> []
+    end.
 
 %%%===================================================================
 %%% ssb_view callbacks (run in the view_manager process)

@@ -45,7 +45,7 @@ manifest() ->
      {[~"patchwork", ~"liveBacklinks", ~"stream"],     source, owner},
      {[~"patchwork", ~"liveBacklinks", ~"subscribe"],  async,  owner},
      {[~"patchwork", ~"liveBacklinks", ~"unsubscribe"], async, owner},
-     {[~"patchwork", ~"thread", ~"sorted"],            source, owner},
+     %% (patchwork.thread.sorted is real — silkpurse_thread.)
      %% App shell.
      {[~"patchwork", ~"progress"],                     source, owner},
      {[~"patchwork", ~"heartbeat"],                    source, owner},
