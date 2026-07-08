@@ -167,12 +167,20 @@ create_req(Body) ->
 
 decode_body({Props}) ->
     #ssb_rpc{
-        name = proplists:get_value(~"name", Props),
+        name = normalize_name(proplists:get_value(~"name", Props)),
         args = proplists:get_value(~"args", Props),
         type = proplists:get_value(~"type", Props)};
 
 decode_body(Other) ->
     Other.
+
+%% muxrpc sends a method name as an array of path segments
+%% (["blobs","get"]), but the manifest reflection call — which every
+%% ssb-client makes on connect to build its api — arrives as a bare
+%% string ("manifest").  Normalize a bare binary to a single-segment
+%% list so dispatch and the plugin registry see one consistent shape.
+normalize_name(Name) when is_binary(Name) -> [Name];
+normalize_name(Name)                       -> Name.
 
 dispatch(_Calls, ReqNo, Body, _Socket, Nonce, _SecretBoxKey) when ReqNo < 0 ->
     {Nonce, proc_response(ReqNo, Body)};
