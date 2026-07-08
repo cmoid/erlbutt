@@ -117,6 +117,12 @@ push(Event, #vs_state{owner = Owner, req_no = ReqNo,
                     ok = ssb_peer:send_frame(Owner, ReqNo, Bin),
                     State
             end;
+        {send, Bin} ->
+            %% no dedup: for value streams (e.g. about.socialValueStream)
+            %% that re-emit a recomputed value on every change rather than
+            %% pushing distinct stored messages
+            ok = ssb_peer:send_frame(Owner, ReqNo, Bin),
+            State;
         skip ->
             State
     catch C:R ->

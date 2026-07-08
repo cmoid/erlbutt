@@ -37,9 +37,13 @@
 %%   {live_source, [{MsgId, Bin}], ViewMod, EventFun}
 %% to honour {live: true}: the snapshot pairs are sent, then the
 %% stream stays open and a view_stream process pushes every later
-%% match — EventFun(ViewEvent) -> {send, MsgId, Bin} | skip, run in
-%% the stream process, deduplicated against the snapshot ids.  The
-%% stream ends when the client cancels or the connection closes.
+%% match — EventFun(ViewEvent) run in the stream process returns
+%%   {send, MsgId, Bin} — push Bin unless MsgId was in the snapshot
+%%                        (for streams of distinct stored messages)
+%%   {send, Bin}        — push Bin unconditionally (for value streams
+%%                        that re-emit a recomputed value on change)
+%%   skip               — emit nothing for this event
+%% The stream ends when the client cancels or the connection closes.
 -module(ssb_plugin).
 
 -callback manifest() ->
