@@ -286,13 +286,13 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = Name}
              = _ReqBody, Socket, Nonce, SecretBoxKey)
   when Name =:= [~"createLogStream"] orelse Name =:= [~"createFeedStream"] ->
     ets:insert(Calls, {ReqNo, noop}),
-    LogFile = <<(config:ssb_repo_loc())/binary, "log.offset">>,
-    NewNonce = utils:fold_log_file(
+    %% arrival order via the ingest journal; bodies from the per-feed store
+    NewNonce = ingest_journal:stream_messages(
         fun(Body, N) ->
             Flags  = create_flags(1, 0, 2),
             Header = create_header(Flags, size(Body), -ReqNo),
             utils:send_data(utils:combine(Header, Body), Socket, N, SecretBoxKey)
-        end, Nonce, LogFile),
+        end, Nonce),
     TrueEnd = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
     Flags  = create_flags(1, 1, 2),
     Header = create_header(Flags, size(TrueEnd), -ReqNo),

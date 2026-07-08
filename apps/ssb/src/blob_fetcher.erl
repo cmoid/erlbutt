@@ -216,19 +216,19 @@ broadcast_wants(Ids, Peers) ->
 send_wants(PeerPid, Ids) ->
     ssb_peer:request_blob_wants(PeerPid, Ids, {?SERVER, PeerPid}).
 
-%% Fold the global log, collecting distinct blob refs from every message
-%% (decrypting private messages addressed to us), then hand them to the
-%% gen_server.  Runs in its own process — see handle_info(scan, ...).
+%% Fold the per-feed store (archives included), collecting distinct blob
+%% refs from every message (decrypting private messages addressed to
+%% us), then hand them to the gen_server.  Runs in its own process —
+%% see handle_info(scan, ...).
 scan_log() ->
-    LogFile = <<(config:ssb_repo_loc())/binary, "log.offset">>,
-    RefSet = utils:fold_log_file(
+    RefSet = feed_store:fold_all(
         fun(Data, Acc) ->
             try
                 Msg = message:decode(Data, false),
                 lists:foldl(fun(R, A) -> A#{R => true} end, Acc, msg_blob_refs(Msg))
             catch _:_ -> Acc
             end
-        end, #{}, LogFile),
+        end, #{}),
     gen_server:cast(?SERVER, {scan_results, maps:keys(RefSet)}).
 
 %% Blob refs reachable from a stored message: directly from public content, or

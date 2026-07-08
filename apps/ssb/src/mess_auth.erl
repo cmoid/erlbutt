@@ -51,19 +51,18 @@ get(Key) ->
         []           -> not_found
     end.
 
-%% Rebuild the table by scanning the global log.offset.
+%% Rebuild the table by scanning the per-feed store (archives included).
 %% Useful after a DETS→ETS migration that lost old mappings, or after
 %% any restart where the .ets snapshot was incomplete.
 rebuild() ->
-    LogFile = ?b2l(config:ssb_repo_loc()) ++ "log.offset",
-    utils:fold_log_file(
+    feed_store:fold_all(
         fun(MsgData, _Acc) ->
             try
                 #message{id = Id, author = Auth} = message:decode(MsgData, false),
                 ets:insert(?ETS_TAB, {Id, Auth})
             catch _:_ -> ok
             end
-        end, ok, LogFile),
+        end, ok),
     ok.
 
 %% All unique authors — ETS fold with map dedup.

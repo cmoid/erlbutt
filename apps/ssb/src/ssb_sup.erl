@@ -34,6 +34,7 @@ init([]) ->
             ?CHILD(invite_store, worker),
             ?CHILD(room_store, worker),
             ?CHILD(conn_db, worker),
+            ?CHILD(ingest_journal, worker),
             ?CHILD(ssb_feed_sup, supervisor),
             ?CHILD(view_manager, worker),
             ?CHILD(friends, worker),

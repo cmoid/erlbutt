@@ -300,7 +300,8 @@ store(#message{id = Id, sequence = Seq, author = Auth} = Msg,
              contacts = Contacts} = State) ->
     mess_auth:put(Id, Auth),
     write_msg(Msg, Feed),
-    write_msg(Msg, <<(config:ssb_repo_loc())/binary, "log.offset">>),
+    %% arrival-order ref; the message body lives only in the feed's own log
+    ingest_journal:append(Auth, Seq),
     utils:update_refs(Msg),
     case social_msg:is_about(Msg) of
         true -> write_msg(Msg, Profile);
@@ -454,8 +455,8 @@ has_target(Msg, Id, RootId) ->
 
 open_file(File) ->
     %% NOTE: do NOT use the `sync` flag here. It forces an fsync on every
-    %% file:write, and write_msg does two writes per call for both the
-    %% per-feed and the global log.offset (plus profile/contacts) — i.e.
+    %% file:write, and a stored message can hit several files (per-feed
+    %% log plus profile/contacts) — i.e.
     %% several fsyncs per stored message. On Linux that is ~60ms each, which
     %% throttled EBT replication to ~4 msgs/sec and left peers stuck in
     %% "Downloading new messages"/"Scuttling…" during a full-DB sync. Plain
