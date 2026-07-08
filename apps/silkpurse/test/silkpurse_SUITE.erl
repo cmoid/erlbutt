@@ -19,6 +19,7 @@
          live_about_test/1,
          friends_get_test/1,
          public_feed_roots_test/1,
+         public_feed_latest_test/1,
          manifest_includes_silkpurse_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
@@ -36,6 +37,7 @@ all() ->
      live_about_test,
      friends_get_test,
      public_feed_roots_test,
+     public_feed_latest_test,
      manifest_includes_silkpurse_test].
 
 init_per_suite(Config) ->
@@ -168,6 +170,31 @@ public_feed_roots_test(_Config) ->
     ?assertEqual(2, proplists:get_value(~"totalReplies", Props)),
     ?assertEqual(2, length(proplists:get_value(~"latestReplies", Props))),
     gen_server:stop(Peer).
+
+%% publicFeed.latest pushes a root item when a new post creates a
+%% thread while the stream is open.
+public_feed_latest_test(_Config) ->
+    OwnPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, _Ref} = ssb_peer:open_source(Peer, [~"publicFeed", ~"latest"],
+                                      [{[]}], self()),
+    Marker = base64:encode(crypto:strong_rand_bytes(9)),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", Marker}]}),
+    #message{id = RootId} = ssb_feed:fetch_last_msg(OwnPid),
+    ?assert(wait_for_root(RootId, 12)),
+    gen_server:stop(Peer).
+
+wait_for_root(_RootId, 0) -> false;
+wait_for_root(RootId, N) ->
+    receive
+        {stream_data, _, Frame} ->
+            {Props} = utils:nat_decode(Frame),
+            case proplists:get_value(~"key", Props) of
+                RootId -> true;
+                _      -> wait_for_root(RootId, N - 1)
+            end
+    after 3000 -> false
+    end.
 
 %% friends.get({source, dest}) returns the follow relationship the
 %% owner published: true after following the target over the wire.

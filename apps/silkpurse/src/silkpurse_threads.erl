@@ -107,7 +107,8 @@ view_entry(_) ->
 %%%===================================================================
 
 manifest() ->
-    [{[~"publicFeed", ~"roots"], source, owner}].
+    [{[~"publicFeed", ~"roots"],  source, owner},
+     {[~"publicFeed", ~"latest"], source, owner}].
 
 handle_rpc([~"publicFeed", ~"roots"], Args, _Caller) ->
     Opts    = opts(Args),
@@ -120,7 +121,29 @@ handle_rpc([~"publicFeed", ~"roots"], Args, _Caller) ->
     Limited = take(Ordered, Limit),
     {source, [{json, encode_json(Item)}
               || {RootId, Summary} <- Limited,
-                 (Item = item(RootId, Summary)) =/= undefined]}.
+                 (Item = item(RootId, Summary)) =/= undefined]};
+
+%% The live prepend to the public feed: no snapshot, then a root item
+%% each time a thread gains activity (new root or new reply bumping it),
+%% dropping blocked authors and not-yet-seen roots.
+handle_rpc([~"publicFeed", ~"latest"], _Args, _Caller) ->
+    EventFun =
+        fun({thread, RootId}) ->
+                Blocked = blocked_set(),
+                case ets:lookup(?TAB, RootId) of
+                    [{RootId, #{author := A} = Summary}] when is_binary(A) ->
+                        case sets:is_element(A, Blocked) of
+                            true  -> skip;
+                            false ->
+                                case item(RootId, Summary) of
+                                    undefined -> skip;
+                                    Item      -> {send, encode_json(Item)}
+                                end
+                        end;
+                    _ -> skip
+                end
+        end,
+    {live_source, [], ?MODULE, EventFun}.
 
 %%%===================================================================
 %%% gen_server callbacks
