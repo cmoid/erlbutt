@@ -186,58 +186,17 @@ rebuild_view(Mod) ->
     ok.
 
 %% Deliver every stored message past Mod's checkpoints by folding each
-%% feed's own store: archived segments oldest-first, then the live log.
-%% Within a feed the fold is in sequence order, which deliver/2 relies
-%% on (a delivered Seq advances the checkpoint past everything below it).
+%% feed's own store (feed_store: archived segments oldest-first, then
+%% the live log).  Within a feed the fold is in sequence order, which
+%% deliver/2 relies on (a delivered Seq advances the checkpoint past
+%% everything below it).
 catch_up(Mod) ->
     Start = erlang:monotonic_time(millisecond),
-    N = lists:foldl(fun(Dir, Acc) -> Acc + catch_up_feed(Mod, Dir) end,
-                    0, feed_dirs()),
+    N = feed_store:fold_all(
+          fun(Data, Acc) -> Acc + deliver_raw(Mod, Data) end, 0),
     ?SSB_INFO("view_manager: folded ~p messages into ~p in ~p ms",
               [N, Mod, erlang:monotonic_time(millisecond) - Start]),
     ok.
-
-feed_dirs() ->
-    Loc = ?b2l(config:feed_loc()),
-    [D || D <- filelib:wildcard(filename:join(Loc, "*/*")),
-          filelib:is_dir(D)].
-
-catch_up_feed(Mod, Dir) ->
-    Live = filename:join(Dir, "log.offset"),
-    N = lists:foldl(fun(Gz, Acc) -> Acc + fold_archive(Mod, Gz) end,
-                    0, archive_segments(Dir)),
-    N + utils:fold_log_file(fun(Data, Acc) -> Acc + deliver_raw(Mod, Data) end,
-                            0, ?l2b(Live)).
-
-%% Archived segment files, oldest first.  Names are
-%% log.offset.<From>-<To>.gz; sort numerically on From (lexicographic
-%% ordering breaks once sequence numbers gain a digit).
-archive_segments(Dir) ->
-    Segs = filelib:wildcard(filename:join(Dir, "log.offset.*.gz")),
-    Numbered = [{archive_from(S), S} || S <- Segs],
-    [S || {_From, S} <- lists:sort(Numbered)].
-
-archive_from(Path) ->
-    ["gz", Range | _] = lists:reverse(string:split(filename:basename(Path), ".", all)),
-    [From | _] = string:split(Range, "-"),
-    list_to_integer(From).
-
-%% An archive is the gzipped raw log file: the same
-%% <<Len:32, Msg:Len, Len:32, NextOffset:32>> framing, iterated in memory.
-fold_archive(Mod, GzFile) ->
-    try
-        {ok, GzData} = file:read_file(GzFile),
-        fold_log_bin(Mod, zlib:gunzip(GzData), 0)
-    catch C:R ->
-            ?SSB_ERROR("view_manager: unreadable archive ~s: ~p:~p",
-                       [GzFile, C, R]),
-            0
-    end.
-
-fold_log_bin(Mod, <<Len:32, Msg:Len/binary, Len:32, _Next:32, Rest/binary>>, N) ->
-    fold_log_bin(Mod, Rest, N + deliver_raw(Mod, Msg));
-fold_log_bin(_Mod, _Rest, N) ->
-    N.
 
 deliver_raw(Mod, Data) ->
     try message:decode(Data, false) of
@@ -319,25 +278,33 @@ vm_test_() ->
               ?_test(rebuild_folds_archives())]
      end}.
 
+%% Fully isolated home: these tests archive the own feed and rebuild
+%% from disk, and a home shared across eunit runs accumulates
+%% overlapping archives (found the hard way).
 vm_setup() ->
-    lists:foreach(
-      fun({Name, StartFun}) ->
-              case whereis(Name) of
-                  undefined -> {ok, _} = StartFun(), ok;
-                  _         -> ok
-              end
-      end,
-      [{config,       fun() -> config:start_link("test/ssb.cfg") end},
-       {keys,         fun() -> keys:start_link() end},
-       {mess_auth,    fun() -> mess_auth:start_link() end},
-       {blobs,        fun() -> blobs:start_link() end},
-       {ssb_feed_sup, fun() -> ssb_feed_sup:start_link() end},
-       {view_manager, fun() -> view_manager:start_link() end}]).
+    vm_teardown(ignore),
+    Home = filename:join("/tmp", "vm_" ++
+                          integer_to_list(erlang:system_time(microsecond))),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    application:set_env(ssb, ssb_home, Home),
+    {ok, _} = config:start_link("no-such-cfg"),
+    {ok, _} = keys:start_link(),
+    {ok, _} = mess_auth:start_link(),
+    {ok, _} = blobs:start_link(),
+    {ok, _} = ssb_feed_sup:start_link(),
+    {ok, _} = view_manager:start_link(),
+    Home.
 
-vm_teardown(_) ->
+vm_teardown(Home) ->
     application:unset_env(ssb, test_view_version),
     [catch gen_server:stop(Name)
      || Name <- [view_manager, ssb_feed_sup, blobs, mess_auth, keys, config]],
+    case Home of
+        ignore -> ok;
+        _ ->
+            os:cmd("rm -rf " ++ Home),
+            application:unset_env(ssb, ssb_home)
+    end,
     ok.
 
 %% eunit may run each test in its own process; a manager started (and
@@ -418,7 +385,10 @@ rebuild_without_global_log() ->
     {Pid, Id, Priv} = vm_make_peer(),
     #message{id = M1} = vm_store_post(Pid, Id, Priv, null, 1),
     #message{}        = vm_store_post(Pid, Id, Priv, M1, 2),
-    ok = file:delete(?b2l(<<(config:ssb_repo_loc())/binary, "log.offset">>)),
+    %% the global log is not even written anymore — assert that, then
+    %% prove the rebuild source is the per-feed store
+    GlobalLog = ?b2l(<<(config:ssb_repo_loc())/binary, "log.offset">>),
+    ?assertNot(filelib:is_file(GlobalLog)),
     ok = rebuild(test_counter_view),
     ?assertEqual([1, 2], test_counter_view:entries(Id)).
 
