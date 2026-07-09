@@ -133,12 +133,14 @@ init([]) ->
     {ok, #{}, {continue, register}}.
 
 handle_continue(register, State) ->
-    try
-        ok = view_manager:register_view(?MODULE),
-        ok = plugin_registry:register_plugin(?MODULE)
-    catch exit:{noproc, _} ->
-            ?SSB_INFO("silkpurse_by_type: running without ssb services", [])
-    end,
+    %% Register the plugin (method) before the view fold so the method
+    %% is in the served manifest immediately (the table was restored in
+    %% init).  Guard each independently so a service that is down (bare
+    %% eunit setups) does not skip the other.
+    try plugin_registry:register_plugin(?MODULE)
+    catch exit:{noproc, _} -> ok end,
+    try view_manager:register_view(?MODULE)
+    catch exit:{noproc, _} -> ok end,
     {noreply, State}.
 
 handle_call(_Request, _From, State) ->
