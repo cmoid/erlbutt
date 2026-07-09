@@ -192,11 +192,45 @@ rebuild_view(Mod) ->
 %% everything below it).
 catch_up(Mod) ->
     Start = erlang:monotonic_time(millisecond),
-    N = feed_store:fold_all(
-          fun(Data, Acc) -> Acc + deliver_raw(Mod, Data) end, 0),
-    ?SSB_INFO("view_manager: folded ~p messages into ~p in ~p ms",
-              [N, Mod, erlang:monotonic_time(millisecond) - Start]),
+    {N, Skipped} =
+        lists:foldl(
+          fun(Dir, {Acc, Sk}) ->
+                  case caught_up_feed(Mod, Dir) of
+                      true ->
+                          {Acc, Sk + 1};
+                      false ->
+                          Folded = feed_store:fold_feed(
+                                     fun(Data, A) -> A + deliver_raw(Mod, Data) end,
+                                     Acc, Dir),
+                          {Folded, Sk}
+                  end
+          end, {0, 0}, feed_store:feed_dirs()),
+    ?SSB_INFO("view_manager: folded ~p messages into ~p in ~p ms "
+              "(~p feeds already caught up)",
+              [N, Mod, erlang:monotonic_time(millisecond) - Start, Skipped]),
     ok.
+
+%% True when Mod's checkpoint already covers this feed's last message, so
+%% the whole feed can be skipped without folding it.  Determined from a
+%% single cheap tail read; conservatively false on any doubt (unreadable
+%% tail, undecodable message), which just means the feed is folded as
+%% before.  Safe across rebuilds: rebuild_view clears the checkpoints
+%% first, so every feed reads back as not-caught-up and is refolded.
+caught_up_feed(Mod, Dir) ->
+    case feed_store:last_frame(Dir) of
+        {ok, Msg} ->
+            try message:decode(Msg, false) of
+                #message{author = FeedId, sequence = Seq}
+                  when is_binary(FeedId), is_integer(Seq) ->
+                    checkpoint(Mod, FeedId) >= Seq;
+                _ ->
+                    false
+            catch _:_ ->
+                    false
+            end;
+        unknown ->
+            false
+    end.
 
 deliver_raw(Mod, Data) ->
     try message:decode(Data, false) of

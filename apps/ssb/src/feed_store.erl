@@ -15,9 +15,14 @@
 -include_lib("ssb/include/ssb.hrl").
 -compile({no_auto_import, [size/1]}).
 
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
+
 -export([feed_dirs/0,
          fold_feed/3,
          fold_all/2,
+         last_frame/1,
          cursor_open/1,
          cursor_next/1,
          cursor_close/1]).
@@ -44,6 +49,43 @@ fold_feed(Fun, Acc0, Dir) ->
 fold_all(Fun, Acc0) ->
     lists:foldl(fun(Dir, Acc) -> fold_feed(Fun, Acc, Dir) end,
                 Acc0, feed_dirs()).
+
+%% The raw binary of a feed's most recent message, read cheaply from the
+%% tail of the live log (last frame is <<Len:32, Msg:Len, Len:32,
+%% Next:32>>, so the final 8 bytes give the message length).  Returns
+%% `unknown` whenever the last message can't be read confidently without
+%% a full fold — an empty or torn live log, an archives-only feed, or any
+%% io error — so callers can fall back to folding the whole feed.
+last_frame(Dir) ->
+    Live = ?l2b(filename:join(Dir, "log.offset")),
+    case file:open(Live, [read, binary, raw]) of
+        {ok, Fd} ->
+            R = try tail_msg(Fd) catch _:_ -> unknown end,
+            file:close(Fd),
+            R;
+        _ ->
+            unknown
+    end.
+
+tail_msg(Fd) ->
+    {ok, Size} = file:position(Fd, eof),
+    case Size >= 12 of
+        false ->
+            unknown;                       %% empty or too small to frame
+        true ->
+            {ok, <<Len:32/integer, _Next:32/integer>>} =
+                file:pread(Fd, Size - 8, 8),
+            MsgStart = Size - 8 - Len,
+            case MsgStart >= 4 of
+                false ->
+                    unknown;               %% length overruns the file
+                true ->
+                    case file:pread(Fd, MsgStart, Len) of
+                        {ok, Msg} when byte_size(Msg) =:= Len -> {ok, Msg};
+                        _                                     -> unknown
+                    end
+            end
+    end.
 
 %%%===================================================================
 %%% Sequential cursor (archives, then live log)
@@ -129,3 +171,63 @@ read_record(IoDev) ->
             end;
         _ -> eof
     end.
+
+-ifdef(TEST).
+
+%% On-disk frame: <<Len:32, Msg:Len, Len:32, NextOffset:32>>.
+frame(Msg) ->
+    Len = byte_size(Msg),
+    <<Len:32, Msg/binary, Len:32, 0:32>>.
+
+last_frame_test_() ->
+    Setup = fun() ->
+                    Dir = filename:join(
+                            ["/tmp",
+                             "feed_store_lf_" ++
+                                 integer_to_list(erlang:unique_integer([positive]))]),
+                    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+                    Dir
+            end,
+    Teardown = fun(Dir) ->
+                       file:delete(filename:join(Dir, "log.offset")),
+                       file:del_dir(Dir)
+               end,
+    Log = fun(Dir) -> filename:join(Dir, "log.offset") end,
+    {foreach, Setup, Teardown,
+     [fun(Dir) ->
+              {"reads the last of several frames",
+               fun() ->
+                       ok = file:write_file(Log(Dir),
+                                            [frame(~"one"), frame(~"two"),
+                                             frame(~"three")]),
+                       ?assertEqual({ok, ~"three"}, last_frame(Dir))
+               end}
+      end,
+      fun(Dir) ->
+              {"single frame",
+               fun() ->
+                       ok = file:write_file(Log(Dir), frame(~"only")),
+                       ?assertEqual({ok, ~"only"}, last_frame(Dir))
+               end}
+      end,
+      fun(Dir) ->
+              {"empty log is unknown",
+               fun() ->
+                       ok = file:write_file(Log(Dir), <<>>),
+                       ?assertEqual(unknown, last_frame(Dir))
+               end}
+      end,
+      fun(Dir) ->
+              {"missing log is unknown",
+               fun() -> ?assertEqual(unknown, last_frame(Dir)) end}
+      end,
+      fun(Dir) ->
+              {"torn tail is unknown, not a crash",
+               fun() ->
+                       ok = file:write_file(Log(Dir),
+                                            [frame(~"good"), <<7:32, "trunc">>]),
+                       ?assertEqual(unknown, last_frame(Dir))
+               end}
+      end]}.
+
+-endif.
