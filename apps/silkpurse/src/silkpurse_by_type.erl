@@ -123,25 +123,38 @@ handle_rpc([~"messagesByType"], Args, _Caller) ->
 %%%===================================================================
 
 init([]) ->
-    Restored = try ets:file2tab(?b2l(table_file()))
-               catch _:_ -> {error, no_config}
-               end,
-    case Restored of
-        {ok, ?TAB} -> ok;
-        _          -> ets:new(?TAB, [bag, named_table, public])
-    end,
+    %% Create the (empty) table now so it always exists, but defer the
+    %% snapshot restore to handle_continue: file2tab of a large snapshot
+    %% would otherwise block silkpurse_sup:start_link and thus the whole
+    %% node boot (and the shell).  The restores then run concurrently
+    %% across the views rather than serialized by the supervisor.
+    ets:new(?TAB, [bag, named_table, public]),
     {ok, #{}, {continue, register}}.
 
 handle_continue(register, State) ->
-    %% Register the plugin (method) before the view fold so the method
-    %% is in the served manifest immediately (the table was restored in
-    %% init).  Guard each independently so a service that is down (bare
-    %% eunit setups) does not skip the other.
+    %% Swap in the snapshot (if any), then register the plugin (so the
+    %% method appears in the manifest) before the view fold.  Guard each
+    %% registration independently so a service that is down (bare eunit
+    %% setups) does not skip the other.
+    maybe_restore(),
     try plugin_registry:register_plugin(?MODULE)
     catch exit:{noproc, _} -> ok end,
     try view_manager:register_view(?MODULE)
     catch exit:{noproc, _} -> ok end,
     {noreply, State}.
+
+maybe_restore() ->
+    File = ?b2l(table_file()),
+    case filelib:is_regular(File) of
+        false ->
+            ok;                        %% no snapshot; keep the empty table
+        true ->
+            ets:delete(?TAB),
+            case (try ets:file2tab(File) catch _:_ -> error end) of
+                {ok, ?TAB} -> ok;
+                _          -> ets:new(?TAB, [bag, named_table, public])
+            end
+    end.
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
