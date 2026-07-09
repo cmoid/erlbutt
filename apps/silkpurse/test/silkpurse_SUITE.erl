@@ -18,6 +18,8 @@
          about_social_value_test/1,
          live_about_test/1,
          friends_get_test/1,
+         suggest_profile_test/1,
+         profile_avatar_test/1,
          contacts_state_stream_test/1,
          likes_test/1,
          thread_sorted_test/1,
@@ -41,6 +43,8 @@ all() ->
      about_social_value_test,
      live_about_test,
      friends_get_test,
+     suggest_profile_test,
+     profile_avatar_test,
      contacts_state_stream_test,
      likes_test,
      thread_sorted_test,
@@ -310,6 +314,38 @@ wait_for_root(RootId, N) ->
             end
     after 3000 -> false
     end.
+
+%% suggest.profile matches a self-assigned name by prefix.
+suggest_profile_test(_Config) ->
+    OwnId  = keys:pub_key_disp(),
+    OwnPid = utils:find_or_create_feed_pid(OwnId),
+    Target = fresh_feed_id(),
+    Name = <<"Zaphod", (base64:encode(crypto:strong_rand_bytes(4)))/binary>>,
+    %% the owner names the target (an about); the about view indexes it
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"about"},
+                                         {~"about", Target}, {~"name", Name}]}),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, Body} = ssb_peer:rpc_call(Peer, [~"patchwork", ~"suggest", ~"profile"],
+                                   ~"async", [{[{~"text", ~"Zaphod"}]}]),
+    Items = utils:nat_decode(Body),
+    Ids = [proplists:get_value(~"id", P) || {P} <- Items],
+    ?assert(lists:member(Target, Ids)),
+    gen_server:stop(Peer).
+
+%% profile.avatar returns {id, name, image} resolved from the about view.
+profile_avatar_test(_Config) ->
+    OwnId  = keys:pub_key_disp(),
+    OwnPid = utils:find_or_create_feed_pid(OwnId),
+    Target = fresh_feed_id(),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"about"},
+                                         {~"about", Target}, {~"name", ~"Trillian"}]}),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, Body} = ssb_peer:rpc_call(Peer, [~"patchwork", ~"profile", ~"avatar"],
+                                   ~"async", [{[{~"id", Target}]}]),
+    {Props} = utils:nat_decode(Body),
+    ?assertEqual(Target,      proplists:get_value(~"id", Props)),
+    ?assertEqual(~"Trillian", proplists:get_value(~"name", Props)),
+    gen_server:stop(Peer).
 
 %% friends.get({source, dest}) returns the follow relationship the
 %% owner published: true after following the target over the wire.

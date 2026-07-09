@@ -21,7 +21,6 @@ manifest() ->
     %% (needs private unboxing) which stays stubbed here.
     [{[~"patchwork", ~"privateFeed", ~"roots"],        source, owner},
      {[~"patchwork", ~"privateFeed", ~"latest"],       source, owner},
-     {[~"patchwork", ~"profile", ~"avatar"],           async,  owner},
      %% Discovery / sidebar.
      {[~"patchwork", ~"recentFeeds"],                  source, owner},
      {[~"patchwork", ~"channels", ~"get"],             async,  owner},
@@ -29,7 +28,8 @@ manifest() ->
      {[~"patchwork", ~"channels", ~"suggest"],         async,  owner},
      {[~"patchwork", ~"channels", ~"recentStream"],    source, owner},
      {[~"patchwork", ~"subscriptions"],                source, owner},
-     {[~"patchwork", ~"suggest", ~"profile"],          async,  owner},
+     %% (patchwork.suggest.profile is real — silkpurse_db;
+     %%  patchwork.profile.avatar is real — silkpurse_about.)
      %% Message rendering.  (patchwork.likes.* is real — silkpurse_likes.)
      {[~"patchwork", ~"backlinks", ~"referencesStream"], source, owner},
      {[~"patchwork", ~"backlinks", ~"forksStream"],    source, owner},
@@ -44,16 +44,10 @@ manifest() ->
 
 %% Async getters return an empty object/list; source streams are empty.
 %% Side-effecting async methods acknowledge with true.
-handle_rpc([~"patchwork", ~"profile", ~"avatar"], _Args, _Caller) ->
-    {reply, {[]}};
 handle_rpc([~"patchwork", ~"channels", ~"get"], _Args, _Caller) ->
     {reply, []};
 handle_rpc([~"patchwork", ~"channels", ~"suggest"], _Args, _Caller) ->
     {reply, []};
-handle_rpc([~"patchwork", ~"suggest", ~"profile"], _Args, _Caller) ->
-    {reply, []};
-handle_rpc([~"patchwork", ~"likes", ~"get"], _Args, _Caller) ->
-    {reply, {[]}};
 handle_rpc([~"patchwork", ~"liveBacklinks", ~"subscribe"], _Args, _Caller) ->
     {reply, true};
 handle_rpc([~"patchwork", ~"liveBacklinks", ~"unsubscribe"], _Args, _Caller) ->

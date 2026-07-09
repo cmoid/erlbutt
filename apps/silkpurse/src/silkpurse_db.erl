@@ -20,7 +20,8 @@
 manifest() ->
     [{[~"getLatest"], async, owner},
      {[~"latestSequence"], async, owner},
-     {[~"friends", ~"get"], async, owner}].
+     {[~"friends", ~"get"], async, owner},
+     {[~"patchwork", ~"suggest", ~"profile"], async, owner}].
 
 %% getLatest(feedId) -> {id, sequence, ts} of the feed's newest message
 %% (the shape ssb-db clients expect).
@@ -72,7 +73,35 @@ handle_rpc([~"friends", ~"get"], [{Opts}], _Caller) ->
             {error, ~"friends.get needs a source"}
     end;
 handle_rpc([~"friends", ~"get"], _Args, _Caller) ->
-    {error, ~"friends.get takes an options object"}.
+    {error, ~"friends.get takes an options object"};
+
+%% suggest.profile({text, defaultIds, limit}) -> profiles for mention
+%% autocomplete: names matching text (or the defaults when text is
+%% empty), each as {id, name, image, following}.
+handle_rpc([~"patchwork", ~"suggest", ~"profile"], [{Opts}], _Caller) ->
+    Text  = ?pgv(~"text", Opts),
+    Limit = case ?pgv(~"limit", Opts) of L when is_integer(L) -> L; _ -> 20 end,
+    Pairs = case Text of
+                T when is_binary(T), T =/= ~"" ->
+                    silkpurse_about:search_names(T, Limit);
+                _ ->
+                    %% empty text: offer the caller-provided defaults
+                    Ids = case ?pgv(~"defaultIds", Opts) of
+                              DL when is_list(DL) -> DL;
+                              _                   -> []
+                          end,
+                    [{Id, friends:name(Id)} || Id <- Ids, is_binary(Id)]
+            end,
+    Owner = keys:pub_key_disp(),
+    {reply, [suggestion(Id, Name, Owner) || {Id, Name} <- Pairs]};
+handle_rpc([~"patchwork", ~"suggest", ~"profile"], _Args, _Caller) ->
+    {reply, []}.
+
+suggestion(Id, Name, Owner) ->
+    {[{~"id", Id},
+      {~"name", Name},
+      {~"image", silkpurse_about:social_value(Id, ~"image")},
+      {~"following", friends:edge(Owner, Id) =:= true}]}.
 
 -ifdef(TEST).
 

@@ -34,7 +34,7 @@
 -include_lib("ssb/include/ssb.hrl").
 
 %% API
--export([start_link/0]).
+-export([start_link/0, social_value/2, search_names/2]).
 
 %% ssb_view callbacks
 -export([view_version/0, view_load/0, view_reset/0, view_save/0,
@@ -110,7 +110,8 @@ view_entry(_) ->
 
 manifest() ->
     [{[~"about", ~"socialValue"],       async,  owner},
-     {[~"about", ~"socialValueStream"], source, owner}].
+     {[~"about", ~"socialValueStream"], source, owner},
+     {[~"patchwork", ~"profile", ~"avatar"], async, owner}].
 
 handle_rpc([~"about", ~"socialValue"], Args, _Caller) ->
     case dest_key(Args) of
@@ -132,6 +133,18 @@ handle_rpc([~"about", ~"socialValueStream"], Args, _Caller) ->
             %% snapshot = the current resolved value (a value stream, so
             %% no message-id dedup); then live updates on each change
             {live_source, [{make_ref(), Initial}], ?MODULE, EventFun}
+    end;
+
+%% profile.avatar({id}) -> {id, name, image}: a feed's resolved display
+%% name and avatar, for profile headers and lists.
+handle_rpc([~"patchwork", ~"profile", ~"avatar"], [{Opts}], _Caller) ->
+    case ?pgv(~"id", Opts) of
+        Id when is_binary(Id) ->
+            {reply, {[{~"id",    Id},
+                      {~"name",  social_value(Id, ~"name")},
+                      {~"image", social_value(Id, ~"image")}]}};
+        _ ->
+            {error, ~"profile.avatar needs an id"}
     end.
 
 %%%===================================================================
@@ -220,6 +233,33 @@ social_value(Dest, Key) ->
         #{Yours := V}  -> V;
         #{Author := V} -> V;
         _              -> highest_rank(Values)
+    end.
+
+%% Feeds whose resolved display name contains Text (case-insensitive),
+%% up to Limit, as [{FeedId, Name}] — the backing for mention
+%% autocomplete.  Uses the resolved social value, so pet-names the owner
+%% assigned are searchable too.
+search_names(Text, Limit) ->
+    Needle = string:lowercase(Text),
+    try
+        Dests = ets:foldl(
+                  fun({{Dest, ~"name"}, _Map}, Acc) -> [Dest | Acc];
+                     (_, Acc)                        -> Acc
+                  end, [], ?TAB),
+        Matches = lists:filtermap(
+                    fun(Dest) ->
+                            case social_value(Dest, ~"name") of
+                                Name when is_binary(Name) ->
+                                    case string:find(string:lowercase(Name),
+                                                     Needle) of
+                                        nomatch -> false;
+                                        _       -> {true, {Dest, Name}}
+                                    end;
+                                _ -> false
+                            end
+                    end, Dests),
+        lists:sublist(Matches, Limit)
+    catch error:badarg -> []
     end.
 
 %% The most common extractable value across assigners, or null.
