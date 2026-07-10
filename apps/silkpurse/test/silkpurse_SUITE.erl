@@ -26,6 +26,7 @@
          private_feed_test/1,
          backlinks_streams_test/1,
          recent_feeds_test/1,
+         subscriptions_test/1,
          contacts_state_stream_test/1,
          likes_test/1,
          thread_sorted_test/1,
@@ -57,6 +58,7 @@ all() ->
      private_feed_test,
      backlinks_streams_test,
      recent_feeds_test,
+     subscriptions_test,
      contacts_state_stream_test,
      likes_test,
      thread_sorted_test,
@@ -274,6 +276,27 @@ private_feed_test(_Config) ->
     ?assertEqual(~"pf root", proplists:get_value(~"text", Content)),
     gen_server:stop(Peer).
 
+%% subscriptions({channel}) lists a channel's subscribers as {from,value}.
+subscriptions_test(_Config) ->
+    OwnId  = keys:pub_key_disp(),
+    OwnPid = utils:find_or_create_feed_pid(OwnId),
+    Ch = <<"subs", (integer_to_binary(erlang:unique_integer([positive])))/binary>>,
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"channel"},
+                                         {~"channel", Ch},
+                                         {~"subscribed", true}]}),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, _Ref} = ssb_peer:open_source(
+                   Peer, [~"patchwork", ~"subscriptions"],
+                   [{[{~"channel", Ch}]}], self()),
+    receive
+        {stream_data, _, F} ->
+            {P} = utils:nat_decode(F),
+            ?assertEqual(OwnId, proplists:get_value(~"from", P)),
+            ?assertEqual(true,  proplists:get_value(~"value", P))
+    after 3000 -> error(no_subscriber_frame)
+    end,
+    gen_server:stop(Peer).
+
 %% recentFeeds lists feeds that recently started a thread.
 recent_feeds_test(_Config) ->
     OwnId  = keys:pub_key_disp(),
@@ -304,18 +327,30 @@ backlinks_streams_test(_Config) ->
         {stream_data, _, F} -> ?assertEqual(ReplyId, (message:decode(F, false))#message.id)
     after 3000 -> error(no_reference)
     end,
-    %% liveBacklinks.stream: open, post a new backlink, receive it dest-tagged
+    %% liveBacklinks.stream: open, post a new backlink, receive it dest-tagged.
+    %% (the referencesStream above is still open and also delivers the reply,
+    %% so skip frames without a dest field.)
     {ok, _L} = ssb_peer:open_source(
                  Peer, [~"patchwork", ~"liveBacklinks", ~"stream"], [], self()),
     ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", ~"live ref"},
                                          {~"root", RootId}]}),
-    receive
-        {stream_data, _, LF} ->
-            {P} = utils:nat_decode(LF),
-            ?assertEqual(RootId, proplists:get_value(~"dest", P))
-    after 3000 -> error(no_live_backlink)
-    end,
+    ?assertEqual(RootId, recv_dest_frame()),
     gen_server:stop(Peer).
+
+%% Receive stream frames until one carries a `dest` field, returning it.
+recv_dest_frame() ->
+    receive
+        {stream_data, _, F} ->
+            case utils:nat_decode(F) of
+                {P} when is_list(P) ->
+                    case proplists:get_value(~"dest", P) of
+                        undefined -> recv_dest_frame();
+                        Dest      -> Dest
+                    end;
+                _ -> recv_dest_frame()
+            end
+    after 3000 -> error(no_live_backlink)
+    end.
 
 %% channels.suggest matches a channel by prefix (with a post count), and
 %% channels.recentStream lists recently-active channels.

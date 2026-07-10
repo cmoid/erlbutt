@@ -45,7 +45,9 @@ start_link() ->
 %%% ssb_view callbacks (run in the view_manager process)
 %%%===================================================================
 
-view_version() -> 1.
+%% 2: subscriptions are tracked per subscriber feed (key {sub,Ch,Feed}),
+%% not just the owner, so channels.subscriptions can list subscribers.
+view_version() -> 2.
 
 view_load() ->
     Loaded = try ets:lookup(?TAB, ?MARKER) =/= []
@@ -69,12 +71,12 @@ view_entry(#message{author = Author, timestamp = Ts, content = {Props}}) ->
         Ch when is_binary(Ch), byte_size(Ch) > 0 ->
             case ?pgv(~"type", Props) of
                 ~"channel" ->
-                    %% a subscription toggle: only the owner's own state
-                    Sub = ?pgv(~"subscribed", Props),
-                    case Author =:= owner() andalso is_boolean(Sub) of
-                        true  -> set_sub(Ch, Sub, Ts),
-                                 {events, [{channel, Ch}]};
-                        false -> ok
+                    %% a subscription toggle by any feed
+                    case ?pgv(~"subscribed", Props) of
+                        Sub when is_boolean(Sub) ->
+                            set_sub(Ch, Author, Sub, Ts),
+                            {events, [{csub, Ch, Author, Sub}]};
+                        _ -> ok
                     end;
                 _ ->
                     %% any other message tagged with a channel is activity
@@ -93,7 +95,8 @@ view_entry(_) ->
 
 manifest() ->
     [{[~"patchwork", ~"channels", ~"suggest"],      async,  owner},
-     {[~"patchwork", ~"channels", ~"recentStream"], source, owner}].
+     {[~"patchwork", ~"channels", ~"recentStream"], source, owner},
+     {[~"patchwork", ~"subscriptions"],             source, owner}].
 
 handle_rpc([~"patchwork", ~"channels", ~"suggest"], [{Opts}], _Caller) ->
     Text  = case ?pgv(~"text", Opts) of T when is_binary(T) -> T; _ -> ~"" end,
@@ -117,7 +120,26 @@ handle_rpc([~"patchwork", ~"channels", ~"recentStream"], Args, _Caller) ->
     EventFun = fun({channel, _Ch}) -> {send, encode_json(recent(Limit))};
                   (_)              -> skip
                end,
-    {live_source, [{make_ref(), Initial}], ?MODULE, EventFun}.
+    {live_source, [{make_ref(), Initial}], ?MODULE, EventFun};
+
+%% subscriptions({channel}): who subscribes to the channel, as
+%% {from, value} toggles — current subscribers first, then live changes.
+handle_rpc([~"patchwork", ~"subscriptions"], [{Opts}], _Caller) ->
+    case normalize_channel(?pgv(~"channel", Opts)) of
+        Ch when is_binary(Ch), byte_size(Ch) > 0 ->
+            Snapshot = [{make_ref(), toggle(F, true)} || F <- subscribers(Ch)],
+            EventFun = fun({csub, C, F, B}) when C =:= Ch -> {send, toggle(F, B)};
+                          (_)                             -> skip
+                       end,
+            {live_source, Snapshot, ?MODULE, EventFun};
+        _ ->
+            {source, []}
+    end;
+handle_rpc([~"patchwork", ~"subscriptions"], _Args, _Caller) ->
+    {source, []}.
+
+toggle(Feed, Value) ->
+    encode_json({[{~"from", Feed}, {~"value", Value}]}).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -188,23 +210,30 @@ bump(Ch, Ts) ->
                     end,
     ets:insert(?TAB, {{stat, Ch}, Count + 1, max(Last, sort_key(Ts))}).
 
-set_sub(Ch, Subscribed, Ts) ->
+set_sub(Ch, Feed, Subscribed, Ts) ->
     T = sort_key(Ts),
-    case ets:lookup(?TAB, {sub, Ch}) of
+    case ets:lookup(?TAB, {sub, Ch, Feed}) of
         %% keep the newer toggle; on an equal timestamp the later-folded
         %% message wins (feeds fold in sequence order), so accept it
         [{_, _Old, OldTs}] when OldTs > T -> ok;
-        _ -> ets:insert(?TAB, {{sub, Ch}, Subscribed =:= true, T})
+        _ -> ets:insert(?TAB, {{sub, Ch, Feed}, Subscribed =:= true, T})
     end.
 
 sort_key(Ts) when is_integer(Ts) -> Ts;
 sort_key(_)                      -> 0.
 
+%% Whether the node owner currently subscribes to Ch (for suggest).
 is_subscribed(Ch) ->
-    case ets:lookup(?TAB, {sub, Ch}) of
+    case ets:lookup(?TAB, {sub, Ch, owner()}) of
         [{_, Sub, _}] -> Sub;
         []            -> false
     end.
+
+%% Feeds currently subscribed to Ch.
+subscribers(Ch) ->
+    ets:foldl(fun({{sub, C, F}, true, _}, Acc) when C =:= Ch -> [F | Acc];
+                 (_, Acc)                                    -> Acc
+              end, [], ?TAB).
 
 %% Channels whose name contains Text (empty text matches all), most posts
 %% first, capped at Limit, as [{id, count, subscribed}].
@@ -302,6 +331,9 @@ subscription_tracked() ->
     ?assertNot(is_subscribed(~"elm")),
     %% suggest reflects the (now unsubscribed) state
     ?assertMatch([{[{~"id", ~"elm"}, {~"count", 1}, {~"subscribed", false}]}],
-                 suggest(~"elm", 20)).
+                 suggest(~"elm", 20)),
+    %% subscribe again and check the subscribers list
+    sub_in(Pid, ~"#elm", true),
+    ?assertEqual([keys:pub_key_disp()], subscribers(~"elm")).
 
 -endif.

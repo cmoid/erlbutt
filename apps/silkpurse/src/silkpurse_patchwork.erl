@@ -24,7 +24,7 @@ manifest() ->
      {[~"patchwork", ~"channels", ~"get"],             async,  owner},
      {[~"patchwork", ~"channels", ~"stream"],          source, owner},
      %% (patchwork.channels.suggest/recentStream are real — silkpurse_channels.)
-     {[~"patchwork", ~"subscriptions"],                source, owner},
+     %% (patchwork.subscriptions is real — silkpurse_channels.)
      %% (patchwork.suggest.profile is real — silkpurse_db;
      %%  patchwork.profile.avatar is real — silkpurse_about.)
      %% Message rendering.  (patchwork.likes.* is real — silkpurse_likes.)
