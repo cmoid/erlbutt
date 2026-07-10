@@ -55,6 +55,18 @@ handle_rpc([~"patchwork", ~"liveBacklinks", ~"unsubscribe"], _Args, _Caller) ->
 handle_rpc([~"patchwork", ~"disconnect"], _Args, _Caller) ->
     {reply, true};
 
+%% A live source that emits a tick just under once a second, driven by
+%% the silkpurse_heartbeat timer through the view-event pg group.  The
+%% client's progress-notifier resets its "waiting" flag on every tick,
+%% so this keeps the "Scuttling..." spinner hidden once the node is up.
+%% The frame body is an arbitrary JSON value (the emit time); the client
+%% only cares that a frame arrived.
+handle_rpc([~"patchwork", ~"heartbeat"], _Args, _Caller) ->
+    EventFun = fun(_) ->
+                       {send, integer_to_binary(erlang:system_time(millisecond))}
+               end,
+    {live_source, [], silkpurse_heartbeat, EventFun};
+
 %% Everything else registered here is a source stub: an empty stream.
 handle_rpc([~"patchwork" | _], _Args, _Caller) ->
     {source, []}.

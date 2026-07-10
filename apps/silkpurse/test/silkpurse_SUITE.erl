@@ -20,6 +20,7 @@
          friends_get_test/1,
          suggest_profile_test/1,
          profile_avatar_test/1,
+         heartbeat_test/1,
          contacts_state_stream_test/1,
          likes_test/1,
          thread_sorted_test/1,
@@ -45,6 +46,7 @@ all() ->
      friends_get_test,
      suggest_profile_test,
      profile_avatar_test,
+     heartbeat_test,
      contacts_state_stream_test,
      likes_test,
      thread_sorted_test,
@@ -208,6 +210,20 @@ likes_test(_Config) ->
             ?assertEqual(1, utils:nat_decode(CountFrame))
     after 3000 ->
         error(no_count_frame)
+    end,
+    gen_server:stop(Peer).
+
+%% patchwork.heartbeat is a live source the silkpurse_heartbeat timer
+%% pulses under once a second; a frame must arrive to keep the client's
+%% progress spinner hidden.
+heartbeat_test(_Config) ->
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, _Ref} = ssb_peer:open_source(
+                   Peer, [~"patchwork", ~"heartbeat"], [], self()),
+    receive
+        {stream_data, _, _TickFrame} -> ok
+    after 3000 ->
+        error(no_heartbeat_frame)
     end,
     gen_server:stop(Peer).
 

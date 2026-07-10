@@ -38,6 +38,7 @@
          ingest/1,
          subscribe/1,
          unsubscribe/1,
+         notify/2,
          checkpoint/2,
          save/0]).
 
@@ -87,6 +88,13 @@ subscribe(ViewMod) ->
 
 unsubscribe(ViewMod) ->
     ok = pg:leave(?PG_SCOPE, {view, ViewMod}, self()).
+
+%% Send an ad-hoc Event to a view's subscribers, exactly as a view's own
+%% change events are delivered.  Lets non-view producers (e.g. a periodic
+%% heartbeat) drive a live_source over the same pg mechanism.  Runs in
+%% the caller's process — no view_manager round-trip.
+notify(ViewMod, Event) ->
+    publish(ViewMod, [Event]).
 
 %% The highest sequence of FeedId delivered to ViewMod (0 if none).
 %% Reads the protected checkpoint table directly.
