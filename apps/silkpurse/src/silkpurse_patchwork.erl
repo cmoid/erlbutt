@@ -25,8 +25,7 @@ manifest() ->
      {[~"patchwork", ~"recentFeeds"],                  source, owner},
      {[~"patchwork", ~"channels", ~"get"],             async,  owner},
      {[~"patchwork", ~"channels", ~"stream"],          source, owner},
-     {[~"patchwork", ~"channels", ~"suggest"],         async,  owner},
-     {[~"patchwork", ~"channels", ~"recentStream"],    source, owner},
+     %% (patchwork.channels.suggest/recentStream are real — silkpurse_channels.)
      {[~"patchwork", ~"subscriptions"],                source, owner},
      %% (patchwork.suggest.profile is real — silkpurse_db;
      %%  patchwork.profile.avatar is real — silkpurse_about.)
@@ -45,8 +44,6 @@ manifest() ->
 %% Async getters return an empty object/list; source streams are empty.
 %% Side-effecting async methods acknowledge with true.
 handle_rpc([~"patchwork", ~"channels", ~"get"], _Args, _Caller) ->
-    {reply, []};
-handle_rpc([~"patchwork", ~"channels", ~"suggest"], _Args, _Caller) ->
     {reply, []};
 handle_rpc([~"patchwork", ~"liveBacklinks", ~"subscribe"], _Args, _Caller) ->
     {reply, true};

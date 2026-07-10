@@ -21,6 +21,7 @@
          suggest_profile_test/1,
          profile_avatar_test/1,
          heartbeat_test/1,
+         channels_test/1,
          contacts_state_stream_test/1,
          likes_test/1,
          thread_sorted_test/1,
@@ -47,6 +48,7 @@ all() ->
      suggest_profile_test,
      profile_avatar_test,
      heartbeat_test,
+     channels_test,
      contacts_state_stream_test,
      likes_test,
      thread_sorted_test,
@@ -212,6 +214,32 @@ likes_test(_Config) ->
             ?assertEqual(1, utils:nat_decode(CountFrame))
     after 3000 ->
         error(no_count_frame)
+    end,
+    gen_server:stop(Peer).
+
+%% channels.suggest matches a channel by prefix (with a post count), and
+%% channels.recentStream lists recently-active channels.
+channels_test(_Config) ->
+    OwnPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    Ch = <<"ct", (integer_to_binary(erlang:unique_integer([positive])))/binary>>,
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", ~"in a channel"},
+                                         {~"channel", Ch}]}),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    Prefix = binary:part(Ch, 0, 4),
+    {ok, Body} = ssb_peer:rpc_call(Peer, [~"patchwork", ~"channels", ~"suggest"],
+                                   ~"async", [{[{~"text", Prefix}, {~"limit", 20}]}]),
+    Items = utils:nat_decode(Body),
+    Ids = [proplists:get_value(~"id", P) || {P} <- Items],
+    ?assert(lists:member(Ch, Ids)),
+    %% recentStream is live; read its first frame (the current list)
+    {ok, _Ref} = ssb_peer:open_source(
+                   Peer, [~"patchwork", ~"channels", ~"recentStream"],
+                   [{[{~"limit", 10}]}], self()),
+    receive
+        {stream_data, _, Frame} ->
+            ?assert(lists:member(Ch, utils:nat_decode(Frame)))
+    after 3000 ->
+        error(no_recent_frame)
     end,
     gen_server:stop(Peer).
 
