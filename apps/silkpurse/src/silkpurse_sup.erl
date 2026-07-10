@@ -21,4 +21,5 @@ init([]) ->
            ?CHILD(silkpurse_about, worker),
            ?CHILD(silkpurse_threads, worker),
            ?CHILD(silkpurse_likes, worker),
-           ?CHILD(silkpurse_channels, worker)]}}.
+           ?CHILD(silkpurse_channels, worker),
+           ?CHILD(silkpurse_private, worker)]}}.

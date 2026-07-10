@@ -23,6 +23,7 @@
          heartbeat_test/1,
          channels_test/1,
          private_get_test/1,
+         private_feed_test/1,
          contacts_state_stream_test/1,
          likes_test/1,
          thread_sorted_test/1,
@@ -51,6 +52,7 @@ all() ->
      heartbeat_test,
      channels_test,
      private_get_test,
+     private_feed_test,
      contacts_state_stream_test,
      likes_test,
      thread_sorted_test,
@@ -240,6 +242,32 @@ private_get_test(_Config) ->
     ?assertEqual(true, proplists:get_value(~"private", Value)),
     {Content} = proplists:get_value(~"content", Value),
     ?assertEqual(~"a secret", proplists:get_value(~"text", Content)),
+    gen_server:stop(Peer).
+
+%% privateFeed.roots rolls up private threads with decrypted content and
+%% excludes public posts.
+private_feed_test(_Config) ->
+    OwnId  = keys:pub_key_disp(),
+    OwnPid = utils:find_or_create_feed_pid(OwnId),
+    ok = ssb_feed:post_private(OwnPid,
+                               {[{~"type", ~"post"}, {~"text", ~"pf root"},
+                                 {~"recps", [OwnId]}]}, [OwnId]),
+    #message{id = RootId} = ssb_feed:fetch_last_msg(OwnPid),
+    ok = ssb_feed:post_private(OwnPid,
+                               {[{~"type", ~"post"}, {~"text", ~"pf reply"},
+                                 {~"root", RootId}, {~"recps", [OwnId]}]}, [OwnId]),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, Frames} = ssb_peer:rpc_stream_call(
+                     Peer, [~"patchwork", ~"privateFeed", ~"roots"], [{[]}]),
+    Decoded = [utils:nat_decode(F) || F <- Frames],
+    Match = [P || {P} <- Decoded, proplists:get_value(~"key", P) =:= RootId],
+    ?assertMatch([_], Match),
+    [Props] = Match,
+    ?assertEqual(1, proplists:get_value(~"totalReplies", Props)),
+    {Value} = proplists:get_value(~"value", Props),
+    ?assertEqual(true, proplists:get_value(~"private", Value)),
+    {Content} = proplists:get_value(~"content", Value),
+    ?assertEqual(~"pf root", proplists:get_value(~"text", Content)),
     gen_server:stop(Peer).
 
 %% channels.suggest matches a channel by prefix (with a post count), and

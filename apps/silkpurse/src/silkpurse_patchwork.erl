@@ -17,11 +17,9 @@
 -export([manifest/0, handle_rpc/3]).
 
 manifest() ->
-    %% Feed rollups live in silkpurse_threads now, EXCEPT privateFeed
-    %% (needs private unboxing) which stays stubbed here.
-    [{[~"patchwork", ~"privateFeed", ~"roots"],        source, owner},
-     {[~"patchwork", ~"privateFeed", ~"latest"],       source, owner},
-     %% Discovery / sidebar.
+    %% Feed rollups live in silkpurse_threads; privateFeed is real in
+    %% silkpurse_private.
+    [%% Discovery / sidebar.
      {[~"patchwork", ~"recentFeeds"],                  source, owner},
      {[~"patchwork", ~"channels", ~"get"],             async,  owner},
      {[~"patchwork", ~"channels", ~"stream"],          source, owner},

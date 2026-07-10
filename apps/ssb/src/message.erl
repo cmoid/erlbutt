@@ -14,6 +14,7 @@
          encode/1,
          encode_value/1,
          encode_value_decrypted/2,
+         encode_decrypted/2,
          ssb_encoder/3,
          new_msg/4]).
 
@@ -55,11 +56,23 @@ encode_value(#message{swapped = Swapped} = Msg) ->
 %% Like encode_value/1 for a decrypted private message: the boxed content
 %% string is replaced by the given decrypted content object (EJSON) and a
 %% `private: true` marker is added, matching ssb-db get({private:true}).
-encode_value_decrypted(#message{swapped = Swapped} = Msg, ContentObj) ->
-    Base  = build_props(msg_to_proplist(Msg), Swapped),
-    Props = lists:keyreplace(~"content", 1, Base, {~"content", ContentObj})
-            ++ [{~"private", true}],
-    iolist_to_binary(ssb_encoder({Props}, fun ssb_encoder/3, [use_nil])).
+encode_value_decrypted(#message{} = Msg, ContentObj) ->
+    iolist_to_binary(ssb_encoder({value_decrypted(Msg, ContentObj)},
+                                 fun ssb_encoder/3, [use_nil])).
+
+%% Like encode/1 (the {key, value, timestamp} envelope) but with the
+%% boxed content replaced by the decrypted object and a private marker —
+%% the shape a feed rollup returns for a private message.
+encode_decrypted(#message{id = Key, received = Received} = Msg, ContentObj) ->
+    iolist_to_binary(
+      ssb_encoder({[{~"key", Key},
+                    {~"value", {value_decrypted(Msg, ContentObj)}},
+                    {~"timestamp", Received}]}, fun ssb_encoder/3, [use_nil])).
+
+value_decrypted(#message{swapped = Swapped} = Msg, ContentObj) ->
+    Base = build_props(msg_to_proplist(Msg), Swapped),
+    lists:keyreplace(~"content", 1, Base, {~"content", ContentObj})
+        ++ [{~"private", true}].
 
 %% Decode a value-only JSON binary (as sent by EBT / createHistoryStream keys:false).
 %% The message ID is computed by hashing the canonical (pretty) JSON, matching
