@@ -181,7 +181,9 @@ thread_sorted_test(_Config) ->
     Decoded = [utils:nat_decode(F) || F <- Frames],
     Keys = [proplists:get_value(~"key", P) || {P} <- Decoded,
                                               proplists:is_defined(~"key", P)],
-    ?assert(lists:member(RootId, Keys)),   %% root present
+    %% the root is NOT streamed — the renderer supplies it via get and
+    %% prepends it; emitting it here too duplicates it in the thread
+    ?assertNot(lists:member(RootId, Keys)),
     ?assert(lists:member(ReplyId, Keys)),  %% reply present
     ?assert(lists:any(fun({P}) -> proplists:get_value(~"sync", P) =:= true;
                          (_) -> false end, Decoded)),   %% sync sentinel

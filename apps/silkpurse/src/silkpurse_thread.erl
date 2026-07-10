@@ -2,10 +2,15 @@
 %%
 %% Copyright (C) 2026 Charles Moid
 %%
-%% patchwork.thread.sorted: the messages of one thread, for the thread
-%% page.  It streams the root, then every reply (a post/about whose
-%% content.root is the thread root), then a {sync: true} sentinel, then
-%% — in live mode — replies as they arrive.
+%% patchwork.thread.sorted: the replies of one thread, for the thread
+%% page.  It streams every reply (a post/about whose content.root is the
+%% thread root) in timestamp order, then a {sync: true} sentinel, then —
+%% in live mode — replies as they arrive.
+%%
+%% The root itself is NOT streamed: the renderer fetches the root
+%% separately (get) and prepends it, then appends this stream's replies.
+%% Emitting the root here too would put it in the thread twice and make
+%% ssb-sort throw "thread has duplicate message" when composing a reply.
 %%
 %% No view of its own: the reply set is the backlinks to the root,
 %% filtered to thread replies, so it reads the backlinks view and
@@ -50,14 +55,11 @@ handle_rpc([~"patchwork", ~"thread", ~"sorted"], [{Opts}], _Caller) ->
 %%% Internal
 %%%===================================================================
 
-%% [{Id, EncodedEnvelope}] for the root and its replies in timestamp
-%% order, followed by a {sync: true} sentinel (the renderer waits for it
-%% before showing the thread).
+%% [{Id, EncodedEnvelope}] for the thread's replies in timestamp order,
+%% followed by a {sync: true} sentinel (the renderer waits for it before
+%% showing the thread).  The root is deliberately excluded — see the
+%% module doc.
 snapshot(Dest, Types) ->
-    Root = case get_msg(Dest) of
-               #message{} = M -> [{Dest, message:encode(M)}];
-               _              -> []
-           end,
     Replies = lists:filtermap(
                 fun(Id) ->
                         case reply_msg(Id, Dest, Types) of
@@ -68,7 +70,7 @@ snapshot(Dest, Types) ->
                         end
                 end, silkpurse_backlinks:refs(Dest)),
     Sorted = [{Id, Bin} || {_Key, Id, Bin} <- lists:sort(Replies)],
-    Root ++ Sorted ++ [{make_ref(), encode_json({[{~"sync", true}]})}].
+    Sorted ++ [{make_ref(), encode_json({[{~"sync", true}]})}].
 
 sort_key(Ts) when is_integer(Ts) -> Ts;
 sort_key(_)                      -> 0.
