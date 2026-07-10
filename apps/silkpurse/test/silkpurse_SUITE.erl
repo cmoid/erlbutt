@@ -22,6 +22,7 @@
          profile_avatar_test/1,
          heartbeat_test/1,
          channels_test/1,
+         private_get_test/1,
          contacts_state_stream_test/1,
          likes_test/1,
          thread_sorted_test/1,
@@ -49,6 +50,7 @@ all() ->
      profile_avatar_test,
      heartbeat_test,
      channels_test,
+     private_get_test,
      contacts_state_stream_test,
      likes_test,
      thread_sorted_test,
@@ -215,6 +217,29 @@ likes_test(_Config) ->
     after 3000 ->
         error(no_count_frame)
     end,
+    gen_server:stop(Peer).
+
+%% get({id, private:true}) unboxes a private message addressed to us:
+%% the content comes back decrypted with a private:true marker.
+private_get_test(_Config) ->
+    OwnId  = keys:pub_key_disp(),
+    OwnPid = utils:find_or_create_feed_pid(OwnId),
+    ok = ssb_feed:post_private(OwnPid,
+                               {[{~"type", ~"post"}, {~"text", ~"a secret"},
+                                 {~"recps", [OwnId]}]}, [OwnId]),
+    #message{id = MsgId} = ssb_feed:fetch_last_msg(OwnPid),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    %% without private:true the content stays boxed
+    {ok, Boxed} = ssb_peer:rpc_call(Peer, [~"get"], ~"async", [MsgId]),
+    {BoxedVal} = utils:nat_decode(Boxed),
+    ?assert(is_binary(proplists:get_value(~"content", BoxedVal))),
+    %% with private:true it is unboxed in place
+    {ok, Body} = ssb_peer:rpc_call(Peer, [~"get"], ~"async",
+                                   [{[{~"id", MsgId}, {~"private", true}]}]),
+    {Value} = utils:nat_decode(Body),
+    ?assertEqual(true, proplists:get_value(~"private", Value)),
+    {Content} = proplists:get_value(~"content", Value),
+    ?assertEqual(~"a secret", proplists:get_value(~"text", Content)),
     gen_server:stop(Peer).
 
 %% channels.suggest matches a channel by prefix (with a post count), and

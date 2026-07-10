@@ -295,14 +295,19 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"get"],
         Id when is_binary(Id)       -> Id;
         _                           -> undefined
     end,
+    Private = case Arg of
+                  {Ps} when is_list(Ps) -> proplists:get_value(~"private", Ps) =:= true;
+                  _                     -> false
+              end,
     case MsgId =/= undefined andalso mess_auth:get(MsgId) of
         Author when is_binary(Author) ->
             FeedPid = utils:find_or_create_feed_pid(Author),
             Msg  = ssb_feed:fetch_msg(FeedPid, MsgId),
             %% ssb-db get returns the bare message value, not the
             %% {key, value, timestamp} envelope (the renderer reads
-            %% value.content directly).
-            Body = message:encode_value(Msg),
+            %% value.content directly).  With {private: true} a boxed
+            %% message we can read is unboxed in place.
+            Body = get_value(Msg, Private),
             Flags  = create_flags(0, 0, 2),   %% async reply: stream=0
             Header = create_header(Flags, size(Body), -ReqNo),
             utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
@@ -669,6 +674,20 @@ encode_json({json, Bin}) when is_binary(Bin) ->
     Bin;
 encode_json(Term) ->
     iolist_to_binary(message:ssb_encoder(Term, fun message:ssb_encoder/3, [pretty])).
+
+%% The value JSON for a get: with {private: true} and a box we can read,
+%% unbox the content in place; otherwise the bare stored value.
+get_value(#message{content = Content} = Msg, true) ->
+    case private_box:is_private(Content) andalso private_box:decrypt(Content) of
+        {ok, Plain} ->
+            try message:encode_value_decrypted(Msg, utils:nat_decode(Plain))
+            catch _:_ -> message:encode_value(Msg)
+            end;
+        _ ->
+            message:encode_value(Msg)
+    end;
+get_value(Msg, false) ->
+    message:encode_value(Msg).
 
 %% The caller's identity and permission class, from the remote key the
 %% handshake authenticated: the node's own key = a local client (owner);
