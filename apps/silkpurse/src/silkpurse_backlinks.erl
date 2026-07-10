@@ -96,7 +96,9 @@ view_entry(#message{id = MsgId, content = Content}) ->
 %%%===================================================================
 
 manifest() ->
-    [{[~"backlinks", ~"read"], source, owner}].
+    [{[~"backlinks", ~"read"],                          source, owner},
+     {[~"patchwork", ~"backlinks", ~"referencesStream"], source, owner},
+     {[~"patchwork", ~"liveBacklinks", ~"stream"],      source, owner}].
 
 handle_rpc([~"backlinks", ~"read"], Args, _Caller) ->
     case dest_of(Args) of
@@ -124,7 +126,43 @@ handle_rpc([~"backlinks", ~"read"], Args, _Caller) ->
                         end,
                     {live_source, Snapshot, ?MODULE, EventFun}
             end
-    end.
+    end;
+
+%% referencesStream({id, since}): messages that reference id, those after
+%% `since` as a snapshot, then live new ones — the per-message references
+%% shown in the UI (backlinks.obs.references).
+handle_rpc([~"patchwork", ~"backlinks", ~"referencesStream"], [{Opts}], _Caller) ->
+    case ?pgv(~"id", Opts) of
+        Id when is_binary(Id) ->
+            Since = ?pgv(~"since", Opts),
+            Snapshot = [{MsgId, Bin} || MsgId <- refs(Id),
+                                        (Bin = fetch_encoded(MsgId)) =/= undefined,
+                                        after_since(Bin, Since)],
+            EventFun = fun({link, T, MsgId}) when T =:= Id ->
+                               case fetch_encoded(MsgId) of
+                                   undefined -> skip;
+                                   Bin       -> {send, MsgId, Bin}
+                               end;
+                          (_) -> skip
+                       end,
+            {live_source, Snapshot, ?MODULE, EventFun};
+        _ ->
+            {error, ~"referencesStream needs an id"}
+    end;
+
+%% liveBacklinks.stream(): every new backlink, tagged with the dest it
+%% references, for the whole connection.  The client routes each frame by
+%% its `dest` to the message it is viewing, so subscribe/unsubscribe are
+%% just traffic hints (harmless no-ops here) and no per-id state is kept.
+handle_rpc([~"patchwork", ~"liveBacklinks", ~"stream"], _Args, _Caller) ->
+    EventFun = fun({link, Target, MsgId}) ->
+                       case dest_tagged(Target, MsgId) of
+                           undefined -> skip;
+                           Bin       -> {send, Bin}  %% distinct per (dest,msg)
+                       end;
+                  (_) -> skip
+               end,
+    {live_source, [], ?MODULE, EventFun}.
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -228,6 +266,34 @@ fetch_encoded(MsgId) ->
             catch _:_ -> undefined
             end
     end.
+
+%% The message envelope with a `dest` field naming the target it links
+%% to, for liveBacklinks.stream, or undefined if it can't be fetched.
+dest_tagged(Target, MsgId) ->
+    case fetch_encoded(MsgId) of
+        undefined -> undefined;
+        Bin ->
+            try
+                {Env} = utils:nat_decode(Bin),
+                encode_json({Env ++ [{~"dest", Target}]})
+            catch _:_ -> undefined
+            end
+    end.
+
+%% True when the message's asserted timestamp is past Since (or Since is
+%% absent) — the incremental cursor referencesStream is polled with.
+after_since(_Bin, Since) when not is_integer(Since) ->
+    true;
+after_since(Bin, Since) ->
+    try
+        {Env} = utils:nat_decode(Bin),
+        {Val} = ?pgv(~"value", Env),
+        ?pgv(~"timestamp", Val) > Since
+    catch _:_ -> true
+    end.
+
+encode_json(Term) ->
+    iolist_to_binary(message:ssb_encoder(Term, fun message:ssb_encoder/3, [pretty])).
 
 %% Boolean option (live, old) from the request's option object.
 flag_of(Key, [{Props}], Default) ->

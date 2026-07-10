@@ -24,6 +24,7 @@
          channels_test/1,
          private_get_test/1,
          private_feed_test/1,
+         backlinks_streams_test/1,
          contacts_state_stream_test/1,
          likes_test/1,
          thread_sorted_test/1,
@@ -53,6 +54,7 @@ all() ->
      channels_test,
      private_get_test,
      private_feed_test,
+     backlinks_streams_test,
      contacts_state_stream_test,
      likes_test,
      thread_sorted_test,
@@ -268,6 +270,37 @@ private_feed_test(_Config) ->
     ?assertEqual(true, proplists:get_value(~"private", Value)),
     {Content} = proplists:get_value(~"content", Value),
     ?assertEqual(~"pf root", proplists:get_value(~"text", Content)),
+    gen_server:stop(Peer).
+
+%% backlinks.referencesStream returns messages referencing a target, and
+%% liveBacklinks.stream pushes new backlinks tagged with their dest.
+backlinks_streams_test(_Config) ->
+    OwnPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", ~"ref root"}]}),
+    #message{id = RootId} = ssb_feed:fetch_last_msg(OwnPid),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", ~"a ref"},
+                                         {~"root", RootId}]}),
+    #message{id = ReplyId} = ssb_feed:fetch_last_msg(OwnPid),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    %% referencesStream: the existing reply arrives in the snapshot
+    {ok, _R} = ssb_peer:open_source(
+                 Peer, [~"patchwork", ~"backlinks", ~"referencesStream"],
+                 [{[{~"id", RootId}]}], self()),
+    receive
+        {stream_data, _, F} -> ?assertEqual(ReplyId, (message:decode(F, false))#message.id)
+    after 3000 -> error(no_reference)
+    end,
+    %% liveBacklinks.stream: open, post a new backlink, receive it dest-tagged
+    {ok, _L} = ssb_peer:open_source(
+                 Peer, [~"patchwork", ~"liveBacklinks", ~"stream"], [], self()),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", ~"live ref"},
+                                         {~"root", RootId}]}),
+    receive
+        {stream_data, _, LF} ->
+            {P} = utils:nat_decode(LF),
+            ?assertEqual(RootId, proplists:get_value(~"dest", P))
+    after 3000 -> error(no_live_backlink)
+    end,
     gen_server:stop(Peer).
 
 %% channels.suggest matches a channel by prefix (with a post count), and
