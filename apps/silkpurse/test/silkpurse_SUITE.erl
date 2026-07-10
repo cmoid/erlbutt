@@ -25,6 +25,7 @@
          private_get_test/1,
          private_feed_test/1,
          backlinks_streams_test/1,
+         recent_feeds_test/1,
          contacts_state_stream_test/1,
          likes_test/1,
          thread_sorted_test/1,
@@ -55,6 +56,7 @@ all() ->
      private_get_test,
      private_feed_test,
      backlinks_streams_test,
+     recent_feeds_test,
      contacts_state_stream_test,
      likes_test,
      thread_sorted_test,
@@ -270,6 +272,18 @@ private_feed_test(_Config) ->
     ?assertEqual(true, proplists:get_value(~"private", Value)),
     {Content} = proplists:get_value(~"content", Value),
     ?assertEqual(~"pf root", proplists:get_value(~"text", Content)),
+    gen_server:stop(Peer).
+
+%% recentFeeds lists feeds that recently started a thread.
+recent_feeds_test(_Config) ->
+    OwnId  = keys:pub_key_disp(),
+    OwnPid = utils:find_or_create_feed_pid(OwnId),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", ~"recent root"}]}),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, Frames} = ssb_peer:rpc_stream_call(
+                     Peer, [~"patchwork", ~"recentFeeds"], [{[{~"since", 0}]}]),
+    Feeds = [utils:nat_decode(F) || F <- Frames],
+    ?assert(lists:member(OwnId, Feeds)),
     gen_server:stop(Peer).
 
 %% backlinks.referencesStream returns messages referencing a target, and

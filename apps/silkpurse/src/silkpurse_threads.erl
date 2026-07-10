@@ -113,16 +113,41 @@ view_entry(_) ->
 %% activity — publicFeed with a filter.  roots is the paginated history,
 %% latest the live prepend.
 manifest() ->
-    lists:flatten(
-      [[{[~"patchwork", Feed, ~"roots"],  source, owner},
-        {[~"patchwork", Feed, ~"latest"], source, owner}]
-       || Feed <- [~"publicFeed", ~"networkFeed", ~"participatingFeed",
-                   ~"mentionsFeed", ~"profile", ~"channelFeed"]]).
+    [{[~"patchwork", ~"recentFeeds"], source, owner} |
+     lists:flatten(
+       [[{[~"patchwork", Feed, ~"roots"],  source, owner},
+         {[~"patchwork", Feed, ~"latest"], source, owner}]
+        || Feed <- [~"publicFeed", ~"networkFeed", ~"participatingFeed",
+                    ~"mentionsFeed", ~"profile", ~"channelFeed"]])].
 
+handle_rpc([~"patchwork", ~"recentFeeds"], Args, _Caller) ->
+    recent_feeds(Args);
 handle_rpc([~"patchwork", Feed, ~"roots"], Args, _Caller) ->
     roots(feed_filter(Feed, Args), Args);
 handle_rpc([~"patchwork", Feed, ~"latest"], Args, _Caller) ->
     latest(feed_filter(Feed, Args)).
+
+%% recentFeeds({since}): feed ids that started a thread since `since`,
+%% most recent first — the "recently updated" discovery list.  A snapshot
+%% (the live case is not needed: the client polls with live:false).
+recent_feeds(Args) ->
+    Since = case Args of
+                [{Props}] -> case ?pgv(~"since", Props) of
+                                 S when is_integer(S) -> S;
+                                 _                    -> 0
+                             end;
+                _ -> 0
+            end,
+    Latest = ets:foldl(
+               fun({?MARKER}, Acc) -> Acc;
+                  ({_Root, #{author := A, ts := Ts}}, Acc)
+                    when is_binary(A), is_integer(Ts) ->
+                       maps:update_with(A, fun(Old) -> max(Old, Ts) end, Ts, Acc);
+                  (_, Acc) -> Acc
+               end, #{}, ?TAB),
+    Recent = [{Ts, A} || {A, Ts} <- maps:to_list(Latest), Ts > Since],
+    Sorted = lists:sort(fun({X, _}, {Y, _}) -> X >= Y end, Recent),
+    {source, [{json, encode_json(A)} || {_Ts, A} <- Sorted]}.
 
 %% Paginated thread roots passing Filter, newest activity first.
 roots(Filter, Args) ->

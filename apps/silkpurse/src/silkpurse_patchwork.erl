@@ -19,8 +19,8 @@
 manifest() ->
     %% Feed rollups live in silkpurse_threads; privateFeed is real in
     %% silkpurse_private.
-    [%% Discovery / sidebar.
-     {[~"patchwork", ~"recentFeeds"],                  source, owner},
+    [%% Discovery / sidebar.  (patchwork.recentFeeds is real —
+     %%  silkpurse_threads.)
      {[~"patchwork", ~"channels", ~"get"],             async,  owner},
      {[~"patchwork", ~"channels", ~"stream"],          source, owner},
      %% (patchwork.channels.suggest/recentStream are real — silkpurse_channels.)
