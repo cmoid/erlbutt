@@ -135,7 +135,10 @@ insert(Blob) ->
     case file:open(BlobFile, [write]) of
         {ok, F} ->
             file:write(F, Blob),
-            file:close(F);
+            file:close(F),
+            %% feeds live blobs.ls streams (silkpurse_blobs); catch so a
+            %% missing view_manager/pg (eunit) never fails the store
+            catch view_manager:notify(blobs, {blob, CodedBlob});
         Else ->
             ?LOG_INFO("Tried to open failed: ~p ~n", [Else])
     end,

@@ -20,6 +20,7 @@ start(_StartType, _StartArgs) ->
     ok = plugin_registry:register_plugin(silkpurse_contacts),
     ok = plugin_registry:register_plugin(silkpurse_thread),
     ok = plugin_registry:register_plugin(silkpurse_patchwork),
+    ok = plugin_registry:register_plugin(silkpurse_blobs),
     silkpurse_sup:start_link().
 
 stop(_State) ->
@@ -28,4 +29,5 @@ stop(_State) ->
     plugin_registry:unregister_plugin(silkpurse_contacts),
     plugin_registry:unregister_plugin(silkpurse_thread),
     plugin_registry:unregister_plugin(silkpurse_patchwork),
+    plugin_registry:unregister_plugin(silkpurse_blobs),
     ok.

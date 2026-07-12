@@ -21,6 +21,7 @@
          suggest_profile_test/1,
          profile_avatar_test/1,
          heartbeat_test/1,
+         blobs_ls_test/1,
          channels_test/1,
          private_get_test/1,
          private_feed_test/1,
@@ -53,6 +54,7 @@ all() ->
      suggest_profile_test,
      profile_avatar_test,
      heartbeat_test,
+     blobs_ls_test,
      channels_test,
      private_get_test,
      private_feed_test,
@@ -360,7 +362,8 @@ channels_test(_Config) ->
     ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", ~"in a channel"},
                                          {~"channel", Ch}]}),
     {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
-    Prefix = binary:part(Ch, 0, 4),
+    %% unique_integer can be a single digit, so the name may be <4 bytes
+    Prefix = binary:part(Ch, 0, min(byte_size(Ch), 4)),
     {ok, Body} = ssb_peer:rpc_call(Peer, [~"patchwork", ~"channels", ~"suggest"],
                                    ~"async", [{[{~"text", Prefix}, {~"limit", 20}]}]),
     Items = utils:nat_decode(Body),
@@ -389,6 +392,24 @@ heartbeat_test(_Config) ->
         {stream_data, _, _TickFrame} -> ok
     after 3000 ->
         error(no_heartbeat_frame)
+    end,
+    gen_server:stop(Peer).
+
+%% blobs.ls({old:false}) live-streams each newly stored blob id — the
+%% renderer's blob-arrival wait path (blob/obs/has.js waitFor).
+blobs_ls_test(_Config) ->
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, _Ref} = ssb_peer:open_source(Peer, [~"blobs", ~"ls"],
+                                      [{[{~"old", false}]}], self()),
+    %% requests on one connection are processed in order: once whoami
+    %% answers, the ls subscription is registered and live
+    {ok, _} = ssb_peer:rpc_call(Peer, [~"whoami"], ~"sync", []),
+    BlobId = blobs:store(crypto:strong_rand_bytes(64)),
+    receive
+        {stream_data, _, Frame} ->
+            ?assertEqual(BlobId, utils:nat_decode(Frame))
+    after 3000 ->
+        error(no_blobs_ls_frame)
     end,
     gen_server:stop(Peer).
 
