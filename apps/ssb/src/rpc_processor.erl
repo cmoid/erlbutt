@@ -378,8 +378,9 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobshas],
     Body = iolist_to_binary(message:ssb_encoder(Has, fun message:ssb_encoder/3, [pretty])),
     Flags  = create_flags(0, 0, 2),
     Header = create_header(Flags, size(Body), -ReqNo),
-    NewNonce = utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey),
-    utils:send_data(?RPC_END, Socket, NewNonce, SecretBoxKey);
+    %% Async reply is complete on its own — a trailing ?RPC_END here is the
+    %% muxrpc goodbye and terminates the peer's whole session.
+    utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
 
 proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobsget],
                              args = Args}
