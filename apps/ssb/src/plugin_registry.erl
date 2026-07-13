@@ -58,6 +58,7 @@
          {[?gossip, ?ping],             duplex, anyone},
          {[?blobs, ?blobshas],          async,  anyone},
          {[?blobs, ?blobsget],          source, anyone},
+         {[?blobs, ?blobswant],         async,  owner},
          {[?blobs, ?createwants],       source, anyone},
          {[?ebt, ~"replicate"],         duplex, anyone},
          {[?tunnel, ?isRoom],           sync,   anyone},

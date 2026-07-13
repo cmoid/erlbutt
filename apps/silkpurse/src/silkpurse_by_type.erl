@@ -99,11 +99,14 @@ handle_rpc([~"messagesByType"], Args, _Caller) ->
             {error, ~"messagesByType takes a type"};
         Type ->
             Ids = [Id || {_T, Id} <- ets:lookup(?TAB, Type), is_binary(Id)],
-            Pairs = [{Id, Bin} || Id <- Ids,
-                                  (Bin = fetch_encoded(Id)) =/= undefined],
+            %% hydrate lazily — one message per sent frame.  Building the
+            %% whole [{Id, Bin}] list up front meant a full store's worth
+            %% of per-feed fetches before the first byte went out,
+            %% wedging the connection's rpc_processor for minutes.
+            Pairs = [{Id, fun() -> fetch_encoded(Id) end} || Id <- Ids],
             case flag_of(~"live", Args, false) of
                 false ->
-                    {source, [{json, B} || {_, B} <- Pairs]};
+                    {source, [F || {_, F} <- Pairs]};
                 true ->
                     Snapshot = case flag_of(~"old", Args, true) of
                                    false -> [];
@@ -274,20 +277,21 @@ index_and_read_by_type() ->
                                                      {~"value", 1}]}}]}),
     #message{id = VoteId} = ssb_feed:fetch_last_msg(OwnPid),
     Caller = #{class => owner, feed_id => OwnId},
-    {source, [{json, PostBin}]} =
+    %% items hydrate lazily: each is a fun/0 producing the encoded body
+    {source, [PostFun]} =
         handle_rpc([~"messagesByType"], [~"post"], Caller),
-    #message{id = PostId} = message:decode(PostBin, false),
-    {source, [{json, VoteBin}]} =
+    #message{id = PostId} = message:decode(PostFun(), false),
+    {source, [VoteFun]} =
         handle_rpc([~"messagesByType"], [{[{~"type", ~"vote"}]}], Caller),
-    #message{id = VoteId} = message:decode(VoteBin, false),
+    #message{id = VoteId} = message:decode(VoteFun(), false),
     {source, []} = handle_rpc([~"messagesByType"], [~"gathering"], Caller),
     %% live mode: backlog, then the {sync:true} sentinel as the last
     %% snapshot pair
     {live_source, LivePairs, ?MODULE, _Fun} =
         handle_rpc([~"messagesByType"],
                    [{[{~"type", ~"post"}, {~"live", true}]}], Caller),
-    [{_, PostBin2}, {_, SyncBin}] = LivePairs,
-    #message{id = PostId} = message:decode(PostBin2, false),
+    [{_, PostFun2}, {_, SyncBin}] = LivePairs,
+    #message{id = PostId} = message:decode(PostFun2(), false),
     ?assertEqual({[{~"sync", true}]}, utils:nat_decode(SyncBin)),
     %% old:false still carries the sentinel so the client knows the
     %% (empty) backlog is done

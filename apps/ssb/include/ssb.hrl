@@ -56,6 +56,7 @@
 -define(createwants, <<"createWants">>).
 -define(blobsget, <<"get">>).
 -define(blobshas, <<"has">>).
+-define(blobswant, <<"want">>).
 
 -record(ssb_conn,
         { socket,

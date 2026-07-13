@@ -372,6 +372,22 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?blobs, ?createwants],
     ets:insert(Calls, {ReqNo, blob_wants}),
     Nonce;
 
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobswant],
+                             args = [BlobId]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) when is_binary(BlobId) ->
+    %% Fire-and-forget: register the want (broadcast to peers by
+    %% blob_fetcher) and acknowledge.  Arrival is observable on the
+    %% blobs.ls live stream; we do not hold the reply until the blob
+    %% lands the way ssb-blobs does.
+    case blobs:has(BlobId) of
+        true  -> ok;
+        false -> blob_fetcher:want(BlobId)
+    end,
+    TrueBody = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+    Flags  = create_flags(0, 0, 2),
+    Header = create_header(Flags, size(TrueBody), -ReqNo),
+    utils:send_data(utils:combine(Header, TrueBody), Socket, Nonce, SecretBoxKey);
+
 proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobshas],
                              args = [BlobId]}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
@@ -632,7 +648,7 @@ plugin_dispatch(Mod, Kind, Name, Args, Caller, Calls,
                 undefined ->
                     %% no owning ssb_peer (e.g. unit tests): finite fallback
                     ets:insert(Calls, {ReqNo, noop}),
-                    N0 = send_source_items([{json, B} || {_, B} <- Pairs],
+                    N0 = send_source_items([snapshot_item(B) || {_, B} <- Pairs],
                                            ReqNo, Socket, Nonce, SecretBoxKey),
                     TrueEnd = encode_json(true),
                     Header = create_header(create_flags(1, 1, 2),
@@ -643,7 +659,7 @@ plugin_dispatch(Mod, Kind, Name, Args, Caller, Calls,
                     {ok, Stream} = view_stream:start(OwnerPid, -ReqNo,
                                                      ViewMod, EventFun),
                     ets:insert(Calls, {ReqNo, {live_source, Stream}}),
-                    N1 = send_source_items([{json, B} || {_, B} <- Pairs],
+                    N1 = send_source_items([snapshot_item(B) || {_, B} <- Pairs],
                                            ReqNo, Socket, Nonce, SecretBoxKey),
                     ok = view_stream:release(Stream, [Id || {Id, _} <- Pairs]),
                     N1
@@ -660,15 +676,38 @@ plugin_dispatch(Mod, Kind, Name, Args, Caller, Calls,
             rpc_error(ReqNo, ~"internal error", Kind, Socket, Nonce, SecretBoxKey)
     end.
 
+%% An item may be a fun/0 producing the encoded body (or undefined to
+%% skip): large snapshots hydrate one item at a time DURING the send
+%% fold, so frames flow immediately and nothing is built up front — an
+%% eager [{json, Bin}] list for a big index wedged the connection's
+%% rpc_processor for minutes while it hydrated (messagesByType on a
+%% full store).
 send_source_items(Items, ReqNo, Socket, Nonce, SecretBoxKey) ->
     lists:foldl(
-      fun(Item, N) ->
-              Body = encode_json(Item),
-              Header = create_header(create_flags(1, 0, 2),
-                                     size(Body), -ReqNo),
-              utils:send_data(utils:combine(Header, Body),
-                              Socket, N, SecretBoxKey)
+      fun(Item0, N) ->
+              case materialize(Item0) of
+                  skip ->
+                      N;
+                  Item ->
+                      Body = encode_json(Item),
+                      Header = create_header(create_flags(1, 0, 2),
+                                             size(Body), -ReqNo),
+                      utils:send_data(utils:combine(Header, Body),
+                                      Socket, N, SecretBoxKey)
+              end
       end, Nonce, Items).
+
+materialize(F) when is_function(F, 0) ->
+    case F() of
+        undefined -> skip;
+        Bin       -> {json, Bin}
+    end;
+materialize(Item) ->
+    Item.
+
+%% live_source snapshot pairs are {Id, Bin} or {Id, fun/0} (lazy).
+snapshot_item(F) when is_function(F, 0) -> F;
+snapshot_item(B)                        -> {json, B}.
 
 %% The error frame's stream flag must match the call's kind: a standard
 %% muxrpc client routes a stream-flagged frame to its open source and a
