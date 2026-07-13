@@ -7,7 +7,14 @@
 %% (JS: ssb-db), which clients use for type-scoped scans.
 %%
 %% Same shape as silkpurse_backlinks: an ssb_view over a named public
-%% ETS bag {Type, MsgId} plus an ssb_plugin, in one gen_server.
+%% ETS duplicate_bag {Type, MsgId} plus an ssb_plugin, in one
+%% gen_server.  duplicate_bag, NOT bag: nearly every row shares the one
+%% key <<"post">>, and a bag insert scans the key's bucket for an exact
+%% duplicate — restoring EarlButt's 263k-row snapshot was quadratic and
+%% pinned handle_continue for ~40 minutes, so the node served no
+%% messagesByType (and looked like a registration failure) until the
+%% grind finished.  Duplicates from a crash-window refold are possible
+%% and deduplicated at read time instead.
 %% Private (still-encrypted) content has no visible type and is not
 %% indexed.  live/old are honoured; a live stream emits a {sync: true}
 %% sentinel between the backlog and the live tail (ssb-db convention —
@@ -53,7 +60,9 @@ start_link() ->
 %%% ssb_view callbacks (run in the view_manager process)
 %%%===================================================================
 
-view_version() -> 1.
+%% v2: table type bag -> duplicate_bag (the quadratic-restore fix); the
+%% bump discards old checkpoints so the new table is refolded in full.
+view_version() -> 2.
 
 view_load() ->
     Loaded = try ets:lookup(?TAB, ?MARKER) =/= []
@@ -98,7 +107,10 @@ handle_rpc([~"messagesByType"], Args, _Caller) ->
         undefined ->
             {error, ~"messagesByType takes a type"};
         Type ->
-            Ids = [Id || {_T, Id} <- ets:lookup(?TAB, Type), is_binary(Id)],
+            %% usort: duplicate_bag can hold repeats after a
+            %% crash-window refold
+            Ids = lists:usort([Id || {_T, Id} <- ets:lookup(?TAB, Type),
+                                     is_binary(Id)]),
             %% hydrate lazily — one message per sent frame.  Building the
             %% whole [{Id, Bin}] list up front meant a full store's worth
             %% of per-feed fetches before the first byte went out,
@@ -135,7 +147,7 @@ init([]) ->
     %% would otherwise block silkpurse_sup:start_link and thus the whole
     %% node boot (and the shell).  The restores then run concurrently
     %% across the views rather than serialized by the supervisor.
-    ets:new(?TAB, [bag, named_table, public]),
+    ets:new(?TAB, [duplicate_bag, named_table, public]),
     {ok, #{}, {continue, register}}.
 
 handle_continue(register, State) ->
@@ -148,14 +160,38 @@ handle_continue(register, State) ->
 
 maybe_restore() ->
     File = ?b2l(table_file()),
-    case filelib:is_regular(File) of
+    case snapshot_loadable(File) of
         false ->
             ok;                        %% no snapshot; keep the empty table
         true ->
             ets:delete(?TAB),
             case (try ets:file2tab(File) catch _:_ -> error end) of
                 {ok, ?TAB} -> ok;
-                _          -> ets:new(?TAB, [bag, named_table, public])
+                _          -> ets:new(?TAB, [duplicate_bag, named_table,
+                                             public])
+            end
+    end.
+
+%% Never file2tab an old-format (bag) snapshot: loading it is the
+%% quadratic grind itself.  Drop the file; the version bump makes
+%% view_manager rebuild the view from the feeds.
+snapshot_loadable(File) ->
+    case filelib:is_regular(File) of
+        false -> false;
+        true ->
+            case ets:tabfile_info(File) of
+                {ok, Info} ->
+                    case proplists:get_value(type, Info) of
+                        duplicate_bag -> true;
+                        Old ->
+                            ?SSB_INFO("by_type: discarding ~p snapshot "
+                                      "(old table type ~p)", [File, Old]),
+                            file:delete(File),
+                            false
+                    end;
+                _ ->
+                    file:delete(File),
+                    false
             end
     end.
 
@@ -307,5 +343,30 @@ index_and_read_by_type() ->
                    [{[{~"type", ~"post"}, {~"live", true}, {~"old", false}]}],
                    Caller),
     ?assertEqual({[{~"sync", true}]}, utils:nat_decode(OnlySync)).
+
+%% An old-format (bag) snapshot must be discarded without loading it —
+%% file2tab of a bag whose rows share one key is quadratic (the
+%% EarlButt 40-minute boot grind); the version bump refolds instead.
+old_snapshot_discarded_test() ->
+    Home = bt_setup(),
+    try
+        gen_server:stop(silkpurse_by_type),
+        %% forge an old-style bag snapshot at the view's snapshot path
+        Old = ets:new(silkpurse_by_type, [bag, named_table, public]),
+        ets:insert(Old, {~"post", ~"%oldmsg.sha256"}),
+        File = ?b2l(table_file()),
+        filelib:ensure_dir(File),
+        ok = ets:tab2file(Old, File),
+        ets:delete(Old),
+        {ok, _} = silkpurse_by_type:start_link(),
+        %% a call syncs past handle_continue (runs before other messages)
+        _ = sys:get_state(silkpurse_by_type),
+        %% the bag snapshot was dropped, not loaded
+        ?assertEqual(duplicate_bag, ets:info(?TAB, type)),
+        ?assertEqual([], ets:lookup(?TAB, ~"post")),
+        ?assertNot(filelib:is_regular(File))
+    after
+        bt_teardown(Home)
+    end.
 
 -endif.
