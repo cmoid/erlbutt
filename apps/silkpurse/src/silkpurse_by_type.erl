@@ -9,7 +9,10 @@
 %% Same shape as silkpurse_backlinks: an ssb_view over a named public
 %% ETS bag {Type, MsgId} plus an ssb_plugin, in one gen_server.
 %% Private (still-encrypted) content has no visible type and is not
-%% indexed.  live/reverse flags are not yet honoured.
+%% indexed.  live/old are honoured; a live stream emits a {sync: true}
+%% sentinel between the backlog and the live tail (ssb-db convention —
+%% the silkpurse search indexer waits for it).  gt is NOT honoured:
+%% live callers get the full backlog and must skip below their cursor.
 -module(silkpurse_by_type).
 
 -ifdef(TEST).
@@ -114,7 +117,8 @@ handle_rpc([~"messagesByType"], Args, _Caller) ->
                                 end;
                            (_) -> skip
                         end,
-                    {live_source, Snapshot, ?MODULE, EventFun}
+                    {live_source, Snapshot ++ [sync_sentinel()], ?MODULE,
+                     EventFun}
             end
     end.
 
@@ -199,6 +203,13 @@ type_of([{Props}]) ->
 type_of(_) ->
     undefined.
 
+%% Closes the backlog of a live stream, before the live tail begins.
+sync_sentinel() ->
+    {make_ref(),
+     iolist_to_binary(message:ssb_encoder({[{~"sync", true}]},
+                                          fun message:ssb_encoder/3,
+                                          [pretty]))}.
+
 fetch_encoded(MsgId) ->
     case mess_auth:get(MsgId) of
         not_found -> undefined;
@@ -269,6 +280,21 @@ index_and_read_by_type() ->
     {source, [{json, VoteBin}]} =
         handle_rpc([~"messagesByType"], [{[{~"type", ~"vote"}]}], Caller),
     #message{id = VoteId} = message:decode(VoteBin, false),
-    {source, []} = handle_rpc([~"messagesByType"], [~"gathering"], Caller).
+    {source, []} = handle_rpc([~"messagesByType"], [~"gathering"], Caller),
+    %% live mode: backlog, then the {sync:true} sentinel as the last
+    %% snapshot pair
+    {live_source, LivePairs, ?MODULE, _Fun} =
+        handle_rpc([~"messagesByType"],
+                   [{[{~"type", ~"post"}, {~"live", true}]}], Caller),
+    [{_, PostBin2}, {_, SyncBin}] = LivePairs,
+    #message{id = PostId} = message:decode(PostBin2, false),
+    ?assertEqual({[{~"sync", true}]}, utils:nat_decode(SyncBin)),
+    %% old:false still carries the sentinel so the client knows the
+    %% (empty) backlog is done
+    {live_source, [{_, OnlySync}], ?MODULE, _} =
+        handle_rpc([~"messagesByType"],
+                   [{[{~"type", ~"post"}, {~"live", true}, {~"old", false}]}],
+                   Caller),
+    ?assertEqual({[{~"sync", true}]}, utils:nat_decode(OnlySync)).
 
 -endif.
