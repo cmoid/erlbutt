@@ -197,11 +197,12 @@ dispatch(Calls, ReqNo, Body, Socket, Nonce, SecretBoxKey) ->
                 _                                        -> none
             end,
             {NewNonce, Tag};
-        {denied, Name, Class, Perm} ->
+        {denied, Name, Class, Perm, Kind} ->
             ?SSB_INFO("rpc ~p denied for ~p (class ~p, needs ~p)",
                       [Name, caller_feed_id(Calls), Class, Perm]),
             ets:insert(Calls, {ReqNo, noop}),
-            {rpc_error(ReqNo, ~"method not allowed", Socket, Nonce, SecretBoxKey),
+            {rpc_error(ReqNo, ~"method not allowed", Kind,
+                       Socket, Nonce, SecretBoxKey),
              none}
     end.
 
@@ -209,10 +210,10 @@ dispatch(Calls, ReqNo, Body, Socket, Nonce, SecretBoxKey) ->
 %% plugin.  Methods the registry does not know keep the old fall-through
 %% behavior (answered with true), so unknown-method handling is unchanged.
 permitted(Calls, #ssb_rpc{name = Name}) when is_list(Name) ->
-    Perm = case plugin_registry:lookup(Name) of
-        {ok, {_Mod, _Kind, P}}  -> P;
-        {builtin, _Kind, P}     -> P;
-        unknown                 -> anyone
+    {Kind, Perm} = case plugin_registry:lookup(Name) of
+        {ok, {_Mod, K, P}}  -> {K, P};
+        {builtin, K, P}     -> {K, P};
+        unknown             -> {async, anyone}
     end,
     case Perm of
         anyone -> true;
@@ -220,7 +221,7 @@ permitted(Calls, #ssb_rpc{name = Name}) when is_list(Name) ->
             Class = maps:get(class, caller_info(Calls)),
             case plugin_registry:allowed(Class, Perm) of
                 true  -> true;
-                false -> {denied, Name, Class, Perm}
+                false -> {denied, Name, Class, Perm, Kind}
             end
     end;
 permitted(_Calls, _Req) ->
@@ -382,9 +383,13 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobshas],
     %% muxrpc goodbye and terminates the peer's whole session.
     utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
 
-proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobsget],
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobsget],
                              args = Args}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    %% Register the stream so the client's end-ack after our final frame
+    %% is swallowed instead of falling through to unhandled_request
+    %% (which would answer it with a spurious end frame).
+    ets:insert(Calls, {ReqNo, noop}),
     %% blobs.get args are either the id string directly, or an object whose
     %% blob id lives under "key" (ssb-blobs / PonchoWonky) or "hash".
     %% this is missing in the protocol guide.
@@ -402,7 +407,9 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobsget],
             send_blob_chunks(BlobData, -ReqNo, Socket, Nonce, SecretBoxKey);
         _ ->
             ErrMsg = utils:error_msg(~"Error", ~"blob not found"),
-            Flags  = create_flags(0, 1, 2),
+            %% blobs.get is a source: the error must carry the stream
+            %% flag or a standard client never routes it and hangs
+            Flags  = create_flags(1, 1, 2),
             Header = create_header(Flags, size(ErrMsg), -ReqNo),
             utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey)
     end;
@@ -646,11 +653,11 @@ plugin_dispatch(Mod, Kind, Name, Args, Caller, Calls,
             Header = create_header(create_flags(0, 0, 2), size(Body), -ReqNo),
             utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
         {_, {error, Reason}} when is_binary(Reason) ->
-            rpc_error(ReqNo, Reason, Socket, Nonce, SecretBoxKey);
+            rpc_error(ReqNo, Reason, Kind, Socket, Nonce, SecretBoxKey);
         {_, Other} ->
             ?SSB_ERROR("plugin ~p returned ~p for ~p method ~p",
                        [Mod, Other, Kind, Name]),
-            rpc_error(ReqNo, ~"internal error", Socket, Nonce, SecretBoxKey)
+            rpc_error(ReqNo, ~"internal error", Kind, Socket, Nonce, SecretBoxKey)
     end.
 
 send_source_items(Items, ReqNo, Socket, Nonce, SecretBoxKey) ->
@@ -663,9 +670,14 @@ send_source_items(Items, ReqNo, Socket, Nonce, SecretBoxKey) ->
                               Socket, N, SecretBoxKey)
       end, Nonce, Items).
 
-rpc_error(ReqNo, Reason, Socket, Nonce, SecretBoxKey) ->
+%% The error frame's stream flag must match the call's kind: a standard
+%% muxrpc client routes a stream-flagged frame to its open source and a
+%% plain one to its async callback — the wrong flag means the caller
+%% never sees the error and waits forever.
+rpc_error(ReqNo, Reason, Kind, Socket, Nonce, SecretBoxKey) ->
     ErrMsg = utils:error_msg(~"Error", Reason),
-    Flags  = create_flags(0, 1, 2),
+    Stream = case Kind of source -> 1; _ -> 0 end,
+    Flags  = create_flags(Stream, 1, 2),
     Header = create_header(Flags, size(ErrMsg), -ReqNo),
     utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey).
 
