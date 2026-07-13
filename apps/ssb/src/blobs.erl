@@ -61,9 +61,15 @@ init([]) ->
     process_flag(trap_exit, true),
     {ok, #state{}}.
 
+%% Blob ids arrive from the network; a degenerate id (e.g. all-zero
+%% bytes, whose decoded hex is shorter than the 2-char dir prefix)
+%% must answer not_found, not crash this singleton and cascade into
+%% the connection.
 handle_call({fetch, BlobId}, _From, State) ->
-    DecBId = utils:decode_id(BlobId),
-    {reply, lookup(DecBId), State};
+    Reply = try lookup(utils:decode_id(BlobId))
+            catch _:_ -> {error, not_found}
+            end,
+    {reply, Reply, State};
 
 handle_call({store, Blob}, _From, State) ->
     {reply, insert(Blob), State};
@@ -76,16 +82,20 @@ handle_call({store_verified, BlobId, Blob}, _From, State) ->
     {reply, Reply, State};
 
 handle_call({has, BlobId}, _From, State) ->
-    DecBId = utils:decode_id(BlobId),
-    {reply, filelib:is_regular(blob_path(DecBId)), State};
+    Reply = try filelib:is_regular(blob_path(utils:decode_id(BlobId)))
+            catch _:_ -> false
+            end,
+    {reply, Reply, State};
 
 handle_call({size_of, BlobId}, _From, State) ->
-    DecBId = utils:decode_id(BlobId),
-    BlobFile = blob_path(DecBId),
-    Result = case filelib:is_regular(BlobFile) of
-        true  -> {ok, filelib:file_size(BlobFile)};
-        false -> {error, not_found}
-    end,
+    Result = try
+                 BlobFile = blob_path(utils:decode_id(BlobId)),
+                 case filelib:is_regular(BlobFile) of
+                     true  -> {ok, filelib:file_size(BlobFile)};
+                     false -> {error, not_found}
+                 end
+             catch _:_ -> {error, not_found}
+             end,
     {reply, Result, State}.
 
 handle_cast(_Request, State) ->
@@ -183,6 +193,19 @@ store_verified_test() ->
                            ++ ".sha256"),
     ?assertEqual({error, hash_mismatch}, blobs:store_verified(BadId, Blob)),
     ?assertNot(blobs:has(BadId)),
+    gen_server:stop(Pid),
+    gen_server:stop(Pid2).
+
+degenerate_id_test() ->
+    {ok, Pid} = config:start_link("test/ssb.cfg"),
+    {ok, Pid2} = blobs:start_link(),
+    %% all-zero bytes: decode_id strips leading zeros, leaving less than
+    %% the 2-char dir prefix — must answer not_found, not crash
+    Zero = list_to_binary("&" ++ utils:base_64(<<0:256>>) ++ ".sha256"),
+    ?assertNot(blobs:has(Zero)),
+    ?assertEqual({error, not_found}, blobs:fetch(Zero)),
+    ?assertEqual({error, not_found}, blobs:size_of(Zero)),
+    ?assert(is_process_alive(whereis(blobs))),
     gen_server:stop(Pid),
     gen_server:stop(Pid2).
 
