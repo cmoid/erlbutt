@@ -39,8 +39,74 @@
 
 -include_lib("ssb/include/ssb.hrl").
 
+-export([ensure_registered/1,
+         ensure_registered/2]).
+
 -callback view_version() -> pos_integer().
 -callback view_load() -> ok | empty.
 -callback view_reset() -> ok.
 -callback view_save() -> ok.
 -callback view_entry(#message{}) -> ok | {events, [term()]}.
+
+%% Register Mod with its services, LOUDLY.  The old per-module pattern
+%% (try ... catch exit:{noproc,_} -> ok) turned a failed registration
+%% into silently missing RPC methods: EarlButt booted with
+%% messagesByType unregistered and nothing in the log (July 13 2026).
+%%
+%% Returns ok when every service accepted (or rejected — see below) the
+%% registration, retry when any attempt failed transiently; the caller
+%% re-sends itself a timer message and calls again.  Both registries
+%% are idempotent, so re-attempting an already-registered service is
+%% free.
+%%
+%% A deterministic rejection ({error, method_taken | invalid_manifest})
+%% cannot be fixed by retrying: it is logged at error level and treated
+%% as final.  An exception (noproc while the service is down, a timeout,
+%% a crash) is transient: logged and retried.
+ensure_registered(Mod) ->
+    ensure_registered(Mod, [plugin, view]).
+
+ensure_registered(Mod, Services) ->
+    Results = [attempt(Service, Mod) || Service <- Services],
+    case lists:member(retry, Results) of
+        true  -> retry;
+        false -> ok
+    end.
+
+attempt(plugin, Mod) ->
+    classify(plugin, Mod, fun() -> plugin_registry:register_plugin(Mod) end);
+attempt(view, Mod) ->
+    classify(view, Mod, fun() -> view_manager:register_view(Mod) end).
+
+classify(Service, Mod, F) ->
+    try F() of
+        ok ->
+            ok;
+        Rejected ->
+            ?SSB_ERROR("~p: ~p registration REJECTED: ~p — its methods "
+                       "will be MISSING (not retrying: deterministic)",
+                       [Mod, Service, Rejected]),
+            ok
+    catch
+        Class:Reason ->
+            ?SSB_ERROR("~p: ~p registration attempt failed: ~p:~p — "
+                       "will retry",
+                       [Mod, Service, Class, Reason]),
+            retry
+    end.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+ensure_registered_test() ->
+    %% no services requested: trivially done
+    ?assertEqual(ok, ensure_registered(nosuch_view, [])),
+    %% with the registries down, attempts are transient -> retry
+    case {whereis(plugin_registry), whereis(view_manager)} of
+        {undefined, undefined} ->
+            ?assertEqual(retry, ensure_registered(nosuch_view)),
+            ?assertEqual(retry, ensure_registered(nosuch_view, [view]));
+        _ ->
+            ok  %% another fixture's services are up; skip the down-path
+    end.
+-endif.

@@ -124,16 +124,12 @@ init([]) ->
     {ok, #{}, {continue, register}}.
 
 handle_continue(register, State) ->
-    %% Swap in the snapshot (if any), then register the plugin (so the
-    %% method appears in the manifest) before the view fold.  Guard each
-    %% registration independently so a service that is down (bare eunit
-    %% setups) does not skip the other.
+    %% Swap in the snapshot (if any), then register plugin + view.
+    %% Failures are loud and transient ones retried on a timer
+    %% (ssb_view:ensure_registered) — the old silent noproc swallow
+    %% here cost EarlButt its messagesByType method (July 2026).
     maybe_restore(),
-    try plugin_registry:register_plugin(?MODULE)
-    catch exit:{noproc, _} -> ok end,
-    try view_manager:register_view(?MODULE)
-    catch exit:{noproc, _} -> ok end,
-    {noreply, State}.
+    ensure_registered(State).
 
 maybe_restore() ->
     File = ?b2l(table_file()),
@@ -150,7 +146,19 @@ maybe_restore() ->
 
 handle_call(_Request, _From, State) -> {reply, ok, State}.
 handle_cast(_Msg, State) -> {noreply, State}.
-handle_info(_Info, State) -> {noreply, State}.
+handle_info(ensure_registered, State) ->
+    ensure_registered(State);
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+%% First attempt (from handle_continue) and every timer retry land
+%% here; keep trying until every service accepts the registration.
+ensure_registered(State) ->
+    case ssb_view:ensure_registered(?MODULE) of
+        ok    -> ok;
+        retry -> erlang:send_after(2000, self(), ensure_registered)
+    end,
+    {noreply, State}.
 terminate(_Reason, _State) -> catch view_save(), ok.
 code_change(_OldVsn, State, _Extra) -> {ok, State}.
 

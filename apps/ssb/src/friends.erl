@@ -204,13 +204,11 @@ init([]) ->
     {ok, #{}, {continue, register_view}}.
 
 handle_continue(register_view, State) ->
-    try view_manager:register_view(?MODULE)
-    catch exit:{noproc, _} ->
-            %% No view_manager (some eunit setups): the tables stay as
-            %% restored/empty and nothing feeds them.
-            ?SSB_INFO("friends: running without view_manager", [])
-    end,
-    {noreply, State}.
+    %% Registration failures are loud and transient ones retried on a
+    %% timer (ssb_view:ensure_registered) — a silent skip means the
+    %% follow graph stops updating.  In eunit setups without a
+    %% view_manager the retries just keep logging.
+    ensure_registered(State).
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
@@ -218,7 +216,19 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+handle_info(ensure_registered, State) ->
+    ensure_registered(State);
 handle_info(_Info, State) ->
+    {noreply, State}.
+
+%% First attempt (from handle_continue) and every timer retry land
+%% here; keep trying until the view registration is accepted.  friends
+%% registers no plugin — its RPC surface lives in the silkpurse app.
+ensure_registered(State) ->
+    case ssb_view:ensure_registered(?MODULE, [view]) of
+        ok    -> ok;
+        retry -> erlang:send_after(2000, self(), ensure_registered)
+    end,
     {noreply, State}.
 
 terminate(_Reason, _State) ->
