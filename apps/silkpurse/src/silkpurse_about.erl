@@ -10,17 +10,28 @@
 %% An ssb_view over a named public ETS set {{Dest, Key} => #{Author =>
 %% Value}} — each author's latest assignment, a {remove: true} pruning
 %% the author's entry — plus an ssb_plugin serving:
-%%   about.socialValue({dest, key})        async, owner
-%%   about.socialValueStream({dest, key})   source (live), owner
+%%   about.socialValue({dest, key})          async, owner
+%%   about.socialValueStream({dest, key})    source (live), owner
+%%   about.socialValuesStream({dest, key})   source (live), owner
+%%   about.latestValueStream({dest, key, authorId?}) source (live), owner
 %%
 %% Resolution (getSocialValue, matching ssb-social-index exactly):
 %%   1. the node owner's own assignment, else
 %%   2. the described feed's own self-assignment, else
 %%   3. the most common value across all assigners (plurality).
 %%
-%% Not yet served: socialValuesStream/groupedValues ("also known as"
-%% alternate names) and the latest-family (latestValue/latestValues) —
-%% the latter have no UI callers today.
+%% socialValuesStream is the "also known as" backing: one snapshot
+%% frame with every author's assignment ({author: value}), then a
+%% single-pair frame per change — a remove is sent raw so the client's
+%% checkDelete drops the author (MutantPullDict semantics).
+%%
+%% APPROXIMATION: latestValueStream without authorId is defined in JS
+%% as "the value set by whoever assigned last"; the view keeps no
+%% assignment order, so we serve the resolved social value instead.
+%% With authorId it is exact (that author's current assignment).
+%%
+%% Not yet served: the latest-family getters (latestValue/latestValues)
+%% — no UI callers today.
 -module(silkpurse_about).
 
 -ifdef(TEST).
@@ -109,8 +120,10 @@ view_entry(_) ->
 %%%===================================================================
 
 manifest() ->
-    [{[~"about", ~"socialValue"],       async,  owner},
-     {[~"about", ~"socialValueStream"], source, owner},
+    [{[~"about", ~"socialValue"],        async,  owner},
+     {[~"about", ~"socialValueStream"],  source, owner},
+     {[~"about", ~"socialValuesStream"], source, owner},
+     {[~"about", ~"latestValueStream"],  source, owner},
      {[~"patchwork", ~"profile", ~"avatar"], async, owner}].
 
 handle_rpc([~"about", ~"socialValue"], Args, _Caller) ->
@@ -126,13 +139,46 @@ handle_rpc([~"about", ~"socialValueStream"], Args, _Caller) ->
         {Dest, Key} ->
             Initial = encode_value(social_value(Dest, Key)),
             EventFun =
-                fun({about, D, K}) when D =:= Dest, K =:= Key ->
+                fun({about, D, K, _A, _V}) when D =:= Dest, K =:= Key ->
                         {send, encode_value(social_value(Dest, Key))};
                    (_) -> skip
                 end,
             %% snapshot = the current resolved value (a value stream, so
             %% no message-id dedup); then live updates on each change
             {live_source, [{make_ref(), Initial}], ?MODULE, EventFun}
+    end;
+
+handle_rpc([~"about", ~"socialValuesStream"], Args, _Caller) ->
+    case dest_key(Args) of
+        undefined ->
+            {error, ~"about.socialValuesStream needs dest and key"};
+        {Dest, Key} ->
+            Initial = encode_json(values_object(Dest, Key)),
+            EventFun =
+                fun({about, D, K, Author, Value}) when D =:= Dest,
+                                                        K =:= Key ->
+                        %% single-pair diff; removes go through raw so
+                        %% the client deletes the author's entry
+                        {send, encode_json({[{Author, Value}]})};
+                   (_) -> skip
+                end,
+            {live_source, [{make_ref(), Initial}], ?MODULE, EventFun}
+    end;
+
+handle_rpc([~"about", ~"latestValueStream"], [{Props}] = Args, _Caller) ->
+    case dest_key(Args) of
+        undefined ->
+            {error, ~"about.latestValueStream needs dest and key"};
+        {Dest, Key} ->
+            AuthorId = ?pgv(~"authorId", Props),
+            Current = fun() -> latest_value(Dest, Key, AuthorId) end,
+            EventFun =
+                fun({about, D, K, _A, _V}) when D =:= Dest, K =:= Key ->
+                        {send, encode_value(Current())};
+                   (_) -> skip
+                end,
+            {live_source, [{make_ref(), encode_value(Current())}],
+             ?MODULE, EventFun}
     end;
 
 %% profile.avatar({id}) -> {id, name, image}: a feed's resolved display
@@ -225,13 +271,33 @@ apply_field(Dest, Key, Author, Value) ->
         true  -> unchanged;
         false ->
             ets:insert(?TAB, {TabKey, New}),
-            {changed, {about, Dest, Key}}
+            %% carry the author and RAW value (removes included) so
+            %% socialValuesStream can emit exact single-pair diffs
+            {changed, {about, Dest, Key, Author, Value}}
     end.
 
 is_remove({Props}) when is_list(Props) ->
     ?pgv(~"remove", Props) =:= true;
 is_remove(_) ->
     false.
+
+%% Every author's current assignment for {Dest, Key} as a JSON object.
+values_object(Dest, Key) ->
+    Values = case ets:lookup(?TAB, {Dest, Key}) of
+                 [{_, Map}] -> Map;
+                 []         -> #{}
+             end,
+    {maps:to_list(Values)}.
+
+%% latestValueStream's value: exact for a given author; the resolved
+%% social value otherwise (see the module-doc approximation note).
+latest_value(Dest, Key, AuthorId) when is_binary(AuthorId) ->
+    case ets:lookup(?TAB, {Dest, Key}) of
+        [{_, #{AuthorId := V}}] -> V;
+        _                       -> null
+    end;
+latest_value(Dest, Key, _) ->
+    social_value(Dest, Key).
 
 %% getSocialValue: node owner's assignment, else the described feed's
 %% own, else plurality.  Returns the raw value item, or null.
@@ -350,7 +416,9 @@ resolution_test_() ->
               ?_test(author_wins_without_self()),
               ?_test(plurality_without_self_or_author()),
               ?_test(remove_falls_back()),
-              ?_test(live_pushes_on_change())]
+              ?_test(live_pushes_on_change()),
+              ?_test(social_values_stream()),
+              ?_test(latest_value_stream())]
      end}.
 
 ab_setup() ->
@@ -429,11 +497,50 @@ live_pushes_on_change() ->
                                          {~"about", OwnId},
                                          {~"name", ~"live name"}]}),
     receive
-        {view_event, silkpurse_about, {about, OwnId, ~"name"}} -> ok
+        {view_event, silkpurse_about, {about, OwnId, ~"name", OwnId,
+                                       ~"live name"}} -> ok
     after 1000 ->
         error(no_about_event)
     end,
     ?assertEqual(~"live name", social_value(OwnId, ~"name")),
     ok = view_manager:unsubscribe(silkpurse_about).
+
+social_values_stream() ->
+    Dest = ~"@svsfeedddddddddddddddddddddddddddddddddddd=.ed25519",
+    A = ~"@svsaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=.ed25519",
+    put_about(Dest, ~"name", A,    ~"ay"),
+    put_about(Dest, ~"name", Dest, ~"me"),
+    {live_source, [{_, Snap}], ?MODULE, EventFun} =
+        handle_rpc([~"about", ~"socialValuesStream"],
+                   [{[{~"dest", Dest}, {~"key", ~"name"}]}], caller()),
+    {Props} = utils:nat_decode(Snap),
+    ?assertEqual(~"ay", ?pgv(A, Props)),
+    ?assertEqual(~"me", ?pgv(Dest, Props)),
+    %% live diff: one {author: value} pair, removes passed through raw
+    Remove = {[{~"remove", true}]},
+    {send, Diff} = EventFun({about, Dest, ~"name", A, Remove}),
+    {[{A, {DiffVal}}]} = utils:nat_decode(Diff),
+    ?assertEqual(true, ?pgv(~"remove", DiffVal)),
+    ?assertEqual(skip, EventFun({about, ~"@other", ~"name", A, ~"x"})).
+
+latest_value_stream() ->
+    Dest = ~"@lvsfeedddddddddddddddddddddddddddddddddddd=.ed25519",
+    A = ~"@lvsaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=.ed25519",
+    put_about(Dest, ~"title", A,    ~"their title"),
+    put_about(Dest, ~"title", Dest, ~"own title"),
+    %% authorId: that author's assignment exactly
+    {live_source, [{_, ForA}], ?MODULE, _} =
+        handle_rpc([~"about", ~"latestValueStream"],
+                   [{[{~"dest", Dest}, {~"key", ~"title"},
+                      {~"authorId", A}]}], caller()),
+    ?assertEqual(~"their title", utils:nat_decode(ForA)),
+    %% without authorId: the resolved social value (documented approx)
+    {live_source, [{_, Resolved}], ?MODULE, _} =
+        handle_rpc([~"about", ~"latestValueStream"],
+                   [{[{~"dest", Dest}, {~"key", ~"title"}]}], caller()),
+    ?assertEqual(~"own title", utils:nat_decode(Resolved)).
+
+caller() ->
+    #{class => owner, feed_id => keys:pub_key_disp()}.
 
 -endif.
