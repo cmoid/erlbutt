@@ -35,6 +35,7 @@
          contacts_state_stream_test/1,
          likes_test/1,
          thread_sorted_test/1,
+         private_thread_reply_test/1,
          public_feed_roots_test/1,
          public_feed_latest_test/1,
          profile_roots_test/1,
@@ -72,6 +73,7 @@ all() ->
      contacts_state_stream_test,
      likes_test,
      thread_sorted_test,
+     private_thread_reply_test,
      public_feed_roots_test,
      public_feed_latest_test,
      profile_roots_test,
@@ -211,6 +213,40 @@ thread_sorted_test(_Config) ->
                          (_) -> false end, Decoded)),   %% sync sentinel
     gen_server:stop(Peer).
 
+%% A reply inside a PRIVATE thread must show up in that thread, served
+%% decrypted.  Its content is a box, so the backlinks view has to decrypt
+%% it to see the ref at all — without that a DM reply produced no backlink
+%% and thread.sorted returned nothing, so replying to a DM looked like the
+%% post had vanished (it was on the feed the whole time).
+private_thread_reply_test(_Config) ->
+    OwnId  = keys:pub_key_disp(),
+    OwnPid = utils:find_or_create_feed_pid(OwnId),
+    ok = ssb_feed:post_private(OwnPid, {[{~"type", ~"post"},
+                                         {~"text", ~"private root"}]}, [OwnId]),
+    #message{id = RootId} = ssb_feed:fetch_last_msg(OwnPid),
+    ok = ssb_feed:post_private(OwnPid, {[{~"type", ~"post"},
+                                         {~"text", ~"private reply"},
+                                         {~"root", RootId}]}, [OwnId]),
+    #message{id = ReplyId} = ssb_feed:fetch_last_msg(OwnPid),
+
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    Args = [{[{~"dest", RootId}, {~"live", false}, {~"old", true},
+              {~"types", [~"post"]}]}],
+    {ok, Frames} = ssb_peer:rpc_stream_call(
+                     Peer, [~"patchwork", ~"thread", ~"sorted"], Args),
+    Decoded = [utils:nat_decode(F) || F <- Frames],
+    Keys = [proplists:get_value(~"key", P) || {P} <- Decoded,
+                                              proplists:is_defined(~"key", P)],
+    ?assert(lists:member(ReplyId, Keys)),
+
+    %% and it is served decrypted — the renderer reads content.text directly
+    [{Reply}] = [{P} || {P} <- Decoded,
+                        proplists:get_value(~"key", P) =:= ReplyId],
+    {Val} = proplists:get_value(~"value", Reply),
+    {Content} = proplists:get_value(~"content", Val),
+    ?assertEqual(~"private reply", proplists:get_value(~"text", Content)),
+    gen_server:stop(Peer).
+
 %% likes.get returns the likers of a message, and countStream its live
 %% count, after a vote is posted over the wire.
 likes_test(_Config) ->
@@ -329,12 +365,20 @@ backlinks_streams_test(_Config) ->
                                          {~"root", RootId}]}),
     #message{id = ReplyId} = ssb_feed:fetch_last_msg(OwnPid),
     {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
-    %% referencesStream: the existing reply arrives in the snapshot
+    %% referencesStream: the existing reply arrives in the snapshot, as a flat
+    %% {id, author, timestamp} summary.  The renderer reads link.author off the
+    %% top level; a message envelope left it undefined and crashed the page, so
+    %% assert the fields it actually uses, not just the id.
+    OwnId = keys:pub_key_disp(),
     {ok, _R} = ssb_peer:open_source(
                  Peer, [~"patchwork", ~"backlinks", ~"referencesStream"],
                  [{[{~"id", RootId}]}], self()),
     receive
-        {stream_data, _, F} -> ?assertEqual(ReplyId, (message:decode(F, false))#message.id)
+        {stream_data, _, F} ->
+            {Ref} = utils:nat_decode(F),
+            ?assertEqual(ReplyId, proplists:get_value(~"id", Ref)),
+            ?assertEqual(OwnId,   proplists:get_value(~"author", Ref)),
+            ?assert(is_integer(proplists:get_value(~"timestamp", Ref)))
     after 3000 -> error(no_reference)
     end,
     %% liveBacklinks.stream: open, post a new backlink, receive it dest-tagged.
