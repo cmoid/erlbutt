@@ -18,6 +18,9 @@
          rpc_stream_call/3,
          open_source/4,
          open_duplex/4,
+         open_sink/4,
+         send_sink_data/3,
+         send_sink_end/2,
          send_frame/3,
          tunnel_connect/3,
          start_tunnel_server/3,
@@ -185,6 +188,22 @@ open_source(Pid, Method, Args, NotifyPid) ->
 %% further frames with send_frame/3 on the same (positive) ReqNo.
 open_duplex(Pid, Method, Args, SinkPid) ->
     gen_server:call(Pid, {open_duplex, Method, Args, SinkPid}).
+
+%% Open a sink stream (e.g. blobs.add): send the request, then push the
+%% payload with send_sink_data/3 and close it with send_sink_end/2.  The
+%% peer's terminating frame — JSON `true`, or an error — is delivered to
+%% NotifyPid as {rpc_reply, Ref, Body}.  Returns {ok, ReqNo, Ref}.
+open_sink(Pid, Method, Args, NotifyPid) ->
+    gen_server:call(Pid, {open_sink, Method, Args, NotifyPid}).
+
+%% One chunk of a sink's payload: a BINARY frame (type 0), which is how a
+%% muxrpc client streams bytes — unlike send_frame/3's JSON frames.
+send_sink_data(Pid, ReqNo, Body) ->
+    gen_server:cast(Pid, {send_sink_data, ReqNo, Body}).
+
+%% Close a sink cleanly: end frame carrying JSON `true`.
+send_sink_end(Pid, ReqNo) ->
+    gen_server:cast(Pid, {send_sink_end, ReqNo}).
 
 %% Send a single stream data frame (stream flag, no end) on ReqNo, using this
 %% connection's enc_nonce.  Async; ordering preserved per caller.
@@ -562,6 +581,23 @@ handle_call({open_source, Method, Args, NotifyPid}, _From,
     NewNonce = utils:send_data(utils:combine(Header, ReqBody), Socket, EncNonce, EncBoxKey),
     {reply, {ok, Ref}, State1#sbox_state{enc_nonce = NewNonce}};
 
+handle_call({open_sink, Method, Args, NotifyPid}, _From,
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc} = State) ->
+    {ReqNo, State1} = next_req(State),
+    Ref = make_ref(),
+    %% the sink's single terminating frame comes back on -ReqNo
+    ok = rpc_processor:register_stream(RpcProc, -ReqNo, {reply_to, NotifyPid, Ref}),
+    ReqBody = utils:encode_rec({[{~"name", Method},
+                                  {~"args", Args},
+                                  {~"type", ~"sink"}]}),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(ReqBody), ReqNo),
+    NewNonce = utils:send_data(utils:combine(Header, ReqBody), Socket, EncNonce, EncBoxKey),
+    {reply, {ok, ReqNo, Ref}, State1#sbox_state{enc_nonce = NewNonce}};
+
 handle_call({open_duplex, Method, Args, SinkPid}, _From,
             #sbox_state{socket = Socket,
                         enc_sbox_key = EncBoxKey,
@@ -657,6 +693,26 @@ handle_cast({send_frame, ReqNo, Body},
                         enc_sbox_key = EncBoxKey,
                         enc_nonce = EncNonce} = State) ->
     Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(Body), ReqNo),
+    NewNonce = send_data(combine(Header, Body), Socket, EncNonce, EncBoxKey),
+    {noreply, State#sbox_state{enc_nonce = NewNonce}};
+
+handle_cast({send_sink_data, ReqNo, Body},
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce} = State) ->
+    %% type 0 = binary body (the bytes are not JSON)
+    Flags = rpc_processor:create_flags(1, 0, 0),
+    Header = rpc_processor:create_header(Flags, size(Body), ReqNo),
+    NewNonce = send_data(combine(Header, Body), Socket, EncNonce, EncBoxKey),
+    {noreply, State#sbox_state{enc_nonce = NewNonce}};
+
+handle_cast({send_sink_end, ReqNo},
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce} = State) ->
+    Body = utils:encode_rec(true),
+    Flags = rpc_processor:create_flags(1, 1, 2),
     Header = rpc_processor:create_header(Flags, size(Body), ReqNo),
     NewNonce = send_data(combine(Header, Body), Socket, EncNonce, EncBoxKey),
     {noreply, State#sbox_state{enc_nonce = NewNonce}};
