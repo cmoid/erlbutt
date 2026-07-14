@@ -22,6 +22,10 @@
          profile_avatar_test/1,
          heartbeat_test/1,
          blobs_ls_test/1,
+         blobs_add_test/1,
+         blobs_add_verified_test/1,
+         blobs_add_mismatch_test/1,
+         blobs_push_test/1,
          channels_test/1,
          private_get_test/1,
          private_feed_test/1,
@@ -55,6 +59,10 @@ all() ->
      profile_avatar_test,
      heartbeat_test,
      blobs_ls_test,
+     blobs_add_test,
+     blobs_add_verified_test,
+     blobs_add_mismatch_test,
+     blobs_push_test,
      channels_test,
      private_get_test,
      private_feed_test,
@@ -413,6 +421,72 @@ blobs_ls_test(_Config) ->
     end,
     gen_server:stop(Peer).
 
+%% blobs.add is the attachment write path: the client streams the file's
+%% bytes as a sink and we store them.  Multi-chunk, as ssb-blob-files sends
+%% it (64 KB frames).  The terminating frame must be JSON `true` — a muxrpc
+%% sink callback takes only an error, so any other value reads AS an error
+%% (the client computes the id itself; see ssb-client's fix-add-blob.js).
+blobs_add_test(_Config) ->
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    Chunk1 = crypto:strong_rand_bytes(1024),
+    Chunk2 = crypto:strong_rand_bytes(512),
+    Expected = blob_id(<<Chunk1/binary, Chunk2/binary>>),
+    ?assertNot(blobs:has(Expected)),
+
+    {ok, ReqNo, Ref} = ssb_peer:open_sink(Peer, [~"blobs", ~"add"],
+                                          [null], self()),
+    ok = ssb_peer:send_sink_data(Peer, ReqNo, Chunk1),
+    ok = ssb_peer:send_sink_data(Peer, ReqNo, Chunk2),
+    ok = ssb_peer:send_sink_end(Peer, ReqNo),
+
+    ?assertEqual(true, sink_reply(Ref)),
+    ?assert(blobs:has(Expected)),
+    ?assertEqual({ok, <<Chunk1/binary, Chunk2/binary>>}, blobs:fetch(Expected)),
+    gen_server:stop(Peer).
+
+%% The client may name the id up front (ssb-blob-files does for private
+%% blobs); matching bytes are stored.
+blobs_add_verified_test(_Config) ->
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    Blob = crypto:strong_rand_bytes(2048),
+    BlobId = blob_id(Blob),
+
+    {ok, ReqNo, Ref} = ssb_peer:open_sink(Peer, [~"blobs", ~"add"],
+                                          [BlobId], self()),
+    ok = ssb_peer:send_sink_data(Peer, ReqNo, Blob),
+    ok = ssb_peer:send_sink_end(Peer, ReqNo),
+
+    ?assertEqual(true, sink_reply(Ref)),
+    ?assert(blobs:has(BlobId)),
+    gen_server:stop(Peer).
+
+%% ...and bytes that do not hash to the named id are refused, not stored.
+blobs_add_mismatch_test(_Config) ->
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    Claimed = blob_id(crypto:strong_rand_bytes(64)),
+    Actual  = crypto:strong_rand_bytes(64),
+
+    {ok, ReqNo, Ref} = ssb_peer:open_sink(Peer, [~"blobs", ~"add"],
+                                          [Claimed], self()),
+    ok = ssb_peer:send_sink_data(Peer, ReqNo, Actual),
+    ok = ssb_peer:send_sink_end(Peer, ReqNo),
+
+    {Err} = sink_reply(Ref),
+    ?assertEqual(~"blob hash mismatch", proplists:get_value(~"message", Err)),
+    ?assertNot(blobs:has(Claimed)),
+    ?assertNot(blobs:has(blob_id(Actual))),
+    gen_server:stop(Peer).
+
+%% blobs.push is called after publishing a message that references a blob;
+%% it acks so the client's publish path proceeds.
+blobs_push_test(_Config) ->
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    BlobId = blobs:store(crypto:strong_rand_bytes(128)),
+    {ok, Body} = ssb_peer:rpc_call(Peer, [~"blobs", ~"push"], ~"async",
+                                   [BlobId]),
+    ?assertEqual(true, utils:nat_decode(Body)),
+    gen_server:stop(Peer).
+
 %% contacts.stateStream (non-live) returns a feed's follow/block dict:
 %% after following a target, the owner's forward state includes it as true.
 contacts_state_stream_test(_Config) ->
@@ -631,6 +705,17 @@ manifest_includes_silkpurse_test(_Config) ->
 
 server_pk() ->
     base64:decode(keys:pub_key()).
+
+%% The single frame a sink is terminated with: JSON `true`, or an error.
+sink_reply(Ref) ->
+    receive
+        {rpc_reply, Ref, Body} -> utils:nat_decode(Body)
+    after 5000 ->
+        error(no_sink_reply)
+    end.
+
+blob_id(Blob) ->
+    <<"&", (base64:encode(crypto:hash(sha256, Blob)))/binary, ".sha256">>.
 
 write_test_cfg(DataDir) ->
     CfgFile = filename:join(DataDir, "ssb.cfg"),

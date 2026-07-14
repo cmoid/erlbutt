@@ -286,7 +286,10 @@ builtin_lookup() ->
     ?assertEqual({builtin, async, anyone}, lookup([?blobs, ?blobshas])),
     %% local-client methods are owner-gated
     ?assertEqual({builtin, async, owner},  lookup([~"publish"])),
-    ?assertEqual({builtin, source, owner}, lookup([~"createLogStream"])).
+    ?assertEqual({builtin, source, owner}, lookup([~"createLogStream"])),
+    %% writing a blob is a local-client privilege, never a remote peer's
+    ?assertEqual({builtin, sink,  owner},  lookup([?blobs, ?blobsadd])),
+    ?assertEqual({builtin, async, owner},  lookup([?blobs, ?blobspush])).
 
 unknown_lookup() ->
     ?assertEqual(unknown, lookup([~"noSuch", ~"method"])).
@@ -328,7 +331,15 @@ manifest_filtering() ->
     {OwnerProps} = manifest(owner),
     %% publish is owner-only: hidden from peers, visible to the owner
     ?assertEqual(undefined, proplists:get_value(~"publish", PeerProps)),
-    ?assertEqual(~"async",  proplists:get_value(~"publish", OwnerProps)).
+    ?assertEqual(~"async",  proplists:get_value(~"publish", OwnerProps)),
+    %% the owner's blobs surface advertises add as a sink; a peer sees
+    %% neither add nor push (they would let a remote write to our store)
+    {OwnerBlobs} = proplists:get_value(?blobs, OwnerProps),
+    ?assertEqual(~"sink",  proplists:get_value(?blobsadd, OwnerBlobs)),
+    ?assertEqual(~"async", proplists:get_value(?blobspush, OwnerBlobs)),
+    {PeerBlobs} = proplists:get_value(?blobs, PeerProps),
+    ?assertEqual(undefined, proplists:get_value(?blobsadd, PeerBlobs)),
+    ?assertEqual(undefined, proplists:get_value(?blobspush, PeerBlobs)).
 
 register_and_dispatch() ->
     ok = register_plugin(test_echo_plugin),
