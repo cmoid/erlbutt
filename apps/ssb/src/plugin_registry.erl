@@ -59,6 +59,8 @@
          {[?blobs, ?blobshas],          async,  anyone},
          {[?blobs, ?blobsget],          source, anyone},
          {[?blobs, ?blobswant],         async,  owner},
+         {[?blobs, ?blobsadd],          sink,   owner},
+         {[?blobs, ?blobspush],         async,  owner},
          {[?blobs, ?createwants],       source, anyone},
          {[?ebt, ~"replicate"],         duplex, anyone},
          {[?tunnel, ?isRoom],           sync,   anyone},
@@ -76,8 +78,11 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
-%% Register every method in Mod:manifest().  Duplex methods are
-%% rejected: the generic dispatch cannot host them yet.
+%% Register every method in Mod:manifest().  Duplex and sink methods are
+%% rejected: both need incoming frames routed back to the handler across
+%% the life of the request, which the generic plugin dispatch (one call,
+%% one result) cannot host.  The sink builtin (blobs.add) is driven by
+%% rpc_processor directly.
 register_plugin(Mod) when is_atom(Mod) ->
     gen_server:call(?MODULE, {register_plugin, Mod}, infinity).
 
@@ -233,6 +238,7 @@ tree_to_ejson(Tree) when is_map(Tree) ->
 kind_bin(sync)   -> ~"sync";
 kind_bin(async)  -> ~"async";
 kind_bin(source) -> ~"source";
+kind_bin(sink)   -> ~"sink";
 kind_bin(duplex) -> ~"duplex".
 
 %%%===================================================================

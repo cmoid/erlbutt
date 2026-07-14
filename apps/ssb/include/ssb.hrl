@@ -57,6 +57,13 @@
 -define(blobsget, <<"get">>).
 -define(blobshas, <<"has">>).
 -define(blobswant, <<"want">>).
+-define(blobsadd, <<"add">>).
+-define(blobspush, <<"push">>).
+
+%% Largest blob we accept over blobs.add.  Matches ssb-blobs' default
+%% (and the limit ssb-blob-files enforces client-side), so a file the
+%% client would refuse to send is also one we refuse to buffer.
+-define(BLOB_MAX_SIZE, 5242880).
 
 -record(ssb_conn,
         { socket,
@@ -72,8 +79,13 @@
           type
         }).
 
+%% sinks: ReqNo => {Chunks, Size} for an open blobs.add sink.  The
+%% chunks live on the rpc_processor's heap, not in the calls table:
+%% re-inserting the growing accumulator into ETS on every 64 KB frame
+%% would copy the whole blob each time (quadratic).
 -record(rpc_state,
-        { calls }).
+        { calls,
+          sinks = #{} }).
 
 -record(message,
         { id,
