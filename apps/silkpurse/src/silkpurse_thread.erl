@@ -63,10 +63,8 @@ snapshot(Dest, Types) ->
     Replies = lists:filtermap(
                 fun(Id) ->
                         case reply_msg(Id, Dest, Types) of
-                            #message{timestamp = Ts} = RM ->
-                                {true, {sort_key(Ts), Id, message:encode(RM)}};
-                            undefined ->
-                                false
+                            {Ts, Bin} -> {true, {sort_key(Ts), Id, Bin}};
+                            undefined -> false
                         end
                 end, silkpurse_backlinks:refs(Dest)),
     Sorted = [{Id, Bin} || {_Key, Id, Bin} <- lists:sort(Replies)],
@@ -78,21 +76,52 @@ sort_key(_)                      -> 0.
 %% A live backlinks event that names a new reply to this thread.
 live_reply({link, Target, MsgId}, Dest, Types) when Target =:= Dest ->
     case reply_msg(MsgId, Dest, Types) of
-        #message{} = M -> {send, MsgId, message:encode(M)};
-        undefined      -> skip
+        {_Ts, Bin} -> {send, MsgId, Bin};
+        undefined  -> skip
     end;
 live_reply(_Event, _Dest, _Types) ->
     skip.
 
-%% The message MsgId if it is a thread reply to Dest of an allowed type,
-%% else undefined.
+%% {Timestamp, EncodedEnvelope} when MsgId is a reply to Dest of an allowed
+%% type, else undefined.
+%%
+%% A private reply is boxed, so its root and type can only be read by
+%% decrypting it — and it is then served DECRYPTED (as privateFeed does,
+%% and as get({private: true}) does), since the thread page renders the
+%% content directly.  Decryption happens per query; nothing is stored.
 reply_msg(MsgId, Dest, Types) ->
     case get_msg(MsgId) of
-        #message{content = {Props}} = M ->
-            case lists:member(?pgv(~"type", Props), Types)
-                 andalso ?pgv(~"root", Props) =:= Dest of
-                true  -> M;
+        #message{content = {Props}, timestamp = Ts} = M ->
+            case is_reply(Props, Dest, Types) of
+                true  -> {Ts, message:encode(M)};
                 false -> undefined
+            end;
+        #message{content = Box, timestamp = Ts} = M when is_binary(Box) ->
+            case decrypt(Box) of
+                {ok, {Props} = ContentObj} ->
+                    case is_reply(Props, Dest, Types) of
+                        true  -> {Ts, message:encode_decrypted(M, ContentObj)};
+                        false -> undefined
+                    end;
+                _ ->
+                    undefined
+            end;
+        _ ->
+            undefined
+    end.
+
+is_reply(Props, Dest, Types) ->
+    lists:member(?pgv(~"type", Props), Types)
+        andalso ?pgv(~"root", Props) =:= Dest.
+
+%% The plaintext content object of a box addressed to us, if we can read it.
+decrypt(Box) ->
+    case private_box:is_private(Box) andalso private_box:decrypt(Box) of
+        {ok, Plain} ->
+            try utils:nat_decode(Plain) of
+                {_} = ContentObj -> {ok, ContentObj};
+                _                -> undefined     %% not a content object
+            catch _:_ -> undefined                %% body need not be JSON
             end;
         _ ->
             undefined

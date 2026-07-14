@@ -61,7 +61,9 @@ refs(Target) ->
 %%% ssb_view callbacks (run in the view_manager process)
 %%%===================================================================
 
-view_version() -> 1.
+%% 2: private (boxed) content is now decrypted and indexed — the existing
+%% snapshot has no backlinks for any DM, so it must be refolded.
+view_version() -> 2.
 
 view_load() ->
     Loaded = try ets:lookup(?TAB, ?MARKER) =/= []
@@ -257,7 +259,23 @@ table_file() ->
     <<(config:ssb_repo_loc())/binary, "views/backlinks.tab">>.
 
 %% Every SSB reference (%msg, @feed, &blob) anywhere in the content.
-%% Private (still-encrypted binary) content has no visible links.
+%%
+%% Private content arrives as an opaque `.box` binary, which walk/1 sees
+%% as one non-link string — so a DM reply used to produce NO backlinks at
+%% all, and thread.sorted (which is built entirely on this index) could
+%% never show it.  Decrypt the box when it is addressed to us and walk the
+%% plaintext instead.  Only ids are stored, never plaintext: the bag holds
+%% {Target, MsgId} pairs, the same shape of metadata silkpurse_private
+%% already keeps.
+collect_links(Content) when is_binary(Content) ->
+    case private_box:is_private(Content) andalso private_box:decrypt(Content) of
+        {ok, Plain} ->
+            try lists:usort(walk(utils:nat_decode(Plain)))
+            catch _:_ -> []          %% a DM body need not be JSON
+            end;
+        _ ->
+            []                       %% not ours to read
+    end;
 collect_links(Content) ->
     lists:usort(walk(Content)).
 
