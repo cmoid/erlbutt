@@ -131,17 +131,39 @@ handle_rpc([~"backlinks", ~"read"], Args, _Caller) ->
 %% referencesStream({id, since}): messages that reference id, those after
 %% `since` as a snapshot, then live new ones — the per-message references
 %% shown in the UI (backlinks.obs.references).
+%%
+%% Items are flat reference SUMMARIES ({id, author, timestamp}), not the
+%% message envelope: message/html/references.js reads link.author and
+%% link.id off the top level (an envelope gave it author = undefined, and
+%% about.obs.name(undefined) then threw inside mutant's update loop and
+%% took the page down).  liveBacklinks.stream below keeps the envelope —
+%% backlinks.obs.for sorts whole messages there.
 handle_rpc([~"patchwork", ~"backlinks", ~"referencesStream"], [{Opts}], _Caller) ->
     case ?pgv(~"id", Opts) of
         Id when is_binary(Id) ->
             Since = ?pgv(~"since", Opts),
-            Snapshot = [{MsgId, Bin} || MsgId <- refs(Id),
-                                        (Bin = fetch_encoded(MsgId)) =/= undefined,
-                                        after_since(Bin, Since)],
+            Snapshot =
+                lists:filtermap(
+                  fun(MsgId) ->
+                          case fetch_encoded(MsgId) of
+                              undefined -> false;
+                              Bin ->
+                                  case after_since(Bin, Since)
+                                      andalso ref_summary(Bin) of
+                                      false     -> false;
+                                      undefined -> false;
+                                      Sum       -> {true, {MsgId, Sum}}
+                                  end
+                          end
+                  end, refs(Id)),
             EventFun = fun({link, T, MsgId}) when T =:= Id ->
                                case fetch_encoded(MsgId) of
                                    undefined -> skip;
-                                   Bin       -> {send, MsgId, Bin}
+                                   Bin ->
+                                       case ref_summary(Bin) of
+                                           undefined -> skip;
+                                           Sum       -> {send, MsgId, Sum}
+                                       end
                                end;
                           (_) -> skip
                        end,
@@ -285,6 +307,20 @@ dest_tagged(Target, MsgId) ->
                 encode_json({Env ++ [{~"dest", Target}]})
             catch _:_ -> undefined
             end
+    end.
+
+%% A reference as backlinks.obs.references wants it: the referencing
+%% message's id and author, plus the asserted timestamp the client sends
+%% back as its `since` cursor (so it must be the field after_since/2
+%% compares).
+ref_summary(Bin) ->
+    try
+        {Env} = utils:nat_decode(Bin),
+        {Val} = ?pgv(~"value", Env),
+        encode_json({[{~"id",        ?pgv(~"key", Env)},
+                      {~"author",    ?pgv(~"author", Val)},
+                      {~"timestamp", ?pgv(~"timestamp", Val)}]})
+    catch _:_ -> undefined
     end.
 
 %% True when the message's asserted timestamp is past Since (or Since is
