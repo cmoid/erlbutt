@@ -101,7 +101,23 @@ handle_call({rpc_process, {Header, Body}, #ssb_conn{
     %% owning module's handle_data/3.
     ReqNo = req_no(Header),
     HasSeen = ets:lookup(Calls, ReqNo),
-    {Non, Res} = case HasSeen of
+    %% A blobs.add frame updates the sink accumulator, so it is the one
+    %% continuation that also rewrites State.  Handled before the generic
+    %% 2-tuple clause below, which would otherwise match {blob_add, Id}.
+    case HasSeen of
+        [{ReqNo, {blob_add, ExpectedId}}] ->
+            {Non, NewState} = blob_add_frame(ReqNo, ExpectedId, Header, Body,
+                                             Socket, Nonce, SecretBoxKey, State),
+            {reply, {Non, none}, NewState};
+        _ ->
+            {reply, rpc_frame(HasSeen, ReqNo, Header, Body, Conn, Calls), State}
+    end.
+
+rpc_frame(HasSeen, ReqNo, Header, Body,
+          #ssb_conn{socket = Socket,
+                    nonce = Nonce,
+                    secret_box = SecretBoxKey} = Conn, Calls) ->
+    case HasSeen of
         [{ReqNo, noop}] ->
             %% Stream already ended or handled; silently ignore continuations.
             {Nonce, none};
@@ -137,8 +153,7 @@ handle_call({rpc_process, {Header, Body}, #ssb_conn{
             {NewNonce, none};
         [] ->
             dispatch(Calls, ReqNo, Body, Socket, Nonce, SecretBoxKey)
-    end,
-    {reply, {Non, Res}, State}.
+    end.
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -379,6 +394,42 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobswant],
     %% blob_fetcher) and acknowledge.  Arrival is observable on the
     %% blobs.ls live stream; we do not hold the reply until the blob
     %% lands the way ssb-blobs does.
+    case blobs:has(BlobId) of
+        true  -> ok;
+        false -> blob_fetcher:want(BlobId)
+    end,
+    TrueBody = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+    Flags  = create_flags(0, 0, 2),
+    Header = create_header(Flags, size(TrueBody), -ReqNo),
+    utils:send_data(utils:combine(Header, TrueBody), Socket, Nonce, SecretBoxKey);
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobsadd],
+                             args = Args}
+             = _ReqBody, _Socket, Nonce, _SecretBoxKey) ->
+    %% Opening frame of a sink: the client now streams the blob's bytes as
+    %% binary frames on this same (positive) ReqNo, then an end frame.  We
+    %% only register here; the bytes are collected in handle_call (which
+    %% owns the accumulator) and stored when the end frame lands.
+    %%
+    %% args are [null] (hash it yourself) or [BlobId] (verify against it):
+    %% ssb-client's fix-add-blob hashes the stream CLIENT-side and hands its
+    %% own callback that id, so we never send the id back — see blob_add_end.
+    ExpectedId = case Args of
+        [Id] when is_binary(Id) -> Id;
+        _                       -> undefined
+    end,
+    ?SSB_DEBUG("rpc_processor: blobs.add reqno ~p expecting ~p~n",
+               [ReqNo, ExpectedId]),
+    ets:insert(Calls, {ReqNo, {blob_add, ExpectedId}}),
+    Nonce;
+
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobspush],
+                             args = [BlobId]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) when is_binary(BlobId) ->
+    %% "Make sure peers can get this blob."  We hold it already (the client
+    %% just added it), and blob_wants answers any peer's want with a have,
+    %% so there is nothing to schedule: ack so the client's publish proceeds.
+    %% If we somehow do NOT have it, fall back to wanting it like blobs.want.
     case blobs:has(BlobId) of
         true  -> ok;
         false -> blob_fetcher:want(BlobId)
@@ -712,13 +763,102 @@ snapshot_item(B)                        -> {json, B}.
 %% The error frame's stream flag must match the call's kind: a standard
 %% muxrpc client routes a stream-flagged frame to its open source and a
 %% plain one to its async callback — the wrong flag means the caller
-%% never sees the error and waits forever.
+%% never sees the error and waits forever.  A sink is a stream too.
 rpc_error(ReqNo, Reason, Kind, Socket, Nonce, SecretBoxKey) ->
     ErrMsg = utils:error_msg(~"Error", Reason),
-    Stream = case Kind of source -> 1; _ -> 0 end,
+    Stream = case Kind of
+                 source -> 1;
+                 sink   -> 1;
+                 _      -> 0
+             end,
     Flags  = create_flags(Stream, 1, 2),
     Header = create_header(Flags, size(ErrMsg), -ReqNo),
     utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey).
+
+%%%===================================================================
+%%% blobs.add — the one sink method
+%%%===================================================================
+
+%% Frames on an open blobs.add sink.  Data frames carry raw bytes (the
+%% client sends the file in 64 KB binary frames); the end frame closes it.
+blob_add_frame(ReqNo, ExpectedId, Header, Body, Socket, Nonce, SecretBoxKey,
+               #rpc_state{calls = Calls, sinks = Sinks} = State) ->
+    {_, IsEnd, _} = parse_flags(Header),
+    case IsEnd of
+        1 ->
+            {Chunks, _Size} = maps:get(ReqNo, Sinks, {[], 0}),
+            N = blob_add_end(ReqNo, ExpectedId, Chunks, Body,
+                             Socket, Nonce, SecretBoxKey),
+            ets:insert(Calls, {ReqNo, noop}),
+            {N, State#rpc_state{sinks = maps:remove(ReqNo, Sinks)}};
+        0 ->
+            {Chunks, Size} = maps:get(ReqNo, Sinks, {[], 0}),
+            NewSize = Size + byte_size(Body),
+            case NewSize > ?BLOB_MAX_SIZE of
+                true ->
+                    %% Refuse rather than buffer an unbounded blob.  The sink
+                    %% stays registered as noop, so the client's remaining
+                    %% frames and its end are swallowed.
+                    ?SSB_INFO("blobs.add req ~p exceeds max blob size (~p bytes)",
+                              [ReqNo, NewSize]),
+                    N = rpc_error(ReqNo, ~"blob exceeds max size", sink,
+                                  Socket, Nonce, SecretBoxKey),
+                    ets:insert(Calls, {ReqNo, noop}),
+                    {N, State#rpc_state{sinks = maps:remove(ReqNo, Sinks)}};
+                false ->
+                    %% prepend: reversed and flattened once, at the end
+                    {Nonce,
+                     State#rpc_state{sinks = Sinks#{ReqNo =>
+                                                    {[Body | Chunks], NewSize}}}}
+            end
+    end.
+
+%% The client ended the sink.  A clean end carries JSON `true`; anything
+%% else is the client aborting (pull-stream propagates the error), in which
+%% case we drop the partial blob and answer nothing.
+blob_add_end(ReqNo, ExpectedId, Chunks, Body, Socket, Nonce, SecretBoxKey) ->
+    case is_clean_end(Body) of
+        false ->
+            ?SSB_INFO("blobs.add req ~p aborted by client: ~p", [ReqNo, Body]),
+            Nonce;
+        true ->
+            Blob = iolist_to_binary(lists:reverse(Chunks)),
+            case store_blob(ExpectedId, Blob) of
+                {ok, BlobId} ->
+                    ?SSB_INFO("blobs.add stored ~p (~p bytes)",
+                              [BlobId, byte_size(Blob)]),
+                    %% Terminate the sink with JSON `true` — NOT the blob id.
+                    %% A muxrpc sink's callback takes only an error, and the
+                    %% client reads any non-`true` end value AS that error
+                    %% (ssb-client computes the id itself: fix-add-blob.js).
+                    TrueEnd = encode_json(true),
+                    Hdr = create_header(create_flags(1, 1, 2),
+                                        size(TrueEnd), -ReqNo),
+                    utils:send_data(utils:combine(Hdr, TrueEnd),
+                                    Socket, Nonce, SecretBoxKey);
+                {error, Reason} ->
+                    ?SSB_INFO("blobs.add req ~p rejected: ~p", [ReqNo, Reason]),
+                    rpc_error(ReqNo, Reason, sink, Socket, Nonce, SecretBoxKey)
+            end
+    end.
+
+%% With an id in the opening args the bytes must hash to it; without one
+%% (the usual case) we hash whatever arrived.
+store_blob(undefined, Blob) ->
+    {ok, blobs:store(Blob)};
+store_blob(ExpectedId, Blob) ->
+    case blobs:store_verified(ExpectedId, Blob) of
+        ok                     -> {ok, ExpectedId};
+        {error, hash_mismatch} -> {error, ~"blob hash mismatch"}
+    end.
+
+is_clean_end(Body) ->
+    try utils:nat_decode(Body) of
+        true -> true;
+        _    -> false
+    catch _:_ ->
+        false
+    end.
 
 %% {json, Bin} is pre-encoded JSON passed through untouched — used by
 %% plugins that serve stored message bytes (see ssb_plugin).
