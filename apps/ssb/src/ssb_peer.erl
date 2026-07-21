@@ -747,10 +747,7 @@ terminate(_Reason, #sbox_state{transport = tunnel,
                                ebt_entropy_ref = EntropyRef}) ->
     cancel_ebt_timer(StaleRef),
     cancel_ebt_timer(EntropyRef),
-    case is_pid(RpcProc) of
-        true -> gen_server:stop(RpcProc);
-        false -> ok
-    end,
+    stop_rpc_proc(RpcProc),
     ok;
 terminate(_Reason, #sbox_state{rpc_proc = RpcProc,
                                remote_pk = RemotePk,
@@ -759,7 +756,7 @@ terminate(_Reason, #sbox_state{rpc_proc = RpcProc,
     cancel_ebt_timer(StaleRef),
     cancel_ebt_timer(EntropyRef),
     peer_registry:unregister(RemotePk),
-    gen_server:stop(RpcProc),
+    stop_rpc_proc(RpcProc),
     ok;
 terminate(_Reason, #sbox_state{remote_pk = RemotePk}) ->
     peer_registry:unregister(RemotePk),
@@ -773,6 +770,17 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+%% The per-connection rpc_processor is often already down by the time we
+%% terminate (it crashing is frequently what tore the connection down).  Guard
+%% the stop: a bare gen_server:stop/1 on a dead pid exits with noproc, which
+%% would crash terminate/2 itself and OVERWRITE the real termination reason
+%% (masking the actual cause in the logs).
+stop_rpc_proc(RpcProc) when is_pid(RpcProc) ->
+    catch gen_server:stop(RpcProc),
+    ok;
+stop_rpc_proc(_) ->
+    ok.
 
 schedule_ebt_stale_check() ->
     erlang:send_after(?EBT_STALE_CHECK_MS, self(), check_ebt_stale).
