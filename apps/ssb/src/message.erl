@@ -194,11 +194,35 @@ canonical_sign_props(#message{previous  = Prev,  author    = Auth,
      {~"hash",      Hash},
      {~"content",   Content}].
 
-compute_id(Msg) ->
+compute_id(CanonJson) ->
     ?l2b("%" ++
-        utils:base_64(crypto:hash(sha256, Msg))
+        utils:base_64(crypto:hash(sha256, ssb_hash_bytes(CanonJson)))
         ++
         ".sha256").
+
+%% SSB message IDs are the SHA256 of the canonical JSON hashed the way
+%% ssb-keys does it: Buffer.from(jsonString, 'binary'), i.e. every UTF-16
+%% code unit reduced to its low byte (latin1) — NOT the UTF-8 encoding.
+%% For ASCII the two are identical, so existing ids are unchanged; for
+%% non-ASCII (e.g. the U+202F narrow no-break space macOS puts in
+%% screenshot filenames) they differ, and we must match ssb-keys so that
+%% cross-client references (votes, backlinks, replies) to a non-ASCII
+%% message resolve to the same id.  Signing stays UTF-8 (ssb-keys signs
+%% over Buffer.from(json) with no encoding); only the id hash is latin1.
+ssb_hash_bytes(CanonJson) ->
+    << <<B>> || CP <- unicode:characters_to_list(CanonJson, utf8),
+                B  <- utf16_low_bytes(CP) >>.
+
+%% ssb-keys' 'binary' encoding of one codepoint: a BMP code unit contributes
+%% its low byte; an astral codepoint becomes a UTF-16 surrogate pair, each
+%% surrogate contributing its low byte.
+utf16_low_bytes(CP) when CP =< 16#FFFF ->
+    [CP band 16#FF];
+utf16_low_bytes(CP) ->
+    C  = CP - 16#10000,
+    Hi = 16#D800 bor (C bsr 10),
+    Lo = 16#DC00 bor (C band 16#3FF),
+    [Hi band 16#FF, Lo band 16#FF].
 
 current_time() ->
     erlang:system_time(millisecond).
@@ -301,6 +325,38 @@ bad_msg_test() ->
     F = Cwd ++ "/testdata/" ++ "bad.full",
     {ok, FilBin} = file:read_file(F),
     ?assert(FilBin == encode(decode(FilBin, true))).
+
+%% A real post (feed @ASFlv8..., seq 11) authored in a JS client whose
+%% screenshot-filename mention contains U+202F (NARROW NO-BREAK SPACE, the
+%% char macOS puts before "PM").  ssb-keys hashes the message id as latin1,
+%% so U+202F contributes only its low byte (0x2F); erlbutt formerly hashed
+%% UTF-8 and computed the wrong id (%qlb9...), which broke the vote/backlink
+%% that referenced this post from other clients.  The canonical id is the
+%% latin1 hash: %EWthyy...
+non_ascii_message_id_test() ->
+    NNBSP = <<16#202F/utf8>>,
+    Name  = <<"Screenshot 2026-07-12 at 4.39.17", NNBSP/binary, "PM.png">>,
+    Blob  = <<"&T0i/vYmhT1PNlqQIhj9DRsRbBmzfU+Onp7RaWhC31vg=.sha256">>,
+    Value = iolist_to_binary(
+        ["{\"previous\":\"%7Y5SyM7lLMciLPjjarhxlmR2SXNpN2JLXuU8RbRZsAk=.sha256\",",
+         "\"author\":\"@ASFlv8MHXcuHeRMruDnUPZwMkFTx+t1fYvoP7xWkXRo=.ed25519\",",
+         "\"sequence\":11,\"timestamp\":1784020809354,\"hash\":\"sha256\",",
+         "\"content\":{\"type\":\"post\",",
+         "\"root\":\"%KKkY5A/UZxg1o+ANFVJLaK9jmYTci2H42pvlVYmGNv0=.sha256\",",
+         "\"branch\":\"%eN//hfJI0HwX/3p4dgTXPyGSBOeJpcrG6NUcZUpF9lo=.sha256\",",
+         "\"reply\":{",
+         "\"%KKkY5A/UZxg1o+ANFVJLaK9jmYTci2H42pvlVYmGNv0=.sha256\":",
+         "\"@ASFlv8MHXcuHeRMruDnUPZwMkFTx+t1fYvoP7xWkXRo=.ed25519\",",
+         "\"%eN//hfJI0HwX/3p4dgTXPyGSBOeJpcrG6NUcZUpF9lo=.sha256\":",
+         "\"@PerULA9DgxWbudMHzEv9RuUmasdGwTUcRJSVGZAKt+Q=.ed25519\"},",
+         "\"channel\":null,\"recps\":null,",
+         "\"text\":\"once we can do attachments :)\\n\\n![", Name, "](", Blob, ")\\n\",",
+         "\"mentions\":[{\"link\":\"", Blob, "\",\"name\":\"", Name,
+         "\",\"type\":\"image/png\",\"size\":438087}]},",
+         "\"signature\":\"jkEQX5BlyEJsEOjb9mudFghtRfmrIqmayrgkLpImV7ov1YnRQcrkEARhLRSRwcG1Lmx1X",
+         "+p1k7/cqY3T2CV2Cg==.sig.ed25519\"}"]),
+    #message{id = Id} = decode_value(Value, false),
+    ?assertEqual(<<"%EWthyyv7gnqzXKx0PFjwuEaui1StcwVoQpo9fR1T8ak=.sha256">>, Id).
 
 
 -endif.
