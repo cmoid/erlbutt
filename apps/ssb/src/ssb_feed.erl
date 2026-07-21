@@ -23,6 +23,7 @@
          post_content/2,
          post_private/3,
          store_msg/2,
+         store_msg_checked/2,
          fetch_msg/2,
          fetch_last_msg/1,
          store_ref/2,
@@ -71,6 +72,12 @@ post_private(FeedPid, Content, RecipientIds) ->
 
 store_msg(FeedPid, Msg) ->
     gen_server:call(FeedPid, {store, Msg}, infinity).
+
+%% Like store_msg/2 but rejects a message that does not continue the feed's
+%% chain (wrong `previous`, or a gap).  Used by the untrusted EBT ingest path;
+%% trusted/local callers use store_msg/2.
+store_msg_checked(FeedPid, Msg) ->
+    gen_server:call(FeedPid, {store_checked, Msg}, infinity).
 
 fetch_msg(FeedPid, Key) ->
     gen_server:call(FeedPid, {fetch, Key}).
@@ -152,6 +159,30 @@ handle_call({store, Msg}, _From, #state{last_seq = Before} = State) ->
         false -> skipped
     end,
     {reply, Status, NewState};
+
+handle_call({store_checked, Msg}, _From,
+            #state{last_seq = Before, last_msg = LastMsg, id = FeedId} = State) ->
+    %% Chain-validated store for the untrusted replication path.  erlbutt only
+    %% verified the signature on ingest, so a message whose `previous` linked a
+    %% non-canonical id (the UTF-8/latin1 id bug) would splice a broken chain
+    %% into the log — and lenient peers keep re-gossiping such junk.  Accept only a sequence
+    %% we already hold (store/2 dedups it) or the next sequence whose previous
+    %% matches our current tail.
+    case chain_continues(Msg, State) of
+        false ->
+            #message{sequence = Seq, previous = Prev} = Msg,
+            ?SSB_INFO("feed ~s: rejecting seq ~p — chain break "
+                      "(tail seq ~p id ~p; msg previous ~p)~n",
+                      [FeedId, Seq, Before, LastMsg, Prev]),
+            {reply, skipped, State};
+        true ->
+            NewState = store(Msg, State),
+            Status = case NewState#state.last_seq > Before of
+                true  -> stored;
+                false -> skipped
+            end,
+            {reply, Status, NewState}
+    end;
 
 
 handle_call({fetch, Key}, _From, #state{feed = Feed,
@@ -296,6 +327,27 @@ archive_filename(FeedFile, From, To) ->
     <<FeedFile/binary, ".",
       (integer_to_binary(From))/binary, "-",
       (integer_to_binary(To))/binary, ".gz">>.
+
+%% Whether a received message may be stored: a sequence we already hold (it
+%% will be dedup-skipped), or the very next sequence whose `previous` matches
+%% the id of our current tail.  Guards the received-message path against
+%% chain-broken junk; local authoring (post/2) bypasses this.
+chain_continues(#message{sequence = Seq}, #state{last_seq = LastSeq})
+  when Seq =< LastSeq ->
+    true;
+chain_continues(#message{sequence = Seq, previous = Prev},
+                #state{last_seq = LastSeq, last_msg = LastMsg}) ->
+    Seq =:= LastSeq + 1 andalso same_ref(Prev, LastMsg).
+
+%% Message-id equality that treats every "no previous" spelling (genesis) as
+%% equal to an empty tail, so a genuine genesis (previous = null) is accepted.
+same_ref(A, A) -> true;
+same_ref(A, B) -> is_null_ref(A) andalso is_null_ref(B).
+
+is_null_ref(null)      -> true;
+is_null_ref(nil)       -> true;
+is_null_ref(undefined) -> true;
+is_null_ref(_)         -> false.
 
 store(#message{sequence = Seq},
       #state{last_seq = LastSeq} = State) when Seq =< LastSeq ->
@@ -512,6 +564,7 @@ feed_test_() ->
       fun sequence_increments_test/1,
       fun fetch_last_msg_test/1,
       fun store_msg_dedup_test/1,
+      fun store_msg_checked_chain_test/1,
       fun archive_manual_test/1,
       fun post_after_archive_test/1,
       fun second_archive_naming_test/1,
@@ -584,6 +637,30 @@ store_msg_dedup_test({Pid, FeedId, _}) ->
                               {FeedId, keys:priv_key()}),
         ?assertEqual(stored,  ssb_feed:store_msg(Pid, Msg)),
         ?assertEqual(skipped, ssb_feed:store_msg(Pid, Msg))
+    end.
+
+%% store_msg_checked/2 accepts a genesis and an in-chain successor, but
+%% rejects a (validly signed) message whose `previous` does not link the tail
+%% — the shape of the chain-broken junk lenient peers re-gossip.
+store_msg_checked_chain_test({Pid, FeedId, _}) ->
+    fun() ->
+        Priv = keys:priv_key(),
+        Post = fun(Prev, Seq, T) ->
+                   message:new_msg(Prev, Seq,
+                                   {[{~"type", ~"post"}, {~"text", T}]},
+                                   {FeedId, Priv})
+               end,
+        Gen = Post(null, 1, ~"g"),
+        ?assertEqual(stored,  ssb_feed:store_msg_checked(Pid, Gen)),
+        Two = Post(Gen#message.id, 2, ~"two"),
+        ?assertEqual(stored,  ssb_feed:store_msg_checked(Pid, Two)),
+        %% seq 3 whose previous points at a bogus (non-canonical) id is rejected
+        Bogus = <<"%", (binary:copy(~"A", 43))/binary, "=.sha256">>,
+        Bad   = Post(Bogus, 3, ~"bad"),
+        ?assertEqual(skipped, ssb_feed:store_msg_checked(Pid, Bad)),
+        %% the correct seq 3 (previous = seq 2's id) is still accepted after
+        Good  = Post(Two#message.id, 3, ~"three"),
+        ?assertEqual(stored,  ssb_feed:store_msg_checked(Pid, Good))
     end.
 
 archive_manual_test({Pid, _, _}) ->

@@ -317,12 +317,13 @@ store_message(Body) ->
                             [{Msg#message.author, Msg#message.id}]),
                         error;
                     Pid ->
-                        case ssb_feed:store_msg(Pid, Msg) of
+                        case ssb_feed:store_msg_checked(Pid, Msg) of
                             stored ->
                                 {ok, Msg#message.author, Msg#message.sequence};
                             _ ->
-                                %% Duplicate (already have this seq): don't ack,
-                                %% so we don't re-invite the peer to resend.
+                                %% Duplicate, or a chain-broken message we
+                                %% reject: don't ack, so we don't re-invite the
+                                %% peer to resend.
                                 skipped
                         end
                 end
