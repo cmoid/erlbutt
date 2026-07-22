@@ -103,26 +103,28 @@ cursor_next({segments, [Gz | Rest], Live}) ->
         error     -> cursor_next({segments, Rest, Live})
     end;
 cursor_next({segments, [], Live}) ->
-    case file:open(Live, [read, binary, read_ahead]) of
-        {ok, IoDev} -> cursor_next({live, IoDev});
-        {error, _}  -> eof
-    end;
+    cursor_next({live, Live, 0});
 cursor_next({bin, <<Len:32, Msg:Len/binary, Len:32, _Next:32, Rest/binary>>, K}) ->
     {Msg, {bin, Rest, K}};
 cursor_next({bin, _Rest, K}) ->
     cursor_next(K);
-cursor_next({live, IoDev}) ->
-    case read_record(IoDev) of
-        {ok, Msg} -> {Msg, {live, IoDev}};
-        eof       -> file:close(IoDev), eof
+%% Read the live log positionally (open/pread/close per record) rather than
+%% holding an open file handle.  A fold that interleaves many feeds (the ingest
+%% journal behind createLogStream) would otherwise accumulate one open fd per
+%% feed and exhaust the process's descriptor limit — emfile then crashes
+%% heartbeat and cascades to a node shutdown.  This keeps concurrent fds ~1.
+cursor_next({live, Path, Offset}) ->
+    case pread_record(Path, Offset) of
+        {ok, Msg, Next} -> {Msg, {live, Path, Next}};
+        eof             -> eof
     end;
 cursor_next(eof) ->
     eof.
 
-cursor_close({live, IoDev})       -> file:close(IoDev), ok;
-cursor_close({bin, _, K})         -> cursor_close(K);
-cursor_close({segments, _, _})    -> ok;
-cursor_close(eof)                 -> ok.
+cursor_close({live, _Path, _Offset}) -> ok;   % nothing held open
+cursor_close({bin, _, K})            -> cursor_close(K);
+cursor_close({segments, _, _})       -> ok;
+cursor_close(eof)                    -> ok.
 
 %%%===================================================================
 %%% Internal
@@ -162,14 +164,24 @@ fold_bin(Fun, Acc, <<Len:32, Msg:Len/binary, Len:32, _Next:32, Rest/binary>>) ->
 fold_bin(_Fun, Acc, _Rest) ->
     Acc.
 
-read_record(IoDev) ->
-    case file:read(IoDev, 4) of
-        {ok, <<Len:32>>} ->
-            case file:read(IoDev, Len + 8) of
-                {ok, <<Msg:Len/binary, _Trailer:8/binary>>} -> {ok, Msg};
-                _ -> eof
-            end;
-        _ -> eof
+%% Read one framed record (<<Len:32, Msg:Len, Len:32, Next:32>>) at Offset
+%% without holding the file open, returning the byte offset of the next record.
+pread_record(Path, Offset) ->
+    case file:open(Path, [read, binary, raw]) of
+        {ok, Fd} ->
+            Res = case file:pread(Fd, Offset, 4) of
+                      {ok, <<Len:32>>} ->
+                          case file:pread(Fd, Offset + 4, Len + 8) of
+                              {ok, <<Msg:Len/binary, _Trailer:8/binary>>} ->
+                                  {ok, Msg, Offset + 4 + Len + 8};
+                              _ -> eof
+                          end;
+                      _ -> eof
+                  end,
+            ok = file:close(Fd),
+            Res;
+        {error, _} ->
+            eof
     end.
 
 -ifdef(TEST).
