@@ -77,9 +77,9 @@ fold_refs(Fun, Acc0) ->
 %% held as {Cursor, Pending} where Pending is a read-ahead record that
 %% did not match its ref (a journal hole); it is offered to the next ref.
 stream_messages(Fun, Acc0) ->
-    {Cursors, Acc} =
+    {Cursors, _Warned, Acc} =
         fold_refs(
-          fun({FeedId, Seq}, {Curs, AccIn}) ->
+          fun({FeedId, Seq}, {Curs, Warned, AccIn}) ->
                   C0 = case Curs of
                            #{FeedId := C} -> C;
                            _ ->
@@ -90,13 +90,30 @@ stream_messages(Fun, Acc0) ->
                        end,
                   case next_matching(C0, FeedId, Seq) of
                       {Msg, C1} when is_binary(Msg) ->
-                          {Curs#{FeedId => C1}, Fun(Msg, AccIn)};
+                          {Curs#{FeedId => C1}, Warned, Fun(Msg, AccIn)};
                       {skip, C1} ->
-                          {Curs#{FeedId => C1}, AccIn}
+                          {Curs#{FeedId => C1}, warn_gap(FeedId, Seq, Warned),
+                           AccIn}
                   end
-          end, {#{}, Acc0}),
+          end, {#{}, #{}, Acc0}),
     [feed_store:cursor_close(C) || _ := {C, _} <- Cursors],
     Acc.
+
+%% Log a journal/store gap at most ONCE per feed.  A drifted journal (e.g.
+%% after a wipe/truncate that shrank the store without rebuilding the journal)
+%% can have thousands of refs with no backing record; logging one error per ref
+%% floods the logger hard enough to trip its overload protection and take the
+%% node down.  One line per feed keeps the diagnostic without the flood.
+warn_gap(FeedId, Seq, Warned) ->
+    case Warned of
+        #{FeedId := _} -> Warned;
+        _ ->
+            ?SSB_ERROR("ingest_journal: ~s has journal refs with no store "
+                       "record (first gap at seq ~p; journal is ahead of the "
+                       "feed store — rebuild ingest.journal). Further gaps for "
+                       "this feed are suppressed.", [FeedId, Seq]),
+            Warned#{FeedId => true}
+    end.
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -173,11 +190,12 @@ backfill(File) ->
 %% pending for the next ref rather than being consumed.
 next_matching({Cursor, {PSeq, PMsg}}, _FeedId, Seq) when PSeq =:= Seq ->
     {PMsg, {Cursor, none}};
-next_matching({_Cursor, {PSeq, _PMsg}} = C, FeedId, Seq) when PSeq > Seq ->
-    ?SSB_ERROR("ingest_journal: no record for ~s seq ~p", [FeedId, Seq]),
+%% Read-ahead record is beyond this ref (a store hole): skip the ref, keep the
+%% record pending for a later one.  The caller logs the gap once per feed.
+next_matching({_Cursor, {PSeq, _PMsg}} = C, _FeedId, Seq) when PSeq > Seq ->
     {skip, C};
-next_matching({eof, _}, FeedId, Seq) ->
-    ?SSB_ERROR("ingest_journal: no record for ~s seq ~p", [FeedId, Seq]),
+%% Store exhausted but the journal still has refs: skip.  Caller logs once.
+next_matching({eof, _}, _FeedId, _Seq) ->
     {skip, {eof, none}};
 next_matching({Cursor, _}, FeedId, Seq) ->
     case feed_store:cursor_next(Cursor) of
