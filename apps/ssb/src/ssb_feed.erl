@@ -79,6 +79,8 @@ store_msg(FeedPid, Msg) ->
 store_msg_checked(FeedPid, Msg) ->
     gen_server:call(FeedPid, {store_checked, Msg}, infinity).
 
+%% The message with id Key from this feed's history — the live log first,
+%% then the archived segments — or `not_found` if the feed does not hold it.
 fetch_msg(FeedPid, Key) ->
     gen_server:call(FeedPid, {fetch, Key}).
 
@@ -187,15 +189,7 @@ handle_call({store_checked, Msg}, _From,
 
 handle_call({fetch, Key}, _From, #state{feed = Feed,
                                        msg_cache = Messages} = State) ->
-    Val = ets:lookup(Messages, Key),
-    {Pos, Msg} = feed_get(Feed, Val, Key),
-    case Val of
-        [] ->
-            ets:insert(Messages, {Key, Pos});
-        _Else ->
-            nop
-    end,
-    {reply, message:decode(Msg, false), State};
+    {reply, do_fetch(Key, Feed, Messages), State};
 
 handle_call({fetch_last_msg}, _From, #state{feed = Feed,
                                            msg_cache = Messages} = State) ->
@@ -296,8 +290,12 @@ archive_length() ->
     config:archive_length().
 
 do_archive(#state{id = FeedId, last_seq = LastSeq,
-                  feed = FeedFile} = State) ->
+                  feed = FeedFile, msg_cache = Messages} = State) ->
     {ok, LogData} = file:read_file(FeedFile),
+    %% Every cached offset points into the live log we are about to
+    %% replace; keeping them would send do_fetch scanning a fresh log
+    %% from a stale position.
+    ets:delete_all_objects(Messages),
     %% The segment's range comes from its own content: the first record
     %% of the live log.  (A tracked segment_start used to be guessed at
     %% restart and produced archives whose filenames lied about their
@@ -448,6 +446,46 @@ recover_from_archives(#state{id = FeedId, feed = Feed} = State) ->
             ?SSB_INFO("feed ~s: no live log but archives present; "
                       "recovered last_seq ~p", [FeedId, LastSeq]),
             State#state{last_seq = LastSeq, last_msg = LastId}
+    end.
+
+%% Fetch a message by id: the live log first (a hit's offset is cached in
+%% msg_cache), then the archived segments.  A feed whose history has been
+%% archived is no longer answerable from log.offset alone — before this,
+%% such an id fell through feed_get/3's not_found and badmatched here,
+%% crashing a gen_server shared by every caller of that feed.  Misses now
+%% return not_found.
+do_fetch(Key, Feed, Messages) ->
+    Live = try feed_get(Feed, ets:lookup(Messages, Key), Key)
+           catch _:_ -> not_found      %% torn log, stale offset, bad frame
+           end,
+    case Live of
+        {Pos, Msg} when is_integer(Pos) ->
+            ets:insert(Messages, {Key, Pos}),
+            message:decode(Msg, false);
+        _NotInLiveLog ->
+            fetch_archived(Key, Feed)
+    end.
+
+%% Scan the whole feed store (archived segments oldest first, then the
+%% live log) for Key.  Positions inside an archive are not live-log
+%% offsets, so a hit here is deliberately not cached in msg_cache.
+fetch_archived(Key, Feed) ->
+    Dir = filename:dirname(?b2l(Feed)),
+    scan_cursor(feed_store:cursor_open(Dir), Key).
+
+scan_cursor(Cursor, Key) ->
+    case feed_store:cursor_next(Cursor) of
+        eof ->
+            feed_store:cursor_close(Cursor),
+            not_found;
+        {Msg, Next} ->
+            case extract_key(Msg) of
+                Key ->
+                    feed_store:cursor_close(Next),
+                    message:decode(Msg, false);
+                _Other ->
+                    scan_cursor(Next, Key)
+            end
     end.
 
 feed_get(Feed, [], Key) ->
