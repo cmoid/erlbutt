@@ -603,7 +603,9 @@ feed_test_() ->
       fun fetch_last_msg_test/1,
       fun store_msg_dedup_test/1,
       fun store_msg_checked_chain_test/1,
+      fun fetch_missing_msg_test/1,
       fun archive_manual_test/1,
+      fun fetch_archived_msg_test/1,
       fun post_after_archive_test/1,
       fun second_archive_naming_test/1,
       fun restart_then_archive_naming_test/1,
@@ -699,6 +701,35 @@ store_msg_checked_chain_test({Pid, FeedId, _}) ->
         %% the correct seq 3 (previous = seq 2's id) is still accepted after
         Good  = Post(Two#message.id, 3, ~"three"),
         ?assertEqual(stored,  ssb_feed:store_msg_checked(Pid, Good))
+    end.
+
+%% An id this feed does not hold answers not_found — it must not badmatch
+%% and take down the feed process, which is shared by every caller.
+fetch_missing_msg_test({Pid, _, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"only message"),
+        Absent = <<"%", (binary:copy(~"A", 43))/binary, "=.sha256">>,
+        ?assertEqual(not_found, ssb_feed:fetch_msg(Pid, Absent)),
+        ?assert(is_process_alive(Pid)),
+        %% the live log is still readable afterwards
+        #message{id = Key} = ssb_feed:fetch_last_msg(Pid),
+        #message{content = ~"only message"} = ssb_feed:fetch_msg(Pid, Key)
+    end.
+
+%% Once history is archived it is no longer in log.offset, but fetch_msg
+%% must still resolve it — previously this returned not_found from the
+%% live-log scan and crashed the feed on the {Pos, Msg} badmatch.
+fetch_archived_msg_test({Pid, _, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"archived one"),
+        #message{id = Key} = ssb_feed:fetch_last_msg(Pid),
+        ok = ssb_feed:post_content(Pid, ~"archived two"),
+        {ok, _} = ssb_feed:archive(Pid),
+        %% the live log now holds only the archive-genesis message
+        #message{content = {Props}} = ssb_feed:fetch_last_msg(Pid),
+        ?assertEqual(~"archive", proplists:get_value(~"type", Props)),
+        #message{content = ~"archived one"} = ssb_feed:fetch_msg(Pid, Key),
+        ?assert(is_process_alive(Pid))
     end.
 
 archive_manual_test({Pid, _, _}) ->
