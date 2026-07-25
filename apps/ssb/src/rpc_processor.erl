@@ -315,10 +315,17 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"get"],
                   {Ps} when is_list(Ps) -> proplists:get_value(~"private", Ps) =:= true;
                   _                     -> false
               end,
-    case MsgId =/= undefined andalso mess_auth:get(MsgId) of
-        Author when is_binary(Author) ->
-            FeedPid = utils:find_or_create_feed_pid(Author),
-            Msg  = ssb_feed:fetch_msg(FeedPid, MsgId),
+    Found = case MsgId =/= undefined andalso mess_auth:get(MsgId) of
+                Author when is_binary(Author) ->
+                    FeedPid = utils:find_or_create_feed_pid(Author),
+                    %% may be not_found: the id->author index can outlive
+                    %% the message (a truncated or wiped feed)
+                    ssb_feed:fetch_msg(FeedPid, MsgId);
+                _ ->
+                    not_found
+            end,
+    case Found of
+        #message{} = Msg ->
             %% ssb-db get returns the bare message value, not the
             %% {key, value, timestamp} envelope (the renderer reads
             %% value.content directly).  With {private: true} a boxed
@@ -327,7 +334,7 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"get"],
             Flags  = create_flags(0, 0, 2),   %% async reply: stream=0
             Header = create_header(Flags, size(Body), -ReqNo),
             utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
-        _ ->
+        not_found ->
             ErrMsg = utils:error_msg(~"Error", ~"message not found"),
             Flags  = create_flags(0, 1, 2),
             Header = create_header(Flags, size(ErrMsg), -ReqNo),

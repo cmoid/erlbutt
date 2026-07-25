@@ -113,6 +113,11 @@ is_about(#message{content = {ContentProps}}) ->
             Type == ~"about"
     end.
 
+%% A message we do not hold (ssb_feed:fetch_msg/2 miss) has no branches —
+%% tangle walks routinely reference ids that never replicated to us.
+is_branch(not_found) ->
+    false;
+
 is_branch(#message{content = Content}) when is_binary(Content) ->
     false;
 
