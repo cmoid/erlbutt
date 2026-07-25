@@ -262,7 +262,10 @@ fetch_encoded(MsgId) ->
         Author ->
             try
                 Pid = utils:find_or_create_feed_pid(Author),
-                message:encode(ssb_feed:fetch_msg(Pid, MsgId))
+                case ssb_feed:fetch_msg(Pid, MsgId) of
+                    not_found -> undefined;
+                    Msg       -> message:encode(Msg)
+                end
             catch _:_ -> undefined
             end
     end.

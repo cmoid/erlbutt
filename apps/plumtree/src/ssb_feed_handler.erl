@@ -35,13 +35,18 @@ retrieve(MsgId) ->
         not_found ->
             not_found;
         Author ->
-            Pid     = utils:find_or_create_feed_pid(Author),
-            Msg     = ssb_feed:fetch_msg(Pid, MsgId),
-            Encoded = message:encode(Msg),
-            {PropList} = utils:nat_decode(Encoded),
-            Value   = proplists:get_value(~"value", PropList),
-            Payload = iolist_to_binary(
-                message:ssb_encoder(Value, fun message:ssb_encoder/3,
-                                    [pretty, use_nil])),
-            {ok, Payload}
+            Pid = utils:find_or_create_feed_pid(Author),
+            %% the id->author index can outlive the message itself
+            case ssb_feed:fetch_msg(Pid, MsgId) of
+                not_found ->
+                    not_found;
+                Msg ->
+                    Encoded = message:encode(Msg),
+                    {PropList} = utils:nat_decode(Encoded),
+                    Value   = proplists:get_value(~"value", PropList),
+                    Payload = iolist_to_binary(
+                        message:ssb_encoder(Value, fun message:ssb_encoder/3,
+                                            [pretty, use_nil])),
+                    {ok, Payload}
+            end
     end.
