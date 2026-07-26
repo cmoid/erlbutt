@@ -255,6 +255,7 @@ bl_setup() ->
     {ok, _} = mess_auth:start_link(),
     {ok, _} = blobs:start_link(),
     {ok, _} = ssb_feed_sup:start_link(),
+    {ok, _} = ssb_store:start_link(),
     {ok, _} = view_manager:start_link(),
     {ok, _} = ssb_links:start_link(),
     ok = bl_wait(250),
@@ -271,7 +272,7 @@ bl_wait(N) ->
 
 bl_teardown(Home) ->
     [catch gen_server:stop(Name)
-     || Name <- [ssb_links, view_manager, ssb_feed_sup,
+     || Name <- [ssb_links, view_manager, ssb_store, ssb_feed_sup,
                  blobs, mess_auth, keys, config]],
     case Home of
         ignore -> ok;

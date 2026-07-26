@@ -39,11 +39,21 @@
 %% IDS ARE INTERNED to integers.  Measured on a 2.5M-message corpus, the
 %% edge set stores three 53-byte ids per row and lands at 1.33 GB
 %% indexed; interning takes that to roughly a fifth (§8).  The intern
-%% table is also the msgid -> id mapping the eventual store needs, so it
-%% is not a private optimisation.
+%% table is also the msgid -> id mapping the store needs, so it is not a
+%% private optimisation.
 %%
-%% This is ETS today and moves to the embedded store in §8 item 11; the
-%% shape here is chosen to survive that move unchanged.
+%% Interning is SQLite's own rowid: `num INTEGER PRIMARY KEY` IS the
+%% rowid, so an upsert with RETURNING both assigns and reads the number
+%% in one statement, and no counter is kept anywhere.
+%%
+%% WRITES ARE ONE TRANSACTION PER MESSAGE: a message's own id and each of
+%% its targets are interned and its rows inserted inside a single commit.
+%% Measured at ~15 us, because WAL with synchronous=NORMAL does not fsync
+%% per commit — about 36 s of commit overhead across a 2.5M-message
+%% refold.  More than the ~6 s a single bulk load would cost, and less
+%% than the price of buffering, which would need view_manager to signal
+%% batch boundaries and would leave a just-stored reply invisible to
+%% backlinks until the next flush.
 -module(ssb_links).
 
 -behaviour(gen_server).
@@ -74,19 +84,28 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
          handle_info/2, terminate/2, code_change/3]).
 
-%% Id <-> integer, both directions, plus the counter and the completeness
-%% marker (atom keys, which never collide with the binary ids).
--define(IDS,   ssb_links_ids).
--define(NAMES, ssb_links_names).
-%% bag: {ToInt, FromInt, Field, Kind}
--define(LINKS, ssb_links_edges).
+%% kind column: what the referenced id names.  Stored as an integer so a
+%% row is four small values rather than four strings.
+-define(K_MSG,  0).
+-define(K_FEED, 1).
+-define(K_BLOB, 2).
 
--define(NEXT, '$next').
--define(COMPLETE, '$complete').
-
--define(TABLES, [{?IDS,   ~"links_ids.tab"},
-                 {?NAMES, ~"links_names.tab"},
-                 {?LINKS, ~"links_edges.tab"}]).
+-define(SCHEMA_VERSION, 1).
+-define(DDL,
+        [%% num is the rowid, so inserting a new id assigns its number and
+         %% the UNIQUE index on id is the lookup in the other direction —
+         %% SQLite does the interning, no counter is kept anywhere.
+         "CREATE TABLE IF NOT EXISTS link_ids("
+         "  num INTEGER PRIMARY KEY,"
+         "  id  TEXT NOT NULL UNIQUE);",
+         %% the primary key both deduplicates an edge restated in the same
+         %% field and indexes the only query shape there is: by target.
+         "CREATE TABLE IF NOT EXISTS links("
+         "  to_id   INTEGER NOT NULL,"
+         "  from_id INTEGER NOT NULL,"
+         "  field   TEXT NOT NULL,"
+         "  kind    INTEGER NOT NULL,"
+         "  PRIMARY KEY (to_id, from_id, field)) WITHOUT ROWID;"]).
 
 %%%===================================================================
 %%% API
@@ -98,40 +117,42 @@ start_link() ->
 %% Ids of the messages that reference Target anywhere in their content.
 %% One message can reach the same target through several fields (a reply
 %% names its root as both `root` and `branch`), which is two edges but
-%% one referrer — so the source ids are deduplicated here, keeping the
-%% order they were first indexed in.
+%% one referrer — hence DISTINCT.
+%%
+%% Ordered by from_id, the number assigned when a referrer was first
+%% interned, so referrers come back oldest-indexed first.  tangle reads
+%% sibling replies in this order.
 refs(Target) when is_binary(Target) ->
-    dedup([name_of(From) || {_To, From, _Field, _Kind} <- edges_to(Target)]).
+    [Id || [Id] <- rows("SELECT DISTINCT n.id FROM links l"
+                        "  JOIN link_ids t ON t.num = l.to_id"
+                        "  JOIN link_ids n ON n.num = l.from_id"
+                        " WHERE t.id = ?1 ORDER BY l.from_id", [Target])].
 
 %% The same, restricted to references made in a particular field —
 %% "who named this as their `root`" rather than "who mentioned it".
 refs(Target, Field) when is_binary(Target), is_binary(Field) ->
-    dedup([name_of(From) || {_To, From, F, _Kind} <- edges_to(Target),
-                            F =:= Field]).
-
-dedup(Ids) ->
-    dedup(Ids, #{}, []).
-
-dedup([], _Seen, Acc) ->
-    lists:reverse(Acc);
-dedup([Id | Rest], Seen, Acc) when is_map_key(Id, Seen) ->
-    dedup(Rest, Seen, Acc);
-dedup([Id | Rest], Seen, Acc) ->
-    dedup(Rest, Seen#{Id => true}, [Id | Acc]).
-
-edges_to(Target) ->
-    case id_of(Target) of
-        {ok, To} -> try ets:lookup(?LINKS, To) catch error:badarg -> [] end;
-        miss     -> []
-    end.
+    [Id || [Id] <- rows("SELECT DISTINCT n.id FROM links l"
+                        "  JOIN link_ids t ON t.num = l.to_id"
+                        "  JOIN link_ids n ON n.num = l.from_id"
+                        " WHERE t.id = ?1 AND l.field = ?2"
+                        " ORDER BY l.from_id", [Target, Field])].
 
 %% Total edges held.  For the admin surface and for tests that want to
 %% assert the index is not silently empty.
 edge_count() ->
-    try ets:info(?LINKS, size) of
-        N when is_integer(N) -> N;
-        _                    -> 0
-    catch error:badarg -> 0
+    case rows("SELECT count(*) FROM links", []) of
+        [[N]] -> N;
+        _     -> 0
+    end.
+
+%% A query before the store is up answers empty rather than raising: a
+%% view read sits on the path of RPC handlers and tangle walks, and a
+%% missing index means "no data", never a crash.
+rows(Sql, Params) ->
+    try ssb_store:q(Sql, Params) of
+        L when is_list(L) -> L;
+        _                 -> []
+    catch _:_ -> []
     end.
 
 %%%===================================================================
@@ -202,22 +223,23 @@ view_version() -> 1.
 view_class() -> core.
 
 view_load() ->
-    case has_marker() of
+    case ssb_store:complete(?MODULE) of
         true  -> ok;
         false -> empty
     end.
 
 view_reset() ->
-    [catch ets:delete_all_objects(Tab) || {Tab, _} <- ?TABLES],
+    _ = ssb_store:clear_complete(?MODULE),
+    %% link_ids goes too: the numbers are only meaningful relative to the
+    %% edges that use them, and a refold re-interns everything it sees.
+    _ = ssb_store:exec("DELETE FROM links;"),
+    _ = ssb_store:exec("DELETE FROM link_ids;"),
     ok.
 
+%% Rows are durable as they are written; only the completeness marker is
+%% recorded here (see ssb_store on why that marker is still needed).
 view_save() ->
-    ets:insert(?IDS, {?COMPLETE, true}),
-    [begin
-         File = table_file(Name),
-         filelib:ensure_dir(File),
-         ok = ets:tab2file(Tab, ?b2l(File))
-     end || {Tab, Name} <- ?TABLES],
+    _ = ssb_store:mark_complete(?MODULE),
     ok.
 
 %% Index one message's outgoing references.  Self-references are dropped:
@@ -228,9 +250,14 @@ view_entry(#message{id = MsgId, content = Content}) when is_binary(MsgId) ->
         [] ->
             ok;
         Links ->
-            From = intern(MsgId),
-            [ets:insert(?LINKS, {intern(Target), From, Field, Kind})
-             || {Target, Field, Kind} <- Links],
+            _ = ssb_store:transaction(
+                  fun(Db) ->
+                          From = intern(Db, MsgId),
+                          [insert_edge(Db, intern(Db, Target), From,
+                                       Field, kind_num(Kind))
+                           || {Target, Field, Kind} <- Links],
+                          ok
+                  end),
             %% Same event shape the silkpurse backlinks view publishes, so
             %% its live streams can be repointed here without changing
             %% their subscribers.
@@ -242,44 +269,35 @@ view_entry(_) ->
 %%%===================================================================
 %%% Interning
 %%%===================================================================
+
+%% The id's number, assigning one if this is the first time it is seen.
+%% The upsert-with-RETURNING does both in a single statement; the
+%% no-op DO UPDATE exists only so that an existing row still RETURNs.
 %%
-%% Writes happen only in view_entry, which view_manager runs in one
-%% process, so the lookup-then-insert below cannot race.  Readers only
-%% ever look up.
+%% Runs inside view_entry's transaction, so a message's ids and its edges
+%% are interned and inserted atomically or not at all.
+intern(Db, Bin) ->
+    [[Num]] = esqlite3:q(Db,
+                         "INSERT INTO link_ids(id) VALUES(?1)"
+                         " ON CONFLICT(id) DO UPDATE SET id=excluded.id"
+                         " RETURNING num", [Bin]),
+    Num.
 
-intern(Bin) ->
-    case ets:lookup(?IDS, Bin) of
-        [{Bin, Int}] ->
-            Int;
-        [] ->
-            Int = ets:update_counter(?IDS, ?NEXT, 1, {?NEXT, 0}),
-            ets:insert(?IDS, {Bin, Int}),
-            ets:insert(?NAMES, {Int, Bin}),
-            Int
-    end.
+insert_edge(Db, To, From, Field, Kind) ->
+    [] = esqlite3:q(Db, "INSERT OR IGNORE INTO links(to_id,from_id,field,kind)"
+                        " VALUES(?1,?2,?3,?4)", [To, From, Field, Kind]),
+    ok.
 
-%% Look up without creating: a query for an id we have never seen must
-%% not grow the intern table.
-id_of(Bin) ->
-    try ets:lookup(?IDS, Bin) of
-        [{Bin, Int}] -> {ok, Int};
-        []           -> miss
-    catch error:badarg -> miss              %% table absent: not running
-    end.
-
-name_of(Int) ->
-    try ets:lookup(?NAMES, Int) of
-        [{Int, Bin}] -> Bin;
-        []           -> undefined
-    catch error:badarg -> undefined
-    end.
+kind_num(msg)  -> ?K_MSG;
+kind_num(feed) -> ?K_FEED;
+kind_num(blob) -> ?K_BLOB.
 
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
 init([]) ->
-    [restore_or_create(Tab, Name, kind_of(Tab)) || {Tab, Name} <- ?TABLES],
+    ok = ssb_store:declare(?MODULE, ?SCHEMA_VERSION, ?DDL),
     {ok, #{}, {continue, register_view}}.
 
 handle_continue(register_view, State) ->
@@ -314,28 +332,6 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal
 %%%===================================================================
 
-kind_of(?LINKS) -> bag;
-kind_of(_)      -> set.
-
-restore_or_create(Tab, Name, Kind) ->
-    %% table_file needs config; without it (bare eunit setups) start
-    %% fresh — view_load/0 then reports empty and the manager rebuilds.
-    Restored = try ets:file2tab(?b2l(table_file(Name)))
-               catch _:_ -> {error, no_config}
-               end,
-    case Restored of
-        {ok, Tab} -> ok;
-        _         -> ets:new(Tab, [Kind, named_table, public])
-    end.
-
-table_file(Name) ->
-    <<(config:ssb_repo_loc())/binary, "views/", Name/binary>>.
-
-has_marker() ->
-    try ets:lookup(?IDS, ?COMPLETE) =/= []
-    catch error:badarg -> false
-    end.
-
 %%%===================================================================
 %%% Tests
 %%%===================================================================
@@ -361,14 +357,14 @@ setup() ->
     ok = filelib:ensure_dir(Home ++ "/"),
     application:set_env(ssb, ssb_home, Home),
     {ok, _} = config:start_link("no-such-cfg"),
-    [catch ets:new(Tab, [kind_of(Tab), named_table, public])
-     || {Tab, _} <- ?TABLES],
+    {ok, _} = ssb_store:start_link(),
+    ok = ssb_store:declare(?MODULE, ?SCHEMA_VERSION, ?DDL),
     Home.
 
 cleanup(Home) ->
     catch gen_server:stop(?MODULE),
+    catch gen_server:stop(ssb_store),
     catch gen_server:stop(config),
-    [catch ets:delete(Tab) || {Tab, _} <- ?TABLES],
     os:cmd("rm -rf " ++ Home),
     application:unset_env(ssb, ssb_home),
     ok.
@@ -414,15 +410,22 @@ indexes_and_interns() ->
                                       content = {[{~"root", Target}]}}),
     ?assertEqual([Source], refs(Target)),
     ?assertEqual([], refs(msg(~"never-seen"))),
-    %% the ids really are interned: the edge table holds integers
-    [{To, From, _F, _K}] = ets:lookup(?LINKS, element(2, id_of(Target))),
+    %% the edge row really does hold integers, not the ids themselves —
+    %% which is the whole point of interning
+    [[To, From]] = rows("SELECT l.to_id, l.from_id FROM links l"
+                        "  JOIN link_ids t ON t.num = l.to_id"
+                        " WHERE t.id = ?1", [Target]),
     ?assert(is_integer(To) andalso is_integer(From)),
-    %% and interning is stable
-    ?assertEqual(id_of(Target), id_of(Target)),
+    ?assertNotEqual(To, From),
+    %% interning is stable: the same id keeps its number
+    [[N1]] = rows("SELECT num FROM link_ids WHERE id=?1", [Target]),
+    {events, _} = view_entry(#message{id = msg(~"source1b"),
+                                      content = {[{~"root", Target}]}}),
+    ?assertEqual([[N1]], rows("SELECT num FROM link_ids WHERE id=?1", [Target])),
     %% a query for an unknown id must not grow the intern table
-    Before = ets:info(?IDS, size),
+    [[Before]] = rows("SELECT count(*) FROM link_ids", []),
     ?assertEqual([], refs(msg(~"still-never-seen"))),
-    ?assertEqual(Before, ets:info(?IDS, size)).
+    ?assertEqual([[Before]], rows("SELECT count(*) FROM link_ids", [])).
 
 filters_by_field() ->
     Target = msg(~"target2"),
@@ -449,7 +452,9 @@ dedups_multi_field_referrer() ->
     %% both edges are really there, they just collapse in refs/1
     ?assertEqual([Reply], refs(Target, ~"root")),
     ?assertEqual([Reply], refs(Target, ~"branch")),
-    ?assertEqual(2, length(edges_to(Target))).
+    ?assertEqual([[2]], rows("SELECT count(*) FROM links l"
+                             "  JOIN link_ids t ON t.num = l.to_id"
+                             " WHERE t.id = ?1", [Target])).
 
 %% A message naming its own id is not an edge.
 drops_self_reference() ->
@@ -485,6 +490,7 @@ int_setup() ->
     {ok, _} = mess_auth:start_link(),
     {ok, _} = blobs:start_link(),
     {ok, _} = ssb_feed_sup:start_link(),
+    {ok, _} = ssb_store:start_link(),
     {ok, _} = view_manager:start_link(),
     {ok, _} = start_link(),
     ok = int_wait(),
@@ -492,9 +498,8 @@ int_setup() ->
 
 int_cleanup(Home) ->
     [catch gen_server:stop(N)
-     || N <- [?MODULE, view_manager, ssb_feed_sup, blobs, mess_auth, keys,
-              config]],
-    [catch ets:delete(Tab) || {Tab, _} <- ?TABLES],
+     || N <- [?MODULE, view_manager, ssb_store, ssb_feed_sup, blobs,
+              mess_auth, keys, config]],
     case Home of
         ignore -> ok;
         _ -> os:cmd("rm -rf " ++ Home),
