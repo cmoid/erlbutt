@@ -281,6 +281,9 @@ do_archive(#state{id = FeedId, last_seq = LastSeq,
     GzData = zlib:gzip(LogData),
     ArchiveFile = archive_filename(FeedFile, From, LastSeq),
     ok = file:write_file(ArchiveFile, GzData),
+    %% Index the segment while its uncompressed bytes are still in hand,
+    %% so later lookups need no decompress-and-scan (feed_store hints).
+    _ = feed_store:write_hint(?b2l(ArchiveFile), LogData),
     BlobId = blobs:store(GzData),
     ok = file:delete(FeedFile),
     Content = {[{~"type",          ~"archive"},
@@ -415,10 +418,7 @@ recover_from_archives(#state{id = FeedId, feed = Feed} = State) ->
 %% crashing a gen_server shared by every caller of that feed.  Misses now
 %% return not_found.
 do_fetch(Key, Feed, Messages) ->
-    Live = try feed_get(Feed, ets:lookup(Messages, Key), Key)
-           catch _:_ -> not_found      %% torn log, stale offset, bad frame
-           end,
-    case Live of
+    case live_lookup(Key, Feed, ets:lookup(Messages, Key)) of
         {Pos, Msg} when is_integer(Pos) ->
             ets:insert(Messages, {Key, Pos}),
             message:decode(Msg, false);
@@ -426,26 +426,30 @@ do_fetch(Key, Feed, Messages) ->
             fetch_archived(Key, Feed)
     end.
 
-%% Scan the whole feed store (archived segments oldest first, then the
-%% live log) for Key.  Positions inside an archive are not live-log
-%% offsets, so a hit here is deliberately not cached in msg_cache.
+%% Scan the live log for Key, starting from the cached offset when there
+%% is one.  A cached offset can go stale if the live log is replaced
+%% behind our back (do_archive clears the cache, but truncate_feed.escript
+%% and friends do not), which would make a message we hold look missing —
+%% so a cached-offset miss is retried from the start before giving up.
+live_lookup(Key, Feed, []) ->
+    try feed_get(Feed, [], Key)
+    catch _:_ -> not_found              %% torn log, bad frame
+    end;
+live_lookup(Key, Feed, [{Key, _Pos}] = Cached) ->
+    case (try feed_get(Feed, Cached, Key) catch _:_ -> not_found end) of
+        {Pos, Msg} when is_integer(Pos) -> {Pos, Msg};
+        _Miss                           -> live_lookup(Key, Feed, [])
+    end.
+
+%% Look Key up in the feed's archived segments.  feed_store consults each
+%% segment's hint file, so only a segment that actually contains Key is
+%% decompressed.  Offsets inside an archive are not live-log positions, so
+%% a hit here is deliberately not cached in msg_cache.
 fetch_archived(Key, Feed) ->
     Dir = filename:dirname(?b2l(Feed)),
-    scan_cursor(feed_store:cursor_open(Dir), Key).
-
-scan_cursor(Cursor, Key) ->
-    case feed_store:cursor_next(Cursor) of
-        eof ->
-            feed_store:cursor_close(Cursor),
-            not_found;
-        {Msg, Next} ->
-            case extract_key(Msg) of
-                Key ->
-                    feed_store:cursor_close(Next),
-                    message:decode(Msg, false);
-                _Other ->
-                    scan_cursor(Next, Key)
-            end
+    case feed_store:find_in_archives(Dir, Key) of
+        {ok, Msg}  -> message:decode(Msg, false);
+        not_found  -> not_found
     end.
 
 feed_get(Feed, [], Key) ->
@@ -567,6 +571,9 @@ feed_test_() ->
       fun fetch_missing_msg_test/1,
       fun archive_manual_test/1,
       fun fetch_archived_msg_test/1,
+      fun archive_writes_hint_test/1,
+      fun missing_hint_rebuilt_test/1,
+      fun corrupt_hint_tolerated_test/1,
       fun post_after_archive_test/1,
       fun second_archive_naming_test/1,
       fun restart_then_archive_naming_test/1,
@@ -741,6 +748,65 @@ post_after_archive_test({Pid, _, _}) ->
         #message{previous = GenesisId, sequence = AfterSeq} = ssb_feed:fetch_last_msg(Pid),
         ?assert(AfterSeq =:= GenesisSeq + 1)
     end.
+
+%% Archiving writes a .hint beside the .gz, listing every message in the
+%% segment with the offset it starts at in the uncompressed frames.
+archive_writes_hint_test({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"hinted one"),
+        #message{id = K1} = ssb_feed:fetch_last_msg(Pid),
+        ok = ssb_feed:post_content(Pid, ~"hinted two"),
+        #message{id = K2} = ssb_feed:fetch_last_msg(Pid),
+        {ok, _} = ssb_feed:archive(Pid),
+        [Gz]  = archive_paths(FeedId),
+        Hint  = feed_store:hint_file(Gz),
+        ?assert(filelib:is_file(Hint)),
+        {ok, Index} = feed_store:read_hint(Gz),
+        ?assertEqual([K1, K2], [Id || {Id, _Seq, _Off, _Len} <- Index]),
+        ?assertEqual([1, 2],   [S  || {_Id, S, _Off, _Len} <- Index]),
+        %% the hinted offsets really do address those records
+        ?assertMatch(#message{content = ~"hinted one"},
+                     ssb_feed:fetch_msg(Pid, K1)),
+        ?assertMatch(#message{content = ~"hinted two"},
+                     ssb_feed:fetch_msg(Pid, K2))
+    end.
+
+%% A segment archived before hints existed has none; the first lookup
+%% rebuilds it from the segment and writes it for next time.
+missing_hint_rebuilt_test({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"pre-hint era"),
+        #message{id = Key} = ssb_feed:fetch_last_msg(Pid),
+        {ok, _} = ssb_feed:archive(Pid),
+        [Gz] = archive_paths(FeedId),
+        Hint = feed_store:hint_file(Gz),
+        ok = file:delete(Hint),
+        ?assertNot(filelib:is_file(Hint)),
+        ?assertMatch(#message{content = ~"pre-hint era"},
+                     ssb_feed:fetch_msg(Pid, Key)),
+        ?assert(filelib:is_file(Hint))          %% healed itself
+    end.
+
+%% A corrupt hint must not make a message we hold look missing: it is
+%% treated as absent and rebuilt.
+corrupt_hint_tolerated_test({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"survives a bad hint"),
+        #message{id = Key} = ssb_feed:fetch_last_msg(Pid),
+        {ok, _} = ssb_feed:archive(Pid),
+        [Gz] = archive_paths(FeedId),
+        Hint = feed_store:hint_file(Gz),
+        ok = file:write_file(Hint, <<"not a term at all">>),
+        ?assertMatch(#message{content = ~"survives a bad hint"},
+                     ssb_feed:fetch_msg(Pid, Key)),
+        %% rebuilt over the garbage
+        ?assertMatch({ok, [{Key, 1, _, _}]}, feed_store:read_hint(Gz))
+    end.
+
+%% Full paths of a feed's archived segments.
+archive_paths(FeedId) ->
+    Dir = filename:dirname(?b2l(feed_file(FeedId))),
+    lists:sort(filelib:wildcard(filename:join(Dir, "log.offset.*.gz"))).
 
 archive_files(FeedId) ->
     Dir = filename:dirname(?b2l(feed_file(FeedId))),

@@ -25,7 +25,11 @@
          last_frame/1,
          cursor_open/1,
          cursor_next/1,
-         cursor_close/1]).
+         cursor_close/1,
+         hint_file/1,
+         write_hint/2,
+         read_hint/1,
+         find_in_archives/2]).
 
 %%%===================================================================
 %%% Folds
@@ -127,6 +131,136 @@ cursor_close({segments, _, _})       -> ok;
 cursor_close(eof)                    -> ok.
 
 %%%===================================================================
+%%% Hint files
+%%%===================================================================
+%%
+%% A hint file sits beside each archived segment and says what is in it
+%% without anyone having to decompress it:
+%%
+%%   log.offset.<From>-<To>.gz    the frozen frames, gzipped
+%%   log.offset.<From>-<To>.hint  [{MsgId, Seq, Offset, Len}]
+%%
+%% Offset is the position of the record's leading Len field within the
+%% *uncompressed* frame stream, so a hit extracts with one gunzip and a
+%% binary:part — no fold.  Borrowed from bitcask, where hint files let
+%% the keydir be rebuilt at startup without reading values
+%% (doc/persistence.md §6).
+%%
+%% Written when do_archive/1 freezes a segment, and built on demand for
+%% segments archived before this existed, so an upgrading node heals
+%% itself one segment at a time rather than needing a migration.
+
+%% The hint path for a segment: log.offset.1-2.gz -> log.offset.1-2.hint.
+%% Segment globs match "*.gz" only, so hints are never mistaken for data.
+hint_file(GzPath) ->
+    filename:rootname(GzPath, ".gz") ++ ".hint".
+
+%% Index Data (a segment's uncompressed frames) and write it beside
+%% GzPath.  Temp-then-rename so a crash mid-write cannot leave a
+%% truncated hint that would later parse as a short segment.
+write_hint(GzPath, Data) ->
+    File = hint_file(GzPath),
+    Tmp  = File ++ ".tmp",
+    Bin  = term_to_binary({hint, 1, index_of(Data)}, [compressed]),
+    case file:write_file(Tmp, Bin) of
+        ok ->
+            case file:rename(Tmp, File) of
+                ok -> ok;
+                {error, R} ->
+                    ?SSB_ERROR("feed_store: hint rename failed ~s: ~p",
+                               [File, R]),
+                    _ = file:delete(Tmp),
+                    error
+            end;
+        {error, R} ->
+            ?SSB_ERROR("feed_store: hint write failed ~s: ~p", [Tmp, R]),
+            error
+    end.
+
+%% The index for a segment: read the hint if there is a usable one,
+%% otherwise build it from the segment and write it for next time.
+%% Returns {ok, [{MsgId, Seq, Offset, Len}]} or error.
+read_hint(GzPath) ->
+    case load_hint(hint_file(GzPath)) of
+        {ok, Index} ->
+            {ok, Index};
+        error ->
+            case read_archive(GzPath) of
+                {ok, Data} ->
+                    _ = write_hint(GzPath, Data),   %% best effort
+                    {ok, index_of(Data)};
+                error ->
+                    error
+            end
+    end.
+
+%% A corrupt, truncated or old-format hint is not an error — it just
+%% means "no hint", and read_hint/1 rebuilds it.
+load_hint(File) ->
+    try
+        {ok, Bin} = file:read_file(File),
+        {hint, 1, Index} = binary_to_term(Bin),
+        true = is_list(Index),
+        {ok, Index}
+    catch _:_ ->
+            error
+    end.
+
+%% [{MsgId, Seq, Offset, Len}] for a segment's uncompressed frames.
+index_of(Data) ->
+    index_of(Data, 0, []).
+
+index_of(<<Len:32, Msg:Len/binary, Len:32, _Next:32, Rest/binary>>,
+         Offset, Acc) ->
+    Entry = try
+                #message{id = Id, sequence = Seq} = message:decode(Msg, false),
+                [{Id, Seq, Offset, Len}]
+            catch _:_ -> []      %% undecodable record: absent from the hint
+            end,
+    index_of(Rest, Offset + 4 + Len + 8, Entry ++ Acc);
+index_of(_Rest, _Offset, Acc) ->
+    lists:reverse(Acc).
+
+%% The raw bytes of MsgId from Dir's archived segments, or not_found.
+%%
+%% Hints make this a search over small sidecar files instead of a
+%% decompress-and-scan of every segment: only the segment whose hint
+%% names MsgId is ever gunzipped.
+find_in_archives(Dir, MsgId) ->
+    find_in_archives_1(archive_segments(Dir), MsgId).
+
+find_in_archives_1([], _MsgId) ->
+    not_found;
+find_in_archives_1([Gz | Rest], MsgId) ->
+    case read_hint(Gz) of
+        {ok, Index} ->
+            case lists:keyfind(MsgId, 1, Index) of
+                {MsgId, _Seq, Offset, Len} -> extract(Gz, Offset, Len, MsgId);
+                false                      -> find_in_archives_1(Rest, MsgId)
+            end;
+        error ->
+            find_in_archives_1(Rest, MsgId)
+    end.
+
+%% Pull one record out of a segment at a hinted offset.  A hint that does
+%% not line up with the segment (hand-edited archive, truncated file) is
+%% treated as absent rather than trusted.
+extract(Gz, Offset, Len, MsgId) ->
+    case read_archive(Gz) of
+        {ok, Data} when byte_size(Data) >= Offset + 4 + Len ->
+            case Data of
+                <<_:Offset/binary, Len:32, Msg:Len/binary, _/binary>> ->
+                    {ok, Msg};
+                _ ->
+                    ?SSB_ERROR("feed_store: hint for ~s in ~s does not match "
+                               "the segment; ignoring it", [MsgId, Gz]),
+                    not_found
+            end;
+        _ ->
+            not_found
+    end.
+
+%%%===================================================================
 %%% Internal
 %%%===================================================================
 
@@ -190,6 +324,30 @@ pread_record(Path, Offset) ->
 frame(Msg) ->
     Len = byte_size(Msg),
     <<Len:32, Msg/binary, Len:32, 0:32>>.
+
+hint_naming_test() ->
+    ?assertEqual("/x/log.offset.1-2.hint", hint_file("/x/log.offset.1-2.gz")),
+    %% hints must not look like segments to the "*.gz" glob
+    ?assertNotEqual(".gz", filename:extension(hint_file("a/log.offset.3-9.gz"))).
+
+%% The whole point of a hint is that it answers without the segment being
+%% decompressed.  Write one for a .gz that does not exist at all: if
+%% read_hint/1 still returns the index, it cannot have read the segment.
+hint_is_authoritative_test() ->
+    Dir = "/tmp/feed_store_hint_" ++
+          integer_to_list(erlang:unique_integer([positive])),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    Gz = filename:join(Dir, "log.offset.1-2.gz"),
+    Index = [{~"%one.sha256", 1, 0, 40}, {~"%two.sha256", 2, 52, 40}],
+    ok = file:write_file(hint_file(Gz),
+                         term_to_binary({hint, 1, Index}, [compressed])),
+    ?assertNot(filelib:is_file(Gz)),
+    ?assertEqual({ok, Index}, read_hint(Gz)),
+    %% and with neither hint nor segment there is nothing to report
+    ok = file:delete(hint_file(Gz)),
+    ?assertEqual(error, read_hint(Gz)),
+    os:cmd("rm -rf " ++ Dir),
+    ok.
 
 last_frame_test_() ->
     Setup = fun() ->
