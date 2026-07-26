@@ -61,7 +61,12 @@
                 msg_cache,
                 %% has the whole live log been indexed into msg_cache in
                 %% this run?  Reset whenever the live log is replaced.
-                indexed = false}).
+                indexed = false,
+                %% undefined, or {FirstRejectedSeq, Count} while a peer is
+                %% offering messages that do not link our tail.  Keeps the
+                %% rejection log to one line per stall instead of one per
+                %% message.
+                chain_break}).
 %%%===================================================================
 %%% API
 %%%===================================================================
@@ -165,18 +170,14 @@ handle_call({store_checked, Msg}, _From,
     %% matches our current tail.
     case chain_continues(Msg, State) of
         false ->
-            #message{sequence = Seq, previous = Prev} = Msg,
-            ?SSB_INFO("feed ~s: rejecting seq ~p — chain break "
-                      "(tail seq ~p id ~p; msg previous ~p)~n",
-                      [FeedId, Seq, Before, LastMsg, Prev]),
-            {reply, skipped, State};
+            {reply, skipped, note_chain_break(Msg, LastMsg, Before, FeedId, State)};
         true ->
             NewState = store(Msg, State),
             Status = case NewState#state.last_seq > Before of
                 true  -> stored;
                 false -> skipped
             end,
-            {reply, Status, NewState}
+            {reply, Status, clear_chain_break(Status, FeedId, NewState)}
     end;
 
 
@@ -288,6 +289,37 @@ archive_filename(FeedFile, From, To) ->
     <<FeedFile/binary, ".",
       (integer_to_binary(From))/binary, "-",
       (integer_to_binary(To))/binary, ".gz">>.
+
+%% A peer offered a message that does not link our tail.
+%%
+%% One line per stall, not per message.  A peer whose EBT clock has run
+%% ahead of us re-offers every message from its position onward, and at
+%% one log line each that is thousands of lines that bury the one fact
+%% worth knowing.  The first line carries the diagnosis — where the hole
+%% is, how big, and why it will not close by itself — and the rest are
+%% counted silently until the feed recovers.
+note_chain_break(#message{sequence = Seq, previous = Prev}, LastMsg, Tail,
+                 FeedId, #state{chain_break = undefined} = State) ->
+    ?SSB_INFO("feed ~s: STALLED at seq ~p — a peer is offering seq ~p, a gap "
+              "of ~p message(s).  Its EBT clock is ahead of ours and will not "
+              "rewind, so nothing will close this gap until that peer's clock "
+              "for us is reset (stop the peer, delete its stored clock for our "
+              "id, restart).  Tail id ~p; offered previous ~p.  Further "
+              "rejections for this feed are counted, not logged.~n",
+              [FeedId, Tail, Seq, max(Seq - Tail - 1, 0), LastMsg, Prev]),
+    State#state{chain_break = {Seq, 1}};
+note_chain_break(_Msg, _LastMsg, _Tail, _FeedId,
+                 #state{chain_break = {First, N}} = State) ->
+    State#state{chain_break = {First, N + 1}}.
+
+%% A store succeeded, so the stall is over — report what it cost.
+clear_chain_break(stored, FeedId, #state{chain_break = {First, N},
+                                         last_seq = Seq} = State) ->
+    ?SSB_INFO("feed ~s: resumed at seq ~p after rejecting ~p message(s) "
+              "from seq ~p~n", [FeedId, Seq, N, First]),
+    State#state{chain_break = undefined};
+clear_chain_break(_Status, _FeedId, State) ->
+    State.
 
 %% Whether a received message may be stored: a sequence we already hold (it
 %% will be dedup-skipped), or the very next sequence whose `previous` matches
@@ -553,6 +585,7 @@ feed_test_() ->
       fun fetch_last_msg_test/1,
       fun store_msg_dedup_test/1,
       fun store_msg_checked_chain_test/1,
+      fun chain_break_is_counted_then_cleared_test/1,
       fun no_profile_or_contacts_files_test/1,
       fun fetch_missing_msg_test/1,
       fun archive_manual_test/1,
@@ -736,6 +769,39 @@ post_after_archive_test({Pid, _, _}) ->
         #message{previous = GenesisId, sequence = AfterSeq} = ssb_feed:fetch_last_msg(Pid),
         ?assert(AfterSeq =:= GenesisSeq + 1)
     end.
+
+%% A run of chain-broken messages is logged once and counted, and the
+%% count is cleared when the feed resumes.  The rejections must still all
+%% be REJECTED — suppressing the log must not suppress the check.
+chain_break_is_counted_then_cleared_test({Pid, FeedId, _}) ->
+    fun() ->
+        Priv = keys:priv_key(),
+        Post = fun(Prev, Seq, T) ->
+                   message:new_msg(Prev, Seq,
+                                   {[{~"type", ~"post"}, {~"text", T}]},
+                                   {FeedId, Priv})
+               end,
+        Gen = Post(null, 1, ~"g"),
+        ?assertEqual(stored, ssb_feed:store_msg_checked(Pid, Gen)),
+        ?assertEqual(undefined, feed_chain_break(Pid)),
+        %% a peer whose clock has run ahead: seqs 5..9, none of which link
+        Bogus = <<"%", (binary:copy(~"A", 43))/binary, "=.sha256">>,
+        [?assertEqual(skipped,
+                      ssb_feed:store_msg_checked(Pid, Post(Bogus, S, ~"ahead")))
+         || S <- lists:seq(5, 9)],
+        %% one stall, five rejections counted against it
+        ?assertEqual({5, 5}, feed_chain_break(Pid)),
+        %% the feed is untouched by any of them
+        ?assertMatch(#message{sequence = 1}, ssb_feed:fetch_last_msg(Pid)),
+        %% the real successor still lands, and clears the stall
+        ?assertEqual(stored,
+                     ssb_feed:store_msg_checked(Pid, Post(Gen#message.id, 2, ~"two"))),
+        ?assertEqual(undefined, feed_chain_break(Pid)),
+        ?assertMatch(#message{sequence = 2}, ssb_feed:fetch_last_msg(Pid))
+    end.
+
+feed_chain_break(Pid) ->
+    element(#state.chain_break, sys:get_state(Pid)).
 
 %% A restarted feed has an empty index; the first fetch indexes the whole
 %% live log in one pass, so every message becomes readable by id — not

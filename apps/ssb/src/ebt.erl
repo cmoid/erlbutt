@@ -329,9 +329,30 @@ store_message(Body) ->
                 end
         end
     catch
-        _:Reason ->
-            ?SSB_INFO("EBT: failed to decode/store message: ~p~n", [Reason]),
+        Class:Reason ->
+            %% Name the feed and sequence.  Without them this line says a
+            %% message was dropped but not which one, and a single
+            %% undecodable message silently stalls its whole feed: every
+            %% later message fails the chain check against a tail that
+            %% never advanced past the hole.  Reconstructing that from the
+            %% resulting rejection spam took an hour once; it should take
+            %% one line.
+            ?SSB_INFO("EBT: dropped message ~s: ~p:~p — this feed will "
+                      "stall here until the peer resends from our tail~n",
+                      [describe(Body), Class, Reason]),
             error
+    end.
+
+%% Best-effort "which message was that" for one we could not handle.
+%% Deliberately its own decode with validation off: whatever broke the
+%% real one may well break this too, so it must never raise.
+describe(Body) ->
+    try
+        {Props} = utils:nat_decode(Body),
+        io_lib:format("~s seq ~p",
+                      [?pgv(~"author", Props), ?pgv(~"sequence", Props)])
+    catch _:_ ->
+        io_lib:format("(undecodable, ~p bytes)", [byte_size(Body)])
     end.
 
 check_feed_cnt(Cnt) when Cnt rem 1000 =:= 0 ->
