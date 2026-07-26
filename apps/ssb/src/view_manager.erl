@@ -42,6 +42,7 @@
          checkpoint/2,
          views/0,
          views/1,
+         info/0,
          save/0]).
 
 %% gen_server callbacks
@@ -122,6 +123,15 @@ views(Class) when Class =:= core; Class =:= app; Class =:= any ->
     catch exit:{noproc, _} -> []
     end.
 
+%% [{Mod, Class, Version, FeedsCheckpointed}] for every registered view,
+%% in delivery order.  An accessor rather than letting callers read the
+%% checkpoint table directly — it is owned by this process and other apps
+%% (admin) should not depend on its shape.
+info() ->
+    try gen_server:call(?SERVER, info, infinity)
+    catch exit:{noproc, _} -> []
+    end.
+
 %% Flush every view's durable state and the checkpoint table to disk.
 save() ->
     gen_server:call(?SERVER, save, infinity).
@@ -173,6 +183,10 @@ handle_call({rebuild, Mod}, _From, #vm_state{views = Views} = State) ->
 
 handle_call({views, Class}, _From, #vm_state{views = Views} = State) ->
     {reply, [M || {M, C} <- Views, Class =:= any orelse C =:= Class], State};
+
+handle_call(info, _From, #vm_state{views = Views} = State) ->
+    {reply, [{Mod, Class, stored_version(Mod), feeds_checkpointed(Mod)}
+             || {Mod, Class} <- Views], State};
 
 handle_call({ingest, Msg}, _From, #vm_state{views = Views} = State) ->
     [deliver(Mod, Msg) || {Mod, _Class} <- Views],
@@ -331,6 +345,13 @@ stored_version(Mod) ->
     case ets:lookup(?CKPT, {Mod, version}) of
         [{_, V}] -> V;
         []       -> undefined
+    end.
+
+%% How many feeds Mod holds a checkpoint for — a cheap "how far along is
+%% this view" number for the admin surface.
+feeds_checkpointed(Mod) ->
+    try ets:select_count(?CKPT, [{{{Mod, feed, '_'}, '_'}, [], [true]}])
+    catch error:badarg -> 0
     end.
 
 %%%===================================================================

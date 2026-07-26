@@ -1,0 +1,33 @@
+%% SPDX-License-Identifier: GPL-2.0-only
+%%
+%% Copyright (C) 2026 Charles Moid
+%%
+%% The control plane: an owner-only muxrpc namespace for operating a
+%% running node (doc/persistence.md §5).
+%%
+%% Before this app, administering erlbutt meant either a remsh session
+%% calling internal modules by hand, or a client like maxbutt reaching
+%% into the BEAM over Erlang distribution — which coupled it to module
+%% names and let it rot silently when they changed.  Everything here is
+%% reachable over muxrpc instead, so every client gets it: sbutt, a UI
+%% settings pane, maxbutt once it is ported.
+%%
+%% SCOPE: the control plane, NOT BEAM introspection.  Process listings,
+%% memory, code reload and tracing genuinely need same-node access and
+%% stay on remsh/distel — putting them behind muxrpc would be both
+%% awkward and a much larger attack surface.
+%%
+%% PERMISSIONS: every method is `owner`.  Nothing here is ever `anyone`
+%% or `member`.  This is the first surface where a wrong permission class
+%% is a security problem rather than a bug — views.rebuild from an
+%% arbitrary peer is a free denial of service, blocking view_manager for
+%% the length of a full refold.
+{application, admin,
+ [{description, "Owner-only control plane for operating an erlbutt node"},
+  {vsn, {cmd, "echo 0.1-`git describe --always --tags`"}},
+  {registered, [admin_sup]},
+  {mod, {admin_app, []}},
+  {applications, [kernel, stdlib, ssb]},
+  {env, []},
+  {licenses, ["GPL-2.0-only"]}
+ ]}.
