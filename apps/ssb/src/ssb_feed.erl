@@ -3,9 +3,17 @@
 %% Copyright (C) 2023 Charles Moid
 %%
 %% Per-feed gen_server.  Each SSB author gets one instance, managed by
-%% ssb_feed_sup.  Owns four append-only files: log.offset (all messages),
-%% profile (about messages only), contacts (contact/follow messages only),
+%% ssb_feed_sup.  Owns two append-only files: log.offset (all messages)
 %% and references (tangle arc records).
+%%
+%% It used to own two more — profile (about messages) and contacts
+%% (follow/block messages) — which duplicated message bodies into
+%% per-feed logs so that a lazy loader could rebuild the name and follow
+%% graphs from them.  That loader went away when friends became an
+%% ssb_view, leaving the files written on every store and read by
+%% nobody.  Dropped; the views are the index now (doc/persistence.md §3).
+%% Stale profile/contacts files in existing feed directories are inert —
+%% nothing globs them — and can be removed at leisure.
 -module(ssb_feed).
 
 -ifdef(TEST).
@@ -29,8 +37,6 @@
          store_ref/2,
          references/3,
          foldl/3,
-         fold_contacts/3,
-         profile_name/1,
          archive/1]).
 
 %% gen_server callbacks
@@ -46,8 +52,6 @@
                 last_msg = null,
                 last_seq = 0,
                 feed,
-                profile,
-                contacts,
                 refs,
                 msg_cache}).
 %%%===================================================================
@@ -98,14 +102,6 @@ references(FeedPid, MsgId, RootId) ->
 foldl(FeedPid, Fun, Acc) ->
     gen_server:call(FeedPid, {foldl, Fun, Acc}, infinity).
 
-fold_contacts(FeedPid, Fun, Acc) ->
-    gen_server:call(FeedPid, {fold_contacts, Fun, Acc}, infinity).
-
-%% Return the most recent self-chosen display name from the feed's profile,
-%% or undefined if none has been set.
-profile_name(FeedPid) ->
-    gen_server:call(FeedPid, profile_name, infinity).
-
 archive(FeedPid) ->
     gen_server:call(FeedPid, archive, infinity).
 
@@ -115,11 +111,9 @@ archive(FeedPid) ->
 %%%===================================================================
 init([FeedId]) ->
     process_flag(trap_exit, true),
-    {Feed, Profile, Contacts, Refs} = init_directories(FeedId),
+    {Feed, Refs} = init_directories(FeedId),
     State = #state{id = FeedId,
                    feed = Feed,
-                   profile = Profile,
-                   contacts = Contacts,
                    refs = Refs,
                    msg_cache = ets:new(messages, [])},
     %% Register in the global feed registry when running under ssb_feed_sup.
@@ -217,24 +211,7 @@ handle_call({refs, MsgId, TangleId}, _From, #state{refs = Refs} = State) ->
     {reply, Result, State};
 
 handle_call({foldl, Fun, Acc}, _From, #state{feed = Feed} = State) ->
-    {reply, utils:fold_log_file(Fun, Acc, Feed), State};
-
-handle_call({fold_contacts, Fun, Acc}, _From, #state{contacts = Contacts} = State) ->
-    {reply, utils:fold_log_file(Fun, Acc, Contacts), State};
-
-handle_call(profile_name, _From, #state{id = Id, profile = Profile} = State) ->
-    Name = utils:fold_log_file(
-        fun(MsgData, Acc) ->
-            try
-                #message{content = {Props}} = message:decode(MsgData, false),
-                case {?pgv(~"about", Props), ?pgv(~"name", Props)} of
-                    {Id, N} when is_binary(N) -> N;
-                    _                         -> Acc
-                end
-            catch _:_ -> Acc
-            end
-        end, undefined, Profile),
-    {reply, Name, State}.
+    {reply, utils:fold_log_file(Fun, Acc, Feed), State}.
 
 handle_cast({store_ref, Arrow}, #state{refs = Refs} = State) ->
     write_msg(Arrow, Refs),
@@ -352,25 +329,12 @@ store(#message{sequence = Seq},
     %% Already have this sequence or earlier — skip silently.
     State;
 store(#message{id = Id, sequence = Seq, author = Auth} = Msg,
-      #state{feed = Feed,
-             profile = Profile,
-             contacts = Contacts} = State) ->
+      #state{feed = Feed} = State) ->
     mess_auth:put(Id, Auth),
     write_msg(Msg, Feed),
     %% arrival-order ref; the message body lives only in the feed's own log
     ingest_journal:append(Auth, Seq),
     utils:update_refs(Msg),
-    case social_msg:is_about(Msg) of
-        true -> write_msg(Msg, Profile);
-        _    -> ok
-    end,
-    %% The contacts file holds all contact messages — follows and blocks —
-    %% so friends can lazily load both graphs from it on first query.
-    case social_msg:is_follow(Msg) =/= nope
-         orelse social_msg:is_block(Msg) =/= nope of
-        true  -> write_msg(Msg, Contacts);
-        false -> ok
-    end,
     social_msg:dispatch(Msg),
     view_manager:ingest(Msg),
     State#state{last_msg = Id, last_seq = Seq}.
@@ -395,14 +359,10 @@ write_msg(Msg, Store) ->
 init_directories(FeedId) ->
     FeedDir = utils:feed_dir(FeedId),
     Feed = <<FeedDir/binary,~"/"/binary,~"log.offset"/binary>>,
-    Profile = <<FeedDir/binary,~"/"/binary,~"profile"/binary>>,
-    Contacts = <<FeedDir/binary,~"/"/binary,~"contacts"/binary>>,
     Refs = <<FeedDir/binary,~"/"/binary,~"references"/binary>>,
     filelib:ensure_dir(Feed),
-    filelib:ensure_dir(Profile),
-    filelib:ensure_dir(Contacts),
     filelib:ensure_dir(Refs),
-    {Feed, Profile, Contacts, Refs}.
+    {Feed, Refs}.
 
 %% Only feed corresponding to the owner of the peer can post.
 %% All the other feeds are only meant to be read
@@ -572,8 +532,8 @@ has_target(Msg, Id, RootId) ->
 
 open_file(File) ->
     %% NOTE: do NOT use the `sync` flag here. It forces an fsync on every
-    %% file:write, and a stored message can hit several files (per-feed
-    %% log plus profile/contacts) — i.e.
+    %% file:write, and a stored message can hit more than one file (the
+    %% per-feed log, plus a references entry in each linked feed) — i.e.
     %% several fsyncs per stored message. On Linux that is ~60ms each, which
     %% throttled EBT replication to ~4 msgs/sec and left peers stuck in
     %% "Downloading new messages"/"Scuttling…" during a full-DB sync. Plain
