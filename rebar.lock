@@ -1,16 +1,12 @@
-{"1.2.0",
 [{<<"enacl">>,
   {git,"https://github.com/cmoid/enacl",
        {ref,"3be2ed2e4ee1fdfbd73c04207c0b572fcde49720"}},
   0},
- {<<"esqlite">>,{pkg,<<"esqlite">>,<<"0.9.0">>},0},
+ {<<"esqlite">>,
+  {git,"https://github.com/cmoid/esqlite",
+       {ref,"5c8d590d8eb70de17dd2c64dfc7502f4fd2fcba8"}},
+  0},
  {<<"ranch">>,
   {git,"https://github.com/ninenines/ranch",
        {ref,"ebf216e91ef2ae54d378234062db949d95f01c0d"}},
-  0}]}.
-[
-{pkg_hash,[
- {<<"esqlite">>, <<"23960E182234D0300F946066C6FA9F3E06951ABF2FD36E07F1FD18F40B8624E0">>}]},
-{pkg_hash_ext,[
- {<<"esqlite">>, <<"CCF72258A4EE152EC7AD92AA9A03552EB6CA1B06B65C93AD5B6E55C302E05855">>}]}
-].
+  0}].

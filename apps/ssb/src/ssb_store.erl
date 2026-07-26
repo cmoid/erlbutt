@@ -58,6 +58,12 @@
 -define(SERVER, ?MODULE).
 -define(HANDLE, {?MODULE, db}).      %% persistent_term key for the connection
 
+%% How long SQLite waits out a lock before reporting busy, and how many
+%% times we then retry a step ourselves.
+-define(BUSY_TIMEOUT_MS, 5000).
+-define(BUSY_RETRIES, 5).
+-define(BUSY_SLEEP_MS, 50).
+
 -record(st, {db, file}).
 
 %%%===================================================================
@@ -160,10 +166,37 @@ insert_many(Sql, Rows) when is_list(Rows) ->
               lists:foreach(
                 fun(Row) ->
                         ok = esqlite3:bind(Stmt, Row),
-                        '$done' = esqlite3:step(Stmt),
+                        ok = step_done(Stmt, ?BUSY_RETRIES),
                         ok = esqlite3:reset(Stmt)
                 end, Rows)
       end).
+
+%% Step a statement to completion.
+%%
+%% This is the one place we call step/1 directly, so it is the one place
+%% that can see '$busy' as a value rather than as a case_clause from
+%% inside esqlite3:q/3.  The busy_timeout PRAGMA should mean we never get
+%% here, so reaching a retry at all is worth noticing; exhausting them
+%% fails the transaction, which rolls back cleanly.
+%%
+%% A statement with a RETURNING clause yields rows before '$done', so
+%% they are drained rather than treated as an error.
+step_done(_Stmt, 0) ->
+    error({sqlite_busy, retries_exhausted});
+step_done(Stmt, Retries) ->
+    case esqlite3:step(Stmt) of
+        '$done' ->
+            ok;
+        Row when is_list(Row) ->
+            step_done(Stmt, Retries);          %% RETURNING row; keep going
+        '$busy' ->
+            ?SSB_ERROR("ssb_store: SQLITE_BUSY past the ~p ms timeout; "
+                       "retrying (~p left)", [?BUSY_TIMEOUT_MS, Retries - 1]),
+            timer:sleep(?BUSY_SLEEP_MS),
+            step_done(Stmt, Retries - 1);
+        {error, _} = E ->
+            error({sqlite_step_failed, E})
+    end.
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -182,6 +215,22 @@ init([]) ->
     ok = esqlite3:exec(Db, "PRAGMA journal_mode=WAL;"),
     ok = esqlite3:exec(Db, "PRAGMA synchronous=NORMAL;"),
     ok = esqlite3:exec(Db, "PRAGMA foreign_keys=ON;"),
+    %% Let SQLite wait out a lock itself instead of handing us SQLITE_BUSY.
+    %%
+    %% This matters more than it looks.  esqlite3:step/1 can return
+    %% '$busy', but esqlite3:q/3 does not handle it — its fetchall loop
+    %% matches only a row, '$done' and {error, _}, so a busy statement
+    %% raises case_clause.  A busy READ would then be swallowed by the
+    %% views' try/catch and read as "no data"; a busy WRITE would take
+    %% this server down with it.  With a busy handler installed, SQLite
+    %% retries internally and only reports busy after the timeout, which
+    %% in practice it never reaches: one connection, one writer.
+    %%
+    %% The case it does cover is a second connection holding the write
+    %% lock — someone opening store.db with the sqlite3 CLI on a running
+    %% node, say.
+    ok = esqlite3:exec(Db, "PRAGMA busy_timeout=" ++
+                           integer_to_list(?BUSY_TIMEOUT_MS) ++ ";"),
     ok = esqlite3:exec(Db,
         "CREATE TABLE IF NOT EXISTS ssb_schema("
         "  name TEXT PRIMARY KEY,"
@@ -225,14 +274,17 @@ handle_call({declare, Name, Version, DDL}, _From, #st{db = Db} = St) ->
     end;
 
 handle_call({exec, Sql}, _From, #st{db = Db} = St) ->
-    {reply, esqlite3:exec(Db, Sql), St};
+    {reply, guarded(fun() -> esqlite3:exec(Db, Sql) end), St};
 
 handle_call({write, Sql, Params}, _From, #st{db = Db} = St) ->
-    Reply = case esqlite3:q(Db, Sql, Params) of
-                []              -> ok;
-                {error, _} = E  -> E;
-                Other           -> Other
-            end,
+    Reply = guarded(
+              fun() ->
+                      case esqlite3:q(Db, Sql, Params) of
+                          []              -> ok;
+                          {error, _} = E  -> E;
+                          Other           -> Other
+                      end
+              end),
     {reply, Reply, St};
 
 handle_call({transaction, Fun}, _From, #st{db = Db} = St) ->
@@ -260,6 +312,22 @@ db() ->
     case persistent_term:get(?HANDLE, undefined) of
         undefined -> error(ssb_store_not_running);
         Db        -> Db
+    end.
+
+%% Run a statement without letting it take the server down.
+%%
+%% This server owns the one connection and publishes its handle in
+%% persistent_term, so a raise here is not one failed write — it is a
+%% store-wide outage that every view then reads as "no data".  esqlite3
+%% raises for at least two reachable reasons: a case_clause on '$busy'
+%% (its fetchall loop has no clause for it) and a badmatch on malformed
+%% SQL.  Both are reported, not fatal.
+guarded(Fun) ->
+    try Fun()
+    catch Class:Reason:Stack ->
+            ?SSB_ERROR("ssb_store: statement failed: ~p:~p~n~p",
+                       [Class, Reason, Stack]),
+            {error, {Class, Reason}}
     end.
 
 %% BEGIN/COMMIT around Fun; ROLLBACK and report on failure.
@@ -298,6 +366,8 @@ store_test_() ->
               ?_test(version_bump_reapplies()),
               ?_test(batch_insert_and_query()),
               ?_test(transaction_rolls_back()),
+              ?_test(busy_timeout_is_set()),
+              ?_test(bad_sql_does_not_kill_the_store()),
               ?_test(reads_run_concurrently())]
      end}.
 
@@ -369,6 +439,27 @@ transaction_rolls_back() ->
     ?assertEqual(Before, whereis(?SERVER)),
     ?assertEqual(ok, insert_many("INSERT INTO t_roll VALUES(?1)", [[4]])),
     ?assertEqual([[3]], q("SELECT count(*) FROM t_roll")).
+
+%% A busy handler must be installed: without one, esqlite3:q/3 raises a
+%% case_clause on '$busy' rather than returning it, which would surface
+%% as a silently empty read or a dead store.
+busy_timeout_is_set() ->
+    ?assertEqual([[?BUSY_TIMEOUT_MS]], q("PRAGMA busy_timeout")).
+
+%% A statement that raises inside the server is reported to the caller,
+%% not fatal — the server owns the one connection, so killing it over a
+%% single bad statement would take every view's reads down with it.
+bad_sql_does_not_kill_the_store() ->
+    Before = whereis(?SERVER),
+    ?assertMatch({error, _}, exec("THIS IS NOT SQL;")),
+    ?assertMatch({error, _}, write("INSERT INTO nosuchtable VALUES(?1)", [1])),
+    ?assertEqual(Before, whereis(?SERVER)),
+    ?assert(available()),
+    %% still usable afterwards
+    ok = declare(after_bad_sql, 1,
+                 ["CREATE TABLE IF NOT EXISTS t_after(a INTEGER);"]),
+    ok = insert_many("INSERT INTO t_after VALUES(?1)", [[1]]),
+    ?assertEqual([[1]], q("SELECT count(*) FROM t_after")).
 
 %% Reads run in the caller, so several processes query at once — this is
 %% what makes a store-backed view as cheap to read as an ETS-backed one.
