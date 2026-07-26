@@ -43,6 +43,7 @@
          views/0,
          views/1,
          info/0,
+         caught_up/1,
          save/0]).
 
 %% gen_server callbacks
@@ -53,12 +54,19 @@
 -define(CKPT, ssb_view_checkpoints).
 -define(PG_SCOPE, ssb_views).
 -define(SAVE_EVERY_MS, 60_000).
+%% Feeds folded per catch-up chunk, and the sweep count past which we stop
+%% chasing a store that is growing faster than we can fold it.
+-define(CATCH_UP_FEEDS, 64).
+-define(CATCH_UP_MAX_PASSES, 8).
 
 %% Registered views as [{Mod, core | app}], in delivery order: every core
 %% view before every app view, each group in registration order.  Core
 %% views are protocol infrastructure an app view may fold against, so they
 %% must see a message first (doc/persistence.md §5).
--record(vm_state, {views = []}).
+-record(vm_state, {views = [],
+                   %% #{Mod => true} for views whose catch-up fold is
+                   %% still running; they receive no ingests until done.
+                   catching = #{}}).
 
 %%%===================================================================
 %%% API
@@ -70,13 +78,19 @@ start_link() ->
 %% Register a view module.  If its stored version matches
 %% Mod:view_version() and Mod:view_load() reports surviving state, the
 %% view is caught up from its checkpoints; otherwise it is reset and
-%% rebuilt from the whole log.  Synchronous: when this returns, the
-%% view is current.
+%% refolded from the whole log.
+%%
+%% Returns as soon as the catch-up is SCHEDULED, not when it finishes —
+%% the fold runs in chunks in this server's message loop so that ingest
+%% and every other call keep being served while it runs.  Poll
+%% caught_up/1 if you need the view complete.
 register_view(Mod) when is_atom(Mod) ->
     gen_server:call(?SERVER, {register_view, Mod}, infinity).
 
 %% Wipe a registered view's derived state and refold it from the whole
-%% log — the recovery hammer for a corrupted or suspect index.
+%% log — the recovery hammer for a corrupted or suspect index.  Returns
+%% as soon as the refold has been scheduled; poll caught_up/1 to know
+%% when it has finished.
 rebuild(Mod) when is_atom(Mod) ->
     gen_server:call(?SERVER, {rebuild, Mod}, infinity).
 
@@ -110,6 +124,14 @@ checkpoint(ViewMod, FeedId) ->
         [{_, Seq}] -> Seq;
         []         -> 0
     catch error:badarg -> 0
+    end.
+
+%% Has Mod finished its catch-up fold?  Registration returns before the
+%% fold does, so anything that needs the view complete (a test, a status
+%% display) asks here.
+caught_up(Mod) ->
+    try gen_server:call(?SERVER, {caught_up, Mod}, infinity)
+    catch exit:{noproc, _} -> false
     end.
 
 %% Registered views in delivery order (core first).
@@ -164,22 +186,31 @@ handle_call({register_view, Mod}, _From, #vm_state{views = Views} = State) ->
             Class   = ssb_view:class(Mod),
             StoredV = stored_version(Mod),
             CodeV   = Mod:view_version(),
-            case StoredV =:= CodeV andalso Mod:view_load() =:= ok of
-                true ->
-                    catch_up(Mod);
-                false ->
-                    ?SSB_INFO("view_manager: rebuilding ~p ~p (stored ~p, code ~p)",
-                              [Class, Mod, StoredV, CodeV]),
-                    rebuild_view(Mod)
-            end,
-            {reply, ok, State#vm_state{views = insert_view(Mod, Class, Views)}}
+            State1 =
+                case StoredV =:= CodeV andalso Mod:view_load() =:= ok of
+                    true ->
+                        start_catch_up(Mod, State);
+                    false ->
+                        ?SSB_INFO("view_manager: rebuilding ~p ~p "
+                                  "(stored ~p, code ~p)",
+                                  [Class, Mod, StoredV, CodeV]),
+                        reset_view(Mod),
+                        start_catch_up(Mod, State)
+                end,
+            {reply, ok, State1#vm_state{views = insert_view(Mod, Class, Views)}}
     end;
 
 handle_call({rebuild, Mod}, _From, #vm_state{views = Views} = State) ->
     case lists:keymember(Mod, 1, Views) of
-        true  -> {reply, rebuild_view(Mod), State};
-        false -> {reply, {error, not_registered}, State}
+        true ->
+            reset_view(Mod),
+            {reply, ok, start_catch_up(Mod, State)};
+        false ->
+            {reply, {error, not_registered}, State}
     end;
+
+handle_call({caught_up, Mod}, _From, #vm_state{catching = Catching} = State) ->
+    {reply, not maps:is_key(Mod, Catching), State};
 
 handle_call({views, Class}, _From, #vm_state{views = Views} = State) ->
     {reply, [M || {M, C} <- Views, Class =:= any orelse C =:= Class], State};
@@ -188,13 +219,97 @@ handle_call(info, _From, #vm_state{views = Views} = State) ->
     {reply, [{Mod, Class, stored_version(Mod), feeds_checkpointed(Mod)}
              || {Mod, Class} <- Views], State};
 
-handle_call({ingest, Msg}, _From, #vm_state{views = Views} = State) ->
-    [deliver(Mod, Msg) || {Mod, _Class} <- Views],
+%% A view still catching up is deliberately skipped: its fold reads the
+%% store, and store/2 writes the message before calling here, so the fold
+%% will see it.  Delivering it now would be actively wrong — deliver/2
+%% would advance the checkpoint to this sequence, and every earlier
+%% message the fold has not reached yet would then be skipped as
+%% already-covered, leaving a permanent hole in the view.
+handle_call({ingest, Msg}, _From,
+            #vm_state{views = Views, catching = Catching} = State) ->
+    [deliver(Mod, Msg) || {Mod, _Class} <- Views,
+                          not maps:is_key(Mod, Catching)],
     {reply, ok, State};
 
 handle_call(save, _From, #vm_state{views = Views} = State) ->
     save_all(Views),
     {reply, ok, State}.
+
+%%%===================================================================
+%%% Chunked catch-up
+%%%===================================================================
+%%
+%% catch_up used to run inside the register_view call, which meant the
+%% manager was blocked for the whole fold — and because ssb_feed:store/2
+%% calls ingest/1 synchronously, replication stalled with it.  Measured
+%% at ~28 s for a 2.5M-message store (doc/persistence.md §8), with every
+%% other view's registration queued behind it.
+%%
+%% Now registration returns immediately and the fold runs in the
+%% manager's own message loop, a few feeds at a time, so ingest and the
+%% other calls interleave with it.
+%%
+%% Correctness comes from two rules: a catching-up view receives no
+%% ingests (see handle_call({ingest, ...})), and the fold keeps sweeping
+%% until a whole pass delivers nothing.  The second rule closes the race
+%% where a feed the sweep has already passed gains a message while later
+%% feeds are still being folded.
+
+start_catch_up(Mod, #vm_state{catching = Catching} = State) ->
+    self() ! {catch_up, Mod, feed_store:feed_dirs(), 0, 1,
+              erlang:monotonic_time(millisecond)},
+    State#vm_state{catching = Catching#{Mod => true}}.
+
+%% Fold one chunk of feeds, then either continue, sweep again, or finish.
+do_catch_up(Mod, Dirs, Delivered, Pass, T0, State) ->
+    {Chunk, Rest} = split_chunk(chunk_size(), Dirs),
+    N = lists:foldl(fun(Dir, Acc) -> Acc + fold_one_feed(Mod, Dir) end,
+                    0, Chunk),
+    case Rest of
+        [] -> finish_pass(Mod, Delivered + N, Pass, T0, State);
+        _  -> self() ! {catch_up, Mod, Rest, Delivered + N, Pass, T0},
+              State
+    end.
+
+%% A pass that delivered nothing means nothing was missed: done.  A pass
+%% that delivered something may have raced with an append to a feed it
+%% had already visited, so sweep again — cheap, because caught_up_feed/2
+%% skips a whole feed on one tail read.
+finish_pass(Mod, 0, Pass, T0, #vm_state{catching = Catching} = State) ->
+    ?SSB_INFO("view_manager: ~p caught up in ~p ms (~p pass(es))",
+              [Mod, erlang:monotonic_time(millisecond) - T0, Pass]),
+    ok = Mod:view_save(),
+    persist_ckpt(),
+    State#vm_state{catching = maps:remove(Mod, Catching)};
+finish_pass(Mod, N, Pass, T0, State) when Pass >= ?CATCH_UP_MAX_PASSES ->
+    %% Still moving after this many sweeps: the store is being written
+    %% faster than we fold.  Stop sweeping and let ingest take over —
+    %% anything missed is picked up by the next run's catch-up.
+    ?SSB_ERROR("view_manager: ~p still delivering (~p) after ~p passes; "
+               "accepting it as caught up", [Mod, N, Pass]),
+    finish_pass(Mod, 0, Pass, T0, State);
+finish_pass(Mod, _N, Pass, T0, State) ->
+    self() ! {catch_up, Mod, feed_store:feed_dirs(), 0, Pass + 1, T0},
+    State.
+
+fold_one_feed(Mod, Dir) ->
+    case caught_up_feed(Mod, Dir) of
+        true  -> 0;
+        false -> feed_store:fold_feed(
+                   fun(Data, Acc) -> Acc + deliver_raw(Mod, Data) end, 0, Dir)
+    end.
+
+split_chunk(N, List) ->
+    case length(List) =< N of
+        true  -> {List, []};
+        false -> lists:split(N, List)
+    end.
+
+%% Feeds per chunk.  Configurable so a test can force the fold to span
+%% several turns of the message loop, which is the only way to actually
+%% exercise a store landing mid-catch-up.
+chunk_size() ->
+    application:get_env(ssb, view_catch_up_feeds, ?CATCH_UP_FEEDS).
 
 %% Append Mod to its class group: core views ahead of every app view,
 %% within a group in registration order.
@@ -206,6 +321,9 @@ insert_view(Mod, app, Views) ->
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
+
+handle_info({catch_up, Mod, Dirs, Delivered, Pass, T0}, State) ->
+    {noreply, do_catch_up(Mod, Dirs, Delivered, Pass, T0, State)};
 
 handle_info(save_tick, #vm_state{views = Views} = State) ->
     save_all(Views),
@@ -226,39 +344,15 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-%% Reset a view and refold it from the start of the log, then snapshot.
-rebuild_view(Mod) ->
+%% Drop a view's derived state and its checkpoints so the catch-up that
+%% follows refolds from the start of the log.  The version is stamped
+%% here, not after the fold, so a crash mid-rebuild leaves the view empty
+%% with no checkpoints — which reads as "rebuild me" next time, not as
+%% "complete".
+reset_view(Mod) ->
     ok = Mod:view_reset(),
     ets:match_delete(?CKPT, {{Mod, feed, '_'}, '_'}),
     ets:insert(?CKPT, {{Mod, version}, Mod:view_version()}),
-    catch_up(Mod),
-    ok = Mod:view_save(),
-    persist_ckpt(),
-    ok.
-
-%% Deliver every stored message past Mod's checkpoints by folding each
-%% feed's own store (feed_store: archived segments oldest-first, then
-%% the live log).  Within a feed the fold is in sequence order, which
-%% deliver/2 relies on (a delivered Seq advances the checkpoint past
-%% everything below it).
-catch_up(Mod) ->
-    Start = erlang:monotonic_time(millisecond),
-    {N, Skipped} =
-        lists:foldl(
-          fun(Dir, {Acc, Sk}) ->
-                  case caught_up_feed(Mod, Dir) of
-                      true ->
-                          {Acc, Sk + 1};
-                      false ->
-                          Folded = feed_store:fold_feed(
-                                     fun(Data, A) -> A + deliver_raw(Mod, Data) end,
-                                     Acc, Dir),
-                          {Folded, Sk}
-                  end
-          end, {0, 0}, feed_store:feed_dirs()),
-    ?SSB_INFO("view_manager: folded ~p messages into ~p in ~p ms "
-              "(~p feeds already caught up)",
-              [N, Mod, erlang:monotonic_time(millisecond) - Start, Skipped]),
     ok.
 
 %% True when Mod's checkpoint already covers this feed's last message, so
@@ -364,6 +458,8 @@ vm_test_() ->
      fun(_) ->
              [?_test(ingest_and_checkpoint()),
               ?_test(core_views_ordered_first()),
+              ?_test(catch_up_is_asynchronous()),
+              ?_test(no_gap_when_storing_during_catch_up()),
               ?_test(events_to_subscriber()),
               ?_test(catch_up_after_restart()),
               ?_test(rebuild_on_version_bump()),
@@ -414,6 +510,20 @@ vm_restart_manager() ->
     {ok, _} = view_manager:start_link(),
     ok.
 
+%% Catch-up is scheduled by register_view/1 and runs in the manager's own
+%% message loop, so a test must wait for it before reading a view's
+%% tables (which it does directly, not through the manager).
+wait_caught_up(Mod) ->
+    wait_caught_up(Mod, 250).
+
+wait_caught_up(Mod, 0) ->
+    error({never_caught_up, Mod});
+wait_caught_up(Mod, N) ->
+    case view_manager:caught_up(Mod) of
+        true  -> ok;
+        false -> timer:sleep(20), wait_caught_up(Mod, N - 1)
+    end.
+
 vm_make_peer() ->
     #{public := Pub, secret := Priv} = enacl:sign_keypair(),
     Id = <<"@", (base64:encode(Pub))/binary, ".ed25519">>,
@@ -429,6 +539,7 @@ ingest_and_checkpoint() ->
     ok = test_counter_view:ensure_table(),
     ok = vm_ensure_manager(),
     ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
     {Pid, Id, Priv} = vm_make_peer(),
     ?assertEqual(0, checkpoint(test_counter_view, Id)),
     #message{id = M1} = vm_store_post(Pid, Id, Priv, null, 1),
@@ -449,14 +560,68 @@ core_views_ordered_first() ->
     ?assertEqual(core, ssb_view:class(test_core_view)),
     ok = register_view(test_counter_view),      %% app registers FIRST
     ok = register_view(test_core_view),         %% core registers second
+    ok = wait_caught_up(test_core_view),
     ?assertEqual([test_core_view, test_counter_view], views()),
     ?assertEqual([test_core_view], views(core)),
     ?assertEqual([test_counter_view], views(app)).
+
+%% register_view/1 must not block on the fold: the manager keeps
+%% answering while catch-up runs, which is the whole point of chunking it
+%% (a 2.5M-message store folded for ~28 s inside the call, stalling
+%% replication with it — doc/persistence.md §8).
+catch_up_is_asynchronous() ->
+    ok = test_counter_view:ensure_table(),
+    ok = vm_ensure_manager(),
+    ok = register_view(test_counter_view),
+    %% the manager is responsive immediately after registering
+    ?assert(lists:member(test_counter_view, views())),
+    ok = wait_caught_up(test_counter_view),
+    ?assert(caught_up(test_counter_view)),
+    %% an unregistered view is never "catching up"
+    ?assert(caught_up(never_registered_view)).
+
+%% The hazard chunking introduces: a message stored while a view is still
+%% folding must not be delivered ahead of the fold.  deliver/2 would
+%% advance the checkpoint to that sequence and every earlier message the
+%% fold had not yet reached would read as already-covered, leaving a
+%% permanent hole.  ingest skips catching-up views for exactly this
+%% reason, and the sweep picks the message up instead — so the view ends
+%% with a contiguous run, no gap.
+no_gap_when_storing_during_catch_up() ->
+    ok = test_counter_view:ensure_table(),
+    ok = vm_ensure_manager(),
+    ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
+    {Pid, Id, Priv} = vm_make_peer(),
+    %% history for one feed, plus a second so the fold spans chunks
+    Ids = lists:foldl(
+            fun(Seq, [Prev | _] = Acc) ->
+                    #message{id = New} = vm_store_post(Pid, Id, Priv, Prev, Seq),
+                    [New | Acc]
+            end, [null], lists:seq(1, 12)),
+    {Pid2, Id2, Priv2} = vm_make_peer(),
+    #message{} = vm_store_post(Pid2, Id2, Priv2, null, 1),
+    %% One feed per chunk, so the fold takes several turns of the message
+    %% loop and the store below genuinely lands in the middle of it.
+    application:set_env(ssb, view_catch_up_feeds, 1),
+    try
+        %% rebuild forces a full refold of an already-registered view
+        ok = rebuild(test_counter_view),
+        [Last | _] = Ids,
+        #message{} = vm_store_post(Pid, Id, Priv, Last, 13),
+        ok = wait_caught_up(test_counter_view),
+        %% every sequence present exactly once, none skipped
+        ?assertEqual(lists:seq(1, 13), test_counter_view:entries(Id)),
+        ?assertEqual(13, checkpoint(test_counter_view, Id))
+    after
+        application:unset_env(ssb, view_catch_up_feeds)
+    end.
 
 events_to_subscriber() ->
     ok = test_counter_view:ensure_table(),
     ok = vm_ensure_manager(),
     ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
     ok = subscribe(test_counter_view),
     {Pid, Id, Priv} = vm_make_peer(),
     #message{} = vm_store_post(Pid, Id, Priv, null, 1),
@@ -473,6 +638,7 @@ catch_up_after_restart() ->
     ok = test_counter_view:ensure_table(),
     ok = vm_ensure_manager(),
     ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
     {Pid, Id, Priv} = vm_make_peer(),
     #message{id = M1} = vm_store_post(Pid, Id, Priv, null, 1),
     ?assertEqual([1], test_counter_view:entries(Id)),
@@ -481,6 +647,7 @@ catch_up_after_restart() ->
     ?assertEqual([1], test_counter_view:entries(Id)),
     {ok, _} = view_manager:start_link(),
     ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
     ?assertEqual([1, 2], test_counter_view:entries(Id)),
     ?assertEqual(2, checkpoint(test_counter_view, Id)).
 
@@ -492,6 +659,7 @@ rebuild_without_global_log() ->
     ok = test_counter_view:ensure_table(),
     ok = vm_ensure_manager(),
     ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
     {Pid, Id, Priv} = vm_make_peer(),
     #message{id = M1} = vm_store_post(Pid, Id, Priv, null, 1),
     #message{}        = vm_store_post(Pid, Id, Priv, M1, 2),
@@ -500,6 +668,7 @@ rebuild_without_global_log() ->
     GlobalLog = ?b2l(<<(config:ssb_repo_loc())/binary, "log.offset">>),
     ?assertNot(filelib:is_file(GlobalLog)),
     ok = rebuild(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
     ?assertEqual([1, 2], test_counter_view:entries(Id)).
 
 %% Archived segments are folded too: after archiving, a rebuild sees the
@@ -508,6 +677,7 @@ rebuild_folds_archives() ->
     ok = test_counter_view:ensure_table(),
     ok = vm_ensure_manager(),
     ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
     OwnId  = keys:pub_key_disp(),
     OwnPid = utils:find_or_create_feed_pid(OwnId),
     ok = ssb_feed:post_content(OwnPid, ~"before archive one"),
@@ -516,6 +686,7 @@ rebuild_folds_archives() ->
     ok = ssb_feed:post_content(OwnPid, ~"after archive"),
     #message{sequence = Last} = ssb_feed:fetch_last_msg(OwnPid),
     ok = rebuild(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
     ?assertEqual(lists:seq(1, Last), test_counter_view:entries(OwnId)).
 
 %% A version bump forces reset + refold of the whole log.
@@ -523,6 +694,7 @@ rebuild_on_version_bump() ->
     ok = test_counter_view:ensure_table(),
     ok = vm_ensure_manager(),
     ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
     {Pid, Id, Priv} = vm_make_peer(),
     #message{id = M1} = vm_store_post(Pid, Id, Priv, null, 1),
     #message{}        = vm_store_post(Pid, Id, Priv, M1, 2),
@@ -530,6 +702,7 @@ rebuild_on_version_bump() ->
     application:set_env(ssb, test_view_version, 2),
     ok = vm_restart_manager(),
     ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
     %% state wiped and refolded from the log, exactly once per message
     ?assertEqual([1, 2], test_counter_view:entries(Id)),
     ?assertEqual(2, checkpoint(test_counter_view, Id)).

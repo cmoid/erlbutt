@@ -355,7 +355,25 @@ setup() ->
          {view_manager, fun() -> view_manager:start_link() end},
          {ssb_social_graph, fun() -> ssb_social_graph:start_link() end},
          {ssb_feed_meta,    fun() -> ssb_feed_meta:start_link() end}]),
+    %% A view registers itself from its own handle_continue, and
+    %% view_manager schedules the catch-up fold rather than running it in
+    %% the call.  A view that is still catching up receives no ingests
+    %% (they would open a checkpoint gap), so these tests must wait for
+    %% the fold before storing anything and asserting on the result.
+    ok = wait_caught_up(ssb_social_graph),
+    ok = wait_caught_up(ssb_feed_meta),
     Started.
+
+wait_caught_up(Mod) ->
+    wait_caught_up(Mod, 250).
+
+wait_caught_up(Mod, 0) ->
+    error({never_caught_up, Mod});
+wait_caught_up(Mod, N) ->
+    case view_manager:caught_up(Mod) of
+        true  -> ok;
+        false -> timer:sleep(20), wait_caught_up(Mod, N - 1)
+    end.
 
 teardown(Pids) ->
     %% reverse start order, so the views go down before the
@@ -593,7 +611,9 @@ rebuild_from_log_test(_) ->
         %% simulate lost derived state, then refold from the log
         ok = view_reset(),
         ?assertEqual([], ssb_social_graph:direct_follows(Id)),
+        %% rebuild/1 schedules the refold rather than running it inline
         ok = view_manager:rebuild(ssb_social_graph),
+        ok = wait_caught_up(ssb_social_graph),
         ?assertEqual([Id2], ssb_social_graph:direct_follows(Id))
     end.
 

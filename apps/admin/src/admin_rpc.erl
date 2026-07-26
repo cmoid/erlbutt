@@ -75,22 +75,27 @@ handle_rpc([~"admin", ~"dialer", ~"trigger"], _Args, _Caller) ->
 %%%===================================================================
 
 handle_rpc([~"admin", ~"views", ~"list"], _Args, _Caller) ->
-    {reply, [{[{~"module",  atom_to_binary(Mod)},
-               {~"class",   atom_to_binary(Class)},
-               {~"version", null_for_undefined(Version)},
-               {~"feeds",   Feeds}]}
+    {reply, [{[{~"module",   atom_to_binary(Mod)},
+               {~"class",    atom_to_binary(Class)},
+               {~"version",  null_for_undefined(Version)},
+               {~"feeds",    Feeds},
+               {~"caughtUp", view_manager:caught_up(Mod)}]}
              || {Mod, Class, Version, Feeds} <- view_manager:info()]};
 
 %% Wipe a view's derived state and refold it from the whole log.  Only a
 %% currently-registered view may be named: binary_to_existing_atom keeps
 %% a caller from minting atoms, and the membership check keeps this from
 %% being a way to poke arbitrary modules.
+%%
+%% The refold is scheduled, not awaited — view_manager runs it in chunks
+%% so the node keeps serving.  The reply says `rebuilding`, and
+%% admin.views.list reports progress via each view's checkpoint count.
 handle_rpc([~"admin", ~"views", ~"rebuild"], [Name], _Caller)
   when is_binary(Name) ->
     case registered_view(Name) of
         {ok, Mod} ->
             case view_manager:rebuild(Mod) of
-                ok    -> {reply, {[{~"rebuilt", Name}]}};
+                ok    -> {reply, {[{~"rebuilding", Name}]}};
                 Other -> {error, iolist_to_binary(io_lib:format("~p", [Other]))}
             end;
         error ->
