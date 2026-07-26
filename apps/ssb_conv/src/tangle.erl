@@ -9,10 +9,15 @@
 %% This lives in ssb_conv, not in the foundation, because it is one
 %% interpretation of the reference graph rather than the graph itself
 %% (doc/persistence.md §5).  `root`/`branch` are SSB application
-%% conventions; replication never needs them.  The edges it walks come
-%% from ssb_feed:references/3 today and from the ssb_links core view once
-%% that lands (§8 item 10), at which point most of the recursion here
-%% collapses into a reachability query.
+%% conventions; replication never needs them.
+%%
+%% The edges it walks come from the ssb_links core view.  A reply to M
+%% inside the tangle rooted at R is a message that names M as a `branch`
+%% AND R as its `root`, so a step of the walk is the intersection of two
+%% ssb_links queries and reads no message bodies at all.  It used to come
+%% from a per-feed `references` file that ssb_feed wrote on every store —
+%% a tangle-shaped index maintained by the foundation, which is precisely
+%% the layering ssb_links exists to undo (doc/persistence.md §5).
 -module(tangle).
 
 -ifdef(TEST).
@@ -31,8 +36,7 @@
 get_tangle(TangleId) ->
     %% retrieve tangle root author
     Auth = mess_auth:get(TangleId),
-    FeedPid = utils:find_or_create_feed_pid(Auth),
-    Targets = ssb_feed:references(FeedPid, TangleId, TangleId),
+    Targets = children_of(TangleId, TangleId),
     Fun = fun([M, A]) ->
                   find_paths(M, A, TangleId)
           end,
@@ -94,16 +98,10 @@ decrypted_text(Plain) ->
     end.
 
 children(MsgId, TangleId) ->
-    %% retrieve tangle root author
-    Auth = mess_auth:get(MsgId),
-    FeedPid = utils:find_or_create_feed_pid(Auth),
-    {MsgId, ssb_feed:references(FeedPid, MsgId, TangleId)}.
+    {MsgId, children_of(MsgId, TangleId)}.
 
 descendants(MsgId, TangleId) ->
-    %% retrieve tangle root author
-    Auth = mess_auth:get(MsgId),
-    FeedPid = utils:find_or_create_feed_pid(Auth),
-    Targets = ssb_feed:references(FeedPid, MsgId, TangleId),
+    Targets = children_of(MsgId, TangleId),
     Fun = fun([M, A]) ->
                   find_paths(M, A, TangleId)
           end,
@@ -114,7 +112,7 @@ parents(MsgId, TangleId) ->
     Auth = mess_auth:get(MsgId),
     FeedPid = utils:find_or_create_feed_pid(Auth),
     Msg = ssb_feed:fetch_msg(FeedPid, MsgId),
-    Branches = social_msg:is_branch(Msg),
+    Branches = ssb_conv_msg:is_branch(Msg),
     case Branches of
         false ->
             none;
@@ -130,7 +128,7 @@ ancestors(MsgId, TangleId) ->
     Auth = mess_auth:get(MsgId),
     FeedPid = utils:find_or_create_feed_pid(Auth),
     Msg = ssb_feed:fetch_msg(FeedPid, MsgId),
-    Branches = social_msg:is_branch(Msg),
+    Branches = ssb_conv_msg:is_branch(Msg),
     case Branches of
         false ->
             none;
@@ -146,24 +144,31 @@ ancestors(MsgId, TangleId) ->
 %%%===================================================================
 
 find_paths(MsgId, AuthId, RootId) ->
-    Pid = utils:find_or_create_feed_pid(AuthId),
-    Targets = ssb_feed:references(Pid, MsgId, RootId),
+    Targets = children_of(MsgId, RootId),
     Fun = fun([M, A]) ->
                   find_paths(M, A, RootId)
           end,
     case Targets of
         [] ->
             {MsgId, AuthId};
-        done ->
-            {MsgId, AuthId};
         _Else ->
             {MsgId, AuthId, lists:map(Fun, Targets)}
     end.
 
+%% Replies to MsgId within the tangle rooted at TangleId, as
+%% [[ReplyId, ReplyAuthor]] — the intersection of "named MsgId as a
+%% branch" and "named TangleId as its root".  Both come from ssb_links,
+%% so no message is read to answer this.
+children_of(MsgId, TangleId) ->
+    InTangle = sets:from_list(ssb_links:refs(TangleId, ~"root")),
+    [[Id, mess_auth:get(Id)]
+     || Id <- ssb_links:refs(MsgId, ~"branch"),
+        sets:is_element(Id, InTangle)].
+
 find_par_paths(MsgId, AuthId, RootId) ->
     Pid = utils:find_or_create_feed_pid(AuthId),
     Msg = ssb_feed:fetch_msg(Pid, MsgId),
-    Branches = social_msg:is_branch(Msg),
+    Branches = ssb_conv_msg:is_branch(Msg),
     case Branches of
         false ->
             {MsgId, AuthId};
@@ -206,7 +211,8 @@ setup() ->
 
 cleanup(Home) ->
     [catch gen_server:stop(Name)
-     || Name <- [ssb_feed_sup, mess_auth, keys, config]],
+     || Name <- [ssb_links, view_manager, ssb_feed_sup, mess_auth, keys,
+                 config]],
     case Home of
         ignore -> ok;
         _ ->
@@ -252,9 +258,13 @@ tangle3() ->
     #message{id = Id4} = make_msg(4, Id2, Id, Id2, Auth2, Priv2, Feed2),
 
 
+    %% Siblings come back oldest-first (Id3 before Id4).  The old
+    %% references file was folded into a reversed accumulator, so it
+    %% yielded newest-first; ssb_links:refs/1 preserves indexing order,
+    %% which is the more useful one for reading a conversation.
     ?assert({Id, Auth, [{Id2, Auth,
-                   [{Id4, Auth2},
-                    {Id3, Auth}]}]} == tangle:get_tangle(Id)).
+                   [{Id3, Auth},
+                    {Id4, Auth2}]}]} == tangle:get_tangle(Id)).
 
 tangle4() ->
     {Auth, Priv, Feed} = init(),
@@ -271,9 +281,10 @@ tangle4() ->
     #message{id = Id5} = make_msg(5, Id4, Id, [Id4, Id3], Auth2, Priv2, Feed2),
 
 
+    %% Id5 branches off both Id3 and Id4, so it appears under each.
     ?assert({Id, Auth, [{Id2, Auth,
-                   [{Id4, Auth2, [{Id5, Auth2}]},
-                    {Id3, Auth, [{Id5, Auth2}]}]}]} == tangle:get_tangle(Id)).
+                   [{Id3, Auth,  [{Id5, Auth2}]},
+                    {Id4, Auth2, [{Id5, Auth2}]}]}]} == tangle:get_tangle(Id)).
 
 %% get_msg/2 must tolerate every content shape a tangle can contain.
 get_msg_post() ->
@@ -307,12 +318,27 @@ get_msg_private() ->
     ssb_feed:store_msg(Feed, Theirs),
     ?assertEqual(?ENCRYPTED_PLACEHOLDER, get_msg(Theirs#message.id, Auth)).
 
+%% The tangle walk reads the ssb_links core view rather than a per-feed
+%% references file, so these tests need the view manager and the view
+%% running — and need the view caught up before storing anything, since
+%% a view mid-catch-up receives no ingests.
 init() ->
     config:start_link("test/ssb.cfg"),
     keys:start_link(),
     mess_auth:start_link(),
     ssb_feed_sup:start_link(),
+    view_manager:start_link(),
+    ssb_links:start_link(),
+    ok = wait_caught_up(ssb_links, 250),
     create_id().
+
+wait_caught_up(_Mod, 0) ->
+    error(never_caught_up);
+wait_caught_up(Mod, N) ->
+    case view_manager:caught_up(Mod) of
+        true  -> ok;
+        false -> timer:sleep(20), wait_caught_up(Mod, N - 1)
+    end.
 
 create_id() ->
     {Pub, Priv} = utils:create_key_pair(),

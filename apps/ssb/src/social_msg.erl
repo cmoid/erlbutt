@@ -15,14 +15,12 @@
 %%     it registers pubs with conn_db and hands blob refs to the
 %%     fetcher, both protocol concerns.
 %%
-%%   CONVENTION — belongs in ssb_conv.  is_branch/1 reads `root`/`branch`,
-%%     which only a conversation cares about.  It cannot move yet:
-%%     utils:update_refs/1 calls it from the foundation to build the
-%%     per-feed references file, and `apps/ssb` must never depend on
-%%     `apps/ssb_conv`.  That use disappears when references becomes the
-%%     ssb_links core view, which extracts edges by scanning for
-%%     sigil-shaped values and knows no message type at all; is_branch/1
-%%     moves up with it.
+%%   CONVENTION — gone.  is_branch/1 read `root`/`branch`, which only a
+%%     conversation cares about; it lived here only because
+%%     utils:update_refs/1 called it from the foundation to build the
+%%     per-feed references file.  That file is now the ssb_links core
+%%     view, which extracts references by shape and knows no message type
+%%     at all, so is_branch/1 moved to ssb_conv_msg where it belongs.
 %%
 %% is_reply/1 and is_private_box/1 are convention predicates with no
 %% caller anywhere — dead surface, not moved rather than moving dead code
@@ -42,7 +40,6 @@
          is_block/1,
          is_about/1,
          is_reply/1,
-         is_branch/1,
          is_private_box/1]).
 
 %% Dispatch a stored message to application-layer handlers based on type.
@@ -138,32 +135,6 @@ is_about(#message{content = {ContentProps}}) ->
         Type ->
             Type == ~"about"
     end.
-
-%% A message we do not hold (ssb_feed:fetch_msg/2 miss) has no branches —
-%% tangle walks routinely reference ids that never replicated to us.
-is_branch(not_found) ->
-    false;
-
-is_branch(#message{content = Content}) when is_binary(Content) ->
-    false;
-
-is_branch(#message{content = {Content}}) ->
-    Root = ?pgv(~"root", Content),
-    Branch = ?pgv(~"branch", Content),
-    build_branch(Root, Branch).
-
-build_branch(undefined, _Branch) ->
-    false;
-build_branch(_Root, undefined) ->
-    false;
-build_branch(false, _Branch) ->
-    false;
-build_branch(_Root, false) ->
-    false;
-build_branch(Root, Branch) when is_list(Branch) ->
-    {Root, Branch};
-build_branch(Root, Branch) ->
-    {Root, [Branch]}.
 
 is_reply(#message{content = Content}) when is_binary(Content) ->
     false;
@@ -307,20 +278,6 @@ is_not_reply_test() ->
     {ok, FilBin} = file:read_file(F),
 
     ?assert(not social_msg:is_reply(decode(FilBin, true))).
-
-is_single_branch_test() ->
-    {ok, Cwd} = file:get_cwd(),
-    F = Cwd ++ "/testdata/" ++ "single-branch.full",
-    {ok, FilBin} = file:read_file(F),
-    {_Root, Branches} = social_msg:is_branch(decode(FilBin, true)),
-    ?assert(is_list(Branches) andalso length(Branches) == 1).
-
-is_multi_branch_test() ->
-    {ok, Cwd} = file:get_cwd(),
-    F = Cwd ++ "/testdata/" ++ "multi-branch.full",
-    {ok, FilBin} = file:read_file(F),
-    {_Root, Branches} = social_msg:is_branch(decode(FilBin, true)),
-    ?assert(is_list(Branches) andalso length(Branches) == 2).
 
 follow_true_test() ->
     {ok, Cwd} = file:get_cwd(),

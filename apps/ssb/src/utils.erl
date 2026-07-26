@@ -24,7 +24,6 @@
          feed_dir/1,
          find_or_create_feed_pid/1,
          check_id/1,
-         update_refs/1,
          log/1,
          ping_req/1,
          whoami_req/1,
@@ -190,37 +189,6 @@ find_or_create_feed_pid(Id) ->
     case check_id(Id) of
         bad -> bad;
         ok  -> ssb_feed_sup:find_or_start(Id)
-    end.
-
-update_refs(#message{id = Id, author = AuthId} = Msg) ->
-    Branches = social_msg:is_branch(Msg),
-    case Branches of
-        false ->
-            none;
-        {Root, BranchList} ->
-            Target = {~"tar", [Id, AuthId]},
-            lists:map(fun(Bi) ->
-                              %% this is really ugly, branch most often is either a binary
-                              %% or a list of such, but occasionally it's an
-                              %% object like {<<"0">>:<<"%msgid....">>}
-                              %% this is the price one pays for immutable feeds, garbage
-                              %% lasts forever
-                              Ai = if is_binary(Bi) ->
-                                           mess_auth:get(Bi);
-                                      true ->
-                                           not_found
-                                   end,
-                              case Ai of
-                                  not_found ->
-                                      nop;
-                                  _Else ->
-                                      Record = {[{~"root", Root},
-                                                 {~"src", [Bi, Ai]},
-                                                 Target]},
-                                      Pid = find_or_create_feed_pid(Ai),
-                                      ssb_feed:store_ref(Pid, encode_rec(Record))
-                              end
-                      end, BranchList)
     end.
 
 encode_rec(Record) ->

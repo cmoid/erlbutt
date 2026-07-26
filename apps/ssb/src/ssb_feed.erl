@@ -3,17 +3,25 @@
 %% Copyright (C) 2023 Charles Moid
 %%
 %% Per-feed gen_server.  Each SSB author gets one instance, managed by
-%% ssb_feed_sup.  Owns two append-only files: log.offset (all messages)
-%% and references (tangle arc records).
+%% ssb_feed_sup.  Owns one append-only file: log.offset, this feed's
+%% messages, plus the archived segments and hints beside it.
 %%
-%% It used to own two more — profile (about messages) and contacts
-%% (follow/block messages) — which duplicated message bodies into
-%% per-feed logs so that a lazy loader could rebuild the name and follow
-%% graphs from them.  That loader went away when friends became an
-%% ssb_view, leaving the files written on every store and read by
-%% nobody.  Dropped; the views are the index now (doc/persistence.md §3).
-%% Stale profile/contacts files in existing feed directories are inert —
-%% nothing globs them — and can be removed at leisure.
+%% It used to own three more, all of them indexes wearing a log's clothes
+%% (doc/persistence.md §3):
+%%
+%%   profile     every `about` message, duplicated
+%%   contacts    every `contact` message, duplicated
+%%   references  tangle arcs, written into the TARGET author's directory
+%%
+%% profile and contacts fed a lazy loader that went away when the follow
+%% graph became an ssb_view; they were being written on every store and
+%% read by nobody.  references was a tangle-shaped index maintained by
+%% the foundation — the layering error §5 describes — and is now the
+%% ssb_links core view, which records references by shape and knows no
+%% message type at all.
+%%
+%% Stale profile/contacts/references files in existing feed directories
+%% are inert: nothing globs them, and they can be removed at leisure.
 -module(ssb_feed).
 
 -ifdef(TEST).
@@ -34,8 +42,6 @@
          store_msg_checked/2,
          fetch_msg/2,
          fetch_last_msg/1,
-         store_ref/2,
-         references/3,
          foldl/3,
          archive/1]).
 
@@ -52,7 +58,6 @@
                 last_msg = null,
                 last_seq = 0,
                 feed,
-                refs,
                 msg_cache,
                 %% has the whole live log been indexed into msg_cache in
                 %% this run?  Reset whenever the live log is replaced.
@@ -94,14 +99,6 @@ fetch_msg(FeedPid, Key) ->
 fetch_last_msg(FeedPid) ->
     gen_server:call(FeedPid, {fetch_last_msg}).
 
-%% Cast, not call: tangle calls this from inside a feed's handle_call, so a
-%% synchronous call here would deadlock the same process.
-store_ref(FeedPid, Arrow) ->
-    gen_server:cast(FeedPid, {store_ref, Arrow}).
-
-references(FeedPid, MsgId, RootId) ->
-    gen_server:call(FeedPid, {refs, MsgId, RootId}, infinity).
-
 foldl(FeedPid, Fun, Acc) ->
     gen_server:call(FeedPid, {foldl, Fun, Acc}, infinity).
 
@@ -114,10 +111,9 @@ archive(FeedPid) ->
 %%%===================================================================
 init([FeedId]) ->
     process_flag(trap_exit, true),
-    {Feed, Refs} = init_directories(FeedId),
+    Feed = init_directories(FeedId),
     State = #state{id = FeedId,
                    feed = Feed,
-                   refs = Refs,
                    msg_cache = ets:new(messages, [])},
     %% Register in the global feed registry when running under ssb_feed_sup.
     %% The guard keeps direct start_link/1 calls (e.g. in unit tests) working.
@@ -199,26 +195,8 @@ handle_call({fetch_last_msg}, _From, #state{feed = Feed,
             {reply, Else, State}
     end;
 
-handle_call({refs, MsgId, TangleId}, _From, #state{refs = Refs} = State) ->
-    Fun =
-        fun(Data, Acc) ->
-                IsArc = has_target(Data, MsgId, TangleId),
-                case IsArc of
-                    false ->
-                        Acc;
-                    Targets ->
-                        [Targets | Acc]
-                end end,
-
-    Result = utils:fold_log_file(Fun, [], Refs),
-    {reply, Result, State};
-
 handle_call({foldl, Fun, Acc}, _From, #state{feed = Feed} = State) ->
     {reply, utils:fold_log_file(Fun, Acc, Feed), State}.
-
-handle_cast({store_ref, Arrow}, #state{refs = Refs} = State) ->
-    write_msg(Arrow, Refs),
-    {noreply, State};
 
 handle_cast(_Request, State) ->
     {noreply, State}.
@@ -345,7 +323,6 @@ store(#message{id = Id, sequence = Seq, author = Auth} = Msg,
     ets:insert(Messages, {Id, Offset}),
     %% arrival-order ref; the message body lives only in the feed's own log
     ingest_journal:append(Auth, Seq),
-    utils:update_refs(Msg),
     social_msg:dispatch(Msg),
     view_manager:ingest(Msg),
     State#state{last_msg = Id, last_seq = Seq}.
@@ -374,10 +351,8 @@ write_msg(Msg, Store) ->
 init_directories(FeedId) ->
     FeedDir = utils:feed_dir(FeedId),
     Feed = <<FeedDir/binary,~"/"/binary,~"log.offset"/binary>>,
-    Refs = <<FeedDir/binary,~"/"/binary,~"references"/binary>>,
     filelib:ensure_dir(Feed),
-    filelib:ensure_dir(Refs),
-    {Feed, Refs}.
+    Feed.
 
 %% Only feed corresponding to the owner of the peer can post.
 %% All the other feeds are only meant to be read
@@ -544,22 +519,6 @@ extract_key(Data) ->
     ?pgv(~"key", DataProps).
 
 
-
-has_target(Msg, Id, RootId) ->
-    {DecProps} = utils:nat_decode(Msg),
-    Root = ?pgv(~"root", DecProps),
-    IsRootId = RootId == Root,
-    [Src, _AuthId] = ?pgv(~"src", DecProps),
-    case IsRootId of
-        true ->
-            if Src == Id ->
-                    ?pgv(~"tar", DecProps);
-               true ->
-                    false
-            end;
-        false ->
-            false
-    end.
 
 open_file(File) ->
     %% NOTE: do NOT use the `sync` flag here. It forces an fsync on every
