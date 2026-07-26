@@ -20,11 +20,9 @@
 -endif.
 
 -export([convert/3,
-         convert/4,
-         build_refs/1]).
+         convert/4]).
 
--import(utils, [load_term/1,
-                update_refs/1]).
+-import(utils, [load_term/1]).
 
 convert(OffsetLog, Sleep, Feeds)->
     convert(OffsetLog, Sleep, Feeds, default_blob_src()).
@@ -184,15 +182,6 @@ report_blob_stats() ->
         undefined -> ?LOG_INFO("no blobs referenced ~n", []);
         Stats     -> ?LOG_INFO("blob import: ~p ~n", [Stats])
     end.
-
-build_refs(FeedId) ->
-    Feed = ssb_feed_sup:find_or_start(FeedId),
-    Fun = fun(Term, Acc) ->
-                  %% possibly no need to validate this here
-                  Msg = message:decode(Term, false),
-                  [update_refs(Msg) | Acc]
-          end,
-    ssb_feed:foldl(Feed, Fun, []).
 
 -ifdef(TEST).
 
