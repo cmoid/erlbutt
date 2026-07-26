@@ -4,7 +4,7 @@
   0},
  {<<"esqlite">>,
   {git,"https://github.com/cmoid/esqlite",
-       {ref,"5c8d590d8eb70de17dd2c64dfc7502f4fd2fcba8"}},
+       {ref,"b3adc97accc1efb8d6dba2166f1011b3abe52fb6"}},
   0},
  {<<"ranch">>,
   {git,"https://github.com/ninenines/ranch",
