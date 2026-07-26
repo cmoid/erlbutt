@@ -122,12 +122,13 @@ connect() ->
 %%
 %% Exits non-zero if a view is not caught up or the store looks empty, so
 %% it can be used as a post-deploy gate.
+%% Each section is fetched and printed before the next is asked for.
+%%
+%% Gathering all four first meant one failed call threw away the three
+%% that had succeeded — and on a node mid-resync the connection really
+%% does get dropped, so the report has to survive losing it partway.
 cmd_health(Peer) ->
     Status = admin_call(Peer, [<<"admin">>, <<"status">>]),
-    Views  = admin_call(Peer, [<<"admin">>, <<"views">>, <<"list">>]),
-    Tables = admin_call(Peer, [<<"admin">>, <<"store">>, <<"tables">>]),
-    Peers  = admin_call(Peer, [<<"admin">>, <<"peers">>, <<"connected">>]),
-
     io:format("~n== node ==~n"),
     case Status of
         {Props} ->
@@ -144,12 +145,16 @@ cmd_health(Peer) ->
             io:format("  UNAVAILABLE: ~p~n", [Other])
     end,
 
+    Views = admin_call(Peer, [<<"admin">>, <<"views">>, <<"list">>]),
     io:format("~n== views ==~n"),
     Lagging = report_views(Views),
 
+    %% count(*) over every table; on a large store this is the slow call
+    Tables = admin_call(Peer, [<<"admin">>, <<"store">>, <<"tables">>]),
     io:format("~n== store ==~n"),
     EmptyStore = report_tables(Tables),
 
+    Peers = admin_call(Peer, [<<"admin">>, <<"peers">>, <<"connected">>]),
     io:format("~n== peers ==~n"),
     case Peers of
         L when is_list(L), L =/= [] ->
@@ -218,14 +223,20 @@ report_tables(Other) ->
     io:format("  UNAVAILABLE: ~p~n", [Other]),
     true.
 
+%% A dropped connection or a slow reply must degrade this report, not end
+%% it — the sections already printed are the ones you came for.
 admin_call(Peer, Name) ->
-    case ssb_peer:rpc_call(Peer, Name, <<"async">>) of
+    try ssb_peer:rpc_call(Peer, Name, <<"async">>) of
         {ok, Body} ->
             try utils:nat_decode(Body)
             catch _:_ -> {error, undecodable}
             end;
         Err ->
             {error, Err}
+    catch
+        exit:{shutdown, conn_closed} -> {error, connection_closed};
+        exit:{timeout, _}            -> {error, timeout};
+        Class:Reason                 -> {error, {Class, Reason}}
     end.
 
 gv(Key, Props, Default) ->
