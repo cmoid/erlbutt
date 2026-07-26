@@ -42,8 +42,12 @@
          declare/3,
          q/1, q/2,
          exec/1,
+         write/2,
          transaction/1,
          insert_many/2,
+         mark_complete/1,
+         clear_complete/1,
+         complete/1,
          available/0,
          db_file/0]).
 
@@ -89,9 +93,53 @@ q(Sql) ->
 q(Sql, Params) ->
     esqlite3:q(db(), Sql, Params).
 
-%% Single write statement.
+%% Single write statement, no parameters.
 exec(Sql) ->
     gen_server:call(?SERVER, {exec, Sql}, infinity).
+
+%% Single parameterised write.  esqlite3:exec/2 takes no parameters, so
+%% this goes through q/3, which returns [] for an INSERT/UPDATE/DELETE.
+%%
+%% Each call is its own implicit transaction, hence its own commit.  That
+%% is fine for a view whose writes are rare (a follow graph only writes
+%% on a contact message); a view that writes for most messages wants
+%% insert_many/2 or transaction/1 instead — see §6 on batching.
+write(Sql, Params) ->
+    gen_server:call(?SERVER, {write, Sql, Params}, infinity).
+
+%%%===================================================================
+%%% View completeness
+%%%===================================================================
+%%
+%% view_manager keeps its checkpoints in ETS with a periodic snapshot,
+%% while a store-backed view's rows are durable immediately.  The two can
+%% therefore disagree after a crash — in one direction only: the store is
+%% always at or ahead of the last snapshotted checkpoint, so the view
+%% replays messages it has already folded, which is safe because folds are
+%% idempotent per {feed, seq}.
+%%
+%% The dangerous case is the other one: checkpoints claiming coverage of
+%% a store that is EMPTY (store.db deleted, checkpoints.tab kept), which
+%% would leave a view silently blank forever.  A view marks itself
+%% complete here; view_load/0 asks, and a fresh database answers no.
+
+mark_complete(Name) when is_atom(Name) ->
+    write("INSERT INTO ssb_view_state(name,complete) VALUES(?1,1)"
+          " ON CONFLICT(name) DO UPDATE SET complete=1",
+          [atom_to_binary(Name, utf8)]).
+
+clear_complete(Name) when is_atom(Name) ->
+    write("INSERT INTO ssb_view_state(name,complete) VALUES(?1,0)"
+          " ON CONFLICT(name) DO UPDATE SET complete=0",
+          [atom_to_binary(Name, utf8)]).
+
+complete(Name) when is_atom(Name) ->
+    try q("SELECT complete FROM ssb_view_state WHERE name=?1",
+          [atom_to_binary(Name, utf8)]) of
+        [[1]] -> true;
+        _     -> false
+    catch _:_ -> false
+    end.
 
 %% Run Fun inside one transaction, in this server's process.  Fun is
 %% given the connection and may use esqlite3 directly.  Returns ok, or
@@ -138,6 +186,10 @@ init([]) ->
         "CREATE TABLE IF NOT EXISTS ssb_schema("
         "  name TEXT PRIMARY KEY,"
         "  version INTEGER NOT NULL);"),
+    ok = esqlite3:exec(Db,
+        "CREATE TABLE IF NOT EXISTS ssb_view_state("
+        "  name TEXT PRIMARY KEY,"
+        "  complete INTEGER NOT NULL);"),
     persistent_term:put(?HANDLE, Db),
     ?SSB_INFO("ssb_store: open at ~s", [File]),
     {ok, #st{db = Db, file = File}}.
@@ -174,6 +226,14 @@ handle_call({declare, Name, Version, DDL}, _From, #st{db = Db} = St) ->
 
 handle_call({exec, Sql}, _From, #st{db = Db} = St) ->
     {reply, esqlite3:exec(Db, Sql), St};
+
+handle_call({write, Sql, Params}, _From, #st{db = Db} = St) ->
+    Reply = case esqlite3:q(Db, Sql, Params) of
+                []              -> ok;
+                {error, _} = E  -> E;
+                Other           -> Other
+            end,
+    {reply, Reply, St};
 
 handle_call({transaction, Fun}, _From, #st{db = Db} = St) ->
     {reply, in_transaction(Db, Fun), St}.

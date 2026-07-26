@@ -11,20 +11,24 @@
 %% foundation; the display-name cache it also carried moved out to
 %% ssb_feed_meta, where arbitrary self-asserted fields live.
 %%
-%% The graphs are kept in named public ETS tables owned by this
-%% gen_server and populated exclusively by view_manager (this module is
-%% an ssb_view — see ssb_view.erl).  The manager guarantees the tables
-%% are complete: it replays anything missed at registration, rebuilds
-%% from the log when view_version/0 bumps, and folds every newly stored
-%% message in synchronously — so reads are plain ETS lookups and a miss
-%% simply means "no data for that feed".
+%% The graphs live in ssb_store (doc/persistence.md §6) as one table of
+%% edges, and this is the first view ported off ETS-plus-tab2file.  It
+%% was chosen as the pilot for having the fewest readers and the
+%% clearest shape; two things came out better than a straight swap:
+%%
+%%   reverse_edges/1 was a full ets:foldl over both graphs — O(feeds) to
+%%   answer "who follows this person".  It is now an indexed lookup.
+%%
+%%   follows/2 was a hand-rolled breadth-first walk in Erlang carrying a
+%%   visited set.  It is now one recursive CTE; SQLite's UNION does the
+%%   cycle detection the visited set was there for.
 %%
 %% The view callbacks (view_entry/1 etc.) run in the view_manager
-%% process, never in this server; they are plain functions over the
-%% public tables.  Durable state is ets:tab2file snapshots under
-%% <repo>/views/, restored (or created fresh) in init; view_save/0
-%% stamps a completeness marker so view_load/0 can tell a restored
-%% snapshot from a fresh table.
+%% process, never in this server, which now owns no state at all — it
+%% exists to register the view and retry if a service is not up yet.
+%% Writes are durable as they happen, so view_save/0 has nothing to
+%% flush; all it records is the completeness marker view_load/0 reads
+%% (see ssb_store's note on why that marker is still needed).
 -module(ssb_social_graph).
 
 -behaviour(gen_server).
@@ -57,22 +61,25 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
          handle_info/2, terminate/2, code_change/3]).
 
--define(GRAPH, ssb_follow_graph).
--define(BLOCKS, ssb_block_graph).
+%% kind column: a contact message can assert following and blocking
+%% independently, so they are separate edges between the same pair.
+-define(FOLLOW, 0).
+-define(BLOCK,  1).
 
-%% Written by view_save/0 before each snapshot; its presence after a
-%% file2tab restore is how view_load/0 knows the state is complete up to
-%% the manager's checkpoints.
--define(COMPLETE, '$complete').
-
-%% Renamed from friends_*.tab with the module.  An upgrading node finds
-%% no snapshot under the new names, so view_load/0 reports empty and the
-%% manager rebuilds both graphs from the log — the intended behaviour for
-%% a view whose storage identity changed.  The old files are inert and
-%% can be deleted.
--define(TABLES,
-        [{?GRAPH,  ~"social_graph_follows.tab"},
-         {?BLOCKS, ~"social_graph_blocks.tab"}]).
+%% state is the asserted value: 1 for following/blocking, 0 for the
+%% retraction (an unfollow is a fact, not the absence of one), which is
+%% why the row is updated rather than deleted.
+-define(SCHEMA_VERSION, 1).
+-define(DDL,
+        ["CREATE TABLE IF NOT EXISTS social_edges("
+         "  source TEXT NOT NULL,"
+         "  dest   TEXT NOT NULL,"
+         "  kind   INTEGER NOT NULL,"
+         "  state  INTEGER NOT NULL,"
+         "  PRIMARY KEY (source, dest, kind)) WITHOUT ROWID;",
+         %% the index reverse_edges/1 used to lack
+         "CREATE INDEX IF NOT EXISTS ix_social_dest"
+         "  ON social_edges(dest, kind, state);"]).
 
 %%%===================================================================
 %%% API
@@ -85,26 +92,41 @@ start_link() ->
 direct_follows(FeedPid) when is_pid(FeedPid) ->
     direct_follows(ssb_feed:whoami(FeedPid));
 direct_follows(FeedId) ->
-    case lookup(?GRAPH, FeedId) of
-        {ok, Contacts} -> following_ids(Contacts);
-        miss           -> []
-    end.
+    out_edges(FeedId, ?FOLLOW).
 
 %% Feeds the given feed blocks right now.
 blocks(FeedPid) when is_pid(FeedPid) ->
     blocks(ssb_feed:whoami(FeedPid));
 blocks(FeedId) ->
-    case lookup(?BLOCKS, FeedId) of
-        {ok, Blocked} -> blocking_ids(Blocked);
-        miss          -> []
-    end.
+    out_edges(FeedId, ?BLOCK).
+
+out_edges(FeedId, Kind) when is_binary(FeedId) ->
+    [D || [D] <- rows("SELECT dest FROM social_edges"
+                      " WHERE source=?1 AND kind=?2 AND state=1",
+                      [FeedId, Kind])];
+out_edges(_NotAFeed, _Kind) ->
+    [].
 
 %% Transitive follows out to HopCount hops, excluding the start feed.
 follows(FeedPid, HopCount) when is_pid(FeedPid) ->
     follows(ssb_feed:whoami(FeedPid), HopCount);
-follows(FeedId, HopCount) ->
-    {AllFollows, _} = follows2(FeedId, HopCount, sets:from_list([FeedId])),
-    lists:usort(AllFollows).
+follows(FeedId, HopCount) when is_binary(FeedId), is_integer(HopCount) ->
+    %% Reachability over the follow graph, bounded by HopCount and
+    %% excluding the start feed.  UNION (not UNION ALL) makes the walk
+    %% terminate on a cycle, which is what the old visited set did by
+    %% hand.
+    lists:usort(
+      [Id || [Id] <-
+                 rows("WITH RECURSIVE reach(id, depth) AS ("
+                      "  SELECT ?1, 0"
+                      "  UNION"
+                      "  SELECT e.dest, r.depth + 1"
+                      "    FROM social_edges e JOIN reach r ON e.source = r.id"
+                      "   WHERE e.kind = ?3 AND e.state = 1 AND r.depth < ?2)"
+                      " SELECT id FROM reach WHERE id <> ?1",
+                      [FeedId, HopCount, ?FOLLOW])]);
+follows(_FeedId, _HopCount) ->
+    [].
 
 %% The relationship Source holds toward Dest in ssb-friends legacy
 %% terms: true = following, false = blocking, null = neither.  Block
@@ -127,23 +149,17 @@ edges(Source) ->
     maps:merge(Follows, Blocks).
 
 %% All edges pointing AT Dest as #{Source => true | false}: who follows
-%% or blocks Dest (block wins).  Scans the graphs, so O(feeds).
-reverse_edges(Dest) ->
-    F = reverse_fold(?GRAPH, Dest, true, #{}),
-    reverse_fold(?BLOCKS, Dest, false, F).
-
-reverse_fold(Tab, Dest, Value, Acc0) ->
-    try
-        ets:foldl(
-          fun({Source, Map}, Acc) when is_map(Map) ->
-                  case maps:get(Dest, Map, undefined) of
-                      true -> Acc#{Source => Value};
-                      _    -> Acc
-                  end;
-             (_, Acc) -> Acc          %% skip the completeness marker row
-          end, Acc0, Tab)
-    catch error:badarg -> Acc0        %% table absent
-    end.
+%% or blocks Dest (block wins).  An indexed lookup now — this used to
+%% fold both whole graphs.
+reverse_edges(Dest) when is_binary(Dest) ->
+    Rows = rows("SELECT source, kind FROM social_edges"
+                " WHERE dest=?1 AND state=1", [Dest]),
+    %% blocks last so they overwrite a follow between the same pair
+    lists:foldl(fun([Source, Kind], Acc) ->
+                        Acc#{Source => Kind =:= ?FOLLOW}
+                end, #{},
+                [R || [_, K] = R <- Rows, K =:= ?FOLLOW] ++
+                [R || [_, K] = R <- Rows, K =:= ?BLOCK]).
 
 %%%===================================================================
 %%% ssb_view callbacks (run in the view_manager process)
@@ -158,22 +174,20 @@ view_version() -> 2.
 view_class() -> core.
 
 view_load() ->
-    case lists:all(fun({Tab, _}) -> has_marker(Tab) end, ?TABLES) of
+    case ssb_store:complete(?MODULE) of
         true  -> ok;
         false -> empty
     end.
 
 view_reset() ->
-    [ets:delete_all_objects(Tab) || {Tab, _} <- ?TABLES],
+    _ = ssb_store:clear_complete(?MODULE),
+    _ = ssb_store:exec("DELETE FROM social_edges;"),
     ok.
 
+%% Rows are already durable; the only thing to record is that this view's
+%% state is complete up to the manager's checkpoints.
 view_save() ->
-    [begin
-         ets:insert(Tab, {?COMPLETE, true}),
-         File = table_file(FileName),
-         filelib:ensure_dir(File),
-         ok = ets:tab2file(Tab, ?b2l(File))
-     end || {Tab, FileName} <- ?TABLES],
+    _ = ssb_store:mark_complete(?MODULE),
     ok.
 
 %% Fold one stored message into the index.  A contact message can carry
@@ -184,14 +198,14 @@ view_entry(#message{author = Author} = Msg) ->
     FollowEvents =
         case social_msg:is_follow(Msg) of
             {C, F} when is_binary(C) ->
-                apply_edge(?GRAPH, Author, C, F),
+                apply_edge(Author, C, ?FOLLOW, F),
                 [{contact, Author, C, F}];
             _ -> []
         end,
     BlockEvents =
         case social_msg:is_block(Msg) of
             {Cb, B} when is_binary(Cb) ->
-                apply_edge(?BLOCKS, Author, Cb, B),
+                apply_edge(Author, Cb, ?BLOCK, B),
                 [{block, Author, Cb, B}];
             _ -> []
         end,
@@ -205,7 +219,7 @@ view_entry(#message{author = Author} = Msg) ->
 %%%===================================================================
 
 init([]) ->
-    [restore_or_create(Tab, FileName) || {Tab, FileName} <- ?TABLES],
+    ok = ssb_store:declare(?MODULE, ?SCHEMA_VERSION, ?DDL),
     {ok, #{}, {continue, register_view}}.
 
 handle_continue(register_view, State) ->
@@ -250,66 +264,27 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-restore_or_create(Tab, FileName) ->
-    %% table_file needs config; without it (bare eunit setups) start with
-    %% fresh tables — view_load() then reports empty and the manager
-    %% rebuilds if/when one is running.
-    Restored = try ets:file2tab(?b2l(table_file(FileName)))
-               catch _:_ -> {error, no_config}
-               end,
-    case Restored of
-        {ok, Tab} -> ok;
-        _         -> ets:new(Tab, [set, named_table, public])
+%% Read helper.  A query before the store is up (a bare eunit fixture, a
+%% restarting store) answers empty rather than raising: a view read is on
+%% the path of RPC handlers and ebt, and a missing index means "no data",
+%% never a crash — the same contract the ETS lookups had.
+rows(Sql, Params) ->
+    try ssb_store:q(Sql, Params) of
+        L when is_list(L) -> L;
+        _                 -> []
+    catch _:_ -> []
     end.
 
-table_file(FileName) ->
-    <<(config:ssb_repo_loc())/binary, "views/", FileName/binary>>.
-
-has_marker(Tab) ->
-    try ets:lookup(Tab, ?COMPLETE) =/= []
-    catch error:badarg -> false
-    end.
-
-apply_edge(Tab, Author, Contact, Bool) ->
-    Cur = case ets:lookup(Tab, Author) of
-              [{Author, Map}] -> Map;
-              []              -> #{}
-          end,
-    ets:insert(Tab, {Author, Cur#{Contact => Bool}}).
-
-lookup(Tab, Key) ->
-    try ets:lookup(Tab, Key) of
-        [{Key, Val}] -> {ok, Val};
-        []           -> miss
-    catch
-        error:badarg -> miss             %% table absent: server not running
-    end.
-
-following_ids(Contacts) ->
-    [Id || Id := true <- Contacts].
-
-blocking_ids(Blocks) ->
-    [Id || Id := true <- Blocks].
-
-follows2(_FeedId, 0, Visited) ->
-    {[], Visited};
-
-follows2(FeedId, HopCount, Visited0) ->
-    NewDirect = [Id || Id <- direct_follows(FeedId),
-                       not sets:is_element(Id, Visited0)],
-    {Deeper, Visited1} =
-        lists:foldl(
-          fun(Id, {Acc, Vis}) ->
-                  case sets:is_element(Id, Vis) of
-                      true ->
-                          {Acc, Vis};
-                      false ->
-                          Vis2 = sets:add_element(Id, Vis),
-                          {Ids, Vis3} = follows2(Id, HopCount - 1, Vis2),
-                          {lists:append(Ids, Acc), Vis3}
-                  end
-          end, {[], Visited0}, NewDirect),
-    {lists:append(NewDirect, Deeper), Visited1}.
+%% Assert one edge.  A contact message restates the whole relationship,
+%% so this is an upsert on (source, dest, kind) rather than an insert.
+apply_edge(Author, Contact, Kind, Bool) ->
+    State = case Bool of true -> 1; _ -> 0 end,
+    _ = ssb_store:write("INSERT INTO social_edges(source,dest,kind,state)"
+                        " VALUES(?1,?2,?3,?4)"
+                        " ON CONFLICT(source,dest,kind) DO UPDATE SET"
+                        " state=excluded.state",
+                        [Author, Contact, Kind, State]),
+    ok.
 
 -ifdef(TEST).
 
@@ -337,24 +312,25 @@ social_graph_test_() ->
       fun rebuild_from_log_test/1]}.
 
 setup() ->
-    Started = lists:filtermap(
-        fun({Name, StartFun}) ->
-            case whereis(Name) of
-                undefined ->
-                    {ok, Pid} = StartFun(),
-                    {true, Pid};
-                _ ->
-                    false
-            end
-        end,
-        [{config,       fun() -> config:start_link("test/ssb.cfg") end},
-         {keys,         fun() -> keys:start_link() end},
-         {mess_auth,    fun() -> mess_auth:start_link() end},
-         {blobs,        fun() -> blobs:start_link() end},
-         {ssb_feed_sup, fun() -> ssb_feed_sup:start_link() end},
-         {view_manager, fun() -> view_manager:start_link() end},
-         {ssb_social_graph, fun() -> ssb_social_graph:start_link() end},
-         {ssb_feed_meta,    fun() -> ssb_feed_meta:start_link() end}]),
+    %% Isolated home per test.  Before the store, these fixtures shared
+    %% whatever ssb_home resolved to and the ETS tables were wiped by
+    %% teardown; now there is a store.db on disk, so a shared home means
+    %% one run's edges leak into the next (and into the repo's own
+    %% .ssberl).  Each test gets its own directory, removed afterwards.
+    teardown(ignore),
+    Home = filename:join("/tmp", "social_graph_" ++
+                          integer_to_list(erlang:system_time(microsecond))),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    application:set_env(ssb, ssb_home, Home),
+    {ok, _} = config:start_link("test/ssb.cfg"),
+    {ok, _} = keys:start_link(),
+    {ok, _} = mess_auth:start_link(),
+    {ok, _} = blobs:start_link(),
+    {ok, _} = ssb_feed_sup:start_link(),
+    {ok, _} = ssb_store:start_link(),
+    {ok, _} = view_manager:start_link(),
+    {ok, _} = ssb_social_graph:start_link(),
+    {ok, _} = ssb_feed_meta:start_link(),
     %% A view registers itself from its own handle_continue, and
     %% view_manager schedules the catch-up fold rather than running it in
     %% the call.  A view that is still catching up receives no ingests
@@ -362,7 +338,7 @@ setup() ->
     %% the fold before storing anything and asserting on the result.
     ok = wait_caught_up(ssb_social_graph),
     ok = wait_caught_up(ssb_feed_meta),
-    Started.
+    Home.
 
 wait_caught_up(Mod) ->
     wait_caught_up(Mod, 250).
@@ -375,11 +351,19 @@ wait_caught_up(Mod, N) ->
         false -> timer:sleep(20), wait_caught_up(Mod, N - 1)
     end.
 
-teardown(Pids) ->
-    %% reverse start order, so the views go down before the
-    %% services their shutdown paths use (config)
-    lists:foreach(fun(Pid) -> catch gen_server:stop(Pid) end,
-                  lists:reverse(Pids)).
+teardown(Home) ->
+    %% reverse start order, so the views go down before the services
+    %% their shutdown paths use (store, config)
+    [catch gen_server:stop(N)
+     || N <- [ssb_feed_meta, ssb_social_graph, view_manager, ssb_store,
+              ssb_feed_sup, blobs, mess_auth, keys, config]],
+    case Home of
+        ignore -> ok;
+        _ ->
+            os:cmd("rm -rf " ++ Home),
+            application:unset_env(ssb, ssb_home)
+    end,
+    ok.
 
 %% Create a fresh feed backed by a generated key pair.
 %% Returns {FeedPid, FeedId, PrivKey}.

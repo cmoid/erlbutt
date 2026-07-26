@@ -487,6 +487,7 @@ th_setup() ->
     {ok, _} = mess_auth:start_link(),
     {ok, _} = blobs:start_link(),
     {ok, _} = ssb_feed_sup:start_link(),
+    {ok, _} = ssb_store:start_link(),
     {ok, _} = view_manager:start_link(),
     {ok, _} = ssb_social_graph:start_link(),
     {ok, _} = silkpurse_threads:start_link(),
@@ -494,8 +495,9 @@ th_setup() ->
 
 th_teardown(Home) ->
     [catch gen_server:stop(Name)
-     || Name <- [silkpurse_threads, ssb_social_graph, view_manager, ssb_feed_sup,
-                 blobs, mess_auth, keys, config]],
+     || Name <- [silkpurse_threads, ssb_social_graph, view_manager,
+                 ssb_store, ssb_feed_sup, blobs, mess_auth, keys,
+                 config]],
     case Home of
         ignore -> ok;
         _ ->
@@ -552,7 +554,12 @@ block_filtering() ->
     %% a root from another author, whom we block
     Other = ~"@blockedauthorrrrrrrrrrrrrrrrrrrrrrrrrrrrr=.ed25519",
     set_root(~"%theirroot0000000000000000000000000000000=.sha256", Other, 999, []),
-    ets:insert(ssb_block_graph, {OwnId, #{Other => true}}),
+    %% block through the view rather than its storage (store-backed now)
+    _ = ssb_social_graph:view_entry(
+          #message{author = OwnId, sequence = 1,
+                   content = {[{~"type", ~"contact"},
+                               {~"contact", Other},
+                               {~"blocking", true}]}}),
     Keys = [proplists:get_value(~"key", P) || {P} <- roots()],
     ?assert(lists:member(MineRoot, Keys)),
     ?assertNot(lists:member(~"%theirroot0000000000000000000000000000000=.sha256",

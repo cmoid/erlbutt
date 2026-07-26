@@ -397,6 +397,7 @@ rs_setup() ->
     catch gen_server:stop(ebt),
     catch gen_server:stop(room_store),
     catch gen_server:stop(ssb_social_graph),
+    catch gen_server:stop(ssb_store),
     catch gen_server:stop(keys),
     catch gen_server:stop(config),
     Home = filename:join("/tmp", "ebt_rs_"
@@ -405,6 +406,7 @@ rs_setup() ->
     application:set_env(ssb, ssb_home, Home),
     {ok, _} = config:start_link("test/ssb.cfg"),
     {ok, _} = keys:start_link(),
+    {ok, _} = ssb_store:start_link(),
     {ok, _} = ssb_social_graph:start_link(),
     {ok, _} = room_store:start_link(),
     {ok, _} = ebt:start_link(),
@@ -414,6 +416,7 @@ rs_cleanup(Home) ->
     catch gen_server:stop(ebt),
     catch gen_server:stop(room_store),
     catch gen_server:stop(ssb_social_graph),
+    catch gen_server:stop(ssb_store),
     catch gen_server:stop(keys),
     catch gen_server:stop(config),
     os:cmd("rm -rf " ++ Home),
@@ -424,15 +427,27 @@ rs_fresh_feed() ->
     #{public := Pub} = enacl:sign_keypair(),
     <<"@", (base64:encode(Pub))/binary, ".ed25519">>.
 
+%% Assert one contact edge by folding a contact message into the view,
+%% the same path a stored message takes.
+rs_edge(Source, Dest, Field, Value) ->
+    Msg = #message{author = Source, sequence = 1,
+                   content = {[{~"type", ~"contact"},
+                               {~"contact", Dest},
+                               {Field, Value}]}},
+    _ = ssb_social_graph:view_entry(Msg),
+    ok.
+
 repl_set_logic() ->
     Self     = keys:pub_key_disp(),
     Follow   = rs_fresh_feed(),
     Member   = rs_fresh_feed(),
     Blocked  = rs_fresh_feed(),
     Stranger = rs_fresh_feed(),
-    %% Seed the follow/block graphs directly and add a room member.
-    ets:insert(ssb_follow_graph, {Self, #{Follow => true}}),
-    ets:insert(ssb_block_graph,  {Self, #{Blocked => true}}),
+    %% Seed the graphs through the view, not by poking its storage — it
+    %% is store-backed now, and a test that knew the table name was
+    %% coupled to an implementation detail it had no business knowing.
+    ok = rs_edge(Self, Follow,  ~"following", true),
+    ok = rs_edge(Self, Blocked, ~"blocking",  true),
     ok = room_store:add_member(Member),
     ok = refresh_repl_set(),
     ?assert(replicate_feed(Self)),         %% our own feed
@@ -441,7 +456,7 @@ repl_set_logic() ->
     ?assertNot(replicate_feed(Blocked)),   %% blocked
     ?assertNot(replicate_feed(Stranger)),  %% neither followed nor a member
     %% A block wins even over membership.
-    ets:insert(ssb_block_graph, {Self, #{Blocked => true, Member => true}}),
+    ok = rs_edge(Self, Member, ~"blocking", true),
     ok = refresh_repl_set(),
     ?assertNot(replicate_feed(Member)).
 
