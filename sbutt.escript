@@ -53,7 +53,14 @@ run(CmdFun) ->
     case connect() of
         {ok, Peer} ->
             CmdFun(Peer),
-            gen_server:stop(Peer);
+            %% The peer process stops itself when the connection drops,
+            %% which on a busy node can happen while a command is still
+            %% running.  Stopping an already-dead process raised noproc
+            %% AFTER the command had printed its results — including
+            %% clobbering health's exit code, which is meant to be usable
+            %% as a post-deploy gate.
+            catch gen_server:stop(Peer),
+            ok;
         {error, Reason} ->
             io:format("Failed to connect to local erlbutt: ~p~n", [Reason]),
             erlang:halt(1)

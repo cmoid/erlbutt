@@ -723,9 +723,19 @@ plugin_dispatch(Mod, Kind, Name, Args, Caller, Calls,
                     N1
             end;
         {_, {reply, Term}} when Kind =:= sync; Kind =:= async ->
-            Body = encode_json(Term),
-            Header = create_header(create_flags(0, 0, 2), size(Body), -ReqNo),
-            utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+            case safe_encode(Term) of
+                {ok, Body} ->
+                    Header = create_header(create_flags(0, 0, 2), size(Body),
+                                           -ReqNo),
+                    utils:send_data(utils:combine(Header, Body), Socket, Nonce,
+                                    SecretBoxKey);
+                {error, Why} ->
+                    ?SSB_ERROR("plugin ~p: reply to ~p is not encodable (~p) "
+                               "— answering with an error frame",
+                               [Mod, Name, Why]),
+                    rpc_error(ReqNo, ~"reply not encodable", Kind, Socket,
+                              Nonce, SecretBoxKey)
+            end;
         {_, {error, Reason}} when is_binary(Reason) ->
             rpc_error(ReqNo, Reason, Kind, Socket, Nonce, SecretBoxKey);
         {_, Other} ->
@@ -747,11 +757,21 @@ send_source_items(Items, ReqNo, Socket, Nonce, SecretBoxKey) ->
                   skip ->
                       N;
                   Item ->
-                      Body = encode_json(Item),
-                      Header = create_header(create_flags(1, 0, 2),
-                                             size(Body), -ReqNo),
-                      utils:send_data(utils:combine(Header, Body),
-                                      Socket, N, SecretBoxKey)
+                      case safe_encode(Item) of
+                          {ok, Body} ->
+                              Header = create_header(create_flags(1, 0, 2),
+                                                     size(Body), -ReqNo),
+                              utils:send_data(utils:combine(Header, Body),
+                                              Socket, N, SecretBoxKey);
+                          {error, Why} ->
+                              %% Mid-stream there is no way to report one
+                              %% bad item, so drop it and keep the stream
+                              %% alive — losing an item beats losing the
+                              %% connection and every other item with it.
+                              ?SSB_ERROR("rpc_processor: skipping unencodable "
+                                         "stream item (~p)", [Why]),
+                              N
+                      end
               end
       end, Nonce, Items).
 
@@ -873,6 +893,24 @@ encode_json({json, Bin}) when is_binary(Bin) ->
     Bin;
 encode_json(Term) ->
     iolist_to_binary(message:ssb_encoder(Term, fun message:ssb_encoder/3, [pretty])).
+
+%% Encode a reply body, or say why it cannot be encoded.
+%%
+%% Stored SSB content is NOT guaranteed to be valid UTF-8 — messages from
+%% the wild carry latin1 bytes — and Erlang's json module rejects those
+%% with {invalid_byte, N}.  Raised bare, that killed the connection's
+%% rpc_processor part-way through writing a frame; the client saw a
+%% truncated body ("stream ended with:9 but wanted:3190"), reconnected,
+%% re-issued the same request and crashed it again.  A single
+%% unencodable message anywhere in the store became an endless reconnect
+%% loop that looked like a network fault.
+%%
+%% One bad message must cost at most one reply.
+safe_encode(Term) ->
+    try {ok, encode_json(Term)}
+    catch Class:Reason ->
+            {error, {Class, Reason}}
+    end.
 
 %% The value JSON for a get: with {private: true} and a box we can read,
 %% unbox the content in place; otherwise the bare stored value.
@@ -1024,6 +1062,27 @@ body1_test() ->
 body2_test() ->
     Rpc = create_req(iolist_to_binary(ssb_encoder(22222, fun message:ssb_encoder/3, []))),
     ?assert(Rpc == 22222).
+
+%% Stored SSB content is not always valid UTF-8.  Encoding must report
+%% that rather than raise, because raising here happens inside the
+%% connection's process and takes the whole connection with it — and the
+%% client then retries the same request forever.
+safe_encode_survives_latin1_test() ->
+    Valid = {[{~"text", ~"plain ascii"}]},
+    ?assertMatch({ok, _}, safe_encode(Valid)),
+    %% 0xFC is 'ü' in latin1 and not a valid UTF-8 sequence
+    Latin1 = {[{~"text", <<"caf", 252, " closed">>}]},
+    ?assertMatch({error, _}, safe_encode(Latin1)),
+    %% the bad one must not have poisoned anything: encoding still works
+    ?assertMatch({ok, _}, safe_encode(Valid)).
+
+%% A nested bad binary is caught too — the byte is usually buried in
+%% content, not at the top level.
+safe_encode_catches_nested_test() ->
+    Nested = {[{~"value",
+                {[{~"content",
+                   {[{~"text", <<"deep ", 252, " byte">>}]}}]}}]},
+    ?assertMatch({error, _}, safe_encode(Nested)).
 
 flags_test() ->
     ?assert(<<10>> == create_flags(1,0,2)),
