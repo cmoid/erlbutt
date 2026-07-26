@@ -2,96 +2,50 @@
 %%
 %% Copyright (C) 2026 Charles Moid
 %%
-%% Backlinks index: which stored messages reference a given target
-%% (message, feed or blob id) anywhere in their content.  The silkpurse
-%% UI's thread and mention views are built on this (JS: ssb-backlinks).
+%% Backlinks: which stored messages reference a given target (message,
+%% feed or blob id) anywhere in their content.  The silkpurse UI's thread
+%% and mention views are built on this (JS: ssb-backlinks).
 %%
-%% An ssb_view over a named public ETS bag {Target, MsgId}, fed and
-%% rebuilt by erlbutt's view_manager, snapshotted under <repo>/views/;
-%% and an ssb_plugin serving `backlinks.read` (source, owner-only) with
-%% the flumeview-query argument shape the JS client sends:
+%% This used to keep its OWN index — an ssb_view over a bag of
+%% {Target, MsgId}, snapshotted under <repo>/views/.  That index was an
+%% edge set, which is exactly what the ssb_links core view now holds for
+%% the whole node (doc/persistence.md §5), so this module keeps no state
+%% at all: it is a stateless ssb_plugin that queries ssb_links and
+%% renders the answers in the shape the JS client expects.
+%%
+%% It serves `backlinks.read` (source, owner-only) with the
+%% flumeview-query argument shape the client sends:
 %%   {query: [{$filter: {dest: Target}}], ...}
-%% Results are full stored messages in ingest order.  live and old are
-%% honoured ({live: true} keeps the stream open, fed by view events via
-%% view_stream); reverse is not yet.
+%% Results are full stored messages in index order.  live and old are
+%% honoured ({live: true} keeps the stream open, fed by ssb_links' view
+%% events via view_stream); reverse is not yet.
 -module(silkpurse_backlinks).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
--behaviour(gen_server).
--behaviour(ssb_view).
 -behaviour(ssb_plugin).
 
 -include_lib("ssb/include/ssb.hrl").
 
 %% API
--export([start_link/0, refs/1]).
-
-%% ssb_view callbacks
--export([view_version/0, view_load/0, view_reset/0, view_save/0,
-         view_entry/1]).
+-export([refs/1]).
 
 %% ssb_plugin callbacks
 -export([manifest/0, handle_rpc/3]).
-
-%% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
-         handle_info/2, terminate/2, code_change/3]).
-
--define(TAB, silkpurse_backlinks).
--define(MARKER, '$complete').
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 
-start_link() ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
-
 %% Message ids that reference Target anywhere in their content.  Used by
-%% silkpurse_thread to find a thread's replies.
+%% silkpurse_thread to find a thread's replies.  Kept as a named function
+%% rather than inlining ssb_links:refs/1 at the call sites, so the
+%% silkpurse side has one place to change if the query ever needs
+%% app-level filtering.
 refs(Target) ->
-    try [Id || {_T, Id} <- ets:lookup(?TAB, Target), is_binary(Id)]
-    catch error:badarg -> []
-    end.
-
-%%%===================================================================
-%%% ssb_view callbacks (run in the view_manager process)
-%%%===================================================================
-
-%% 2: private (boxed) content is now decrypted and indexed — the existing
-%% snapshot has no backlinks for any DM, so it must be refolded.
-view_version() -> 2.
-
-view_load() ->
-    Loaded = try ets:lookup(?TAB, ?MARKER) =/= []
-             catch error:badarg -> false
-             end,
-    case Loaded of
-        true  -> ok;
-        false -> empty
-    end.
-
-view_reset() ->
-    ets:delete_all_objects(?TAB),
-    ok.
-
-view_save() ->
-    ets:insert(?TAB, {?MARKER}),
-    File = table_file(),
-    filelib:ensure_dir(File),
-    ok = ets:tab2file(?TAB, ?b2l(File)),
-    ok.
-
-view_entry(#message{id = MsgId, content = Content}) ->
-    case [T || T <- collect_links(Content), T =/= MsgId] of
-        [] -> ok;
-        Targets ->
-            [ets:insert(?TAB, {Target, MsgId}) || Target <- Targets],
-            {events, [{link, Target, MsgId} || Target <- Targets]}
-    end.
+    ssb_links:refs(Target).
 
 %%%===================================================================
 %%% ssb_plugin callbacks (run in each connection's rpc_processor)
@@ -107,7 +61,7 @@ handle_rpc([~"backlinks", ~"read"], Args, _Caller) ->
         undefined ->
             {error, ~"backlinks.read: no $filter dest in query"};
         Target ->
-            Ids = [Id || {_T, Id} <- ets:lookup(?TAB, Target), is_binary(Id)],
+            Ids = refs(Target),
             Pairs = [{Id, Bin} || Id <- Ids,
                                   (Bin = fetch_encoded(Id)) =/= undefined],
             case flag_of(~"live", Args, false) of
@@ -126,7 +80,7 @@ handle_rpc([~"backlinks", ~"read"], Args, _Caller) ->
                                 end;
                            (_) -> skip
                         end,
-                    {live_source, Snapshot, ?MODULE, EventFun}
+                    {live_source, Snapshot, ssb_links, EventFun}
             end
     end;
 
@@ -169,7 +123,7 @@ handle_rpc([~"patchwork", ~"backlinks", ~"referencesStream"], [{Opts}], _Caller)
                                end;
                           (_) -> skip
                        end,
-            {live_source, Snapshot, ?MODULE, EventFun};
+            {live_source, Snapshot, ssb_links, EventFun};
         _ ->
             {error, ~"referencesStream needs an id"}
     end;
@@ -186,120 +140,11 @@ handle_rpc([~"patchwork", ~"liveBacklinks", ~"stream"], _Args, _Caller) ->
                        end;
                   (_) -> skip
                end,
-    {live_source, [], ?MODULE, EventFun}.
-
-%%%===================================================================
-%%% gen_server callbacks
-%%%===================================================================
-
-init([]) ->
-    %% Create the (empty) table now so it always exists, but defer the
-    %% snapshot restore to handle_continue: file2tab of a large snapshot
-    %% would otherwise block silkpurse_sup:start_link and thus the whole
-    %% node boot (and the shell).  The restores then run concurrently
-    %% across the views rather than serialized by the supervisor.
-    ets:new(?TAB, [bag, named_table, public]),
-    {ok, #{}, {continue, register}}.
-
-handle_continue(register, State) ->
-    %% Swap in the snapshot (if any), then register plugin + view.
-    %% Failures are loud and transient ones retried on a timer
-    %% (ssb_view:ensure_registered) — the old silent noproc swallow
-    %% here cost EarlButt its messagesByType method (July 2026).
-    maybe_restore(),
-    ensure_registered(State).
-
-maybe_restore() ->
-    File = ?b2l(table_file()),
-    case filelib:is_regular(File) of
-        false ->
-            ok;                        %% no snapshot; keep the empty table
-        true ->
-            ets:delete(?TAB),
-            case (try ets:file2tab(File) catch _:_ -> error end) of
-                {ok, ?TAB} -> ok;
-                _          -> ets:new(?TAB, [bag, named_table, public])
-            end
-    end.
-
-handle_call(_Request, _From, State) ->
-    {reply, ok, State}.
-
-handle_cast(_Msg, State) ->
-    {noreply, State}.
-
-handle_info(ensure_registered, State) ->
-    ensure_registered(State);
-handle_info(_Info, State) ->
-    {noreply, State}.
-
-%% First attempt (from handle_continue) and every timer retry land
-%% here; keep trying until every service accepts the registration.
-ensure_registered(State) ->
-    case ssb_view:ensure_registered(?MODULE) of
-        ok    -> ok;
-        retry -> erlang:send_after(2000, self(), ensure_registered)
-    end,
-    {noreply, State}.
-
-terminate(_Reason, _State) ->
-    %% snapshot before the table dies with this process (views stop
-    %% before view_manager at shutdown — see ssb_social_graph)
-    catch view_save(),
-    ok.
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
+    {live_source, [], ssb_links, EventFun}.
 
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
-
-table_file() ->
-    <<(config:ssb_repo_loc())/binary, "views/backlinks.tab">>.
-
-%% Every SSB reference (%msg, @feed, &blob) anywhere in the content.
-%%
-%% Private content arrives as an opaque `.box` binary, which walk/1 sees
-%% as one non-link string — so a DM reply used to produce NO backlinks at
-%% all, and thread.sorted (which is built entirely on this index) could
-%% never show it.  Decrypt the box when it is addressed to us and walk the
-%% plaintext instead.  Only ids are stored, never plaintext: the bag holds
-%% {Target, MsgId} pairs, the same shape of metadata silkpurse_private
-%% already keeps.
-collect_links(Content) when is_binary(Content) ->
-    case private_box:is_private(Content) andalso private_box:decrypt(Content) of
-        {ok, Plain} ->
-            try lists:usort(walk(utils:nat_decode(Plain)))
-            catch _:_ -> []          %% a DM body need not be JSON
-            end;
-        _ ->
-            []                       %% not ours to read
-    end;
-collect_links(Content) ->
-    lists:usort(walk(Content)).
-
-walk({Props}) when is_list(Props) ->
-    lists:flatmap(fun({_K, V}) -> walk(V) end, Props);
-walk(L) when is_list(L) ->
-    lists:flatmap(fun walk/1, L);
-walk(B) when is_binary(B) ->
-    case is_link(B) of
-        true  -> [B];
-        false -> []
-    end;
-walk(_) ->
-    [].
-
-is_link(<<"%", _/binary>> = B) -> plausible_ref(B);
-is_link(<<"@", _/binary>> = B) -> plausible_ref(B);
-is_link(<<"&", _/binary>> = B) -> plausible_ref(B);
-is_link(_)                     -> false.
-
-%% sigil + base64 + ".suffix"; keep it loose but bounded
-plausible_ref(B) ->
-    byte_size(B) >= 40 andalso byte_size(B) =< 128
-        andalso binary:match(B, ~".") =/= nomatch.
 
 %% The stored (encoded) form of a message by id, via the id->author
 %% index and the author's feed.
@@ -387,22 +232,6 @@ dest_of(_) ->
 %%%===================================================================
 -ifdef(TEST).
 
-collect_links_test() ->
-    Root = ~"%aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=.sha256",
-    Feed = ~"@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=.ed25519",
-    Blob = ~"&ccccccccccccccccccccccccccccccccccccccccccc=.sha256",
-    Content = {[{~"type", ~"post"},
-                {~"text", ~"see this"},
-                {~"root", Root},
-                {~"branch", [Root]},
-                {~"mentions", [{[{~"link", Feed}]},
-                               {[{~"link", Blob}]}]}]},
-    ?assertEqual(lists:sort([Root, Feed, Blob]), collect_links(Content)),
-    %% private content is opaque
-    ?assertEqual([], collect_links(~"gibberish.box")),
-    %% short/plain strings are not refs
-    ?assertEqual([], collect_links({[{~"text", ~"@you & %us"}]})).
-
 dest_of_test() ->
     Root = ~"%aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=.sha256",
     Args = [{[{~"query", [{[{~"$filter", {[{~"dest", Root}]}}]}]},
@@ -427,12 +256,22 @@ bl_setup() ->
     {ok, _} = blobs:start_link(),
     {ok, _} = ssb_feed_sup:start_link(),
     {ok, _} = view_manager:start_link(),
-    {ok, _} = silkpurse_backlinks:start_link(),
+    {ok, _} = ssb_links:start_link(),
+    ok = bl_wait(250),
     Home.
+
+%% ssb_links registers asynchronously; a view mid-catch-up takes no
+%% ingests, so wait before storing anything.
+bl_wait(0) -> error(never_caught_up);
+bl_wait(N) ->
+    case view_manager:caught_up(ssb_links) of
+        true  -> ok;
+        false -> timer:sleep(20), bl_wait(N - 1)
+    end.
 
 bl_teardown(Home) ->
     [catch gen_server:stop(Name)
-     || Name <- [silkpurse_backlinks, view_manager, ssb_feed_sup,
+     || Name <- [ssb_links, view_manager, ssb_feed_sup,
                  blobs, mess_auth, keys, config]],
     case Home of
         ignore -> ok;

@@ -16,6 +16,7 @@ start(_StartType, _StartArgs) ->
     %% incomplete API.  With no state to build, these can register
     %% immediately.
     ok = plugin_registry:register_plugin(silkpurse_db),
+    ok = plugin_registry:register_plugin(silkpurse_backlinks),
     ok = plugin_registry:register_plugin(silkpurse_conn),
     ok = plugin_registry:register_plugin(silkpurse_contacts),
     ok = plugin_registry:register_plugin(silkpurse_thread),
@@ -25,6 +26,7 @@ start(_StartType, _StartArgs) ->
 
 stop(_State) ->
     plugin_registry:unregister_plugin(silkpurse_db),
+    plugin_registry:unregister_plugin(silkpurse_backlinks),
     plugin_registry:unregister_plugin(silkpurse_conn),
     plugin_registry:unregister_plugin(silkpurse_contacts),
     plugin_registry:unregister_plugin(silkpurse_thread),
