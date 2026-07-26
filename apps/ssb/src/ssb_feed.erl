@@ -563,6 +563,7 @@ feed_test_() ->
       fun fetch_last_msg_test/1,
       fun store_msg_dedup_test/1,
       fun store_msg_checked_chain_test/1,
+      fun no_profile_or_contacts_files_test/1,
       fun fetch_missing_msg_test/1,
       fun archive_manual_test/1,
       fun fetch_archived_msg_test/1,
@@ -661,6 +662,32 @@ store_msg_checked_chain_test({Pid, FeedId, _}) ->
         %% the correct seq 3 (previous = seq 2's id) is still accepted after
         Good  = Post(Two#message.id, 3, ~"three"),
         ?assertEqual(stored,  ssb_feed:store_msg_checked(Pid, Good))
+    end.
+
+%% Storing about and contact messages no longer writes the per-feed
+%% `profile` and `contacts` side-logs.  They duplicated message bodies for
+%% a lazy loader that no longer exists (doc/persistence.md §3); the feed
+%% directory should now hold only log.offset and references.
+no_profile_or_contacts_files_test({Pid, FeedId, _}) ->
+    fun() ->
+        Priv = keys:priv_key(),
+        About = message:new_msg(null, 1,
+                                {[{~"type",  ~"about"},
+                                  {~"about", FeedId},
+                                  {~"name",  ~"tester"}]},
+                                {FeedId, Priv}),
+        ?assertEqual(stored, ssb_feed:store_msg(Pid, About)),
+        Contact = message:new_msg(About#message.id, 2,
+                                  {[{~"type",      ~"contact"},
+                                    {~"contact",   FeedId},
+                                    {~"following", true}]},
+                                  {FeedId, Priv}),
+        ?assertEqual(stored, ssb_feed:store_msg(Pid, Contact)),
+        Dir = filename:dirname(?b2l(feed_file(FeedId))),
+        ?assertNot(filelib:is_file(filename:join(Dir, "profile"))),
+        ?assertNot(filelib:is_file(filename:join(Dir, "contacts"))),
+        %% the messages themselves are still stored
+        ?assertMatch(#message{sequence = 2}, ssb_feed:fetch_last_msg(Pid))
     end.
 
 %% An id this feed does not hold answers not_found — it must not badmatch
