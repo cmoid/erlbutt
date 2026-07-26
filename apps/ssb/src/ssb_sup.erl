@@ -41,6 +41,7 @@ init([]) ->
             %% and starts them itself, before any application's views
             ?CHILD(ssb_social_graph, worker),
             ?CHILD(ssb_feed_meta, worker),
+            ?CHILD(ssb_links, worker),
             ?CHILD(ebt, worker),
             ?CHILD(peer_registry, worker),
             ?CHILD(room_attendants, worker),
