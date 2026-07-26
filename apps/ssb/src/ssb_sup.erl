@@ -37,7 +37,10 @@ init([]) ->
             ?CHILD(ingest_journal, worker),
             ?CHILD(ssb_feed_sup, supervisor),
             ?CHILD(view_manager, worker),
-            ?CHILD(friends, worker),
+            %% core views (doc/persistence.md §5): the ssb app owns these
+            %% and starts them itself, before any application's views
+            ?CHILD(ssb_social_graph, worker),
+            ?CHILD(ssb_feed_meta, worker),
             ?CHILD(ebt, worker),
             ?CHILD(peer_registry, worker),
             ?CHILD(room_attendants, worker),

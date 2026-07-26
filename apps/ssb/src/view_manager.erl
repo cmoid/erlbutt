@@ -40,6 +40,8 @@
          unsubscribe/1,
          notify/2,
          checkpoint/2,
+         views/0,
+         views/1,
          save/0]).
 
 %% gen_server callbacks
@@ -51,7 +53,11 @@
 -define(PG_SCOPE, ssb_views).
 -define(SAVE_EVERY_MS, 60_000).
 
--record(vm_state, {views = []}).   %% registered view modules, oldest first
+%% Registered views as [{Mod, core | app}], in delivery order: every core
+%% view before every app view, each group in registration order.  Core
+%% views are protocol infrastructure an app view may fold against, so they
+%% must see a message first (doc/persistence.md §5).
+-record(vm_state, {views = []}).
 
 %%%===================================================================
 %%% API
@@ -75,7 +81,7 @@ rebuild(Mod) when is_atom(Mod) ->
 
 %% Fold one just-stored message into every registered view.  Called
 %% synchronously from ssb_feed:store/2 so views are current when the
-%% store returns (the same contract friends:update/3 used to have).
+%% store returns (the same contract ssb_social_graph:update/3 used to have).
 %% A no-op when the manager is not running.
 ingest(#message{} = Msg) ->
     try gen_server:call(?SERVER, {ingest, Msg}, infinity)
@@ -105,6 +111,17 @@ checkpoint(ViewMod, FeedId) ->
     catch error:badarg -> 0
     end.
 
+%% Registered views in delivery order (core first).
+views() ->
+    views(any).
+
+%% Registered views of one class — `core`, `app`, or `any`.  Lets an
+%% application assert that the core views it builds on are present.
+views(Class) when Class =:= core; Class =:= app; Class =:= any ->
+    try gen_server:call(?SERVER, {views, Class}, infinity)
+    catch exit:{noproc, _} -> []
+    end.
+
 %% Flush every view's durable state and the checkpoint table to disk.
 save() ->
     gen_server:call(?SERVER, save, infinity).
@@ -130,36 +147,48 @@ init([]) ->
     {ok, #vm_state{}}.
 
 handle_call({register_view, Mod}, _From, #vm_state{views = Views} = State) ->
-    case lists:member(Mod, Views) of
+    case lists:keymember(Mod, 1, Views) of
         true ->
             {reply, ok, State};
         false ->
+            Class   = ssb_view:class(Mod),
             StoredV = stored_version(Mod),
             CodeV   = Mod:view_version(),
             case StoredV =:= CodeV andalso Mod:view_load() =:= ok of
                 true ->
                     catch_up(Mod);
                 false ->
-                    ?SSB_INFO("view_manager: rebuilding ~p (stored ~p, code ~p)",
-                              [Mod, StoredV, CodeV]),
+                    ?SSB_INFO("view_manager: rebuilding ~p ~p (stored ~p, code ~p)",
+                              [Class, Mod, StoredV, CodeV]),
                     rebuild_view(Mod)
             end,
-            {reply, ok, State#vm_state{views = Views ++ [Mod]}}
+            {reply, ok, State#vm_state{views = insert_view(Mod, Class, Views)}}
     end;
 
 handle_call({rebuild, Mod}, _From, #vm_state{views = Views} = State) ->
-    case lists:member(Mod, Views) of
+    case lists:keymember(Mod, 1, Views) of
         true  -> {reply, rebuild_view(Mod), State};
         false -> {reply, {error, not_registered}, State}
     end;
 
+handle_call({views, Class}, _From, #vm_state{views = Views} = State) ->
+    {reply, [M || {M, C} <- Views, Class =:= any orelse C =:= Class], State};
+
 handle_call({ingest, Msg}, _From, #vm_state{views = Views} = State) ->
-    [deliver(Mod, Msg) || Mod <- Views],
+    [deliver(Mod, Msg) || {Mod, _Class} <- Views],
     {reply, ok, State};
 
 handle_call(save, _From, #vm_state{views = Views} = State) ->
     save_all(Views),
     {reply, ok, State}.
+
+%% Append Mod to its class group: core views ahead of every app view,
+%% within a group in registration order.
+insert_view(Mod, core, Views) ->
+    {Core, App} = lists:splitwith(fun({_, C}) -> C =:= core end, Views),
+    Core ++ [{Mod, core}] ++ App;
+insert_view(Mod, app, Views) ->
+    Views ++ [{Mod, app}].
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -280,7 +309,7 @@ save_all(Views) ->
              %% (reverse start order) and snapshot themselves in their
              %% own terminate; their tables are already gone here.
              ?SSB_DEBUG("view ~p save skipped: ~p:~p", [Mod, C, R])
-     end || Mod <- Views],
+     end || {Mod, _Class} <- Views],
     persist_ckpt().
 
 persist_ckpt() ->
@@ -313,6 +342,7 @@ vm_test_() ->
     {setup, fun vm_setup/0, fun vm_teardown/1,
      fun(_) ->
              [?_test(ingest_and_checkpoint()),
+              ?_test(core_views_ordered_first()),
               ?_test(events_to_subscriber()),
               ?_test(catch_up_after_restart()),
               ?_test(rebuild_on_version_bump()),
@@ -385,6 +415,23 @@ ingest_and_checkpoint() ->
     ?assertEqual([1, 2], test_counter_view:entries(Id)),
     ?assertEqual(2, checkpoint(test_counter_view, Id)).
 
+%% A core view registered after an app view still sorts (and is
+%% delivered) ahead of it — an app view may fold against core state, so
+%% core has to see each message first.  test_counter_view declares no
+%% view_class and must therefore default to `app`.
+core_views_ordered_first() ->
+    ok = test_counter_view:ensure_table(),
+    ok = test_core_view:ensure_table(),
+    ok = vm_ensure_manager(),
+    %% a view declaring no class is an app view
+    ?assertEqual(app,  ssb_view:class(test_counter_view)),
+    ?assertEqual(core, ssb_view:class(test_core_view)),
+    ok = register_view(test_counter_view),      %% app registers FIRST
+    ok = register_view(test_core_view),         %% core registers second
+    ?assertEqual([test_core_view, test_counter_view], views()),
+    ?assertEqual([test_core_view], views(core)),
+    ?assertEqual([test_counter_view], views(app)).
+
 events_to_subscriber() ->
     ok = test_counter_view:ensure_table(),
     ok = vm_ensure_manager(),
@@ -419,7 +466,7 @@ catch_up_after_restart() ->
 %% Rebuild reads the per-feed logs, not the global log.offset: wiping
 %% the global log must lose nothing.  (Regression: the global log holds
 %% only a fraction of the per-feed history on converted nodes, which
-%% left the friends view nearly empty after its first rebuild.)
+%% left the social graph view nearly empty after its first rebuild.)
 rebuild_without_global_log() ->
     ok = test_counter_view:ensure_table(),
     ok = vm_ensure_manager(),

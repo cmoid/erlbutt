@@ -15,7 +15,7 @@
 %% from the view's own process — so a view backed by a gen_server must
 %% keep its tables public (or otherwise writable from the manager) and
 %% must not implement these callbacks as calls into itself while it is
-%% registering.  The convention (see friends) is: the view's gen_server
+%% registering.  The convention (see ssb_social_graph) is: the view's gen_server
 %% owns named public ETS tables created (or file2tab-restored) in its
 %% init, and these callbacks are plain functions over those tables.
 %%
@@ -40,13 +40,47 @@
 -include_lib("ssb/include/ssb.hrl").
 
 -export([ensure_registered/1,
-         ensure_registered/2]).
+         ensure_registered/2,
+         class/1]).
 
 -callback view_version() -> pos_integer().
 -callback view_load() -> ok | empty.
 -callback view_reset() -> ok.
 -callback view_save() -> ok.
 -callback view_entry(#message{}) -> ok | {events, [term()]}.
+
+%% Which layer the view belongs to (doc/persistence.md §5):
+%%
+%%   core — protocol infrastructure owned by the ssb app, always on, and
+%%          part of what an application may assume exists.  Registered
+%%          before any app view and delivered messages first, so an app
+%%          view folding the same message sees core state already
+%%          updated.
+%%   app  — an application's own concern (silkpurse's channels, likes,
+%%          threads).  The default, so existing views need no change.
+-callback view_class() -> core | app.
+-optional_callbacks([view_class/0]).
+
+%% A view's class, defaulting to `app` for modules that do not declare one.
+class(Mod) when is_atom(Mod) ->
+    case erlang:function_exported(Mod, view_class, 0) of
+        true ->
+            case Mod:view_class() of
+                core -> core;
+                _    -> app
+            end;
+        false ->
+            %% not loaded yet: force it, then ask again
+            case code:ensure_loaded(Mod) of
+                {module, Mod} ->
+                    case erlang:function_exported(Mod, view_class, 0) of
+                        true -> Mod:view_class();
+                        false -> app
+                    end;
+                _ ->
+                    app
+            end
+    end.
 
 %% Register Mod with its services, LOUDLY.  The old per-module pattern
 %% (try ... catch exit:{noproc,_} -> ok) turned a failed registration
