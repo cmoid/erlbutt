@@ -369,7 +369,7 @@ opts(_) ->
 
 %% Feeds the node owner blocks — their threads are hidden.
 blocked_set() ->
-    sets:from_list(friends:blocks(keys:pub_key_disp())).
+    sets:from_list(ssb_social_graph:blocks(keys:pub_key_disp())).
 
 %% Threads whose root has been seen and whose author is not blocked.
 gather(Blocked) ->
@@ -488,13 +488,13 @@ th_setup() ->
     {ok, _} = blobs:start_link(),
     {ok, _} = ssb_feed_sup:start_link(),
     {ok, _} = view_manager:start_link(),
-    {ok, _} = friends:start_link(),
+    {ok, _} = ssb_social_graph:start_link(),
     {ok, _} = silkpurse_threads:start_link(),
     Home.
 
 th_teardown(Home) ->
     [catch gen_server:stop(Name)
-     || Name <- [silkpurse_threads, friends, view_manager, ssb_feed_sup,
+     || Name <- [silkpurse_threads, ssb_social_graph, view_manager, ssb_feed_sup,
                  blobs, mess_auth, keys, config]],
     case Home of
         ignore -> ok;

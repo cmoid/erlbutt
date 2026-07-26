@@ -2,8 +2,16 @@
 %%
 %% Copyright (C) 2023 Charles Moid
 %%
-%% Maintained social index: a follow graph, a block graph and a
-%% profile-name cache, kept in named public ETS tables owned by this
+%% Core view: the follow graph and the block graph.
+%%
+%% This is protocol infrastructure, not a social feature — `ebt` asks it
+%% who to replicate and who to refuse, so a node carrying no social
+%% application at all still needs it (doc/persistence.md §5).  It was
+%% called `friends` until July 2026, a patchwork-ism sitting in the
+%% foundation; the display-name cache it also carried moved out to
+%% ssb_feed_meta, where arbitrary self-asserted fields live.
+%%
+%% The graphs are kept in named public ETS tables owned by this
 %% gen_server and populated exclusively by view_manager (this module is
 %% an ssb_view — see ssb_view.erl).  The manager guarantees the tables
 %% are complete: it replays anything missed at registration, rebuilds
@@ -17,7 +25,7 @@
 %% <repo>/views/, restored (or created fresh) in init; view_save/0
 %% stamps a completeness marker so view_load/0 can tell a restored
 %% snapshot from a fresh table.
--module(friends).
+-module(ssb_social_graph).
 
 -behaviour(gen_server).
 -behaviour(ssb_view).
@@ -35,11 +43,11 @@
          blocks/1,
          edge/2,
          edges/1,
-         reverse_edges/1,
-         name/1]).
+         reverse_edges/1]).
 
 %% ssb_view callbacks
 -export([view_version/0,
+         view_class/0,
          view_load/0,
          view_reset/0,
          view_save/0,
@@ -50,7 +58,6 @@
          handle_info/2, terminate/2, code_change/3]).
 
 -define(GRAPH, ssb_follow_graph).
--define(NAMES, ssb_profile_names).
 -define(BLOCKS, ssb_block_graph).
 
 %% Written by view_save/0 before each snapshot; its presence after a
@@ -58,10 +65,14 @@
 %% the manager's checkpoints.
 -define(COMPLETE, '$complete').
 
+%% Renamed from friends_*.tab with the module.  An upgrading node finds
+%% no snapshot under the new names, so view_load/0 reports empty and the
+%% manager rebuilds both graphs from the log — the intended behaviour for
+%% a view whose storage identity changed.  The old files are inert and
+%% can be deleted.
 -define(TABLES,
-        [{?GRAPH,  ~"friends_graph.tab"},
-         {?NAMES,  ~"friends_names.tab"},
-         {?BLOCKS, ~"friends_blocks.tab"}]).
+        [{?GRAPH,  ~"social_graph_follows.tab"},
+         {?BLOCKS, ~"social_graph_blocks.tab"}]).
 
 %%%===================================================================
 %%% API
@@ -134,13 +145,6 @@ reverse_fold(Tab, Dest, Value, Acc0) ->
     catch error:badarg -> Acc0        %% table absent
     end.
 
-%% Latest self-assigned display name for FeedId, or undefined.
-name(FeedId) ->
-    case lookup(?NAMES, FeedId) of
-        {ok, Name} -> Name;
-        miss       -> undefined
-    end.
-
 %%%===================================================================
 %%% ssb_view callbacks (run in the view_manager process)
 %%%===================================================================
@@ -150,6 +154,8 @@ name(FeedId) ->
 %% claim coverage they don't have, so upgrading nodes must rebuild —
 %% which is exactly what a version bump forces.
 view_version() -> 2.
+
+view_class() -> core.
 
 view_load() ->
     case lists:all(fun({Tab, _}) -> has_marker(Tab) end, ?TABLES) of
@@ -173,7 +179,7 @@ view_save() ->
 %% Fold one stored message into the index.  A contact message can carry
 %% `following` and/or `blocking`; each applies to its own graph and is
 %% announced to subscribers (ebt keeps its replication set current from
-%% these events).  Self-assigned abouts update the name cache.
+%% these events).
 view_entry(#message{author = Author} = Msg) ->
     FollowEvents =
         case social_msg:is_follow(Msg) of
@@ -189,7 +195,6 @@ view_entry(#message{author = Author} = Msg) ->
                 [{block, Author, Cb, B}];
             _ -> []
         end,
-    apply_name(Msg),
     case FollowEvents ++ BlockEvents of
         []     -> ok;
         Events -> {events, Events}
@@ -222,7 +227,7 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 %% First attempt (from handle_continue) and every timer retry land
-%% here; keep trying until the view registration is accepted.  friends
+%% here; keep trying until the view registration is accepted.  This view
 %% registers no plugin — its RPC surface lives in the silkpurse app.
 ensure_registered(State) ->
     case ssb_view:ensure_registered(?MODULE, [view]) of
@@ -272,19 +277,6 @@ apply_edge(Tab, Author, Contact, Bool) ->
           end,
     ets:insert(Tab, {Author, Cur#{Contact => Bool}}).
 
-apply_name(#message{author = Author, content = {Props}} = Msg) ->
-    case social_msg:is_about(Msg) of
-        true ->
-            case {?pgv(~"about", Props), ?pgv(~"name", Props)} of
-                {Author, Name} when is_binary(Name) ->
-                    ets:insert(?NAMES, {Author, Name});
-                _ -> ok
-            end;
-        false -> ok
-    end;
-apply_name(_) ->
-    ok.
-
 lookup(Tab, Key) ->
     try ets:lookup(Tab, Key) of
         [{Key, Val}] -> {ok, Val};
@@ -321,7 +313,7 @@ follows2(FeedId, HopCount, Visited0) ->
 
 -ifdef(TEST).
 
-friends_test_() ->
+social_graph_test_() ->
     {foreach,
      fun setup/0,
      fun teardown/1,
@@ -361,11 +353,12 @@ setup() ->
          {blobs,        fun() -> blobs:start_link() end},
          {ssb_feed_sup, fun() -> ssb_feed_sup:start_link() end},
          {view_manager, fun() -> view_manager:start_link() end},
-         {friends,      fun() -> friends:start_link() end}]),
+         {ssb_social_graph, fun() -> ssb_social_graph:start_link() end},
+         {ssb_feed_meta,    fun() -> ssb_feed_meta:start_link() end}]),
     Started.
 
 teardown(Pids) ->
-    %% reverse start order, so view_manager/friends go down before the
+    %% reverse start order, so the views go down before the
     %% services their shutdown paths use (config)
     lists:foreach(fun(Pid) -> catch gen_server:stop(Pid) end,
                   lists:reverse(Pids)).
@@ -403,7 +396,7 @@ store_block(FeedPid, AuthId, AuthPriv, Prev, Seq, ContactId, Blocking) ->
 direct_follows_empty_test(_) ->
     fun() ->
         {Pid, _Id, _Priv} = make_peer(),
-        ?assertEqual([], friends:direct_follows(Pid))
+        ?assertEqual([], ssb_social_graph:direct_follows(Pid))
     end.
 
 direct_follows_follow_test(_) ->
@@ -411,16 +404,16 @@ direct_follows_follow_test(_) ->
         {Pid, Id, Priv} = make_peer(),
         {_Pid2, Id2, _Priv2} = make_peer(),
         ok = store_contact(Pid, Id, Priv, null, 1, Id2, true),
-        ?assertEqual([Id2], friends:direct_follows(Pid))
+        ?assertEqual([Id2], ssb_social_graph:direct_follows(Pid))
     end.
 
 blocks_block_test(_) ->
     fun() ->
         {Pid, Id, Priv} = make_peer(),
         {_Pid2, Id2, _Priv2} = make_peer(),
-        ?assertEqual([], friends:blocks(Pid)),
+        ?assertEqual([], ssb_social_graph:blocks(Pid)),
         ok = store_block(Pid, Id, Priv, null, 1, Id2, true),
-        ?assertEqual([Id2], friends:blocks(Pid))
+        ?assertEqual([Id2], ssb_social_graph:blocks(Pid))
     end.
 
 blocks_unblock_test(_) ->
@@ -430,7 +423,7 @@ blocks_unblock_test(_) ->
         ok = store_block(Pid, Id, Priv, null, 1, Id2, true),
         #message{id = Msg1Id} = ssb_feed:fetch_last_msg(Pid),
         ok = store_block(Pid, Id, Priv, Msg1Id, 2, Id2, false),
-        ?assertEqual([], friends:blocks(Pid))
+        ?assertEqual([], ssb_social_graph:blocks(Pid))
     end.
 
 %% follow and block are tracked independently, even within the same feed.
@@ -442,8 +435,8 @@ blocks_independent_of_follow_test(_) ->
         ok = store_contact(Pid, Id, Priv, null, 1, Id2, true),
         #message{id = Msg1Id} = ssb_feed:fetch_last_msg(Pid),
         ok = store_block(Pid, Id, Priv, Msg1Id, 2, Id3, true),
-        ?assertEqual([Id2], friends:direct_follows(Pid)),
-        ?assertEqual([Id3], friends:blocks(Pid))
+        ?assertEqual([Id2], ssb_social_graph:direct_follows(Pid)),
+        ?assertEqual([Id3], ssb_social_graph:blocks(Pid))
     end.
 
 direct_follows_unfollow_test(_) ->
@@ -453,7 +446,7 @@ direct_follows_unfollow_test(_) ->
         ok = store_contact(Pid, Id, Priv, null, 1, Id2, true),
         #message{id = Msg1Id} = ssb_feed:fetch_last_msg(Pid),
         ok = store_contact(Pid, Id, Priv, Msg1Id, 2, Id2, false),
-        ?assertEqual([], friends:direct_follows(Pid))
+        ?assertEqual([], ssb_social_graph:direct_follows(Pid))
     end.
 
 %% edge/2: following -> true, blocking -> false (block wins), else null.
@@ -466,9 +459,9 @@ edge_test(_) ->
         ok = store_contact(Pid, Id, Priv, null, 1, Followed, true),
         #message{id = M1} = ssb_feed:fetch_last_msg(Pid),
         ok = store_block(Pid, Id, Priv, M1, 2, Blocked, true),
-        ?assertEqual(true,  friends:edge(Id, Followed)),
-        ?assertEqual(false, friends:edge(Id, Blocked)),
-        ?assertEqual(null,  friends:edge(Id, Stranger))
+        ?assertEqual(true,  ssb_social_graph:edge(Id, Followed)),
+        ?assertEqual(false, ssb_social_graph:edge(Id, Blocked)),
+        ?assertEqual(null,  ssb_social_graph:edge(Id, Stranger))
     end.
 
 edges_test(_) ->
@@ -479,7 +472,7 @@ edges_test(_) ->
         ok = store_contact(Pid, Id, Priv, null, 1, Followed, true),
         #message{id = M1} = ssb_feed:fetch_last_msg(Pid),
         ok = store_block(Pid, Id, Priv, M1, 2, Blocked, true),
-        Edges = friends:edges(Id),
+        Edges = ssb_social_graph:edges(Id),
         ?assertEqual(true,  maps:get(Followed, Edges)),
         ?assertEqual(false, maps:get(Blocked, Edges)),
         ?assertEqual(2, maps:size(Edges))
@@ -493,14 +486,14 @@ incremental_update_test(_) ->
         {_Pid2, Id2, _Priv2} = make_peer(),
         {_Pid3, Id3, _Priv3} = make_peer(),
         ok = store_contact(Pid, Id, Priv, null, 1, Id2, true),
-        ?assertEqual([Id2], friends:direct_follows(Id)),
+        ?assertEqual([Id2], ssb_social_graph:direct_follows(Id)),
         #message{id = Msg1Id} = ssb_feed:fetch_last_msg(Pid),
         ok = store_contact(Pid, Id, Priv, Msg1Id, 2, Id3, true),
         ?assertEqual(lists:sort([Id2, Id3]),
-                     lists:sort(friends:direct_follows(Id))),
+                     lists:sort(ssb_social_graph:direct_follows(Id))),
         #message{id = Msg2Id} = ssb_feed:fetch_last_msg(Pid),
         ok = store_contact(Pid, Id, Priv, Msg2Id, 3, Id2, false),
-        ?assertEqual([Id3], friends:direct_follows(Id))
+        ?assertEqual([Id3], ssb_social_graph:direct_follows(Id))
     end.
 
 %% Legacy planetary garbage: contact field holding a boolean is ignored.
@@ -508,7 +501,7 @@ garbage_contact_test(_) ->
     fun() ->
         {Pid, Id, Priv} = make_peer(),
         ok = store_contact(Pid, Id, Priv, null, 1, true, true),
-        ?assertEqual([], friends:direct_follows(Id))
+        ?assertEqual([], ssb_social_graph:direct_follows(Id))
     end.
 
 follows_zero_hops_test(_) ->
@@ -516,7 +509,7 @@ follows_zero_hops_test(_) ->
         {Pid, Id, Priv} = make_peer(),
         {_Pid2, Id2, _Priv2} = make_peer(),
         ok = store_contact(Pid, Id, Priv, null, 1, Id2, true),
-        ?assertEqual([], friends:follows(Pid, 0))
+        ?assertEqual([], ssb_social_graph:follows(Pid, 0))
     end.
 
 follows_one_hop_test(_) ->
@@ -524,7 +517,7 @@ follows_one_hop_test(_) ->
         {Pid, Id, Priv} = make_peer(),
         {_AlicePid, AliceId, _AlicePriv} = make_peer(),
         ok = store_contact(Pid, Id, Priv, null, 1, AliceId, true),
-        Result = friends:follows(Pid, 1),
+        Result = ssb_social_graph:follows(Pid, 1),
         ?assert(lists:member(AliceId, Result))
     end.
 
@@ -535,7 +528,7 @@ follows_two_hop_test(_) ->
         {_BobPid, BobId, _BobPriv} = make_peer(),
         ok = store_contact(OwnerPid, OwnerId, OwnerPriv, null, 1, AliceId, true),
         ok = store_contact(AlicePid, AliceId, AlicePriv, null, 1, BobId, true),
-        Result = friends:follows(OwnerPid, 2),
+        Result = ssb_social_graph:follows(OwnerPid, 2),
         ?assert(lists:member(AliceId, Result)),
         ?assert(lists:member(BobId, Result))
     end.
@@ -548,7 +541,7 @@ follows_no_cycle_test(_) ->
         {AlicePid, AliceId, AlicePriv} = make_peer(),
         ok = store_contact(OwnerPid, OwnerId, OwnerPriv, null, 1, AliceId, true),
         ok = store_contact(AlicePid, AliceId, AlicePriv, null, 1, OwnerId, true),
-        Result = friends:follows(OwnerPid, 5),
+        Result = ssb_social_graph:follows(OwnerPid, 5),
         ?assert(lists:member(AliceId, Result)),
         ?assertNot(lists:member(OwnerId, Result))
     end.
@@ -557,12 +550,12 @@ follows_no_cycle_test(_) ->
 name_updates_test(_) ->
     fun() ->
         {Pid, Id, Priv} = make_peer(),
-        ?assertEqual(undefined, friends:name(Id)),
+        ?assertEqual(undefined, ssb_feed_meta:name(Id)),
         ok = store_about(Pid, Id, Priv, null, 1, Id, ~"alice"),
-        ?assertEqual(~"alice", friends:name(Id)),
+        ?assertEqual(~"alice", ssb_feed_meta:name(Id)),
         #message{id = Msg1Id} = ssb_feed:fetch_last_msg(Pid),
         ok = store_about(Pid, Id, Priv, Msg1Id, 2, Id, ~"alice the great"),
-        ?assertEqual(~"alice the great", friends:name(Id))
+        ?assertEqual(~"alice the great", ssb_feed_meta:name(Id))
     end.
 
 %% An about message naming someone else must not set that feed's name.
@@ -571,23 +564,23 @@ name_other_about_test(_) ->
         {Pid, Id, Priv} = make_peer(),
         {_Pid2, Id2, _Priv2} = make_peer(),
         ok = store_about(Pid, Id, Priv, null, 1, Id2, ~"impostor"),
-        ?assertEqual(undefined, friends:name(Id2)),
-        ?assertEqual(undefined, friends:name(Id))
+        ?assertEqual(undefined, ssb_feed_meta:name(Id2)),
+        ?assertEqual(undefined, ssb_feed_meta:name(Id))
     end.
 
 %% Follow changes are announced to view subscribers.
 contact_event_test(_) ->
     fun() ->
-        ok = view_manager:subscribe(friends),
+        ok = view_manager:subscribe(ssb_social_graph),
         {Pid, Id, Priv} = make_peer(),
         {_Pid2, Id2, _Priv2} = make_peer(),
         ok = store_contact(Pid, Id, Priv, null, 1, Id2, true),
         receive
-            {view_event, friends, {contact, Id, Id2, true}} -> ok
+            {view_event, ssb_social_graph, {contact, Id, Id2, true}} -> ok
         after 1000 ->
             error(no_contact_event)
         end,
-        ok = view_manager:unsubscribe(friends)
+        ok = view_manager:unsubscribe(ssb_social_graph)
     end.
 
 %% Wiping the derived state and rebuilding refolds it from the log.
@@ -596,12 +589,12 @@ rebuild_from_log_test(_) ->
         {Pid, Id, Priv} = make_peer(),
         {_Pid2, Id2, _Priv2} = make_peer(),
         ok = store_contact(Pid, Id, Priv, null, 1, Id2, true),
-        ?assertEqual([Id2], friends:direct_follows(Id)),
+        ?assertEqual([Id2], ssb_social_graph:direct_follows(Id)),
         %% simulate lost derived state, then refold from the log
         ok = view_reset(),
-        ?assertEqual([], friends:direct_follows(Id)),
-        ok = view_manager:rebuild(friends),
-        ?assertEqual([Id2], friends:direct_follows(Id))
+        ?assertEqual([], ssb_social_graph:direct_follows(Id)),
+        ok = view_manager:rebuild(ssb_social_graph),
+        ?assertEqual([Id2], ssb_social_graph:direct_follows(Id))
     end.
 
 -endif.

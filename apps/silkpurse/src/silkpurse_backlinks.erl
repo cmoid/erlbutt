@@ -244,7 +244,7 @@ ensure_registered(State) ->
 
 terminate(_Reason, _State) ->
     %% snapshot before the table dies with this process (views stop
-    %% before view_manager at shutdown — see friends)
+    %% before view_manager at shutdown — see ssb_social_graph)
     catch view_save(),
     ok.
 

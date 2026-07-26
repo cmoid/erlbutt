@@ -71,8 +71,8 @@ dispatch_type(~"pub", _Author, Props) ->
         _ -> ok
     end;
 
-%% contact and about messages are folded into the friends view by
-%% view_manager:ingest/1 (see friends:view_entry/1), not dispatched here.
+%% contact and about messages are folded into the social graph view by
+%% view_manager:ingest/1 (see ssb_social_graph:view_entry/1), not dispatched here.
 dispatch_type(_, _, _) ->
     ok.
 
@@ -215,7 +215,7 @@ dispatch_contact_test() ->
                                 {~"following", true}]}},
     ?assertEqual(ok, social_msg:dispatch(Msg)).
 
-%% Without the friends server running, dispatch must still succeed.
+%% Without the social graph server running, dispatch must still succeed.
 dispatch_about_no_friends_test() ->
     Msg = #message{id = ~"%a3.sha256", previous = null,
                    author = ~"@author=.ed25519", sequence = 5,

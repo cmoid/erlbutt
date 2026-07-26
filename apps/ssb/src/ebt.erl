@@ -126,10 +126,10 @@ init([]) ->
     ets:new(?REPL_SET, [set, named_table, public]),
     recompute_repl_set(),
     schedule_repl_refresh(),
-    %% Follow/block changes land in the friends view; refresh the
+    %% Follow/block changes land in the social graph view; refresh the
     %% replication set when they do instead of waiting for the periodic
     %% timer (kept as anti-entropy).  No manager in some eunit setups.
-    catch view_manager:subscribe(friends),
+    catch view_manager:subscribe(ssb_social_graph),
     {ok, #state{}}.
 
 handle_call(refresh_repl_set, _From, State) ->
@@ -147,13 +147,13 @@ handle_info(refresh_repl_set, State) ->
     schedule_repl_refresh(),
     {noreply, State};
 
-%% A follow or block changed in the friends view.  Debounce: one
+%% A follow or block changed in the social graph view.  Debounce: one
 %% recompute per second no matter how many contact messages land in a
 %% replication burst.
-handle_info({view_event, friends, _Event}, #state{debounce = undefined} = State) ->
+handle_info({view_event, ssb_social_graph, _Event}, #state{debounce = undefined} = State) ->
     Ref = erlang:send_after(1000, self(), debounced_refresh),
     {noreply, State#state{debounce = Ref}};
-handle_info({view_event, friends, _Event}, State) ->
+handle_info({view_event, ssb_social_graph, _Event}, State) ->
     {noreply, State};
 
 handle_info(debounced_refresh, State) ->
@@ -181,9 +181,9 @@ schedule_repl_refresh() ->
 recompute_repl_set() ->
     try
         Self    = keys:pub_key_disp(),
-        Follows = friends:follows(Self, config:replication_hops()),
+        Follows = ssb_social_graph:follows(Self, config:replication_hops()),
         Members = room_store:members(),
-        Blocked = friends:blocks(Self),
+        Blocked = ssb_social_graph:blocks(Self),
         Combined = lists:usort([Self | Follows] ++ Members),
         Set = [F || F <- Combined, not lists:member(F, Blocked)],
         ets:delete_all_objects(?REPL_SET),
@@ -357,7 +357,7 @@ full_clock_test() ->
     _ = utils:find_or_create_feed_pid(OwnFeed),
 
     %% full_clock/0 builds from the replication set, so seed it directly here
-    %% (this unit test has no friends graph to drive recompute_repl_set/0).
+    %% (this unit test has no social graph to drive recompute_repl_set/0).
     case ets:info(?REPL_SET) of
         undefined -> ets:new(?REPL_SET, [set, named_table, public]);
         _         -> ets:delete_all_objects(?REPL_SET)
@@ -396,7 +396,7 @@ repl_set_test_() ->
 rs_setup() ->
     catch gen_server:stop(ebt),
     catch gen_server:stop(room_store),
-    catch gen_server:stop(friends),
+    catch gen_server:stop(ssb_social_graph),
     catch gen_server:stop(keys),
     catch gen_server:stop(config),
     Home = filename:join("/tmp", "ebt_rs_"
@@ -405,7 +405,7 @@ rs_setup() ->
     application:set_env(ssb, ssb_home, Home),
     {ok, _} = config:start_link("test/ssb.cfg"),
     {ok, _} = keys:start_link(),
-    {ok, _} = friends:start_link(),
+    {ok, _} = ssb_social_graph:start_link(),
     {ok, _} = room_store:start_link(),
     {ok, _} = ebt:start_link(),
     Home.
@@ -413,7 +413,7 @@ rs_setup() ->
 rs_cleanup(Home) ->
     catch gen_server:stop(ebt),
     catch gen_server:stop(room_store),
-    catch gen_server:stop(friends),
+    catch gen_server:stop(ssb_social_graph),
     catch gen_server:stop(keys),
     catch gen_server:stop(config),
     os:cmd("rm -rf " ++ Home),

@@ -66,9 +66,9 @@ handle_rpc([~"friends", ~"get"], [{Opts}], _Caller) ->
     Dest   = ?pgv(~"dest", Opts),
     case {Source, Dest} of
         {S, D} when is_binary(S), is_binary(D) ->
-            {reply, friends:edge(S, D)};
+            {reply, ssb_social_graph:edge(S, D)};
         {S, undefined} when is_binary(S) ->
-            {reply, {maps:to_list(friends:edges(S))}};
+            {reply, {maps:to_list(ssb_social_graph:edges(S))}};
         _ ->
             {error, ~"friends.get needs a source"}
     end;
@@ -90,7 +90,7 @@ handle_rpc([~"patchwork", ~"suggest", ~"profile"], [{Opts}], _Caller) ->
                               DL when is_list(DL) -> DL;
                               _                   -> []
                           end,
-                    [{Id, friends:name(Id)} || Id <- Ids, is_binary(Id)]
+                    [{Id, ssb_feed_meta:name(Id)} || Id <- Ids, is_binary(Id)]
             end,
     Owner = keys:pub_key_disp(),
     {reply, [suggestion(Id, Name, Owner) || {Id, Name} <- Pairs]};
@@ -101,12 +101,12 @@ suggestion(Id, Name, Owner) ->
     {[{~"id", Id},
       {~"name", Name},
       {~"image", silkpurse_about:social_value(Id, ~"image")},
-      {~"following", friends:edge(Owner, Id) =:= true}]}.
+      {~"following", ssb_social_graph:edge(Owner, Id) =:= true}]}.
 
 -ifdef(TEST).
 
 friends_get_args_test() ->
-    %% only shape handling here; graph semantics live in friends.erl
+    %% only shape handling here; graph semantics live in ssb_social_graph.erl
     ?assertMatch({error, _},
                  handle_rpc([~"friends", ~"get"], [~"notanobj"], #{})),
     ?assertMatch({error, _},
