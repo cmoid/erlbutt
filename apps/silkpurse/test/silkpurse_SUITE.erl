@@ -688,7 +688,7 @@ friends_get_test(_Config) ->
     ?assertEqual(null, utils:nat_decode(Body2)),
     gen_server:stop(Peer).
 
-%% friends folds contact messages via the view manager synchronously,
+%% ssb_social_graph folds contact messages via the view manager synchronously,
 %% so the edge is visible immediately; nothing to wait for.
 rpc_refresh_friends() -> ok.
 
