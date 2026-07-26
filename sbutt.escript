@@ -69,7 +69,14 @@ setup() ->
     CfgFile = SSBHome ++ "/ssb.cfg",
     {ok, _} = config:start_link(CfgFile),
     {ok, _} = keys:start_link(),
-    {ok, _} = network_id_cache:start_link().
+    {ok, _} = network_id_cache:start_link(),
+    %% ssb_peer is a full bidirectional peer, so the node we call answers
+    %% back — in particular with blob `createWants`, which the connection
+    %% tries to serve.  Against a node holding real blobs that arrives
+    %% immediately, so the servers those handlers touch have to exist
+    %% here too or the connection dies before any reply is read.
+    {ok, _} = blobs:start_link(),
+    {ok, _} = mess_auth:start_link().
 
 %% Find the beams in either layout.
 %%

@@ -76,6 +76,18 @@ have_reqno(undefined, undefined) -> undefined;
 have_reqno(undefined, OurWantsReq) -> OurWantsReq;
 have_reqno(RemoteWantsReq, _OurWantsReq) -> -RemoteWantsReq.
 
+%% Whether we hold a blob, without letting the answer kill the caller.
+%%
+%% A wants message names hundreds of blobs, and this runs inside the
+%% connection's rpc_processor.  blobs being unavailable — restarting, or
+%% simply not started in a lightweight client that uses ssb_peer to make
+%% calls rather than to serve them — must not take the connection down
+%% with it.  "We have none" is the right answer when we cannot look.
+blob_size(BlobId) ->
+    try blobs:size_of(BlobId)
+    catch _:_ -> not_found
+    end.
+
 respond_to_wants(undefined, _Props, _Socket, Nonce, _Key) ->
     Nonce;
 respond_to_wants(OurWantsReq, Props, Socket, Nonce, Key) ->
@@ -83,7 +95,7 @@ respond_to_wants(OurWantsReq, Props, Socket, Nonce, Key) ->
     Haves = [{BlobId, BlobSize}
              || {BlobId, Val} <- Props,
                 Val < 0,
-                {ok, BlobSize} <- [blobs:size_of(BlobId)]],
+                {ok, BlobSize} <- [blob_size(BlobId)]],
     case Haves of
         [] ->
             Nonce;
