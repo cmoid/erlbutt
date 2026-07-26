@@ -111,8 +111,32 @@ load(File) ->
         {error, enoent} -> #{}
     end.
 
+%% Write the whole address book, then rename it into place.
+%%
+%% This is a read-modify-write of one JSON file, so a crash part-way
+%% through a plain write_file leaves a truncated document — and load/1
+%% treats undecodable JSON as an empty map, meaning a torn write silently
+%% forgets every peer the node knows how to reach.  rename/2 is atomic
+%% within a filesystem, so a reader sees either the old file or the new
+%% one.  A failed write leaves the temp file behind rather than damaging
+%% the real one; the next save overwrites it.
 save(Peers, File) ->
-    file:write_file(File, pretty_json(Peers)).
+    Tmp = File ++ ".tmp",
+    case file:write_file(Tmp, pretty_json(Peers)) of
+        ok ->
+            case file:rename(Tmp, File) of
+                ok ->
+                    ok;
+                {error, Reason} = Err ->
+                    ?SSB_ERROR("conn_db: could not rename ~s into place: ~p",
+                               [Tmp, Reason]),
+                    _ = file:delete(Tmp),
+                    Err
+            end;
+        {error, Reason} = Err ->
+            ?SSB_ERROR("conn_db: could not write ~s: ~p", [Tmp, Reason]),
+            Err
+    end.
 
 pretty_json(Map) when is_map(Map) ->
     case maps:size(Map) of
@@ -172,7 +196,30 @@ conn_db_test_() ->
      fun conn_db_teardown/1,
      [fun remember_stores_peer/1,
       fun announcers_increments/1,
-      fun remember_sets_required_fields/1]}.
+      fun remember_sets_required_fields/1,
+      fun save_is_atomic/1]}.
+
+%% The file is written via a temp file and renamed into place, so a
+%% reader never sees a half-written document — and no .tmp is left
+%% lying around on the success path.
+save_is_atomic({_Pid, _}) ->
+    fun() ->
+        File = ?b2l(config:ssb_repo_loc()) ++ "conn.json",
+        conn_db:remember(~"net:atomic.example.com:8008~shs:zzz=",
+                         #{~"host" => ~"atomic.example.com",
+                           ~"port" => 8008,
+                           ~"key"  => ~"@zzz=.ed25519",
+                           ~"type" => ~"pub"}, ~"pub"),
+        _ = conn_db:all(),                    %% sync barrier for the cast
+        ok = conn_db:flush(),
+        ?assert(filelib:is_regular(File)),
+        ?assertNot(filelib:is_regular(File ++ ".tmp")),
+        %% and what landed is complete, parseable JSON
+        {ok, Json} = file:read_file(File),
+        Decoded = json:decode(Json),
+        ?assert(is_map(Decoded)),
+        ?assert(maps:is_key(~"net:atomic.example.com:8008~shs:zzz=", Decoded))
+    end.
 
 remember_stores_peer({_Pid, _}) ->
     fun() ->
