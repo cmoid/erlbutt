@@ -53,7 +53,10 @@
                 last_seq = 0,
                 feed,
                 refs,
-                msg_cache}).
+                msg_cache,
+                %% has the whole live log been indexed into msg_cache in
+                %% this run?  Reset whenever the live log is replaced.
+                indexed = false}).
 %%%===================================================================
 %%% API
 %%%===================================================================
@@ -181,9 +184,9 @@ handle_call({store_checked, Msg}, _From,
     end;
 
 
-handle_call({fetch, Key}, _From, #state{feed = Feed,
-                                       msg_cache = Messages} = State) ->
-    {reply, do_fetch(Key, Feed, Messages), State};
+handle_call({fetch, Key}, _From, State) ->
+    {Reply, NewState} = do_fetch(Key, State),
+    {reply, Reply, NewState};
 
 handle_call({fetch_last_msg}, _From, #state{feed = Feed,
                                            msg_cache = Messages} = State) ->
@@ -269,9 +272,11 @@ archive_length() ->
 do_archive(#state{id = FeedId, last_seq = LastSeq,
                   feed = FeedFile, msg_cache = Messages} = State) ->
     {ok, LogData} = file:read_file(FeedFile),
-    %% Every cached offset points into the live log we are about to
-    %% replace; keeping them would send do_fetch scanning a fresh log
-    %% from a stale position.
+    %% Every indexed offset points into the live log we are about to
+    %% delete, and the messages themselves are moving into the segment
+    %% (where the hint file addresses them).  Drop the index and mark the
+    %% new live log un-indexed; store/2 below re-seeds it with the
+    %% archive-genesis message.
     ets:delete_all_objects(Messages),
     %% The segment's range comes from its own content: the first record
     %% of the live log.  (A tracked segment_start used to be guessed at
@@ -293,7 +298,7 @@ do_archive(#state{id = FeedId, last_seq = LastSeq,
     NewSeq = LastSeq + 1,
     #message{id = NewId} = Msg =
         message:new_msg(null, NewSeq, Content, {FeedId, keys:priv_key()}),
-    State1 = store(Msg, State),
+    State1 = store(Msg, State#state{indexed = true}),
     {State1#state{last_msg = NewId,
                   last_seq = NewSeq}, BlobId}.
 
@@ -332,9 +337,12 @@ store(#message{sequence = Seq},
     %% Already have this sequence or earlier — skip silently.
     State;
 store(#message{id = Id, sequence = Seq, author = Auth} = Msg,
-      #state{feed = Feed} = State) ->
+      #state{feed = Feed, msg_cache = Messages} = State) ->
     mess_auth:put(Id, Auth),
-    write_msg(Msg, Feed),
+    Offset = write_msg(Msg, Feed),
+    %% Keep the offset index current on the write path, so a message just
+    %% stored is readable by id without re-scanning the live log.
+    ets:insert(Messages, {Id, Offset}),
     %% arrival-order ref; the message body lives only in the feed's own log
     ingest_journal:append(Auth, Seq),
     utils:update_refs(Msg),
@@ -352,12 +360,16 @@ write_msg(#message{} = DecMsg, Store) ->
 %% used by scan/3 to step forward without re-reading the leading length.
 write_msg(Msg, Store) ->
     DataSiz = size(Msg),
+    %% The record starts where the file currently ends; returned so the
+    %% caller can index it without re-reading what it just wrote.
+    Offset = filelib:file_size(Store),
     O = open_file(Store),
     ok = file:write(O,
                <<DataSiz:32, Msg/binary, DataSiz:32>>),
     FileSize = filelib:file_size(Store) + 4,
     ok = file:write(O, <<FileSize:32>>),
-    close_file(O).
+    close_file(O),
+    Offset.
 
 init_directories(FeedId) ->
     FeedDir = utils:feed_dir(FeedId),
@@ -411,61 +423,92 @@ recover_from_archives(#state{id = FeedId, feed = Feed} = State) ->
             State#state{last_seq = LastSeq, last_msg = LastId}
     end.
 
-%% Fetch a message by id: the live log first (a hit's offset is cached in
-%% msg_cache), then the archived segments.  A feed whose history has been
-%% archived is no longer answerable from log.offset alone — before this,
-%% such an id fell through feed_get/3's not_found and badmatched here,
-%% crashing a gen_server shared by every caller of that feed.  Misses now
-%% return not_found.
-do_fetch(Key, Feed, Messages) ->
-    case live_lookup(Key, Feed, ets:lookup(Messages, Key)) of
-        {Pos, Msg} when is_integer(Pos) ->
-            ets:insert(Messages, {Key, Pos}),
-            message:decode(Msg, false);
-        _NotInLiveLog ->
-            fetch_archived(Key, Feed)
+%% Fetch a message by id: the live log's offset index first, then the
+%% archived segments.
+%%
+%% msg_cache maps MsgId -> byte offset in log.offset.  It used to be a
+%% read-through cache in front of a linear scan, so a cold lookup walked
+%% the whole live log and a miss walked it to the end.  It is now an
+%% index: the first miss indexes the entire live log in one pass, and
+%% every lookup after that is a pread.  `indexed` records whether that
+%% pass has happened in this run.  A message this feed does not hold
+%% returns not_found rather than crashing the process, which is shared by
+%% every caller of the feed.
+do_fetch(Key, #state{feed = Feed, msg_cache = Messages} = State) ->
+    case ets:lookup(Messages, Key) of
+        [{Key, Offset}] ->
+            case read_at(Feed, Offset, Key) of
+                {ok, Msg} ->
+                    {message:decode(Msg, false), State};
+                stale ->
+                    %% The log moved under an offset we recorded (an
+                    %% external truncate or rewrite; do_archive resets the
+                    %% index itself).  Drop the entry AND clear `indexed`,
+                    %% so the retry re-indexes rather than concluding the
+                    %% message is only in the archives — every other
+                    %% offset is suspect for the same reason.
+                    ets:delete(Messages, Key),
+                    fetch_uncached(Key, State#state{indexed = false})
+            end;
+        [] ->
+            fetch_uncached(Key, State)
     end.
 
-%% Scan the live log for Key, starting from the cached offset when there
-%% is one.  A cached offset can go stale if the live log is replaced
-%% behind our back (do_archive clears the cache, but truncate_feed.escript
-%% and friends do not), which would make a message we hold look missing —
-%% so a cached-offset miss is retried from the start before giving up.
-live_lookup(Key, Feed, []) ->
-    try feed_get(Feed, [], Key)
-    catch _:_ -> not_found              %% torn log, bad frame
-    end;
-live_lookup(Key, Feed, [{Key, _Pos}] = Cached) ->
-    case (try feed_get(Feed, Cached, Key) catch _:_ -> not_found end) of
-        {Pos, Msg} when is_integer(Pos) -> {Pos, Msg};
-        _Miss                           -> live_lookup(Key, Feed, [])
+fetch_uncached(Key, #state{indexed = true} = State) ->
+    {fetch_archived(Key, State#state.feed), State};
+fetch_uncached(Key, #state{feed = Feed, msg_cache = Messages} = State) ->
+    build_index(Feed, Messages),
+    do_fetch(Key, State#state{indexed = true}).
+
+%% Index every record in the live log as MsgId -> Offset.  One pass, held
+%% in memory: the live log is bounded by config:archive_length() (10k by
+%% default), so this is a few MB, and it only runs for feeds someone
+%% actually reads from — doing it in init/1 instead would put a full scan
+%% of every feed on the boot path.
+build_index(Feed, Messages) ->
+    case file:read_file(Feed) of
+        {ok, Bin} -> index_frames(Bin, 0, Messages);
+        _         -> ok            %% no live log yet: nothing to index
+    end.
+
+index_frames(<<Len:32, Msg:Len/binary, Len:32, _Next:32, Rest/binary>>,
+             Offset, Tab) ->
+    try ets:insert(Tab, {extract_key(Msg), Offset})
+    catch _:_ -> ok                %% undecodable record: not addressable
+    end,
+    index_frames(Rest, Offset + 4 + Len + 8, Tab);
+index_frames(_Rest, _Offset, _Tab) ->
+    ok.
+
+%% Read the record at Offset and confirm it is the one we expect.  The
+%% verification is what makes a stale index detectable rather than a
+%% source of wrong answers.
+read_at(Feed, Offset, Key) ->
+    case file:open(Feed, [read, binary, raw]) of
+        {ok, Fd} ->
+            Res = try
+                      {ok, <<Len:32>>} = file:pread(Fd, Offset, 4),
+                      {ok, Msg} = file:pread(Fd, Offset + 4, Len),
+                      Len = byte_size(Msg),
+                      Key = extract_key(Msg),
+                      {ok, Msg}
+                  catch _:_ -> stale
+                  end,
+            ok = file:close(Fd),
+            Res;
+        {error, _} ->
+            stale
     end.
 
 %% Look Key up in the feed's archived segments.  feed_store consults each
 %% segment's hint file, so only a segment that actually contains Key is
 %% decompressed.  Offsets inside an archive are not live-log positions, so
-%% a hit here is deliberately not cached in msg_cache.
+%% a hit here is deliberately not added to msg_cache.
 fetch_archived(Key, Feed) ->
     Dir = filename:dirname(?b2l(Feed)),
     case feed_store:find_in_archives(Dir, Key) of
         {ok, Msg}  -> message:decode(Msg, false);
         not_found  -> not_found
-    end.
-
-feed_get(Feed, [], Key) ->
-    feed_get(Feed, [{Key, 0}], Key);
-
-feed_get(Feed, [{Key, Pos}], Key) ->
-    try
-        {ok, IoDev} = file:open(Feed, [read, binary]),
-        file:position(IoDev, Pos),
-        Data = scan(IoDev, Pos, Key),
-        file:close(IoDev),
-        Data
-    catch
-        {error, enoent} ->
-            ?LOG_INFO("Probably bad input ~n",[]),
-            done
     end.
 
 feed_get_last(Feed) ->
@@ -500,22 +543,6 @@ extract_key(Data) ->
     {DataProps} = utils:nat_decode(Data),
     ?pgv(~"key", DataProps).
 
-scan(IoDev, Pos, Key) ->
-    case load_term(IoDev) of
-        {ok, Data} ->
-            KeyVal = extract_key(Data),
-            if KeyVal == Key ->
-                    {Pos, Data};
-               true ->
-                    {ok, <<NextPos:32/integer>>} = file:read(IoDev, 4),
-                    scan(IoDev, NextPos, Key)
-            end;
-        {error, eof} ->
-            ?LOG_INFO("Key not found: ~p ~n",[Key]),
-            not_found;
-        {error, Error} ->
-            ?LOG_INFO("Error ~p scanning for key: ~p ~n",[Error, Key])
-    end.
 
 
 has_target(Msg, Id, RootId) ->
@@ -572,6 +599,8 @@ feed_test_() ->
       fun archive_manual_test/1,
       fun fetch_archived_msg_test/1,
       fun archive_writes_hint_test/1,
+      fun live_index_survives_stale_offset_test/1,
+      fun cold_fetch_indexes_whole_live_log_test/1,
       fun missing_hint_rebuilt_test/1,
       fun corrupt_hint_tolerated_test/1,
       fun post_after_archive_test/1,
@@ -748,6 +777,61 @@ post_after_archive_test({Pid, _, _}) ->
         #message{previous = GenesisId, sequence = AfterSeq} = ssb_feed:fetch_last_msg(Pid),
         ?assert(AfterSeq =:= GenesisSeq + 1)
     end.
+
+%% A restarted feed has an empty index; the first fetch indexes the whole
+%% live log in one pass, so every message becomes readable by id — not
+%% just the one that was asked for.
+cold_fetch_indexes_whole_live_log_test({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"cold one"),
+        #message{id = K1} = ssb_feed:fetch_last_msg(Pid),
+        ok = ssb_feed:post_content(Pid, ~"cold two"),
+        #message{id = K2} = ssb_feed:fetch_last_msg(Pid),
+        ok = ssb_feed:post_content(Pid, ~"cold three"),
+        #message{id = K3} = ssb_feed:fetch_last_msg(Pid),
+        %% restart: the index is volatile, so it starts empty
+        ok = gen_server:stop(Pid),
+        {ok, Pid2} = ssb_feed:start_link(FeedId),
+        %% asking for the FIRST message indexes the whole log
+        ?assertMatch(#message{content = ~"cold one"},
+                     ssb_feed:fetch_msg(Pid2, K1)),
+        ?assertMatch(#message{content = ~"cold two"},
+                     ssb_feed:fetch_msg(Pid2, K2)),
+        ?assertMatch(#message{content = ~"cold three"},
+                     ssb_feed:fetch_msg(Pid2, K3)),
+        ?assertEqual(not_found,
+                     ssb_feed:fetch_msg(Pid2, ~"%nope.sha256")),
+        ok = gen_server:stop(Pid2)
+    end.
+
+%% An indexed offset that no longer addresses its message — the live log
+%% rewritten under us, as truncate_feed.escript does — must not produce a
+%% wrong answer or a crash.  read_at/3 verifies the key of whatever it
+%% finds, so the mismatch is detected and the index rebuilt.
+live_index_survives_stale_offset_test({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"first"),
+        #message{id = K1} = ssb_feed:fetch_last_msg(Pid),
+        ok = ssb_feed:post_content(Pid, ~"second"),
+        #message{id = K2} = ssb_feed:fetch_last_msg(Pid),
+        %% index both
+        ?assertMatch(#message{content = ~"first"},  ssb_feed:fetch_msg(Pid, K1)),
+        ?assertMatch(#message{content = ~"second"}, ssb_feed:fetch_msg(Pid, K2)),
+        %% rewrite the log with the two records swapped: every indexed
+        %% offset now points at the wrong message
+        ok = swap_first_two_frames(?b2l(feed_file(FeedId))),
+        ?assertMatch(#message{content = ~"first"},  ssb_feed:fetch_msg(Pid, K1)),
+        ?assertMatch(#message{content = ~"second"}, ssb_feed:fetch_msg(Pid, K2)),
+        ?assert(is_process_alive(Pid))
+    end.
+
+swap_first_two_frames(Path) ->
+    {ok, Bin} = file:read_file(Path),
+    <<L1:32, M1:L1/binary, L1:32, N1:32, Rest/binary>> = Bin,
+    <<L2:32, M2:L2/binary, L2:32, N2:32, Tail/binary>> = Rest,
+    F1 = <<L1:32, M1/binary, L1:32, N1:32>>,
+    F2 = <<L2:32, M2/binary, L2:32, N2:32>>,
+    file:write_file(Path, <<F2/binary, F1/binary, Tail/binary>>).
 
 %% Archiving writes a .hint beside the .gz, listing every message in the
 %% segment with the offset it starts at in the uncompressed frames.
