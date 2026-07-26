@@ -30,7 +30,8 @@ manifest() ->
      {[~"admin", ~"views", ~"list"],     async, owner},
      {[~"admin", ~"views", ~"rebuild"],  async, owner},
      {[~"admin", ~"peers", ~"known"],     async, owner},
-     {[~"admin", ~"peers", ~"connected"], async, owner}].
+     {[~"admin", ~"peers", ~"connected"], async, owner},
+     {[~"admin", ~"store", ~"tables"],    async, owner}].
 
 %%%===================================================================
 %%% status
@@ -118,7 +119,42 @@ handle_rpc([~"admin", ~"peers", ~"known"], _Args, _Caller) ->
 handle_rpc([~"admin", ~"peers", ~"connected"], _Args, _Caller) ->
     Rows = try peer_registry:all() catch _:_ -> [] end,
     {reply, [{[{~"id", PubKey}]} || {PubKey, _Pid} <- Rows,
-                                    is_binary(PubKey)]}.
+                                    is_binary(PubKey)]};
+
+%%%===================================================================
+%%% store
+%%%===================================================================
+
+%% Every table in the derived store with its row count — the "is anything
+%% actually being indexed" question, which has no other owner-reachable
+%% answer.  Deliberately generic: it reads sqlite_master rather than
+%% naming views, so a view added later shows up without touching admin.
+%%
+%% count(*) is a scan, so this is an on-demand command, not something to
+%% poll.
+handle_rpc([~"admin", ~"store", ~"tables"], _Args, _Caller) ->
+    case ssb_store:available() of
+        false ->
+            {reply, []};
+        true ->
+            Names = [N || [N] <- ssb_store:q(
+                                   "SELECT name FROM sqlite_master"
+                                   " WHERE type='table'"
+                                   "   AND name NOT LIKE 'sqlite_%'"
+                                   " ORDER BY name")],
+            {reply, [{[{~"table", N}, {~"rows", table_rows(N)}]} || N <- Names]}
+    end.
+
+%% A table name cannot be a bound parameter, so it is interpolated — the
+%% names come from sqlite_master (our own schema), and double quotes make
+%% it an identifier rather than a literal, which matters because esqlite
+%% is built with SQLITE_DQS=0.
+table_rows(Name) ->
+    try ssb_store:q(["SELECT count(*) FROM \"", Name, "\""]) of
+        [[N]] when is_integer(N) -> N;
+        _                        -> -1
+    catch _:_ -> -1
+    end.
 
 %%%===================================================================
 %%% Internal

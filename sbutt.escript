@@ -12,6 +12,7 @@
 %%   id              Alias for whoami
 %%   ping            Ping the local node
 %%   about           Set own profile name/description/avatar image
+%%   health          Node, view and derived-store health report
 %%
 %% The escript connects to the local erlbutt node on port 8008 using the
 %% shared ~/.ssberl/secret key (same approach as sbot in Node.js: two processes,
@@ -20,6 +21,7 @@
 -define(INFO(Fmt, Args), io:format(Fmt, Args)).
 -define(PORT, 8008).
 
+main(["health"])          -> run(fun cmd_health/1);
 main(["whoami"])          -> run(fun cmd_whoami/1);
 main(["id"])              -> run(fun cmd_whoami/1);
 main(["ping"])            -> run(fun cmd_ping/1);
@@ -58,20 +60,41 @@ run(CmdFun) ->
     end.
 
 setup() ->
-    code:add_path("./_build/default/lib/ssb/ebin/"),
-    code:add_path("./_build/default/lib/enacl/ebin/"),
-    code:add_path("./_build/default/lib/enacl/priv/"),
-    code:add_path("./_build/default/lib/ranch/ebin/"),
     logger:set_primary_config(level, error),
-    %% Default to the release dir so the escript shares keys/data with the
-    %% running node. Override by setting SSB_HOME in the environment.
-    RelDir = "./_build/default/rel/ssb",
-    SSBHome = os:getenv("SSB_HOME", RelDir),
+    %% Default to the dev release dir so the escript shares keys/data with
+    %% the running node. Override by setting SSB_HOME in the environment.
+    SSBHome = os:getenv("SSB_HOME", "./_build/default/rel/ssb"),
+    add_code_paths(SSBHome),
     application:set_env(ssb, ssb_home, SSBHome),
     CfgFile = SSBHome ++ "/ssb.cfg",
     {ok, _} = config:start_link(CfgFile),
     {ok, _} = keys:start_link(),
     {ok, _} = network_id_cache:start_link().
+
+%% Find the beams in either layout.
+%%
+%% The dev tree (_build/default/lib/*/ebin) exists only in a checkout; a
+%% deployed node has the release layout (<home>/lib/<app>-<vsn>/ebin) and
+%% no _build at all, which is why this used to crash on the box with
+%% `undef` before it could report anything useful.  Both are globbed, so
+%% neither has to exist.  esqlite is picked up by the glob too — its NIF
+%% is loaded on demand, so a missing one only matters if a command
+%% touches the store.
+add_code_paths(SSBHome) ->
+    Paths = filelib:wildcard("./_build/default/lib/*/ebin")
+        ++ filelib:wildcard(filename:join(SSBHome, "lib/*/ebin"))
+        ++ filelib:wildcard(filename:join(SSBHome, "lib/*/priv")),
+    [code:add_path(P) || P <- Paths],
+    case code:ensure_loaded(ssb_peer) of
+        {module, _} ->
+            ok;
+        _ ->
+            io:format("Cannot find the erlbutt beams.~n"
+                      "Looked in ./_build/default/lib and ~s/lib.~n"
+                      "Set SSB_HOME to the node's release directory.~n",
+                      [SSBHome]),
+            erlang:halt(1)
+    end.
 
 connect() ->
     %% Both sides share the same key — we're connecting to ourselves locally.
@@ -82,6 +105,142 @@ connect() ->
     end.
 
 %%% Commands ---------------------------------------------------------------
+
+%% One-shot health report over the admin namespace.
+%%
+%% Everything here is owner-only, and this escript authenticates with the
+%% node's own key, so it connects as owner — which also makes running it
+%% an end-to-end check that SHS, muxrpc, the plugin registry and the admin
+%% app are all working, before it reports on anything else.
+%%
+%% Exits non-zero if a view is not caught up or the store looks empty, so
+%% it can be used as a post-deploy gate.
+cmd_health(Peer) ->
+    Status = admin_call(Peer, [<<"admin">>, <<"status">>]),
+    Views  = admin_call(Peer, [<<"admin">>, <<"views">>, <<"list">>]),
+    Tables = admin_call(Peer, [<<"admin">>, <<"store">>, <<"tables">>]),
+    Peers  = admin_call(Peer, [<<"admin">>, <<"peers">>, <<"connected">>]),
+
+    io:format("~n== node ==~n"),
+    case Status of
+        {Props} ->
+            io:format("  id              ~s~n", [gv(<<"id">>, Props, <<"?">>)]),
+            io:format("  uptime          ~s~n",
+                      [fmt_uptime(gv(<<"uptimeMs">>, Props, 0))]),
+            io:format("  feeds on disk   ~p~n", [gv(<<"feeds">>, Props, 0)]),
+            io:format("  replication     ~p hops, dialer ~s~n",
+                      [gv(<<"replicationHops">>, Props, 0),
+                       onoff(gv(<<"dialerEnabled">>, Props, false))]),
+            io:format("  views           ~p registered~n",
+                      [gv(<<"views">>, Props, 0)]);
+        Other ->
+            io:format("  UNAVAILABLE: ~p~n", [Other])
+    end,
+
+    io:format("~n== views ==~n"),
+    Lagging = report_views(Views),
+
+    io:format("~n== store ==~n"),
+    EmptyStore = report_tables(Tables),
+
+    io:format("~n== peers ==~n"),
+    case Peers of
+        L when is_list(L), L =/= [] ->
+            [io:format("  connected  ~s~n", [gv(<<"id">>, P, <<"?">>)])
+             || {P} <- L];
+        _ ->
+            io:format("  (none connected)~n")
+    end,
+
+    io:format("~n"),
+    case {Lagging, EmptyStore} of
+        {[], false} ->
+            io:format("OK~n");
+        {[], true} ->
+            io:format("WARNING: derived store has no rows yet~n"),
+            erlang:halt(2);
+        {Mods, _} ->
+            io:format("WARNING: still catching up: ~s~n",
+                      [lists:join(", ", Mods)]),
+            erlang:halt(2)
+    end.
+
+%% Returns the modules that are not caught up.
+report_views([]) ->
+    io:format("  (none registered)~n"),
+    [];
+report_views(L) when is_list(L) ->
+    lists:filtermap(
+      fun({P}) ->
+              Mod   = gv(<<"module">>, P, <<"?">>),
+              Class = gv(<<"class">>, P, <<"?">>),
+              Ready = gv(<<"caughtUp">>, P, false),
+              io:format("  ~-24s ~-5s v~-3s ~6s feeds  ~s~n",
+                        [Mod, Class,
+                         num(gv(<<"version">>, P, 0)),
+                         num(gv(<<"feeds">>, P, 0)),
+                         case Ready of true -> "ready"; _ -> "CATCHING UP" end]),
+              case Ready of
+                  true -> false;
+                  _    -> {true, binary_to_list(Mod)}
+              end
+      end, L);
+report_views(Other) ->
+    io:format("  UNAVAILABLE: ~p~n", [Other]),
+    [].
+
+%% Returns true when every table is empty (a store that exists but holds
+%% nothing, which after a resync means indexing is not happening).
+report_tables([]) ->
+    io:format("  (store unavailable)~n"),
+    true;
+report_tables(L) when is_list(L) ->
+    Counts = [begin
+                  Rows = gv(<<"rows">>, P, -1),
+                  io:format("  ~-24s ~8s rows~n",
+                            [gv(<<"table">>, P, <<"?">>), num(Rows)]),
+                  Rows
+              end || {P} <- L],
+    %% ssb_schema and ssb_view_state are bookkeeping; ignore them when
+    %% deciding whether anything real got indexed.
+    Real = [R || {{P}, R} <- lists:zip(L, Counts),
+                 not lists:member(gv(<<"table">>, P, <<>>),
+                                  [<<"ssb_schema">>, <<"ssb_view_state">>])],
+    lists:all(fun(R) -> R =< 0 end, Real);
+report_tables(Other) ->
+    io:format("  UNAVAILABLE: ~p~n", [Other]),
+    true.
+
+admin_call(Peer, Name) ->
+    case ssb_peer:rpc_call(Peer, Name, <<"async">>) of
+        {ok, Body} ->
+            try utils:nat_decode(Body)
+            catch _:_ -> {error, undecodable}
+            end;
+        Err ->
+            {error, Err}
+    end.
+
+gv(Key, Props, Default) ->
+    case lists:keyfind(Key, 1, Props) of
+        {Key, V} -> V;
+        false    -> Default
+    end.
+
+onoff(true) -> "on";
+onoff(_)    -> "off".
+
+%% ~p does not accept a negative (left-justifying) field width, so numbers
+%% are rendered to a string first and padded with ~s.
+num(N) when is_integer(N) -> integer_to_list(N);
+num(N)                    -> io_lib:format("~p", [N]).
+
+fmt_uptime(Ms) when is_integer(Ms) ->
+    S = Ms div 1000,
+    io_lib:format("~pd ~ph ~pm", [S div 86400, (S rem 86400) div 3600,
+                                  (S rem 3600) div 60]);
+fmt_uptime(_) ->
+    "?".
 
 cmd_whoami(Peer) ->
     case ssb_peer:rpc_call(Peer, [<<"whoami">>], <<"async">>) of
@@ -216,4 +375,5 @@ usage() ->
     io:format("  invite create HOST PORT       Mint a pub invite code~n"),
     io:format("  log                           Stream all messages~n"),
     io:format("  feed                          Alias for log~n"),
-    io:format("  hist --id FEEDID [--limit N]  Stream one feed's history~n").
+    io:format("  hist --id FEEDID [--limit N]  Stream one feed's history~n"),
+    io:format("  health                        Node/view/store health report~n").
