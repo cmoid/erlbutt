@@ -1,0 +1,34 @@
+%% SPDX-License-Identifier: GPL-2.0-only
+%%
+%% Copyright (C) 2026 Charles Moid
+%%
+%% The convention layer: what sits between the SSB foundation and the
+%% applications built on it (doc/persistence.md §5).
+%%
+%% `apps/ssb` knows the protocol — feeds, sequences, replication, and the
+%% message types replication itself depends on (contact, about).  It does
+%% not know what a conversation is.  Applications — silkpurse, maxbutt,
+%% whatever comes next — know their own UI.  In between sit the SSB
+%% *application conventions* that more than one application needs but
+%% that are not protocol: thread and tangle assembly, post and vote
+%% semantics, the reading of `root`/`branch`.
+%%
+%% This app exists because two clients already need thread assembly.
+%% Duplicating it in each is wrong; promoting it into the foundation is
+%% also wrong, because a non-social application built on erlbutt should
+%% not inherit the notion of a reply.
+%%
+%% DEPENDENCY DIRECTION: ssb_conv depends on ssb.  Nothing in `apps/ssb`
+%% may ever call into here — that inversion is what the layer exists to
+%% prevent.
+%%
+%% A library app: pure functions, no supervision tree, no processes.
+{application, ssb_conv,
+ [{description, "SSB application conventions (threads, tangles) shared "
+                "by clients but not part of the protocol"},
+  {vsn, {cmd, "echo 0.1-`git describe --always --tags`"}},
+  {registered, []},
+  {applications, [kernel, stdlib, ssb]},
+  {env, []},
+  {licenses, ["GPL-2.0-only"]}
+ ]}.

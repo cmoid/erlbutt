@@ -1,6 +1,32 @@
 %% SPDX-License-Identifier: GPL-2.0-only
 %%
 %% Copyright (C) 2023 Charles Moid
+%%
+%% Message-type predicates, and the dispatch of a stored message to the
+%% handlers that care about its type.
+%%
+%% This module straddles the foundation/convention line (doc/persistence.md
+%% §5), and the split runs *through* it rather than around it:
+%%
+%%   FOUNDATION — stays here.  `contact` and `about` are de-facto
+%%     protocol: ebt cannot replicate without the follow graph, so
+%%     is_follow/1, is_block/1 and is_about/1 are what the core views
+%%     ssb_social_graph and ssb_feed_meta fold.  dispatch/1 likewise —
+%%     it registers pubs with conn_db and hands blob refs to the
+%%     fetcher, both protocol concerns.
+%%
+%%   CONVENTION — belongs in ssb_conv.  is_branch/1 reads `root`/`branch`,
+%%     which only a conversation cares about.  It cannot move yet:
+%%     utils:update_refs/1 calls it from the foundation to build the
+%%     per-feed references file, and `apps/ssb` must never depend on
+%%     `apps/ssb_conv`.  That use disappears when references becomes the
+%%     ssb_links core view, which extracts edges by scanning for
+%%     sigil-shaped values and knows no message type at all; is_branch/1
+%%     moves up with it.
+%%
+%% is_reply/1 and is_private_box/1 are convention predicates with no
+%% caller anywhere — dead surface, not moved rather than moving dead code
+%% into a new app.
 -module(social_msg).
 -include_lib("ssb/include/ssb.hrl").
 

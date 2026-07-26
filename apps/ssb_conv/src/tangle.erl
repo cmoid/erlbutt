@@ -1,6 +1,18 @@
 %% SPDX-License-Identifier: GPL-2.0-only
 %%
 %% Copyright (C) 2023 Charles Moid
+%%
+%% Tangle traversal: reading a set of cross-feed references as a
+%% *conversation* — parents, ancestors, children, descendants, and the
+%% depth-first tree of a thread rooted at a message.
+%%
+%% This lives in ssb_conv, not in the foundation, because it is one
+%% interpretation of the reference graph rather than the graph itself
+%% (doc/persistence.md §5).  `root`/`branch` are SSB application
+%% conventions; replication never needs them.  The edges it walks come
+%% from ssb_feed:references/3 today and from the ssb_links core view once
+%% that lands (§8 item 10), at which point most of the recursion here
+%% collapses into a reachability query.
 -module(tangle).
 
 -ifdef(TEST).
@@ -167,13 +179,49 @@ find_par_paths(MsgId, AuthId, RootId) ->
 
 -ifdef(TEST).
 
-basic_test() ->
+%% A fixture, so the servers these tests start are stopped again.  They
+%% used to be plain _test/0 functions calling init/0 and never cleaning
+%% up, which left config/keys/mess_auth/ssb_feed_sup running for whatever
+%% ran next — invisible until this module moved to ssb_conv and the run
+%% order changed, at which point blobs' tests started failing with
+%% {already_started}.
+tangle_test_() ->
+    {foreach, fun setup/0, fun cleanup/1,
+     [fun basic/0,
+      fun tangle1/0,
+      fun tangle2/0,
+      fun tangle3/0,
+      fun tangle4/0,
+      fun get_msg_post/0,
+      fun get_msg_no_text/0,
+      fun get_msg_private/0]}.
+
+setup() ->
+    cleanup(ignore),
+    Home = filename:join("/tmp", "tangle_" ++
+                          integer_to_list(erlang:system_time(microsecond))),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    application:set_env(ssb, ssb_home, Home),
+    Home.
+
+cleanup(Home) ->
+    [catch gen_server:stop(Name)
+     || Name <- [ssb_feed_sup, mess_auth, keys, config]],
+    case Home of
+        ignore -> ok;
+        _ ->
+            os:cmd("rm -rf " ++ Home),
+            application:unset_env(ssb, ssb_home)
+    end,
+    ok.
+
+basic() ->
     {Auth, Priv, Feed} = init(),
     #message{id = Id} = make_msg_one(Auth, Priv, Feed),
     #message{content = {Content}} = ssb_feed:fetch_msg(Feed, Id),
     ?assert(~"bar" == ?pgv(~"foo", Content)).
 
-tangle1_test() ->
+tangle1() ->
     {Auth, Priv, Feed} = init(),
     #message{id = Id} = make_msg_one(Auth, Priv, Feed),
     #message{id = Id2} = make_msg(2, Id, Id, Id, Auth, Priv, Feed),
@@ -181,7 +229,7 @@ tangle1_test() ->
 
     ?assert({Id, Auth, [{Id2, Auth}]} == tangle:get_tangle(Id)).
 
-tangle2_test() ->
+tangle2() ->
     {Auth, Priv, Feed} = init(),
     #message{id = Id} = make_msg_one(Auth, Priv, Feed),
     #message{id = Id2} = make_msg(2, Id, Id, Id, Auth, Priv, Feed),
@@ -190,7 +238,7 @@ tangle2_test() ->
     ?assert({Id, Auth, [{Id2, Auth,
                    [{Id3, Auth}]}]} == tangle:get_tangle(Id)).
 
-tangle3_test() ->
+tangle3() ->
     {Auth, Priv, Feed} = init(),
     #message{id = Id} = make_msg_one(Auth, Priv, Feed),
     #message{id = Id2} = make_msg(2, Id, Id, Id, Auth, Priv, Feed),
@@ -208,7 +256,7 @@ tangle3_test() ->
                    [{Id4, Auth2},
                     {Id3, Auth}]}]} == tangle:get_tangle(Id)).
 
-tangle4_test() ->
+tangle4() ->
     {Auth, Priv, Feed} = init(),
     #message{id = Id} = make_msg_one(Auth, Priv, Feed),
     #message{id = Id2} = make_msg(2, Id, Id, Id, Auth, Priv, Feed),
@@ -228,7 +276,7 @@ tangle4_test() ->
                     {Id3, Auth, [{Id5, Auth2}]}]}]} == tangle:get_tangle(Id)).
 
 %% get_msg/2 must tolerate every content shape a tangle can contain.
-get_msg_post_test() ->
+get_msg_post() ->
     {Auth, Priv, Feed} = init(),
     Post = message:new_msg(nil, 1, {[{~"type", ~"post"},
                                      {~"text", ~"hello tangle"}]}, {Auth, Priv}),
@@ -236,7 +284,7 @@ get_msg_post_test() ->
     ?assertEqual(~"hello tangle", get_msg(Post#message.id, Auth)).
 
 %% A non-post object with no text field returns undefined, not a crash.
-get_msg_no_text_test() ->
+get_msg_no_text() ->
     {Auth, Priv, Feed} = init(),
     Vote = message:new_msg(nil, 1, {[{~"type", ~"vote"}]}, {Auth, Priv}),
     ssb_feed:store_msg(Feed, Vote),
@@ -244,7 +292,7 @@ get_msg_no_text_test() ->
 
 %% Private content addressed to us is decrypted; content for someone else
 %% becomes a placeholder instead of badmatching the {Content} pattern.
-get_msg_private_test() ->
+get_msg_private() ->
     {Auth, Priv, Feed} = init(),
     Me = keys:pub_key_disp(),
     Mine = message:new_msg(nil, 1, private_box:encrypt(~"secret words", [Me]),
