@@ -13,6 +13,7 @@
                   stdlib,
                   crypto,
                   ranch,
-                  enacl]},
+                  enacl,
+                  esqlite]},
   {env, []},
   {mod, {ssb_app, [{ssb_log_level, notice}]}}]}.

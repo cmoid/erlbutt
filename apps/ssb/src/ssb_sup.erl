@@ -35,6 +35,9 @@ init([]) ->
             ?CHILD(room_store, worker),
             ?CHILD(conn_db, worker),
             ?CHILD(ingest_journal, worker),
+            %% before view_manager and the core views: they declare their
+            %% schemas against it as they start
+            ?CHILD(ssb_store, worker),
             ?CHILD(ssb_feed_sup, supervisor),
             ?CHILD(view_manager, worker),
             %% core views (doc/persistence.md §5): the ssb app owns these
