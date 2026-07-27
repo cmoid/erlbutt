@@ -126,9 +126,23 @@ sync()  -> ok.
 %%% gen_server callbacks
 %%%===================================================================
 
+%% A missing store is reported, not fatal.
+%%
+%% ssb_sup starts ssb_store first, so in the node this cannot happen — but
+%% crashing here takes the whole boot down, and every other entry point
+%% in this module already degrades to "no mapping" rather than raising.
+%% Failing loudly and staying up is both more consistent and easier to
+%% diagnose than a crash report during startup.
 init([]) ->
-    ok = ssb_store:declare(?MODULE, ?SCHEMA_VERSION, ?DDL),
-    {ok, #{}, {continue, maybe_rebuild}}.
+    case catch ssb_store:declare(?MODULE, ?SCHEMA_VERSION, ?DDL) of
+        ok ->
+            {ok, #{}, {continue, maybe_rebuild}};
+        Err ->
+            ?SSB_ERROR("mess_auth: could not declare its schema (~p) — "
+                       "message-id lookups will return not_found until the "
+                       "store is available and this is restarted", [Err]),
+            {ok, #{}}
+    end.
 
 %% A fresh store with feeds already on disk needs the mapping refolded.
 %% Done in handle_continue rather than init so a large refold does not

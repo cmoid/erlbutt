@@ -80,10 +80,16 @@ setup() ->
     %% ssb_peer is a full bidirectional peer, so the node we call answers
     %% back — in particular with blob `createWants`, which the connection
     %% tries to serve.  Against a node holding real blobs that arrives
-    %% immediately, so the servers those handlers touch have to exist
-    %% here too or the connection dies before any reply is read.
-    {ok, _} = blobs:start_link(),
-    {ok, _} = mess_auth:start_link().
+    %% immediately, so blobs has to exist here too or the connection dies
+    %% before any reply is read.
+    %%
+    %% Only blobs.  Starting node services in a client is a slope: each
+    %% one drags in whatever IT depends on, and this escript is not the
+    %% node.  mess_auth used to be started here as well, on the guess that
+    %% an inbound handler might want it; when mess_auth moved into
+    %% ssb_store that guess turned into a boot crash on every invocation,
+    %% because a client has no business opening the node's database.
+    {ok, _} = blobs:start_link().
 
 %% Find the beams in either layout.
 %%
