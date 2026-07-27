@@ -140,8 +140,14 @@ check_swapped(Props, Swapped) ->
             [Auth, Seq]
     end.
 
+%% `not_checked` rather than `false` when validation was not requested.
+%%
+%% These are completely different facts — "this signature is wrong" and
+%% "nobody looked" — and collapsing them into `false` is why the
+%% validated field sat unread for so long: no consumer could act on it
+%% without also rejecting every message it had decoded cheaply.
 validate(false, _MsgProps) ->
-    false;
+    not_checked;
 validate(true, MsgProps) ->
     try
         Author = ?pgv(~"author", MsgProps),

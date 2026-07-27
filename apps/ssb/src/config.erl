@@ -18,6 +18,8 @@
          set_archive_length/1,
          replication_hops/0,
          dialer_enabled/0,
+         require_valid_sigs/0,
+         set_require_valid_sigs/1,
          blob_scan_enabled/0,
          is_room/0,
          room_name/0,
@@ -43,6 +45,11 @@
                  replication_hops = ?DEFAULT_REPLICATION_HOPS,
                  dialer = true,
                  blob_scan = false,
+                 %% Reject peer messages whose signature does not verify.
+                 %% Off by default: a node runs in log-and-count mode first
+                 %% so the real rate can be measured before anything starts
+                 %% being refused (see ssb_feed:store_msg_checked/2).
+                 require_valid_sigs = false,
                  room = false,
                  room_name = <<"erlbutt room">>,
                  room_privacy = open}).
@@ -84,6 +91,13 @@ replication_hops() ->
 dialer_enabled() ->
     (get_config())#config.dialer.
 
+%% Whether a peer message that fails signature verification is REJECTED
+%% (true) or stored with a warning and a count (false, the default).
+%% Set {require_valid_sigs, true}. in ssb.cfg once the measured rate on
+%% your corpus is known to be zero.
+require_valid_sigs() ->
+    (get_config())#config.require_valid_sigs.
+
 %% Whether to scan existing on-disk messages for blob references at startup
 %% and fetch any we don't already hold.  Off by default (it folds the whole
 %% log); enable with {blob_scan, true}. in ssb.cfg.
@@ -103,6 +117,11 @@ room_privacy() ->
 
 add_network_id(NetId) when is_binary(NetId) ->
     gen_server:call(?MODULE, {add_network_id, NetId}, infinity).
+
+%% Flip signature enforcement at runtime — for measuring on a live node,
+%% and for tests, without editing ssb.cfg and restarting.
+set_require_valid_sigs(Bool) when is_boolean(Bool) ->
+    gen_server:call(?MODULE, {set_require_valid_sigs, Bool}, infinity).
 
 set_archive_length(undefined) ->
     gen_server:call(?MODULE, {set_archive_length, undefined}, infinity);
@@ -143,6 +162,9 @@ init([Config]) ->
 
 handle_call({add_network_id, NetId}, _From, #config{extra_network_ids = Extras}=Cfg) ->
     {reply, ok, publish(Cfg#config{extra_network_ids = Extras ++ [NetId]})};
+
+handle_call({set_require_valid_sigs, Bool}, _From, Cfg) ->
+    {reply, ok, publish(Cfg#config{require_valid_sigs = Bool})};
 
 handle_call({set_archive_length, Len}, _From, Cfg) ->
     {reply, ok, publish(Cfg#config{archive_length = Len})}.
@@ -203,6 +225,9 @@ parse({extra_network_ids, List}, Cfg) when is_list(List) ->
 
 parse({archive_length, Len}, Cfg) when is_integer(Len), Len > 0 ->
     Cfg#config{archive_length = Len};
+
+parse({require_valid_sigs, Bool}, Cfg) when is_boolean(Bool) ->
+    Cfg#config{require_valid_sigs = Bool};
 
 parse({replication_hops, Hops}, Cfg) when is_integer(Hops), Hops >= 0 ->
     Cfg#config{replication_hops = Hops};

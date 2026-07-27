@@ -66,7 +66,9 @@
                 %% offering messages that do not link our tail.  Keeps the
                 %% rejection log to one line per stall instead of one per
                 %% message.
-                chain_break}).
+                chain_break,
+                %% same shape, for messages that failed the signature check
+                bad_sig}).
 %%%===================================================================
 %%% API
 %%%===================================================================
@@ -160,24 +162,20 @@ handle_call({store, Msg}, _From, #state{last_seq = Before} = State) ->
     end,
     {reply, Status, NewState};
 
+%% Ingest from an untrusted peer: verify the signature, then the chain.
+%%
+%% Two independent guards, and neither subsumes the other.  The chain
+%% check stops a hole being spliced into a feed and served onward; the
+%% signature check stops content being attributed to an author who never
+%% wrote it.  A forged message can chain perfectly, and a genuine message
+%% can arrive out of order, so both are needed.
 handle_call({store_checked, Msg}, _From,
             #state{last_seq = Before, last_msg = LastMsg, id = FeedId} = State) ->
-    %% Chain-validated store for the untrusted replication path.  erlbutt only
-    %% verified the signature on ingest, so a message whose `previous` linked a
-    %% non-canonical id (the UTF-8/latin1 id bug) would splice a broken chain
-    %% into the log — and lenient peers keep re-gossiping such junk.  Accept only a sequence
-    %% we already hold (store/2 dedups it) or the next sequence whose previous
-    %% matches our current tail.
-    case chain_continues(Msg, State) of
-        false ->
-            {reply, skipped, note_chain_break(Msg, LastMsg, Before, FeedId, State)};
-        true ->
-            NewState = store(Msg, State),
-            Status = case NewState#state.last_seq > Before of
-                true  -> stored;
-                false -> skipped
-            end,
-            {reply, Status, clear_chain_break(Status, FeedId, NewState)}
+    case signature_ok(Msg, FeedId, State) of
+        {false, State1} ->
+            {reply, skipped, State1};
+        {true, State1} ->
+            store_if_chained(Msg, LastMsg, Before, FeedId, State1)
     end;
 
 
@@ -289,6 +287,72 @@ archive_filename(FeedFile, From, To) ->
     <<FeedFile/binary, ".",
       (integer_to_binary(From))/binary, "-",
       (integer_to_binary(To))/binary, ".gz">>.
+
+store_if_chained(Msg, LastMsg, Before, FeedId, State) ->
+    case chain_continues(Msg, State) of
+        false ->
+            {reply, skipped, note_chain_break(Msg, LastMsg, Before, FeedId, State)};
+        true ->
+            NewState = store(Msg, State),
+            Status = case NewState#state.last_seq > Before of
+                true  -> stored;
+                false -> skipped
+            end,
+            {reply, Status, clear_chain_break(Status, FeedId, NewState)}
+    end.
+
+%% Does this message carry a signature we verified?
+%%
+%% `#message.validated` is set by message:decode_value/2 and, until now,
+%% was written by every ingest path and read by none — so a message with
+%% a bad or absent signature was stored as readily as a good one, and
+%% then re-served to other peers.
+%%
+%% Three outcomes, and the third is the one worth naming: `not_checked`
+%% means the ingest site decoded without asking for verification, which
+%% is a bug at that call site rather than an attack, and is reported
+%% differently so it cannot hide among genuine failures.
+%%
+%% Default is to COUNT AND WARN, not reject.  Turning rejection on is a
+%% config decision ({require_valid_sigs, true}) to be taken once the rate
+%% on a real corpus is known — erlbutt re-encodes canonically to check a
+%% signature, and if that ever disagrees with what was originally signed
+%% the messages at stake are genuine ones.
+signature_ok(#message{validated = true}, _FeedId, State) ->
+    {true, State};
+signature_ok(#message{sequence = Seq, validated = V}, FeedId, State) ->
+    Reason = case V of
+                 false -> ~"signature did not verify";
+                 _     -> ~"ingest path did not verify the signature"
+             end,
+    count_bad_signature(),
+    State1 = note_bad_signature(Seq, Reason, FeedId, State),
+    {not config:require_valid_sigs(), State1}.
+
+%% One line per feed, with the rest counted — a peer replaying a bad feed
+%% would otherwise flood the log exactly when it is least readable.
+note_bad_signature(Seq, Reason, FeedId, #state{bad_sig = undefined} = State) ->
+    ?SSB_ERROR("feed ~s: seq ~p REJECTED BY SIGNATURE CHECK — ~s.  Mode is "
+               "~s.  Further occurrences for this feed are counted, not "
+               "logged; the running total is in admin.status as "
+               "invalidSignatures.~n",
+               [FeedId, Seq, Reason,
+                case config:require_valid_sigs() of
+                    true  -> ~"reject";
+                    false -> ~"warn only, message stored"
+                end]),
+    State#state{bad_sig = {Seq, 1}};
+note_bad_signature(_Seq, _Reason, _FeedId,
+                   #state{bad_sig = {First, N}} = State) ->
+    State#state{bad_sig = {First, N + 1}}.
+
+%% Node-wide count, kept in the feed registry table so it survives any
+%% one feed process and needs no owner of its own.
+count_bad_signature() ->
+    try ets:update_counter(ssb_feed_registry, '$invalid_sigs', {2, 1},
+                           {'$invalid_sigs', 0})
+    catch error:badarg -> 0          %% no registry (bare eunit): don't count
+    end.
 
 %% A peer offered a message that does not link our tail.
 %%
@@ -586,6 +650,8 @@ feed_test_() ->
       fun store_msg_dedup_test/1,
       fun store_msg_checked_chain_test/1,
       fun chain_break_is_counted_then_cleared_test/1,
+      fun bad_signature_warns_but_stores_test/1,
+      fun bad_signature_rejected_when_enforcing_test/1,
       fun no_profile_or_contacts_files_test/1,
       fun fetch_missing_msg_test/1,
       fun archive_manual_test/1,
@@ -802,6 +868,63 @@ chain_break_is_counted_then_cleared_test({Pid, FeedId, _}) ->
 
 feed_chain_break(Pid) ->
     element(#state.chain_break, sys:get_state(Pid)).
+
+feed_bad_sig(Pid) ->
+    element(#state.bad_sig, sys:get_state(Pid)).
+
+%% Default mode is measure, not enforce: a message whose signature did
+%% not verify is COUNTED and logged but still stored.  That is the whole
+%% point of the first phase — find out whether a real corpus produces any
+%% failures before anything starts being refused.
+bad_signature_warns_but_stores_test({Pid, FeedId, _}) ->
+    fun() ->
+        ?assertEqual(false, config:require_valid_sigs()),
+        Priv = keys:priv_key(),
+        Good = message:new_msg(null, 1,
+                               {[{~"type", ~"post"}, {~"text", ~"g"}]},
+                               {FeedId, Priv}),
+        %% new_msg leaves validated unset — an ingest path that never
+        %% verified.  Distinct from a signature that failed, and reported
+        %% as such, but still not something store_msg_checked may trust.
+        ?assertEqual(undefined, Good#message.validated),
+        ?assertEqual(stored, ssb_feed:store_msg_checked(Pid, Good)),
+        ?assertMatch({1, 1}, feed_bad_sig(Pid)),
+        %% stored despite the warning
+        ?assertMatch(#message{sequence = 1}, ssb_feed:fetch_last_msg(Pid)),
+        %% and further ones are counted, not re-logged
+        Two = message:new_msg(Good#message.id, 2,
+                              {[{~"type", ~"post"}, {~"text", ~"h"}]},
+                              {FeedId, Priv}),
+        ?assertEqual(stored, ssb_feed:store_msg_checked(Pid, Two)),
+        ?assertMatch({1, 2}, feed_bad_sig(Pid)),
+        %% a verified message passes straight through and is not counted
+        Three = (message:new_msg(Two#message.id, 3,
+                                 {[{~"type", ~"post"}, {~"text", ~"i"}]},
+                                 {FeedId, Priv}))#message{validated = true},
+        ?assertEqual(stored, ssb_feed:store_msg_checked(Pid, Three)),
+        ?assertMatch({1, 2}, feed_bad_sig(Pid))
+    end.
+
+%% With {require_valid_sigs, true} the same message is refused, and the
+%% feed is left untouched.
+bad_signature_rejected_when_enforcing_test({Pid, FeedId, _}) ->
+    fun() ->
+        ok = config:set_require_valid_sigs(true),
+        try
+            ?assert(config:require_valid_sigs()),
+            Msg = message:new_msg(null, 1,
+                                  {[{~"type", ~"post"}, {~"text", ~"nope"}]},
+                                  {FeedId, keys:priv_key()}),
+            ?assertEqual(skipped, ssb_feed:store_msg_checked(Pid, Msg)),
+            ?assertEqual(no_file, ssb_feed:fetch_last_msg(Pid)),
+            %% a verified one still lands
+            Ok = Msg#message{validated = true},
+            ?assertEqual(stored, ssb_feed:store_msg_checked(Pid, Ok)),
+            ?assertMatch(#message{sequence = 1}, ssb_feed:fetch_last_msg(Pid))
+        after
+            ok = config:set_require_valid_sigs(false)
+        end
+    end.
 
 %% A restarted feed has an empty index; the first fetch indexes the whole
 %% live log in one pass, so every message becomes readable by id — not

@@ -49,6 +49,12 @@ handle_rpc([~"admin", ~"status"], _Args, _Caller) ->
               {~"archiveLength",   null_for_undefined(config:archive_length())},
               {~"isRoom",          config:is_room()},
               {~"networkIds",      length(config:network_ids())},
+              %% peer messages whose signature did not verify since boot;
+              %% non-zero means either a hostile peer or a canonical-encoding
+              %% disagreement, and either way wants looking at before
+              %% require_valid_sigs is turned on
+              {~"invalidSignatures", ssb_feed_sup:invalid_signature_count()},
+              {~"requireValidSigs", config:require_valid_sigs()},
               {~"views",           length(view_manager:views())}]}};
 
 %%%===================================================================

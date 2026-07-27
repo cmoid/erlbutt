@@ -22,7 +22,11 @@ deliver(MsgId, Payload) ->
             bad ->
                 ?SSB_INFO("plumtree: bad author in message ~s~n", [MsgId]);
             Pid ->
-                ssb_feed:store_msg(Pid, Msg)
+                %% store_msg_checked, not store_msg: this is an untrusted
+                %% peer message and gets the same signature and chain
+                %% guards the EBT path gets.  Using the trusted call here
+                %% let a gossiped message skip both.
+                ssb_feed:store_msg_checked(Pid, Msg)
         end
     catch
         _:Reason ->

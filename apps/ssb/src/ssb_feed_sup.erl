@@ -23,6 +23,7 @@
 -behaviour(supervisor).
 
 -export([start_link/0,
+         invalid_signature_count/0,
          find_or_start/1]).
 
 -export([init/1]).
@@ -30,6 +31,17 @@
 %%%===================================================================
 %%% API
 %%%===================================================================
+
+%% Node-wide count of peer messages that failed the signature check.
+%% Kept in this supervisor's registry table so it outlives any one feed
+%% process and needs no owner of its own; see
+%% ssb_feed:signature_ok/3.
+invalid_signature_count() ->
+    try ets:lookup(ssb_feed_registry, '$invalid_sigs') of
+        [{_, N}] -> N;
+        []       -> 0
+    catch error:badarg -> 0
+    end.
 
 start_link() ->
     case whereis(?MODULE) of
