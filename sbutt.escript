@@ -13,6 +13,7 @@
 %%   ping            Ping the local node
 %%   about           Set own profile name/description/avatar image
 %%   health          Node, view and derived-store health report
+%%   census encoding Count stored messages that cannot be encoded for a client
 %%
 %% The escript connects to the local erlbutt node on port 8008 using the
 %% shared ~/.ssberl/secret key (same approach as sbot in Node.js: two processes,
@@ -22,6 +23,8 @@
 -define(PORT, 8008).
 
 main(["health"])          -> run(fun cmd_health/1);
+main(["census", "encoding" | Args]) ->
+    run_local(fun() -> cmd_census_encoding(Args) end);
 main(["whoami"])          -> run(fun cmd_whoami/1);
 main(["id"])              -> run(fun cmd_whoami/1);
 main(["ping"])            -> run(fun cmd_ping/1);
@@ -65,6 +68,21 @@ run(CmdFun) ->
             io:format("Failed to connect to local erlbutt: ~p~n", [Reason]),
             erlang:halt(1)
     end.
+
+%% For commands that read the node's files directly instead of calling it.
+%%
+%% The logs are append-only, so folding them alongside a running node is
+%% safe and — more to the point — free: a census of a few million messages
+%% takes minutes, and doing that inside the node would block whatever
+%% process ran it for the duration.  No connection, no keys, no blobs;
+%% config is the only thing needed, to find the feed store.
+run_local(CmdFun) ->
+    logger:set_primary_config(level, error),
+    SSBHome = os:getenv("SSB_HOME", "./_build/default/rel/ssb"),
+    add_code_paths(SSBHome),
+    application:set_env(ssb, ssb_home, SSBHome),
+    {ok, _} = config:start_link(SSBHome ++ "/ssb.cfg"),
+    CmdFun().
 
 setup() ->
     logger:set_primary_config(level, error),
@@ -200,6 +218,181 @@ cmd_health(Peer) ->
             io:format("WARNING: still catching up: ~s~n",
                       [lists:join(", ", Mods)]),
             erlang:halt(2)
+    end.
+
+%%% Encoding census ---------------------------------------------------------
+%%
+%% Count the stored messages that cannot be encoded for a client.
+%%
+%% This was written to measure a problem that, on the evidence, does not
+%% exist in stored content, and it is kept because that is worth being
+%% able to demonstrate rather than assume.
+%%
+%% The premise was that stored SSB content is not guaranteed to be valid
+%% UTF-8 — messages from the wild carry latin1 bytes — so a message could
+%% replicate, validate and store perfectly and still be unservable, which
+%% is what rpc_processor's `{invalid_byte, 252}` looked like.  But Erlang's
+%% json module rejects a bad byte symmetrically: raw latin1, an overlong
+%% sequence and a lone surrogate escape all fail on DECODE.  A frame that
+%% will not decode never gets stored, and one that does decode holds only
+%% binaries json already accepted.  So an unencodable STORED message is
+%% close to unreachable, and an `{invalid_byte, _}` on a reply points at a
+%% term erlbutt built — a raw key or hash that never went through JSON —
+%% rather than at anything a peer sent us.
+%%
+%% Both columns are therefore worth having.  `encode failures` should be
+%% zero and its job is to keep saying so, cheaply, whenever the encoder or
+%% the json module changes under us.  `decode failures` is the one that
+%% can move, and it means damaged storage — a torn or corrupted frame —
+%% which is a different problem reported differently.
+cmd_census_encoding(Args) ->
+    Limit = arg_int(Args, "--limit", -1),
+    Feeds = feed_store:feed_dirs(),
+    io:format("~nScanning ~s feed(s)", [num(length(Feeds))]),
+    case Limit > 0 of
+        true  -> io:format(" (stopping after ~s messages)", [num(Limit)]);
+        false -> ok
+    end,
+    io:format("...~n"),
+    T0 = erlang:monotonic_time(millisecond),
+    Acc = census_fold(Feeds, Limit),
+    Ms  = erlang:monotonic_time(millisecond) - T0,
+    report_census(Acc, length(Feeds), Ms).
+
+%% Folded feed by feed rather than through feed_store:fold_all/2 so a
+%% failure can be attributed to a directory.  A decode failure has no
+%% author or sequence to report — that is exactly what could not be read —
+%% so without the directory there would be no way to find it again.
+census_fold(Feeds, Limit) ->
+    Acc0 = #{total => 0, decode => 0, encode => 0,
+             reasons => #{}, feeds => #{}, bad_feeds => #{}, samples => []},
+    %% foldl cannot stop early, so --limit unwinds with a throw
+    try lists:foldl(
+          fun(Dir, A) ->
+                  feed_store:fold_feed(
+                    fun(Data, A1) -> census_one(Data, A1, Dir, Limit) end,
+                    A, Dir)
+          end, Acc0, Feeds)
+    catch throw:{limit, A} -> A
+    end.
+
+census_one(_Data, #{total := N} = Acc0, _Dir, Limit) when Limit > 0, N >= Limit ->
+    throw({limit, Acc0});
+%% Deliberately NOT message:decode/2 + message:encode/1: the term that
+%% actually fails is the one rpc_processor hands to encode_json, which is
+%% the decoded stored frame itself.  Going through the record would also
+%% mean matching on #message{} from an escript, where -include_lib cannot
+%% resolve until the code path is set — which is too late.
+census_one(Data, #{total := N} = Acc0, Dir, _Limit) ->
+    Acc = progress(Acc0#{total := N + 1}),
+    case (catch utils:nat_decode(Data)) of
+        {Props} when is_list(Props) ->
+            try iolist_to_binary(
+                  message:ssb_encoder({Props}, fun message:ssb_encoder/3,
+                                      [pretty])) of
+                Bin when is_binary(Bin) -> Acc
+            catch Class:Reason ->
+                    note_failure(Props, {Class, Reason}, Acc)
+            end;
+        Err ->
+            note_undecodable(Dir, Err, Acc)
+    end.
+
+note_undecodable(Dir, Err, #{decode := D, bad_feeds := B, reasons := R} = Acc) ->
+    Reason = case Err of
+                 {'EXIT', {Cause, _Stack}} -> Cause;
+                 Other                     -> Other
+             end,
+    Acc#{decode    := D + 1,
+         bad_feeds := maps:update_with(Dir, fun(C) -> C + 1 end, 1, B),
+         reasons   := maps:update_with({decode, Reason},
+                                       fun(C) -> C + 1 end, 1, R)}.
+
+note_failure(Props, Reason, #{encode := E, reasons := R, feeds := F,
+                              samples := S} = Acc) ->
+    Id = gv(<<"key">>, Props, <<"?">>),
+    {Author, Seq} =
+        case gv(<<"value">>, Props, undefined) of
+            {V} when is_list(V) -> {gv(<<"author">>, V, <<"?">>),
+                                    gv(<<"sequence">>, V, 0)};
+            _                   -> {<<"?">>, 0}
+        end,
+    Acc#{encode  := E + 1,
+         reasons := maps:update_with(Reason, fun(C) -> C + 1 end, 1, R),
+         feeds   := maps:update_with(Author, fun(C) -> C + 1 end, 1, F),
+         samples := case length(S) < 10 of
+                        true  -> S ++ [{Author, Seq, Id, Reason}];
+                        false -> S
+                    end}.
+
+%% A full corpus takes minutes; say something so it does not look hung.
+progress(#{total := N} = Acc) when N rem 250000 =:= 0 ->
+    io:format("  ...~s messages~n", [num(N)]),
+    Acc;
+progress(Acc) ->
+    Acc.
+
+report_census(#{total := Total, decode := Dec, encode := Enc,
+                reasons := Reasons, feeds := Feeds, bad_feeds := BadFeeds,
+                samples := Samples},
+              NumFeeds, Ms) ->
+    io:format("~n== encoding census ==~n"),
+    io:format("  scanned         ~s messages in ~s feeds (~s ms)~n",
+              [num(Total), num(NumFeeds), num(Ms)]),
+    io:format("  decode failures ~s~s~n", [num(Dec), pct(Dec, Total)]),
+    io:format("  encode failures ~s~s~n", [num(Enc), pct(Enc, Total)]),
+    case Reasons =:= #{} of
+        true  -> ok;
+        false ->
+            io:format("~n  by reason~n"),
+            [io:format("    ~-30s ~s~n", [io_lib:format("~p", [R]), num(C)])
+             || {R, C} <- sort_desc(Reasons)]
+    end,
+    case BadFeeds =:= #{} of
+        true  -> ok;
+        false ->
+            %% by directory, not by author: an undecodable frame is one we
+            %% could not read an author out of
+            io:format("~n  undecodable frames by feed directory~n"),
+            [io:format("    ~s  ~s~n", [D, num(C)]) || {D, C} <- sort_desc(BadFeeds)]
+    end,
+    case Feeds =:= #{} of
+        true  -> ok;
+        false ->
+            io:format("~n  unencodable messages by feed~n"),
+            [io:format("    ~s  ~s~n", [A, num(C)]) || {A, C} <- sort_desc(Feeds)],
+            io:format("~n  first failures~n"),
+            [io:format("    ~s seq ~s  ~s~n", [A, num(Sq), Id])
+             || {A, Sq, Id, _R} <- Samples]
+    end,
+    io:format("~n"),
+    case {Dec, Enc} of
+        {0, 0} ->
+            io:format("OK — every stored message decodes and encodes~n"),
+            erlang:halt(0);
+        {_, 0} ->
+            %% Not the encoder: a frame that will not decode was never
+            %% readable, so this is damage on disk, not a serving bug.
+            io:format("WARNING: ~s frame(s) could not be decoded — this is "
+                      "damaged storage,~n         not an encoding problem~n",
+                      [num(Dec)]),
+            erlang:halt(2);
+        _ ->
+            io:format("WARNING: ~s message(s) cannot be served to a client~n",
+                      [num(Enc)]),
+            erlang:halt(2)
+    end.
+
+sort_desc(Map) ->
+    lists:sort(fun({_, A}, {_, B}) -> A >= B end, maps:to_list(Map)).
+
+pct(_N, 0)     -> "";
+pct(N, Total)  -> io_lib:format("  (~.4f%)", [N * 100 / Total]).
+
+arg_int(Args, Flag, Default) ->
+    case lists:dropwhile(fun(A) -> A =/= Flag end, Args) of
+        [_, V | _] -> try list_to_integer(V) catch _:_ -> Default end;
+        _          -> Default
     end.
 
 %% Returns the modules that are not caught up.
@@ -438,4 +631,7 @@ usage() ->
     io:format("  log                           Stream all messages~n"),
     io:format("  feed                          Alias for log~n"),
     io:format("  hist --id FEEDID [--limit N]  Stream one feed's history~n"),
-    io:format("  health                        Node/view/store health report~n").
+    io:format("  health                        Node/view/store health report~n"),
+    io:format("  census encoding [--limit N]   Count stored messages that cannot~n"),
+    io:format("                                be encoded for a client (reads the~n"),
+    io:format("                                logs directly; no node needed)~n").

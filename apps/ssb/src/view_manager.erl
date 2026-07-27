@@ -503,12 +503,15 @@ import_ckpt_file() ->
     File = <<(config:ssb_repo_loc())/binary, "views/checkpoints.tab">>,
     case catch ets:file2tab(?b2l(File)) of
         {ok, ?CKPT} ->
+            Dead = prune_dead_views(),
             Rows = ets:tab2list(?CKPT),
-            [mark_dirty(Mod, Feed) || {{Mod, feed, Feed}, _} <- Rows],
-            [store_version(Mod, V)  || {{Mod, version}, V} <- Rows],
+            Feeds = [mark_dirty(Mod, Feed) || {{Mod, feed, Feed}, _} <- Rows],
+            Vsns  = [store_version(Mod, V) || {{Mod, version}, V} <- Rows],
             persist_ckpt(),
-            ?SSB_INFO("view_manager: imported ~p checkpoints from ~s; the file "
-                      "is no longer read and may be deleted", [length(Rows), File]);
+            ?SSB_INFO("view_manager: imported ~p feed checkpoints and ~p view "
+                      "versions from ~s~s; the file is no longer read and may "
+                      "be deleted",
+                      [length(Feeds), length(Vsns), File, dead_note(Dead)]);
         {ok, Other} ->
             ets:delete(Other),       %% not the table we snapshot: ignore it
             ok;
@@ -543,6 +546,33 @@ flush_dirty(Dirty) ->
                        [Err, length(Dirty)]),
             ok
     end.
+
+%% Drop rows belonging to view modules that no longer exist.  The snapshot
+%% accumulated across renames and removals and nothing ever pruned it, so
+%% a node still carries checkpoints for views it has not had in months —
+%% invisible, because info/0 only walks REGISTERED views, which is exactly
+%% why they were worth finding.  Carrying them into the store would make
+%% them permanent, so this is the moment to drop them.
+%%
+%% code:which/1 answers for a module that has not been loaded yet, which
+%% matters here: at boot most views have not been.  It says non_existing
+%% only when the beam is genuinely not on the path.
+prune_dead_views() ->
+    Dead = lists:usort([Mod || {Key, _} <- ets:tab2list(?CKPT),
+                               Mod <- [view_of(Key)],
+                               Mod =/= undefined,
+                               code:which(Mod) =:= non_existing]),
+    [ets:match_delete(?CKPT, {{Mod, '_', '_'}, '_'}) || Mod <- Dead],
+    [ets:match_delete(?CKPT, {{Mod, version}, '_'})  || Mod <- Dead],
+    Dead.
+
+view_of({Mod, feed, _}) when is_atom(Mod) -> Mod;
+view_of({Mod, version})  when is_atom(Mod) -> Mod;
+view_of(_)                                 -> undefined.
+
+dead_note([])   -> "";
+dead_note(Dead) -> lists:flatten(io_lib:format(" (dropped rows for ~p, which "
+                                               "no longer exist)", [Dead])).
 
 mark_dirty(Mod, FeedId) ->
     ets:insert(?DIRTY, {{Mod, FeedId}}).
@@ -892,6 +922,10 @@ imports_the_legacy_snapshot() ->
     ok = filelib:ensure_dir(File),
     ?CKPT = ets:new(?CKPT, [named_table, public, set]),
     ets:insert(?CKPT, {{test_counter_view, feed, Id}, 7}),
+    %% a view that has since been renamed away: its rows are invisible to
+    %% info/0 and would otherwise become permanent on import
+    ets:insert(?CKPT, {{no_such_view_module, feed, Id}, 99}),
+    ets:insert(?CKPT, {{no_such_view_module, version}, 3}),
     ok = ets:tab2file(?CKPT, File),
     true = ets:delete(?CKPT),
     %% both tables, or this is not a first boot: an empty view_checkpoint
@@ -902,6 +936,9 @@ imports_the_legacy_snapshot() ->
     ok = ssb_store:exec("DELETE FROM view_version"),
     {ok, _} = view_manager:start_link(),
     ?assertEqual(7, checkpoint(test_counter_view, Id)),
+    ?assertEqual(0, checkpoint(no_such_view_module, Id)),
+    ?assertEqual([], ssb_store:q("SELECT seq FROM view_checkpoint"
+                                 " WHERE view=?1", [~"no_such_view_module"])),
     %% written through on import, so the file is now irrelevant
     ok = file:delete(File),
     ok = vm_restart_manager(),
