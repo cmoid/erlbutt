@@ -103,6 +103,54 @@ make packages        # on the build machine for that platform
 amalgamation). `enacl` needs libsodium, so the box already has a
 toolchain.
 
+### If you have an SSH tunnel open, local release commands hit the REMOTE node
+
+`config/vm.args.src` names the node `erlbutt@localhost` and puts Erlang
+distribution on port 9100, and the documented way to reach a remote node
+is to forward both that and epmd:
+
+```
+ssh -L 4369:localhost:4369 -L 9100:localhost:9100 <box>
+```
+
+While that tunnel is up, `erlbutt@localhost` **on the laptop resolves to
+the node on the box**. Every release command that works over distribution
+therefore targets the remote node:
+
+```
+./bin/ssb ping             # answers from the REMOTE node
+./bin/ssb rpc ...          # runs on the REMOTE node
+./bin/ssb remote_console   # attaches to the REMOTE node
+./bin/ssb stop             # STOPS THE REMOTE NODE
+```
+
+That last one is the reason this section exists. Nothing warns you: the
+commands look local, run from a local release directory, and succeed.
+
+The tunnel also makes a local node unstartable — the name is already
+taken, and the only symptom is a line in `log/erlang.log.1` saying
+`the name erlbutt@localhost seems to be in use by another Erlang node`,
+while `bin/ssb ping` cheerfully answers `pong` from the far end.
+
+Both are avoided by naming a local test node differently, which
+`vm.args.src` already supports:
+
+```
+SSB_NODE=erlbutt_test@localhost SSB_DIST_PORT=9177 ./bin/ssb daemon
+```
+
+To check which you are actually talking to before running anything
+destructive:
+
+```
+lsof -nP -iTCP:9100          # an `ssh` process here means the tunnel is up
+./bin/ssb rpc keys pub_key_disp '[]'   # whose identity answers?
+```
+
+Note that muxrpc (port 8008) is normally NOT forwarded, so
+`sbutt.escript` still talks to a local node and will simply fail to
+connect if there is none. It is the distribution port that crosses.
+
 ## 4. Start, and do not restart afterwards
 
 Start the node. Then **leave it alone** — restarting it during a resync
