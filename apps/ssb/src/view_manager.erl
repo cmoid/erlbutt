@@ -628,6 +628,7 @@ vm_test_() ->
               ?_test(rebuild_folds_archives()),
               ?_test(only_changed_checkpoints_are_flushed()),
               ?_test(checkpoints_survive_a_hard_kill()),
+              ?_test(cold_start_rebuilds_from_logs()),
               ?_test(imports_the_legacy_snapshot())]
      end}.
 
@@ -907,6 +908,41 @@ checkpoints_survive_a_hard_kill() ->
     ok = wait_gone(VM, 100),
     {ok, _} = view_manager:start_link(),
     ?assertEqual(1, checkpoint(test_counter_view, Id)).
+
+%% The wipe, in miniature.  Everything derived is deleted — checkpoints,
+%% recorded versions, completeness flags and the view's own state —
+%% leaving only the feed logs, which is what `rm .ssberl/store.db` on a
+%% live node amounts to.  The whole index must come back from the logs
+%% alone, with checkpoints landing where they were before.
+%%
+%% This is the property that makes the truth/derivation split worth
+%% having, so it is worth asserting directly rather than inferring it
+%% from the rebuild tests, which each wipe only one view's state.
+cold_start_rebuilds_from_logs() ->
+    ok = test_counter_view:ensure_table(),
+    ok = vm_ensure_manager(),
+    ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
+    {Pid, Id, Priv} = vm_make_peer(),
+    #message{id = M1} = vm_store_post(Pid, Id, Priv, null, 1),
+    #message{}        = vm_store_post(Pid, Id, Priv, M1, 2),
+    ?assertEqual([1, 2], test_counter_view:entries(Id)),
+    ok = save(),
+    catch gen_server:stop(view_manager),
+    %% the derived tier, gone
+    [ok = ssb_store:exec(["DELETE FROM ", T])
+     || T <- ["view_checkpoint", "view_version", "ssb_view_state"]],
+    ok = test_counter_view:view_reset(),
+    %% and no legacy snapshot to fall back on — this is a cold start, not
+    %% the migration path
+    _ = file:delete(?b2l(<<(config:ssb_repo_loc())/binary,
+                           "views/checkpoints.tab">>)),
+    {ok, _} = view_manager:start_link(),
+    ?assertEqual(0, checkpoint(test_counter_view, Id)),
+    ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
+    ?assertEqual([1, 2], test_counter_view:entries(Id)),
+    ?assertEqual(2, checkpoint(test_counter_view, Id)).
 
 %% First boot after the port: checkpoints live in a legacy tab2file
 %% snapshot and the store has none.  They must be imported rather than

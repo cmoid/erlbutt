@@ -25,6 +25,19 @@
 %%
 %% Split out of `friends` (now ssb_social_graph), which used to keep a
 %% name-only cache in `friends_names.tab`.
+%%
+%% State lives in ssb_store, written through as it changes.  That is
+%% affordable here for the same reason it is in ssb_social_graph: only an
+%% `about` message writes anything, so the write rate is a small fraction
+%% of the message rate — unlike view_manager's checkpoints, which move on
+%% every message and are therefore batched instead.
+%%
+%% A value is whatever JSON the message carried, which is usually a string
+%% but need not be: patchwork writes `image` as either a blob id or a
+%% {link: …} object.  Strings are stored verbatim and anything else as
+%% JSON with a flag, rather than encoding everything uniformly, so that
+%% the column stays directly queryable — a name search should be able to
+%% say `value LIKE ?` without matching against its own quote marks.
 -module(ssb_feed_meta).
 
 -behaviour(gen_server).
@@ -54,13 +67,15 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
          handle_info/2, terminate/2, code_change/3]).
 
--define(TAB, ssb_feed_meta).
--define(TABFILE, ~"feed_meta.tab").
-
-%% Written by view_save/0 before each snapshot; its presence after a
-%% file2tab restore is how view_load/0 knows the state is complete up to
-%% the manager's checkpoints.
--define(COMPLETE, '$complete').
+-define(SCHEMA_VERSION, 1).
+-define(DDL,
+        ["CREATE TABLE IF NOT EXISTS feed_meta("
+         "  feed  TEXT NOT NULL,"
+         "  key   TEXT NOT NULL,"
+         "  value TEXT,"
+         "  json  INTEGER NOT NULL DEFAULT 0,"
+         "  seq   INTEGER NOT NULL,"
+         "  PRIMARY KEY (feed, key)) WITHOUT ROWID;"]).
 
 %% Envelope fields of an about message; not metadata in their own right.
 -define(SKIP, [~"type", ~"about"]).
@@ -74,18 +89,22 @@ start_link() ->
 
 %% The latest value FeedId asserted for Key, or undefined.
 get(FeedId, Key) when is_binary(FeedId), is_binary(Key) ->
-    try ets:lookup(?TAB, {FeedId, Key}) of
-        [{_, Value, _Seq}] -> Value;
-        []                 -> undefined
-    catch error:badarg -> undefined     %% table absent: server not running
-    end.
+    case rows("SELECT value, json FROM feed_meta WHERE feed=?1 AND key=?2",
+              [FeedId, Key]) of
+        [[Value, Json]] -> decode_value(Value, Json);
+        _               -> undefined
+    end;
+get(_FeedId, _Key) ->
+    undefined.
 
 %% Everything FeedId has asserted about itself, as #{Key => Value}.
 all(FeedId) when is_binary(FeedId) ->
-    try ets:match(?TAB, {{FeedId, '$1'}, '$2', '_'}) of
-        Rows -> maps:from_list([{K, V} || [K, V] <- Rows])
-    catch error:badarg -> #{}
-    end.
+    maps:from_list([{K, decode_value(V, J)}
+                    || [K, V, J] <- rows("SELECT key, value, json"
+                                         " FROM feed_meta WHERE feed=?1",
+                                         [FeedId])]);
+all(_FeedId) ->
+    #{}.
 
 %% Convenience for the near-universal `name` key.
 name(FeedId) ->
@@ -100,20 +119,20 @@ view_version() -> 1.
 view_class() -> core.
 
 view_load() ->
-    case has_marker() of
+    case ssb_store:complete(?MODULE) of
         true  -> ok;
         false -> empty
     end.
 
 view_reset() ->
-    catch ets:delete_all_objects(?TAB),
+    _ = ssb_store:clear_complete(?MODULE),
+    _ = ssb_store:exec("DELETE FROM feed_meta;"),
     ok.
 
+%% Rows are already durable; the only thing to record is that this view's
+%% state is complete up to the manager's checkpoints.
 view_save() ->
-    ets:insert(?TAB, {?COMPLETE, true, 0}),
-    File = table_file(),
-    filelib:ensure_dir(File),
-    ok = ets:tab2file(?TAB, ?b2l(File)),
+    _ = ssb_store:mark_complete(?MODULE),
     ok.
 
 %% Fold one stored message.  Only a self-about counts: a message whose
@@ -122,29 +141,55 @@ view_save() ->
 %% "socialValue"), not this feed's own metadata.
 view_entry(#message{author = Author, sequence = Seq, content = {Props}} = Msg) ->
     case social_msg:is_about(Msg) andalso ?pgv(~"about", Props) =:= Author of
-        true  -> [put_field(Author, K, V, Seq) || {K, V} <- Props,
-                                                  not lists:member(K, ?SKIP)],
-                 ok;
+        true  -> put_fields(Author, Seq,
+                            [{K, V} || {K, V} <- Props, is_binary(K),
+                                       not lists:member(K, ?SKIP)]);
         false -> ok
     end;
 view_entry(_) ->
     ok.
 
-%% Last write wins on sequence: an equal or newer Seq replaces.
-put_field(FeedId, Key, Value, Seq) when is_binary(Key) ->
-    case ets:lookup(?TAB, {FeedId, Key}) of
-        [{_, _, Old}] when Old > Seq -> ok;
-        _ -> ets:insert(?TAB, {{FeedId, Key}, Value, Seq})
-    end;
-put_field(_FeedId, _Key, _Value, _Seq) ->
+%% One about message asserts several fields, so they go in as one
+%% transaction rather than one commit each.
+put_fields(_FeedId, _Seq, []) ->
+    ok;
+put_fields(FeedId, Seq, Fields) ->
+    Rows = [begin
+                {Value, Json} = encode_value(V),
+                [FeedId, K, Value, Json, Seq]
+            end || {K, V} <- Fields],
+    %% Last write wins on sequence, decided in SQL: the WHERE on the
+    %% conflict clause makes an older assertion a no-op rather than a
+    %% read-then-write that another writer could interleave with.
+    _ = ssb_store:insert_many(
+          "INSERT INTO feed_meta(feed, key, value, json, seq)"
+          " VALUES(?1, ?2, ?3, ?4, ?5)"
+          " ON CONFLICT(feed, key) DO UPDATE SET"
+          "   value=excluded.value, json=excluded.json, seq=excluded.seq"
+          " WHERE excluded.seq >= feed_meta.seq", Rows),
     ok.
+
+%% Strings stay strings; anything else becomes JSON with the flag set.
+encode_value(V) when is_binary(V) ->
+    {V, 0};
+encode_value(V) ->
+    try {iolist_to_binary(message:ssb_encoder(V, fun message:ssb_encoder/3, [])), 1}
+    catch _:_ -> {undefined, 0}    %% unrepresentable: record the key, not a lie
+    end.
+
+decode_value(Value, 0) ->
+    Value;
+decode_value(Value, 1) when is_binary(Value) ->
+    try utils:nat_decode(Value) catch _:_ -> undefined end;
+decode_value(_Value, _Json) ->
+    undefined.
 
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
 init([]) ->
-    restore_or_create(),
+    ok = ssb_store:declare(?MODULE, ?SCHEMA_VERSION, ?DDL),
     {ok, #{}, {continue, register_view}}.
 
 handle_continue(register_view, State) ->
@@ -171,9 +216,6 @@ ensure_registered(State) ->
     {noreply, State}.
 
 terminate(_Reason, _State) ->
-    %% Snapshot before the table dies with this process: at shutdown we
-    %% stop before view_manager, so its own final save cannot succeed.
-    catch view_save(),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -183,23 +225,11 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-restore_or_create() ->
-    %% table_file needs config; without it (bare eunit setups) start
-    %% fresh — view_load/0 then reports empty and the manager rebuilds.
-    Restored = try ets:file2tab(?b2l(table_file()))
-               catch _:_ -> {error, no_config}
-               end,
-    case Restored of
-        {ok, ?TAB} -> ok;
-        _          -> ets:new(?TAB, [set, named_table, public])
-    end.
-
-table_file() ->
-    <<(config:ssb_repo_loc())/binary, "views/", (?TABFILE)/binary>>.
-
-has_marker() ->
-    try ets:lookup(?TAB, ?COMPLETE) =/= []
-    catch error:badarg -> false
+rows(Sql, Params) ->
+    try ssb_store:q(Sql, Params) of
+        L when is_list(L) -> L;
+        _                 -> []
+    catch _:_ -> []          %% store down: no metadata, never a crash
     end.
 
 %%%===================================================================
@@ -213,26 +243,29 @@ meta_test_() ->
              [?_test(stores_every_field()),
               ?_test(latest_sequence_wins()),
               ?_test(ignores_about_others()),
+              ?_test(keeps_non_string_values()),
+              ?_test(survives_a_restart()),
               ?_test(is_a_core_view())]
      end}.
 
 setup() ->
-    catch gen_server:stop(?MODULE),
-    catch gen_server:stop(config),
+    cleanup(ignore),
     Home = filename:join("/tmp", "feed_meta_"
                          ++ integer_to_list(erlang:system_time(microsecond))),
     ok = filelib:ensure_dir(Home ++ "/"),
     application:set_env(ssb, ssb_home, Home),
     {ok, _} = config:start_link("no-such-cfg"),
-    catch ets:new(?TAB, [set, named_table, public]),
+    {ok, _} = ssb_store:start_link(),
+    ok = ssb_store:declare(?MODULE, ?SCHEMA_VERSION, ?DDL),
     Home.
 
 cleanup(Home) ->
-    catch gen_server:stop(?MODULE),
-    catch gen_server:stop(config),
-    catch ets:delete(?TAB),
-    os:cmd("rm -rf " ++ Home),
-    application:unset_env(ssb, ssb_home),
+    [catch gen_server:stop(N) || N <- [?MODULE, ssb_store, config]],
+    case Home of
+        ignore -> ok;
+        _ -> os:cmd("rm -rf " ++ Home),
+             application:unset_env(ssb, ssb_home)
+    end,
     ok.
 
 about(Author, Seq, Props) ->
@@ -276,6 +309,28 @@ ignores_about_others() ->
     ok = view_entry(Msg),
     ?assertEqual(undefined, name(Other)),
     ?assertEqual(undefined, name(Me)).
+
+%% patchwork writes `image` as either a blob id or a {link: …} object, so
+%% a value is not always a string and must come back the shape it went in.
+keeps_non_string_values() ->
+    Id  = ~"@meta5.ed25519",
+    Obj = {[{~"link", ~"&blob.sha256"}, {~"size", 1234}]},
+    ok = view_entry(about(Id, 1, [{~"image", Obj},
+                                  {~"name", ~"has an object image"}])),
+    ?assertEqual(Obj, ?MODULE:get(Id, ~"image")),
+    %% the string alongside it is stored verbatim, not as quoted JSON —
+    %% the column has to stay directly queryable
+    ?assertEqual([[~"has an object image"]],
+                 ssb_store:q("SELECT value FROM feed_meta"
+                             " WHERE feed=?1 AND key=?2", [Id, ~"name"])).
+
+%% The point of the port: durable as written, with no snapshot step.
+survives_a_restart() ->
+    Id = ~"@meta6.ed25519",
+    ok = view_entry(about(Id, 3, [{~"name", ~"persisted"}])),
+    ok = gen_server:stop(ssb_store),
+    {ok, _} = ssb_store:start_link(),
+    ?assertEqual(~"persisted", name(Id)).
 
 is_a_core_view() ->
     ?assertEqual(core, view_class()),
