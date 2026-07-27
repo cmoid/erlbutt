@@ -211,7 +211,27 @@ tables filling:
   social_edges                10683 rows
 ```
 
-Reading it:
+To check the messages themselves rather than the indexes built from them:
+
+```
+./sbutt.escript census encoding
+```
+
+This reads every stored frame — no node connection, so it is safe to run
+against a busy node — and reports two counts. Roughly 25k messages/sec,
+so a few hundred thousand messages takes ten seconds.
+
+- **`decode failures`** is the one that can move. It means damaged
+  storage: a torn or corrupted frame. The report names the feed
+  directory, since a frame that will not decode has no author to name.
+- **`encode failures`** should always be zero. Erlang's `json` module
+  rejects a bad byte on decode as well as encode, so a frame that got
+  stored cannot fail to re-encode. An `{invalid_byte, _}` seen on a live
+  reply therefore points at a term erlbutt built — a raw key or hash that
+  never went through JSON — and not at anything a peer sent. Do not go
+  looking in the corpus for it.
+
+Reading `health`:
 
 - **`feeds on disk` exceeding the per-view feed count is normal.** EBT's
   `full_clock` creates a directory for every feed in the replication set,
