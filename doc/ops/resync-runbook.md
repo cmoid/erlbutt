@@ -166,6 +166,29 @@ duplicate-connection guard:
 ./sbutt.escript health        # == peers == should be empty
 ```
 
+### Files under `.ssberl` that are no longer read
+
+Derived state moved into `store.db` module by module, and each move left
+its old file behind. They are inert — nothing reads them — but they are
+easy to mistake for live state when you are deciding what a wipe should
+preserve:
+
+| File | Now in |
+|---|---|
+| `mess_auth.ets` | `msg_author` |
+| `friends_graph.tab`, `friends_names.tab` | `social_edges` |
+| `views/checkpoints.tab` | `view_checkpoint`, `view_version` |
+
+`views/checkpoints.tab` is the one exception, and only once: on the first
+start after the checkpoint port it is imported so the node does not refold
+every view over the whole corpus, and it is dead weight from then on. The
+import logs `imported N checkpoints`. If you wipe `.ssberl` you lose
+nothing by dropping all of these; if you are upgrading in place, keep
+`checkpoints.tab` until you have seen that line once.
+
+The remaining `views/*.tab` files ARE live — they belong to the app views
+that have not been ported.
+
 ## 5. Verify
 
 ```

@@ -64,6 +64,8 @@ Views come in two classes. **Core views** belong to the foundation, are always o
 
 The catch-up fold runs in chunks inside the manager's message loop rather than inside the registration call, so replication keeps flowing while a large view rebuilds. A view that is still catching up receives no live messages — delivering one would advance its checkpoint past everything the fold had not yet reached, leaving a permanent hole — and the fold sweeps until a whole pass delivers nothing.
 
+Checkpoints are the one piece of derived state not written through to the store as it changes, because they change more often than anything else: every message advances one checkpoint per registered view. They are held in memory and the ones that moved are flushed periodically, so the cost of persisting them is proportional to what changed rather than to how many there are. A crash can therefore lose the last few, which only ever costs a view refolding messages it had already folded — folds are idempotent per `(feed, seq)`, and the error runs in that direction only.
+
 There are three core views:
 
 **`ssb_social_graph`** holds follow and block edges. This is protocol machinery: `ebt` asks it who to replicate and who to refuse.
