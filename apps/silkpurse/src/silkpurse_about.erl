@@ -7,9 +7,9 @@
 %% the way ssb-social-index / patchcore does.  This is what renders
 %% names, avatars and descriptions in the UI.
 %%
-%% An ssb_view over a named public ETS set {{Dest, Key} => #{Author =>
-%% Value}} — each author's latest assignment, a {remove: true} pruning
-%% the author's entry — plus an ssb_plugin serving:
+%% An ssb_view over ssb_store holding one row per assignment — (dest,
+%% key, author) -> value, a {remove: true} deleting the row — plus an
+%% ssb_plugin serving:
 %%   about.socialValue({dest, key})          async, owner
 %%   about.socialValueStream({dest, key})    source (live), owner
 %%   about.socialValuesStream({dest, key})   source (live), owner
@@ -32,6 +32,13 @@
 %%
 %% Not yet served: the latest-family getters (latestValue/latestValues)
 %% — no UI callers today.
+%%
+%% A row per assigner rather than a serialised map per {dest, key}: the
+%% resolution above is a fold over assigners, so the map was the shape
+%% ETS forced rather than the shape the data wants.  One row each makes
+%% search_names/2 an indexed scan instead of a fold over every entry in
+%% the index, and leaves plurality expressible as a GROUP BY if it ever
+%% needs to be.
 -module(silkpurse_about).
 
 -ifdef(TEST).
@@ -58,8 +65,19 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
          handle_info/2, terminate/2, code_change/3]).
 
--define(TAB, silkpurse_about).
--define(MARKER, '$complete').
+-define(SCHEMA_VERSION, 1).
+-define(DDL,
+        ["CREATE TABLE IF NOT EXISTS about_assign("
+         "  dest   TEXT NOT NULL,"
+         "  key    TEXT NOT NULL,"
+         "  author TEXT NOT NULL,"
+         "  value  TEXT,"
+         "  json   INTEGER NOT NULL DEFAULT 0,"
+         "  PRIMARY KEY (dest, key, author)) WITHOUT ROWID;",
+         %% key first: search_names/2 asks for every dest carrying a
+         %% `name`, which the primary key (dest-first) cannot serve.
+         "CREATE INDEX IF NOT EXISTS ix_about_key"
+         "  ON about_assign(key, dest);"]).
 
 %% The about fields the UI reads; a bounded set keeps the index small.
 -define(KEYS, [~"name", ~"image", ~"description"]).
@@ -78,23 +96,20 @@ start_link() ->
 view_version() -> 1.
 
 view_load() ->
-    Loaded = try ets:lookup(?TAB, ?MARKER) =/= []
-             catch error:badarg -> false
-             end,
-    case Loaded of
+    case ssb_store:complete(?MODULE) of
         true  -> ok;
         false -> empty
     end.
 
 view_reset() ->
-    ets:delete_all_objects(?TAB),
+    _ = ssb_store:clear_complete(?MODULE),
+    _ = ssb_store:exec("DELETE FROM about_assign;"),
     ok.
 
+%% Rows are already durable; the only thing to record is that this view's
+%% state is complete up to the manager's checkpoints.
 view_save() ->
-    ets:insert(?TAB, {?MARKER}),
-    File = table_file(),
-    filelib:ensure_dir(File),
-    ok = ets:tab2file(?TAB, ?b2l(File)),
+    _ = ssb_store:mark_complete(?MODULE),
     ok.
 
 view_entry(#message{author = Author, content = {Props}}) ->
@@ -198,34 +213,14 @@ handle_rpc([~"patchwork", ~"profile", ~"avatar"], [{Opts}], _Caller) ->
 %%%===================================================================
 
 init([]) ->
-    %% Create the (empty) table now so it always exists, but defer the
-    %% snapshot restore to handle_continue: file2tab of a large snapshot
-    %% would otherwise block silkpurse_sup:start_link and thus the whole
-    %% node boot (and the shell).  The restores then run concurrently
-    %% across the views rather than serialized by the supervisor.
-    ets:new(?TAB, [set, named_table, public]),
+    ok = ssb_store:declare(?MODULE, ?SCHEMA_VERSION, ?DDL),
     {ok, #{}, {continue, register}}.
 
+%% Failures are loud and transient ones retried on a timer
+%% (ssb_view:ensure_registered) — the old silent noproc swallow here cost
+%% EarlButt its messagesByType method (July 2026).
 handle_continue(register, State) ->
-    %% Swap in the snapshot (if any), then register plugin + view.
-    %% Failures are loud and transient ones retried on a timer
-    %% (ssb_view:ensure_registered) — the old silent noproc swallow
-    %% here cost EarlButt its messagesByType method (July 2026).
-    maybe_restore(),
     ensure_registered(State).
-
-maybe_restore() ->
-    File = ?b2l(table_file()),
-    case filelib:is_regular(File) of
-        false ->
-            ok;                        %% no snapshot; keep the empty table
-        true ->
-            ets:delete(?TAB),
-            case (try ets:file2tab(File) catch _:_ -> error end) of
-                {ok, ?TAB} -> ok;
-                _          -> ets:new(?TAB, [set, named_table, public])
-            end
-    end.
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
@@ -248,7 +243,6 @@ ensure_registered(State) ->
     {noreply, State}.
 
 terminate(_Reason, _State) ->
-    catch view_save(),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -258,30 +252,82 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-table_file() ->
-    <<(config:ssb_repo_loc())/binary, "views/about.tab">>.
+rows(Sql, Params) ->
+    try ssb_store:q(Sql, Params) of
+        L when is_list(L) -> L;
+        _                 -> []
+    catch _:_ -> []          %% store down: no index, never a crash
+    end.
 
 %% Apply one author's assignment of Key for Dest; a {remove: true}
-%% value drops the author's entry.  Returns {changed, Event} when the
-%% stored map actually changed, unchanged otherwise.
+%% value drops the author's row.  Returns {changed, Event} when the
+%% stored state actually changed, unchanged otherwise.
+%%
+%% The current value is read first because the caller only emits an event
+%% on a real change, and a stream that fires on every restatement of the
+%% same name would push a frame per about message to every subscriber.
 apply_field(Dest, Key, Author, Value) ->
-    TabKey = {Dest, Key},
-    Cur = case ets:lookup(?TAB, TabKey) of
-              [{TabKey, Map}] -> Map;
-              []              -> #{}
-          end,
-    New = case is_remove(Value) of
-              true  -> maps:remove(Author, Cur);
-              false -> Cur#{Author => Value}
-          end,
-    case New =:= Cur of
-        true  -> unchanged;
-        false ->
-            ets:insert(?TAB, {TabKey, New}),
+    Cur = assignment(Dest, Key, Author),
+    Changed =
+        case is_remove(Value) of
+            true ->
+                Cur =/= undefined andalso
+                    (catch ssb_store:write("DELETE FROM about_assign"
+                                           " WHERE dest=?1 AND key=?2"
+                                           " AND author=?3",
+                                           [Dest, Key, Author]) =:= ok);
+            false ->
+                Cur =/= Value andalso put_assignment(Dest, Key, Author, Value)
+        end,
+    case Changed of
+        true ->
             %% carry the author and RAW value (removes included) so
             %% socialValuesStream can emit exact single-pair diffs
-            {changed, {about, Dest, Key, Author, Value}}
+            {changed, {about, Dest, Key, Author, Value}};
+        _ ->
+            unchanged
     end.
+
+put_assignment(Dest, Key, Author, Value) ->
+    {Enc, Json} = encode_stored(Value),
+    catch ssb_store:write(
+            "INSERT INTO about_assign(dest, key, author, value, json)"
+            " VALUES(?1, ?2, ?3, ?4, ?5)"
+            " ON CONFLICT(dest, key, author) DO UPDATE SET"
+            "   value=excluded.value, json=excluded.json",
+            [Dest, Key, Author, Enc, Json]) =:= ok.
+
+%% One author's current assignment, or undefined.
+assignment(Dest, Key, Author) ->
+    case rows("SELECT value, json FROM about_assign"
+              " WHERE dest=?1 AND key=?2 AND author=?3", [Dest, Key, Author]) of
+        [[V, J]] -> decode_stored(V, J);
+        _        -> undefined
+    end.
+
+%% Every author's current assignment for {Dest, Key}.
+values_map(Dest, Key) ->
+    maps:from_list([{A, decode_stored(V, J)}
+                    || [A, V, J] <- rows("SELECT author, value, json"
+                                         " FROM about_assign"
+                                         " WHERE dest=?1 AND key=?2",
+                                         [Dest, Key])]).
+
+%% Strings stay strings so the column remains directly queryable;
+%% anything else (patchwork's {link: …} images) becomes JSON with a flag.
+encode_stored(V) when is_binary(V) ->
+    {V, 0};
+encode_stored(V) ->
+    try {iolist_to_binary(message:ssb_encoder(V, fun message:ssb_encoder/3, [])), 1}
+    catch _:_ -> {undefined, 0}
+    end.
+
+decode_stored(V, 0) ->
+    V;
+decode_stored(V, 1) when is_binary(V) ->
+    try utils:nat_decode(V) catch _:_ -> undefined end;
+decode_stored(_V, _J) ->
+    undefined.
 
 is_remove({Props}) when is_list(Props) ->
     ?pgv(~"remove", Props) =:= true;
@@ -290,18 +336,14 @@ is_remove(_) ->
 
 %% Every author's current assignment for {Dest, Key} as a JSON object.
 values_object(Dest, Key) ->
-    Values = case ets:lookup(?TAB, {Dest, Key}) of
-                 [{_, Map}] -> Map;
-                 []         -> #{}
-             end,
-    {maps:to_list(Values)}.
+    {maps:to_list(values_map(Dest, Key))}.
 
 %% latestValueStream's value: exact for a given author; the resolved
 %% social value otherwise (see the module-doc approximation note).
 latest_value(Dest, Key, AuthorId) when is_binary(AuthorId) ->
-    case ets:lookup(?TAB, {Dest, Key}) of
-        [{_, #{AuthorId := V}}] -> V;
-        _                       -> null
+    case assignment(Dest, Key, AuthorId) of
+        undefined -> null;
+        V         -> V
     end;
 latest_value(Dest, Key, _) ->
     social_value(Dest, Key).
@@ -309,10 +351,7 @@ latest_value(Dest, Key, _) ->
 %% getSocialValue: node owner's assignment, else the described feed's
 %% own, else plurality.  Returns the raw value item, or null.
 social_value(Dest, Key) ->
-    Values = case ets:lookup(?TAB, {Dest, Key}) of
-                 [{_, Map}] -> Map;
-                 []         -> #{}
-             end,
+    Values = values_map(Dest, Key),
     Yours = keys:pub_key_disp(),
     Author = author_of(Dest),
     case Values of
@@ -325,28 +364,29 @@ social_value(Dest, Key) ->
 %% up to Limit, as [{FeedId, Name}] — the backing for mention
 %% autocomplete.  Uses the resolved social value, so pet-names the owner
 %% assigned are searchable too.
+%% Matching stays in Erlang rather than becoming a SQL LIKE: string:find
+%% on a string:lowercase'd binary is Unicode-aware, and SQLite's lower()
+%% is ASCII-only, so pushing it down would quietly stop matching any name
+%% that is not plain ASCII.  What the port does buy is the candidate set —
+%% an indexed scan for dests carrying a `name`, where this used to fold
+%% every entry in the whole index regardless of key.
 search_names(Text, Limit) ->
     Needle = string:lowercase(Text),
-    try
-        Dests = ets:foldl(
-                  fun({{Dest, ~"name"}, _Map}, Acc) -> [Dest | Acc];
-                     (_, Acc)                        -> Acc
-                  end, [], ?TAB),
-        Matches = lists:filtermap(
-                    fun(Dest) ->
-                            case social_value(Dest, ~"name") of
-                                Name when is_binary(Name) ->
-                                    case string:find(string:lowercase(Name),
-                                                     Needle) of
-                                        nomatch -> false;
-                                        _       -> {true, {Dest, Name}}
-                                    end;
-                                _ -> false
-                            end
-                    end, Dests),
-        lists:sublist(Matches, Limit)
-    catch error:badarg -> []
-    end.
+    Dests = [D || [D] <- rows("SELECT DISTINCT dest FROM about_assign"
+                              " WHERE key=?1", [~"name"])],
+    Matches = lists:filtermap(
+                fun(Dest) ->
+                        case social_value(Dest, ~"name") of
+                            Name when is_binary(Name) ->
+                                case string:find(string:lowercase(Name),
+                                                 Needle) of
+                                    nomatch -> false;
+                                    _       -> {true, {Dest, Name}}
+                                end;
+                            _ -> false
+                        end
+                end, Dests),
+    lists:sublist(Matches, Limit).
 
 %% The most common extractable value across assigners, or null.
 highest_rank(Values) ->
@@ -425,7 +465,11 @@ resolution_test_() ->
               ?_test(remove_falls_back()),
               ?_test(live_pushes_on_change()),
               ?_test(social_values_stream()),
-              ?_test(latest_value_stream())]
+              ?_test(latest_value_stream()),
+              ?_test(restating_a_value_is_not_a_change()),
+              ?_test(remove_deletes_the_row()),
+              ?_test(search_finds_the_resolved_name()),
+              ?_test(survives_a_restart())]
      end}.
 
 ab_setup() ->
@@ -547,6 +591,61 @@ latest_value_stream() ->
         handle_rpc([~"about", ~"latestValueStream"],
                    [{[{~"dest", Dest}, {~"key", ~"title"}]}], caller()),
     ?assertEqual(~"own title", utils:nat_decode(Resolved)).
+
+%% Why apply_field/4 reads before it writes: an about message restating a
+%% name it already asserted must not be reported as a change, or every
+%% subscriber gets a frame per about message.
+restating_a_value_is_not_a_change() ->
+    Dest = ~"@rstfeedddddddddddddddddddddddddddddddddddd=.ed25519",
+    A    = ~"@rstaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=.ed25519",
+    ?assertMatch({changed, _}, put_about(Dest, ~"name", A, ~"same")),
+    ?assertEqual(unchanged,    put_about(Dest, ~"name", A, ~"same")),
+    ?assertMatch({changed, _}, put_about(Dest, ~"name", A, ~"different")).
+
+%% A remove drops the row rather than storing a {remove: true} value —
+%% otherwise resolution would have to filter it out on every read.
+remove_deletes_the_row() ->
+    Dest = ~"@rmvfeedddddddddddddddddddddddddddddddddddd=.ed25519",
+    A    = ~"@rmvaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=.ed25519",
+    put_about(Dest, ~"name", A, ~"briefly"),
+    ?assertEqual([[1]], ssb_store:q("SELECT count(*) FROM about_assign"
+                                    " WHERE dest=?1 AND key=?2", [Dest, ~"name"])),
+    ?assertMatch({changed, _}, put_about(Dest, ~"name", A, {[{~"remove", true}]})),
+    ?assertEqual([[0]], ssb_store:q("SELECT count(*) FROM about_assign"
+                                    " WHERE dest=?1 AND key=?2", [Dest, ~"name"])),
+    %% and removing what is not there is not a change
+    ?assertEqual(unchanged, put_about(Dest, ~"name", A, {[{~"remove", true}]})).
+
+%% Search resolves before matching, so a pet-name the owner assigned is
+%% findable even though the feed calls itself something else.
+search_finds_the_resolved_name() ->
+    Yours = keys:pub_key_disp(),
+    Dest  = ~"@srchfeeddddddddddddddddddddddddddddddddddd=.ed25519",
+    put_about(Dest, ~"name", Dest,  ~"selfchosen"),
+    put_about(Dest, ~"name", Yours, ~"petname"),
+    ?assertEqual([{Dest, ~"petname"}], search_names(~"PETNA", 10)),
+    %% the overridden self-assignment is not what search sees
+    ?assertEqual([], search_names(~"selfchosen", 10)),
+    %% other keys are not candidates
+    put_about(Dest, ~"description", Yours, ~"petname too"),
+    ?assertEqual(1, length(search_names(~"petname", 10))).
+
+%% The point of the port: durable as written, with no snapshot step.
+survives_a_restart() ->
+    Dest = ~"@prsfeedddddddddddddddddddddddddddddddddddd=.ed25519",
+    A    = ~"@prsaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=.ed25519",
+    Img  = {[{~"link", ~"&blob.sha256"}]},
+    put_about(Dest, ~"name",  A, ~"persisted"),
+    put_about(Dest, ~"image", A, Img),
+    ok = gen_server:stop(ssb_store),
+    {ok, _} = ssb_store:start_link(),
+    ?assertEqual(~"persisted", social_value(Dest, ~"name")),
+    %% A non-string value comes back the shape it went in.  Asked for
+    %% through latest_value/3, not social_value/2: with no owner or self
+    %% assignment the latter resolves by plurality, which compares on
+    %% extract/1 and so answers with the bare link.
+    ?assertEqual(Img, latest_value(Dest, ~"image", A)),
+    ?assertEqual(~"&blob.sha256", social_value(Dest, ~"image")).
 
 caller() ->
     #{class => owner, feed_id => keys:pub_key_disp()}.
