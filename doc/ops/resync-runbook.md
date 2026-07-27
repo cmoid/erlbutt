@@ -178,6 +178,13 @@ preserve:
 | `mess_auth.ets` | `msg_author` |
 | `friends_graph.tab`, `friends_names.tab` | `social_edges` |
 | `views/checkpoints.tab` | `view_checkpoint`, `view_version` |
+| `views/feed_meta.tab` | `feed_meta` |
+| `views/about.tab` | `about_assign` |
+| `views/by_type.tab` | `msg_by_type` |
+| `views/threads.tab` | `thread`, `thread_reply`, `thread_actor` |
+| `views/likes.tab` | `msg_like` |
+| `views/channels.tab` | `channel_stat`, `channel_sub` |
+| `views/private.tab` | `private_thread`, `private_reply` |
 
 `views/checkpoints.tab` is the one exception, and only once: on the first
 start after the checkpoint port it is imported so the node does not refold
@@ -186,8 +193,13 @@ import logs `imported N checkpoints`. If you wipe `.ssberl` you lose
 nothing by dropping all of these; if you are upgrading in place, keep
 `checkpoints.tab` until you have seen that line once.
 
-The remaining `views/*.tab` files ARE live — they belong to the app views
-that have not been ported.
+Every view is now in the store, so the whole `views/` directory is inert
+and can go. Two `.tab` files outside it are still live and must NOT be
+deleted: `room_members.tab` and `invites.tab`. Those are not views —
+nothing can rebuild them by refolding the log, because they hold state
+this node authored rather than derived (who was admitted to a room, which
+invite codes were minted). They are truth, not derivation, and they
+belong with `secret`.
 
 ## 5. Verify
 
