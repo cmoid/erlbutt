@@ -9,9 +9,26 @@
 %% pipeline (JS composed it from createFeedStream + LookupRoots +
 %% threadSummary; here it is a single fold over the log).
 %%
-%% An ssb_view over a named public ETS set
-%%   RootId => #{author, ts, total, recent :: [{ReplyId, ReplyTs}], last}
-%% plus an ssb_plugin serving publicFeed.roots (source, owner).
+%% An ssb_view over ssb_store plus an ssb_plugin serving publicFeed.roots
+%% (source, owner).  Three tables: `thread` (one row per root),
+%% `thread_reply` (one per reply) and `thread_actor` (participants and
+%% mentions).
+%%
+%% This was one ETS map per root holding every field at once, and the
+%% decomposition is the point of the port rather than a side effect.  Each
+%% feed tab is a filter over threads ordered by activity, and with the
+%% summary sealed inside a map every one of them — participating,
+%% mentions, profile, channel — had to fold the entire index and filter in
+%% Erlang before it could sort and paginate.  As rows they are indexed
+%% lookups with ORDER BY and LIMIT, so the work is proportional to the
+%% page returned rather than to the number of threads that exist.
+%%
+%% Replies are kept individually rather than as a capped recent-list with
+%% a separate counter.  That cap existed because the list lived in RAM;
+%% on disk the reply count is COUNT(*), which also fixes a latent bug —
+%% the counter was incremented unconditionally, so a message redelivered
+%% in the window between a checkpoint flush and a crash inflated the
+%% thread's reply count permanently.  A primary key cannot double-count.
 %%
 %% Message bodies are NOT stored: the view holds ids, counts and
 %% timestamps, and bodies are fetched from the per-feed store at query
@@ -47,10 +64,43 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
          handle_info/2, terminate/2, code_change/3]).
 
--define(TAB, silkpurse_threads).
--define(MARKER, '$complete').
--define(RECENT_KEEP, 8).       %% recent replies retained per thread
 -define(RECENT_SHOW, 3).       %% recent replies returned to the client
+
+%% thread_actor.kind
+-define(PARTICIPANT, 1).
+-define(MENTION,     2).
+
+-define(SCHEMA_VERSION, 1).
+-define(DDL,
+        ["CREATE TABLE IF NOT EXISTS thread("
+         "  root    TEXT PRIMARY KEY,"
+         "  author  TEXT,"           %% null until the root itself arrives
+         "  ts      INTEGER,"
+         "  last    INTEGER NOT NULL DEFAULT 0,"
+         "  channel TEXT) WITHOUT ROWID;",
+         %% every feed tab orders by activity, so each filter gets an
+         %% index whose trailing column is `last` and can be walked in
+         %% order rather than sorted after the fact
+         "CREATE INDEX IF NOT EXISTS ix_thread_last"
+         "  ON thread(last DESC);",
+         "CREATE INDEX IF NOT EXISTS ix_thread_author"
+         "  ON thread(author, last DESC);",
+         "CREATE INDEX IF NOT EXISTS ix_thread_channel"
+         "  ON thread(channel, last DESC);",
+         "CREATE TABLE IF NOT EXISTS thread_reply("
+         "  root TEXT NOT NULL,"
+         "  msg  TEXT NOT NULL,"
+         "  ts   INTEGER NOT NULL,"
+         "  PRIMARY KEY (root, msg)) WITHOUT ROWID;",
+         "CREATE TABLE IF NOT EXISTS thread_actor("
+         "  root TEXT NOT NULL,"
+         "  feed TEXT NOT NULL,"
+         "  kind INTEGER NOT NULL,"
+         "  PRIMARY KEY (root, feed, kind)) WITHOUT ROWID;",
+         %% participating/mentions ask "which threads is this feed in",
+         %% which the root-first primary key cannot answer
+         "CREATE INDEX IF NOT EXISTS ix_thread_actor_feed"
+         "  ON thread_actor(feed, kind);"]).
 
 %%%===================================================================
 %%% API
@@ -69,23 +119,21 @@ start_link() ->
 view_version() -> 2.
 
 view_load() ->
-    Loaded = try ets:lookup(?TAB, ?MARKER) =/= []
-             catch error:badarg -> false
-             end,
-    case Loaded of
+    case ssb_store:complete(?MODULE) of
         true  -> ok;
         false -> empty
     end.
 
 view_reset() ->
-    ets:delete_all_objects(?TAB),
+    _ = ssb_store:clear_complete(?MODULE),
+    [ssb_store:exec(["DELETE FROM ", T, ";"])
+     || T <- ["thread", "thread_reply", "thread_actor"]],
     ok.
 
+%% Rows are already durable; the only thing to record is that this view's
+%% state is complete up to the manager's checkpoints.
 view_save() ->
-    ets:insert(?TAB, {?MARKER}),
-    File = table_file(),
-    filelib:ensure_dir(File),
-    ok = ets:tab2file(?TAB, ?b2l(File)),
+    _ = ssb_store:mark_complete(?MODULE),
     ok.
 
 view_entry(#message{id = Id, author = Author, timestamp = Ts,
@@ -123,9 +171,9 @@ manifest() ->
 handle_rpc([~"patchwork", ~"recentFeeds"], Args, _Caller) ->
     recent_feeds(Args);
 handle_rpc([~"patchwork", Feed, ~"roots"], Args, _Caller) ->
-    roots(feed_filter(Feed, Args), Args);
-handle_rpc([~"patchwork", Feed, ~"latest"], Args, _Caller) ->
-    latest(feed_filter(Feed, Args)).
+    roots(Feed, Args);
+handle_rpc([~"patchwork", Feed, ~"latest"], _Args, _Caller) ->
+    latest(Feed).
 
 %% recentFeeds({since}): feed ids that started a thread since `since`,
 %% most recent first — the "recently updated" discovery list.  A snapshot
@@ -138,68 +186,107 @@ recent_feeds(Args) ->
                              end;
                 _ -> 0
             end,
-    Latest = ets:foldl(
-               fun({?MARKER}, Acc) -> Acc;
-                  ({_Root, #{author := A, ts := Ts}}, Acc)
-                    when is_binary(A), is_integer(Ts) ->
-                       maps:update_with(A, fun(Old) -> max(Old, Ts) end, Ts, Acc);
-                  (_, Acc) -> Acc
-               end, #{}, ?TAB),
-    Recent = [{Ts, A} || {A, Ts} <- maps:to_list(Latest), Ts > Since],
-    Sorted = lists:sort(fun({X, _}, {Y, _}) -> X >= Y end, Recent),
-    {source, [{json, encode_json(A)} || {_Ts, A} <- Sorted]}.
+    Rows = rows("SELECT author, max(ts) AS t FROM thread"
+                " WHERE author IS NOT NULL AND ts IS NOT NULL"
+                " GROUP BY author HAVING t > ? ORDER BY t DESC", [Since]),
+    {source, [{json, encode_json(A)} || [A, _Ts] <- Rows]}.
 
-%% Paginated thread roots passing Filter, newest activity first.
-roots(Filter, Args) ->
+%% Paginated thread roots in Feed's scope, newest activity first.
+roots(Feed, Args) ->
     Opts    = opts(Args),
     Reverse = maps:get(reverse, Opts, true),
     Limit   = maps:get(limit, Opts, undefined),
     Resume  = maps:get(resume, Opts, undefined),
-    Threads = [T || {_Id, S} = T <- gather(blocked_set()), Filter(S)],
-    Ordered = order(Threads, Reverse, Resume),
-    Limited = take(Ordered, Limit),
+    {Join, Where, ScopeP} = feed_scope(Feed, Args),
+    {BlockSql, BlockP}    = block_clause(),
+    {ResumeSql, ResumeP}  = resume_clause(Resume, Reverse),
+    Sql = ["SELECT t.root, t.last,"
+           " (SELECT count(*) FROM thread_reply r WHERE r.root = t.root)"
+           " FROM thread t", Join,
+           %% author IS NULL means only replies have been seen so far, so
+           %% the thread is not showable yet
+           " WHERE t.author IS NOT NULL", Where, BlockSql, ResumeSql,
+           order_sql(Reverse), limit_sql(Limit)],
+    Found = rows(Sql, ScopeP ++ BlockP ++ ResumeP),
     {source, [{json, encode_json(Item)}
-              || {RootId, Summary} <- Limited,
-                 (Item = item(RootId, Summary)) =/= undefined]}.
+              || [RootId, Last, Total] <- Found,
+                 (Item = item(RootId, Total, Last)) =/= undefined]}.
 
-%% Live prepend: a root item each time a passing thread gains activity.
-latest(Filter) ->
+%% Live prepend: a root item each time a thread in scope gains activity.
+latest(Feed) ->
     EventFun =
         fun({thread, RootId}) ->
-                Blocked = blocked_set(),
-                case ets:lookup(?TAB, RootId) of
-                    [{RootId, #{author := A} = Summary}] when is_binary(A) ->
-                        case (not sets:is_element(A, Blocked))
-                             andalso Filter(Summary) of
-                            true ->
-                                case item(RootId, Summary) of
-                                    undefined -> skip;
-                                    Item      -> {send, encode_json(Item)}
-                                end;
-                            false -> skip
+                case in_scope(Feed, RootId) of
+                    {true, Total, Last} ->
+                        case item(RootId, Total, Last) of
+                            undefined -> skip;
+                            Item      -> {send, encode_json(Item)}
                         end;
-                    _ -> skip
+                    false -> skip
                 end
         end,
     {live_source, [], ?MODULE, EventFun}.
 
-%% The predicate for each feed tab.  owner-relative feeds use the node's
-%% own id; profile/channel take their target from the request options.
-feed_filter(Feed, _Args) when Feed =:= ~"publicFeed";
-                              Feed =:= ~"networkFeed" ->
-    fun(_S) -> true end;
-feed_filter(~"participatingFeed", _Args) ->
-    Owner = keys:pub_key_disp(),
-    fun(S) -> maps:is_key(Owner, maps:get(participants, S, #{})) end;
-feed_filter(~"mentionsFeed", _Args) ->
-    Owner = keys:pub_key_disp(),
-    fun(S) -> maps:is_key(Owner, maps:get(mentions, S, #{})) end;
-feed_filter(~"profile", Args) ->
-    Id = arg(~"id", Args),
-    fun(S) -> maps:get(author, S) =:= Id end;
-feed_filter(~"channelFeed", Args) ->
-    Ch = arg(~"channel", Args),
-    fun(S) -> maps:get(channel, S, undefined) =:= Ch end.
+%% Does one root pass this feed's scope right now?  The same predicate as
+%% roots/2, asked of a single row — expressed as SQL rather than a
+%% separate Erlang path so the live tail and the backlog cannot drift.
+in_scope(Feed, RootId) ->
+    {Join, Where, ScopeP} = feed_scope(Feed, []),
+    {BlockSql, BlockP}    = block_clause(),
+    Sql = ["SELECT t.last,"
+           " (SELECT count(*) FROM thread_reply r WHERE r.root = t.root)"
+           " FROM thread t", Join,
+           " WHERE t.author IS NOT NULL AND t.root = ?", Where, BlockSql],
+    case rows(Sql, [RootId] ++ ScopeP ++ BlockP) of
+        [[Last, Total] | _] -> {true, Total, Last};
+        _                   -> false
+    end.
+
+%% {Join, Where, Params} for each feed tab.  owner-relative feeds use the
+%% node's own id; profile/channel take their target from the request
+%% options.
+%%
+%% latest/1 asks with no Args, so profile/channelFeed have no target and
+%% match nothing — same as the old predicate comparing against undefined.
+feed_scope(Feed, _Args) when Feed =:= ~"publicFeed";
+                             Feed =:= ~"networkFeed" ->
+    {"", "", []};
+feed_scope(~"participatingFeed", _Args) ->
+    actor_scope(keys:pub_key_disp(), ?PARTICIPANT);
+feed_scope(~"mentionsFeed", _Args) ->
+    actor_scope(keys:pub_key_disp(), ?MENTION);
+feed_scope(~"profile", Args) ->
+    {"", " AND t.author = ?", [arg(~"id", Args)]};
+feed_scope(~"channelFeed", Args) ->
+    {"", " AND t.channel = ?", [arg(~"channel", Args)]}.
+
+actor_scope(Feed, Kind) ->
+    {" JOIN thread_actor a ON a.root = t.root",
+     " AND a.feed = ? AND a.kind = ?", [Feed, Kind]}.
+
+%% Feeds the node owner blocks — their threads are hidden.  Asked of
+%% ssb_social_graph rather than joined against its table: the block list
+%% is small, and an app view reaching into a core view's schema would
+%% couple the two in the direction the layering forbids.
+block_clause() ->
+    case ssb_social_graph:blocks(keys:pub_key_disp()) of
+        []      -> {"", []};
+        Blocked -> {[" AND t.author NOT IN (",
+                     lists:join(",", ["?" || _ <- Blocked]), ")"],
+                    Blocked}
+    end.
+
+resume_clause(undefined, _Reverse) -> {"", []};
+resume_clause(Resume, true)        -> {" AND t.last < ?", [Resume]};
+resume_clause(Resume, false)       -> {" AND t.last > ?", [Resume]}.
+
+order_sql(true)  -> " ORDER BY t.last DESC";
+order_sql(false) -> " ORDER BY t.last ASC".
+
+%% Interpolated rather than bound: opts/1 only admits an integer here, and
+%% SQLite will not take a parameter for LIMIT in every position.
+limit_sql(N) when is_integer(N), N >= 0 -> [" LIMIT ", integer_to_list(N)];
+limit_sql(_)                            -> "".
 
 arg(Key, [{Props}]) -> ?pgv(Key, Props);
 arg(_Key, _)        -> undefined.
@@ -209,34 +296,14 @@ arg(_Key, _)        -> undefined.
 %%%===================================================================
 
 init([]) ->
-    %% Create the (empty) table now so it always exists, but defer the
-    %% snapshot restore to handle_continue: file2tab of a large snapshot
-    %% would otherwise block silkpurse_sup:start_link and thus the whole
-    %% node boot (and the shell).  The restores then run concurrently
-    %% across the views rather than serialized by the supervisor.
-    ets:new(?TAB, [set, named_table, public]),
+    ok = ssb_store:declare(?MODULE, ?SCHEMA_VERSION, ?DDL),
     {ok, #{}, {continue, register}}.
 
+%% Failures are loud and transient ones retried on a timer
+%% (ssb_view:ensure_registered) — the old silent noproc swallow here cost
+%% EarlButt its messagesByType method (July 2026).
 handle_continue(register, State) ->
-    %% Swap in the snapshot (if any), then register plugin + view.
-    %% Failures are loud and transient ones retried on a timer
-    %% (ssb_view:ensure_registered) — the old silent noproc swallow
-    %% here cost EarlButt its messagesByType method (July 2026).
-    maybe_restore(),
     ensure_registered(State).
-
-maybe_restore() ->
-    File = ?b2l(table_file()),
-    case filelib:is_regular(File) of
-        false ->
-            ok;                        %% no snapshot; keep the empty table
-        true ->
-            ets:delete(?TAB),
-            case (try ets:file2tab(File) catch _:_ -> error end) of
-                {ok, ?TAB} -> ok;
-                _          -> ets:new(?TAB, [set, named_table, public])
-            end
-    end.
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
@@ -259,7 +326,6 @@ ensure_registered(State) ->
     {noreply, State}.
 
 terminate(_Reason, _State) ->
-    catch view_save(),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -268,9 +334,6 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal: indexing
 %%%===================================================================
-
-table_file() ->
-    <<(config:ssb_repo_loc())/binary, "views/threads.tab">>.
 
 classify(~"post", undefined) ->
     root;
@@ -281,45 +344,52 @@ classify(~"about", Root) when is_binary(Root) ->
 classify(_, _) ->
     ignore.
 
-%% A root message: record its author/ts/channel, bump last activity,
-%% and add the author + its mentions to the thread's participants /
-%% mentions.  A reply may have created the thread first, so preserve
-%% total/recent/participants/mentions.
+%% A root message: record its author/ts/channel, bump last activity, and
+%% add the author + its mentions as actors.  A reply may have created the
+%% thread row first, so this must not clobber `last` downwards — hence
+%% max() rather than assignment.
 set_root(RootId, Author, Ts, Props) ->
-    Cur = current(RootId),
-    New = Cur#{author  => Author,
-               ts      => Ts,
-               last    => max_ts(maps:get(last, Cur), Ts),
-               channel => channel_of(Props),
-               participants => add(Author, maps:get(participants, Cur)),
-               mentions     => add_all(mentions_of(Props),
-                                       maps:get(mentions, Cur))},
-    ets:insert(?TAB, {RootId, New}).
+    _ = write("INSERT INTO thread(root, author, ts, last, channel)"
+              " VALUES(?, ?, ?, ?, ?)"
+              " ON CONFLICT(root) DO UPDATE SET"
+              "   author=excluded.author, ts=excluded.ts,"
+              "   channel=excluded.channel,"
+              "   last=max(thread.last, excluded.last)",
+              [RootId, Author, num_or_null(Ts), num(Ts), channel_of(Props)]),
+    add_actors(RootId, [Author], ?PARTICIPANT),
+    add_actors(RootId, mentions_of(Props), ?MENTION),
+    ok.
 
 add_reply(RootId, ReplyAuthor, ReplyId, Ts, Props) ->
-    Cur = current(RootId),
-    Recent = insert_recent({ReplyId, Ts}, maps:get(recent, Cur)),
-    New = Cur#{total  => maps:get(total, Cur) + 1,
-               recent => Recent,
-               last   => max_ts(maps:get(last, Cur), Ts),
-               participants => add(ReplyAuthor, maps:get(participants, Cur)),
-               mentions     => add_all(mentions_of(Props),
-                                       maps:get(mentions, Cur))},
-    ets:insert(?TAB, {RootId, New}).
+    %% The reply row carries the dedup: redelivering a reply is a no-op on
+    %% (root, msg), where the old counter incremented regardless.
+    _ = write("INSERT INTO thread_reply(root, msg, ts) VALUES(?, ?, ?)"
+              " ON CONFLICT(root, msg) DO UPDATE SET ts=excluded.ts",
+              [RootId, ReplyId, num(Ts)]),
+    _ = write("INSERT INTO thread(root, last) VALUES(?, ?)"
+              " ON CONFLICT(root) DO UPDATE SET"
+              "   last=max(thread.last, excluded.last)",
+              [RootId, num(Ts)]),
+    add_actors(RootId, [ReplyAuthor], ?PARTICIPANT),
+    add_actors(RootId, mentions_of(Props), ?MENTION),
+    ok.
 
-current(RootId) ->
-    case ets:lookup(?TAB, RootId) of
-        [{RootId, Summary}] -> Summary;
-        []                  -> #{author => undefined, ts => undefined,
-                                 total => 0, recent => [], last => 0,
-                                 participants => #{}, mentions => #{},
-                                 channel => undefined}
-    end.
+add_actors(RootId, Feeds, Kind) ->
+    Rows = [[RootId, F, Kind] || F <- Feeds, is_binary(F)],
+    _ = ssb_store:insert_many(
+          "INSERT INTO thread_actor(root, feed, kind) VALUES(?, ?, ?)"
+          " ON CONFLICT(root, feed, kind) DO NOTHING", Rows),
+    ok.
 
-add(FeedId, Map) when is_binary(FeedId) -> Map#{FeedId => true};
-add(_, Map)                             -> Map.
+%% Timestamps are self-asserted and may be missing or non-numeric; `last`
+%% is NOT NULL because it is the sort key, so it floors at 0.
+num(Ts) when is_integer(Ts) -> Ts;
+num(Ts) when is_float(Ts)   -> trunc(Ts);
+num(_)                      -> 0.
 
-add_all(Ids, Map) -> lists:foldl(fun add/2, Map, Ids).
+num_or_null(Ts) when is_integer(Ts) -> Ts;
+num_or_null(Ts) when is_float(Ts)   -> trunc(Ts);
+num_or_null(_)                      -> undefined.
 
 %% content.channel, when a plain string.
 channel_of(Props) ->
@@ -339,16 +409,6 @@ mentions_of(Props) ->
         _ -> []
     end.
 
-%% Keep recent replies newest-first by timestamp, capped.
-insert_recent(Entry, Recent) ->
-    Deduped = lists:keydelete(element(1, Entry), 1, Recent),
-    Sorted = lists:sort(fun({_, A}, {_, B}) -> A >= B end, [Entry | Deduped]),
-    lists:sublist(Sorted, ?RECENT_KEEP).
-
-max_ts(A, B) when is_integer(A), is_integer(B) -> max(A, B);
-max_ts(undefined, B) -> B;
-max_ts(A, undefined) -> A;
-max_ts(_, _)         -> 0.
 
 %%%===================================================================
 %%% Internal: query
@@ -367,46 +427,13 @@ opts([{Props}]) ->
 opts(_) ->
     #{}.
 
-%% Feeds the node owner blocks — their threads are hidden.
-blocked_set() ->
-    sets:from_list(ssb_social_graph:blocks(keys:pub_key_disp())).
-
-%% Threads whose root has been seen and whose author is not blocked.
-gather(Blocked) ->
-    ets:foldl(
-      fun({?MARKER}, Acc) -> Acc;
-         ({RootId, #{author := A} = S}, Acc) when is_binary(A) ->
-              case sets:is_element(A, Blocked) of
-                  true  -> Acc;
-                  false -> [{RootId, S} | Acc]
-              end;
-         (_, Acc) -> Acc
-      end, [], ?TAB).
-
-order(Threads, Reverse, Resume) ->
-    Cmp = case Reverse of
-              true  -> fun({_, #{last := A}}, {_, #{last := B}}) -> A >= B end;
-              false -> fun({_, #{last := A}}, {_, #{last := B}}) -> A =< B end
-          end,
-    Sorted = lists:sort(Cmp, Threads),
-    case Resume of
-        undefined -> Sorted;
-        _ ->
-            [T || {_, #{last := L}} = T <- Sorted,
-                  case Reverse of true -> L < Resume; false -> L > Resume end]
-    end.
-
-take(List, undefined) -> List;
-take(List, N) when is_integer(N), N >= 0 -> lists:sublist(List, N);
-take(List, _) -> List.
-
 %% Build the roots item: the root message envelope extended with
 %% totalReplies, latestReplies (full messages) and bumps, plus rts (the
 %% activity time) as the pagination cursor.
-item(RootId, #{total := Total, recent := Recent, last := Last}) ->
+item(RootId, Total, Last) ->
     case decoded(RootId) of
         {RootProps} ->
-            Replies = [R || {Id, _Ts} <- lists:sublist(Recent, ?RECENT_SHOW),
+            Replies = [R || Id <- recent_replies(RootId),
                             (R = decoded(Id)) =/= undefined],
             Bumps = [bump(R) || R <- Replies],
             {RootProps ++ [{~"totalReplies", Total},
@@ -416,6 +443,23 @@ item(RootId, #{total := Total, recent := Recent, last := Last}) ->
         undefined ->
             undefined                    %% root body not fetchable; skip
     end.
+
+%% The newest few reply ids, which the capped in-memory list used to hold
+%% directly.
+recent_replies(RootId) ->
+    [Id || [Id] <- rows(["SELECT msg FROM thread_reply WHERE root = ?"
+                         " ORDER BY ts DESC, msg DESC LIMIT ",
+                         integer_to_list(?RECENT_SHOW)], [RootId])].
+
+rows(Sql, Params) ->
+    try ssb_store:q(Sql, Params) of
+        L when is_list(L) -> L;
+        _                 -> []
+    catch _:_ -> []          %% store down: no index, never a crash
+    end.
+
+write(Sql, Params) ->
+    catch ssb_store:write(Sql, Params).
 
 %% The stored message as {key, value, timestamp} EJSON, or undefined.
 decoded(MsgId) ->
@@ -460,21 +504,15 @@ classify_test() ->
     ?assertEqual(ignore, classify(~"vote", undefined)),
     ?assertEqual(ignore, classify(~"contact", undefined)).
 
-insert_recent_test() ->
-    R0 = [],
-    R1 = insert_recent({~"a", 10}, R0),
-    R2 = insert_recent({~"b", 30}, R1),
-    R3 = insert_recent({~"c", 20}, R2),
-    ?assertEqual([{~"b", 30}, {~"c", 20}, {~"a", 10}], R3),
-    %% re-inserting an id updates rather than duplicates
-    R4 = insert_recent({~"a", 40}, R3),
-    ?assertEqual([{~"a", 40}, {~"b", 30}, {~"c", 20}], R4).
-
 threads_test_() ->
     {foreach, fun th_setup/0, fun th_teardown/1,
      [fun(_) -> ?_test(rollup_counts_and_recent()) end,
       fun(_) -> ?_test(reply_before_root()) end,
-      fun(_) -> ?_test(block_filtering()) end]}.
+      fun(_) -> ?_test(block_filtering()) end,
+      fun(_) -> ?_test(recent_replies_are_newest_first()) end,
+      fun(_) -> ?_test(redelivery_does_not_inflate_the_count()) end,
+      fun(_) -> ?_test(scoped_feeds_select_their_threads()) end,
+      fun(_) -> ?_test(survives_a_restart()) end]}.
 
 th_setup() ->
     th_teardown(ignore),
@@ -491,7 +529,27 @@ th_setup() ->
     {ok, _} = view_manager:start_link(),
     {ok, _} = ssb_social_graph:start_link(),
     {ok, _} = silkpurse_threads:start_link(),
+    ok = wait_view_ready(silkpurse_threads),
     Home.
+
+%% Registration happens in handle_continue, so start_link/0 returns before
+%% it lands — and registering a view whose state is not marked complete
+%% resets it.  A test that seeds the index directly must therefore wait,
+%% or the reset arrives mid-test and deletes what it just wrote.
+%%
+%% caught_up/1 alone is not enough: it answers true for a module that has
+%% not registered at all, which is exactly the window being waited out.
+wait_view_ready(Mod) ->
+    wait_view_ready(Mod, 250).
+
+wait_view_ready(Mod, 0) ->
+    error({view_never_ready, Mod});
+wait_view_ready(Mod, N) ->
+    case lists:member(Mod, view_manager:views())
+        andalso view_manager:caught_up(Mod) of
+        true  -> ok;
+        false -> timer:sleep(20), wait_view_ready(Mod, N - 1)
+    end.
 
 th_teardown(Home) ->
     [catch gen_server:stop(Name)
@@ -530,21 +588,94 @@ rollup_counts_and_recent() ->
     Replies = proplists:get_value(~"latestReplies", Props),
     ?assertEqual(2, length(Replies)).
 
-%% A reply ingested before its root: the thread is created with an
-%% unknown author (hidden from the feed) and completed when the root
-%% arrives.  Tested at the index level because forcing cross-feed
-%% ordering with real stored bodies is impractical here.
+%% A reply ingested before its root: the thread row is created with a null
+%% author (hidden from every feed) and completed when the root arrives.
+%% Tested at the index level because forcing cross-feed ordering with real
+%% stored bodies is impractical here.
 reply_before_root() ->
     Fake  = ~"%unseenrootxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=.sha256",
     Reply = ~"%replyaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=.sha256",
     add_reply(Fake, ~"@replier=.ed25519", Reply, 100, []),
-    %% reply-only thread: author unknown, so not surfaced
-    ?assertEqual([], gather(sets:new())),
+    %% reply-only thread: author unknown, so not showable
+    ?assertEqual([], showable()),
     set_root(Fake, keys:pub_key_disp(), 50, []),
     %% now complete, with the earlier reply counted and activity bumped
-    [{Fake, Summary}] = gather(sets:new()),
-    ?assertEqual(1, maps:get(total, Summary)),
-    ?assertEqual(100, maps:get(last, Summary)).
+    %% past the root's own (older) timestamp
+    ?assertEqual([[Fake, 100, 1]], showable()).
+
+%% root, last and reply count for every thread whose root has been seen.
+showable() ->
+    ssb_store:q("SELECT t.root, t.last,"
+                " (SELECT count(*) FROM thread_reply r WHERE r.root = t.root)"
+                " FROM thread t WHERE t.author IS NOT NULL"
+                " ORDER BY t.last DESC").
+
+%% latestReplies is the newest few, which the capped in-memory list gave
+%% by construction and an ORDER BY has to be asked for.
+recent_replies_are_newest_first() ->
+    Root = ~"%recentrootxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=.sha256",
+    A    = ~"@rr=.ed25519",
+    set_root(Root, keys:pub_key_disp(), 1, []),
+    [add_reply(Root, A, Id, Ts, [])
+     || {Id, Ts} <- [{~"%old.sha256", 10}, {~"%new.sha256", 30},
+                     {~"%mid.sha256", 20}, {~"%older.sha256", 5}]],
+    %% capped at RECENT_SHOW, newest first
+    ?assertEqual([~"%new.sha256", ~"%mid.sha256", ~"%old.sha256"],
+                 recent_replies(Root)).
+
+%% The old counter incremented on every delivery, so a message redelivered
+%% after a crash (checkpoints flush on a timer) inflated the count for
+%% good.  The reply row's primary key makes that impossible.
+redelivery_does_not_inflate_the_count() ->
+    Root  = ~"%dupsrootxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=.sha256",
+    A     = ~"@dup=.ed25519",
+    Reply = ~"%dupreply.sha256",
+    set_root(Root, keys:pub_key_disp(), 1, []),
+    add_reply(Root, A, Reply, 10, []),
+    add_reply(Root, A, Reply, 10, []),
+    add_reply(Root, A, Reply, 10, []),
+    ?assertEqual([[Root, 10, 1]], showable()).
+
+%% Each feed tab is a different scope over the same threads; the ones
+%% keyed on an actor are why thread_actor exists.
+scoped_feeds_select_their_threads() ->
+    Owner = keys:pub_key_disp(),
+    Other = ~"@scopedotherrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr=.ed25519",
+    Mine  = ~"%scopedmine.sha256",
+    Theirs = ~"%scopedtheirs.sha256",
+    set_root(Mine, Owner, 10, [{~"channel", ~"erlang"}]),
+    set_root(Theirs, Other, 20, []),
+    %% the owner replies to their thread: now a participant, not an author
+    add_reply(Theirs, Owner, ~"%scopedreply.sha256", 30, []),
+    %% and is mentioned in a third
+    Third = ~"%scopedthird.sha256",
+    set_root(Third, Other, 40,
+             [{~"mentions", [{[{~"link", Owner}]}]}]),
+    ?assertEqual([Mine], scope_roots(~"profile", [{[{~"id", Owner}]}])),
+    ?assertEqual([Mine], scope_roots(~"channelFeed",
+                                     [{[{~"channel", ~"erlang"}]}])),
+    %% participating: authored one, replied to another
+    ?assertEqual([Theirs, Mine], scope_roots(~"participatingFeed", [{[]}])),
+    ?assertEqual([Third], scope_roots(~"mentionsFeed", [{[]}])).
+
+%% Root ids a feed tab selects, newest activity first — the query roots/2
+%% runs, without hydrating bodies (these roots have none stored).
+scope_roots(Feed, Args) ->
+    {Join, Where, ScopeP} = feed_scope(Feed, Args),
+    [R || [R] <- ssb_store:q(["SELECT t.root FROM thread t", Join,
+                              " WHERE t.author IS NOT NULL", Where,
+                              " ORDER BY t.last DESC"], ScopeP)].
+
+%% The point of the port: durable as written, with no snapshot step.
+survives_a_restart() ->
+    Root = ~"%persistrootxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=.sha256",
+    set_root(Root, keys:pub_key_disp(), 5, [{~"channel", ~"kept"}]),
+    add_reply(Root, ~"@p=.ed25519", ~"%persistreply.sha256", 25, []),
+    ok = gen_server:stop(ssb_store),
+    {ok, _} = ssb_store:start_link(),
+    ?assertEqual([[Root, 25, 1]], showable()),
+    ?assertEqual([Root], scope_roots(~"channelFeed",
+                                     [{[{~"channel", ~"kept"}]}])).
 
 block_filtering() ->
     OwnId  = keys:pub_key_disp(),

@@ -486,7 +486,25 @@ ab_setup() ->
     {ok, _} = ssb_feed_sup:start_link(),
     {ok, _} = view_manager:start_link(),
     {ok, _} = silkpurse_about:start_link(),
+    ok = wait_view_ready(silkpurse_about),
     Home.
+
+%% Registration lands after start_link/0 returns, and registering a view
+%% whose state is not marked complete resets it — so a test that seeds the
+%% index directly must wait, or the reset deletes what it just wrote.
+%% caught_up/1 alone answers true for a module that has not registered at
+%% all, which is the window being waited out.
+wait_view_ready(Mod) ->
+    wait_view_ready(Mod, 250).
+
+wait_view_ready(Mod, 0) ->
+    error({view_never_ready, Mod});
+wait_view_ready(Mod, N) ->
+    case lists:member(Mod, view_manager:views())
+        andalso view_manager:caught_up(Mod) of
+        true  -> ok;
+        false -> timer:sleep(20), wait_view_ready(Mod, N - 1)
+    end.
 
 ab_teardown(Home) ->
     [catch gen_server:stop(Name)
