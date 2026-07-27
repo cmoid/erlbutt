@@ -118,8 +118,8 @@ handle_rpc([~"admin", ~"peers", ~"known"], _Args, _Caller) ->
 %% Peers with a live connection right now (peer_registry).
 handle_rpc([~"admin", ~"peers", ~"connected"], _Args, _Caller) ->
     Rows = try peer_registry:all() catch _:_ -> [] end,
-    {reply, [{[{~"id", PubKey}]} || {PubKey, _Pid} <- Rows,
-                                    is_binary(PubKey)]};
+    {reply, [{[{~"id", peer_id(PubKey)}]} || {PubKey, _Pid} <- Rows,
+                                             is_binary(PubKey)]};
 
 %%%===================================================================
 %%% store
@@ -160,6 +160,32 @@ table_rows(Name) ->
 %%% Internal
 %%%===================================================================
 
+%% peer_registry keys connections by the RAW 32-byte public key — that is
+%% what the handshake yields and what ssb_peer registers — not the
+%% @base64.ed25519 display form.  Raw key bytes are arbitrary binary, so
+%% emitting them as a JSON string fails on the first one that is not valid
+%% UTF-8, which for random 32-byte keys is most of them.
+%%
+%% That is not a cosmetic bug: before rpc_processor guarded its encoding,
+%% it killed the whole connection, and the client reconnected and asked
+%% again.
+peer_id(PubKey) when byte_size(PubKey) =:= 32 ->
+    utils:display_pub(base64:encode(PubKey));
+peer_id(Other) ->
+    %% already in display form (or something unexpected) — pass it through
+    %% only if it is safe to encode
+    case is_printable(Other) of
+        true  -> Other;
+        false -> utils:display_pub(base64:encode(Other))
+    end.
+
+is_printable(Bin) ->
+    try
+        _ = json:encode(Bin),
+        true
+    catch _:_ -> false
+    end.
+
 %% peer_dialer may be down (it is a supervised worker, but admin must not
 %% crash a connection's rpc_processor if it is restarting).
 dialer_enabled() ->
@@ -196,6 +222,24 @@ registered_view(Name) ->
 %% Every method is owner-only.  This is the invariant worth a test: the
 %% cost of getting it wrong is a remotely triggerable rebuild, not a
 %% wrong answer.
+%% peer_registry holds RAW 32-byte keys.  Rendering one straight into
+%% JSON is what killed connections before rpc_processor guarded encoding,
+%% so this pins the conversion rather than the symptom.
+peer_id_renders_raw_keys_test() ->
+    %% a key containing 0xFC — not valid UTF-8, and perfectly ordinary
+    Raw = <<252, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31>>,
+    ?assertEqual(32, byte_size(Raw)),
+    ?assertError(_, json:encode(Raw)),          %% the original problem
+    Id = peer_id(Raw),
+    ?assertMatch(<<"@", _/binary>>, Id),
+    ?assertMatch(<<_:1/binary, _/binary>>, Id),
+    %% and the rendered form encodes cleanly
+    ?assertMatch(<<_/binary>>, iolist_to_binary(json:encode(Id))),
+    %% a display-form id is passed through untouched
+    Display = ~"@abcdefghijklmnopqrstuvwxyz0123456789ABCDEFX=.ed25519",
+    ?assertEqual(Display, peer_id(Display)).
+
 manifest_is_owner_only_test() ->
     Perms = lists:usort([Perm || {_Name, _Kind, Perm} <- manifest()]),
     ?assertEqual([owner], Perms).
