@@ -23,6 +23,8 @@
 %% that caller as the evidence.
 -module(mess_auth).
 
+-compile({no_auto_import,[put/2, get/1]}).
+
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 -endif.
