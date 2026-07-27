@@ -117,17 +117,20 @@ write(Sql, Params) ->
 %%% View completeness
 %%%===================================================================
 %%
-%% view_manager keeps its checkpoints in ETS with a periodic snapshot,
-%% while a store-backed view's rows are durable immediately.  The two can
-%% therefore disagree after a crash — in one direction only: the store is
-%% always at or ahead of the last snapshotted checkpoint, so the view
-%% replays messages it has already folded, which is safe because folds are
-%% idempotent per {feed, seq}.
+%% view_manager keeps its checkpoints in ETS and flushes the ones that
+%% moved on a timer, while a store-backed view's rows are durable
+%% immediately.  The two can therefore disagree after a crash — in one
+%% direction only: the store is always at or ahead of the last flushed
+%% checkpoint, so the view replays messages it has already folded, which
+%% is safe because folds are idempotent per {feed, seq}.
 %%
 %% The dangerous case is the other one: checkpoints claiming coverage of
-%% a store that is EMPTY (store.db deleted, checkpoints.tab kept), which
-%% would leave a view silently blank forever.  A view marks itself
-%% complete here; view_load/0 asks, and a fresh database answers no.
+%% a store that is EMPTY, which would leave a view silently blank forever.
+%% Checkpoints now live in this same database, so losing the store loses
+%% them with it and that case can no longer arise from a deleted file.  It
+%% still can from a view whose own tables are dropped or emptied out from
+%% under it, so the flag stays: a view marks itself complete here,
+%% view_load/0 asks, and anything that has not said so answers no.
 
 mark_complete(Name) when is_atom(Name) ->
     write("INSERT INTO ssb_view_state(name,complete) VALUES(?1,1)"

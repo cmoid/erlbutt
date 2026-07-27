@@ -21,6 +21,23 @@
 %% published as {view_event, ViewMod, Event} to processes that joined
 %% via subscribe/1 (a pg group in the ssb_views scope, whose process is
 %% started here and lives under this server).
+%%
+%% Checkpoints live in ssb_store, but ETS stays the working copy.  That is
+%% deliberate: deliver/2 consults and advances a checkpoint once per
+%% message PER VIEW, so with nine views a write-through design would put
+%% nine round trips on the ingest path and on every message of every
+%% catch-up fold.  Instead the ETS table is authoritative in memory, a
+%% dirty set records which {view, feed} pairs have moved, and the periodic
+%% flush writes only those — O(what changed), where the ets:tab2file
+%% snapshot this replaced was O(views x feeds) rewritten every minute.
+%%
+%% The flush interval means a checkpoint can lag the view rows it
+%% describes after a crash.  That asymmetry is safe and stays safe: it
+%% only ever runs one way (rows ahead of checkpoint, never behind), and a
+%% view then refolds messages it has already folded, which is idempotent
+%% per {feed, seq}.  What the move does remove is the split-brain case —
+%% checkpoints claiming coverage of a store that was deleted underneath
+%% them — because both now live or die in the same file.
 -module(view_manager).
 
 -ifdef(TEST).
@@ -52,8 +69,20 @@
 
 -define(SERVER, ?MODULE).
 -define(CKPT, ssb_view_checkpoints).
+-define(DIRTY, ssb_view_checkpoints_dirty).
 -define(PG_SCOPE, ssb_views).
 -define(SAVE_EVERY_MS, 60_000).
+
+-define(SCHEMA_VERSION, 1).
+-define(DDL,
+        ["CREATE TABLE IF NOT EXISTS view_checkpoint("
+         "  view TEXT NOT NULL,"
+         "  feed TEXT NOT NULL,"
+         "  seq  INTEGER NOT NULL,"
+         "  PRIMARY KEY (view, feed)) WITHOUT ROWID;",
+         "CREATE TABLE IF NOT EXISTS view_version("
+         "  view    TEXT PRIMARY KEY,"
+         "  version INTEGER NOT NULL) WITHOUT ROWID;"]).
 %% Feeds folded per catch-up chunk, and the sweep count past which we stop
 %% chasing a store that is growing faster than we can fold it.
 -define(CATCH_UP_FEEDS, 64).
@@ -170,11 +199,8 @@ init([]) ->
         {ok, _}                        -> ok;
         {error, {already_started, _}}  -> ok
     end,
-    case ets:file2tab(?b2l(ckpt_file())) of
-        {ok, ?CKPT} -> ok;
-        _ -> ets:new(?CKPT, [named_table, protected, set,
-                             {read_concurrency, true}])
-    end,
+    ets:new(?DIRTY, [named_table, protected, set]),
+    load_ckpt(),
     erlang:send_after(?SAVE_EVERY_MS, self(), save_tick),
     {ok, #vm_state{}}.
 
@@ -349,10 +375,19 @@ code_change(_OldVsn, State, _Extra) ->
 %% here, not after the fold, so a crash mid-rebuild leaves the view empty
 %% with no checkpoints — which reads as "rebuild me" next time, not as
 %% "complete".
+%% The store rows go too, and synchronously — a rebuild interrupted before
+%% the next flush must not come back to checkpoints describing state that
+%% view_reset/0 has already thrown away.  That is the one direction the
+%% lag is not safe in, so it is the one write that does not wait.
 reset_view(Mod) ->
     ok = Mod:view_reset(),
     ets:match_delete(?CKPT, {{Mod, feed, '_'}, '_'}),
-    ets:insert(?CKPT, {{Mod, version}, Mod:view_version()}),
+    ets:match_delete(?DIRTY, {{Mod, '_'}}),
+    catch ssb_store:write("DELETE FROM view_checkpoint WHERE view=?1",
+                          [atom_to_binary(Mod, utf8)]),
+    Version = Mod:view_version(),
+    ets:insert(?CKPT, {{Mod, version}, Version}),
+    store_version(Mod, Version),
     ok.
 
 %% True when Mod's checkpoint already covers this feed's last message, so
@@ -396,6 +431,7 @@ deliver(Mod, #message{author = FeedId, sequence = Seq} = Msg) ->
                           ok
                   end,
             ets:insert(?CKPT, {{Mod, feed, FeedId}, Seq}),
+            mark_dirty(Mod, FeedId),
             case Res of
                 {events, Events} -> publish(Mod, Events);
                 _                -> ok
@@ -420,20 +456,115 @@ save_all(Views) ->
      end || {Mod, _Class} <- Views],
     persist_ckpt().
 
-persist_ckpt() ->
-    %% config may already be down during shutdown teardown; losing one
-    %% checkpoint flush is safe (worst case the view replays messages it
-    %% has already folded — folds are idempotent per {feed, seq}).
-    try
-        File = ckpt_file(),
-        filelib:ensure_dir(File),
-        ok = ets:tab2file(?CKPT, ?b2l(File))
-    catch C:R ->
-            ?SSB_ERROR("view_manager: checkpoint flush failed: ~p:~p", [C, R])
+%% Populate the in-memory table from the store at boot.  A store that is
+%% down or empty leaves the table empty, which every view reads as "no
+%% checkpoint" and answers with a full refold — expensive, but correct,
+%% and never silently partial.
+load_ckpt() ->
+    {Ckpts, Versions} =
+        case catch ssb_store:declare(?MODULE, ?SCHEMA_VERSION, ?DDL) of
+            ok ->
+                {rows("SELECT view, feed, seq FROM view_checkpoint", []),
+                 rows("SELECT view, version FROM view_version", [])};
+            Err ->
+                ?SSB_ERROR("view_manager: could not declare its schema (~p) — "
+                           "every view will refold from the start of the log",
+                           [Err]),
+                {[], []}
+        end,
+    case Ckpts =:= [] andalso Versions =:= [] of
+        true  -> import_ckpt_file();       %% may create ?CKPT itself
+        false -> ok
+    end,
+    ensure_ckpt_table(),
+    [ets:insert(?CKPT, {{to_mod(V), feed, Feed}, Seq}) || [V, Feed, Seq] <- Ckpts],
+    [ets:insert(?CKPT, {{to_mod(V), version}, Ver})     || [V, Ver] <- Versions],
+    ok.
+
+ensure_ckpt_table() ->
+    case ets:info(?CKPT, size) of
+        undefined -> ets:new(?CKPT, [named_table, protected, set,
+                                     {read_concurrency, true}]);
+        _         -> ?CKPT
     end.
 
-ckpt_file() ->
-    <<(config:ssb_repo_loc())/binary, "views/checkpoints.tab">>.
+%% One-time import of the ets:tab2file snapshot this replaced.  Without it
+%% the first boot after the port refolds every registered view over the
+%% whole corpus, which on a real node is the difference between a restart
+%% and an afternoon.
+%%
+%% Runs only when the store has nothing, so a stale file left lying about
+%% can never overwrite live checkpoints.  The snapshot was taken of a
+%% named table, so file2tab restores it under that name — which is why
+%% this runs before ensure_ckpt_table/0 rather than after.  Everything
+%% imported is written through immediately; the file is inert from then on
+%% and can be deleted.
+import_ckpt_file() ->
+    File = <<(config:ssb_repo_loc())/binary, "views/checkpoints.tab">>,
+    case catch ets:file2tab(?b2l(File)) of
+        {ok, ?CKPT} ->
+            Rows = ets:tab2list(?CKPT),
+            [mark_dirty(Mod, Feed) || {{Mod, feed, Feed}, _} <- Rows],
+            [store_version(Mod, V)  || {{Mod, version}, V} <- Rows],
+            persist_ckpt(),
+            ?SSB_INFO("view_manager: imported ~p checkpoints from ~s; the file "
+                      "is no longer read and may be deleted", [length(Rows), File]);
+        {ok, Other} ->
+            ets:delete(Other),       %% not the table we snapshot: ignore it
+            ok;
+        _ ->
+            ok                       %% no snapshot to import: a fresh node
+    end.
+
+%% Flush the checkpoints that have moved since the last flush.  Failure
+%% leaves them dirty for the next tick rather than dropping them: the
+%% store being briefly unavailable should cost a retry, not a refold.
+persist_ckpt() ->
+    case catch ets:tab2list(?DIRTY) of
+        []                    -> ok;
+        Dirty when is_list(Dirty) -> flush_dirty(Dirty);
+        _                     -> ok        %% table gone: shutdown teardown
+    end.
+
+flush_dirty(Dirty) ->
+    Rows = [[atom_to_binary(Mod, utf8), Feed, checkpoint(Mod, Feed)]
+            || {{Mod, Feed}} <- Dirty],
+    case catch ssb_store:insert_many(
+                 "INSERT INTO view_checkpoint(view, feed, seq)"
+                 " VALUES(?1, ?2, ?3)"
+                 " ON CONFLICT(view, feed) DO UPDATE SET seq=excluded.seq",
+                 Rows) of
+        ok ->
+            [ets:delete(?DIRTY, K) || {K} <- Dirty],
+            ok;
+        Err ->
+            ?SSB_ERROR("view_manager: checkpoint flush failed (~p); "
+                       "~p checkpoints held for the next flush",
+                       [Err, length(Dirty)]),
+            ok
+    end.
+
+mark_dirty(Mod, FeedId) ->
+    ets:insert(?DIRTY, {{Mod, FeedId}}).
+
+store_version(Mod, Version) ->
+    catch ssb_store:write("INSERT INTO view_version(view, version)"
+                          " VALUES(?1, ?2)"
+                          " ON CONFLICT(view) DO UPDATE SET"
+                          " version=excluded.version",
+                          [atom_to_binary(Mod, utf8), Version]),
+    ok.
+
+rows(Sql, Params) ->
+    try ssb_store:q(Sql, Params) of
+        L when is_list(L) -> L;
+        _                 -> []
+    catch _:_ -> []
+    end.
+
+%% Rows only ever come from our own writes, so the atom set is bounded by
+%% the views that have registered on this node.
+to_mod(V) when is_binary(V) -> binary_to_atom(V, utf8).
 
 stored_version(Mod) ->
     case ets:lookup(?CKPT, {Mod, version}) of
@@ -464,7 +595,10 @@ vm_test_() ->
               ?_test(catch_up_after_restart()),
               ?_test(rebuild_on_version_bump()),
               ?_test(rebuild_without_global_log()),
-              ?_test(rebuild_folds_archives())]
+              ?_test(rebuild_folds_archives()),
+              ?_test(only_changed_checkpoints_are_flushed()),
+              ?_test(checkpoints_survive_a_hard_kill()),
+              ?_test(imports_the_legacy_snapshot())]
      end}.
 
 %% Fully isolated home: these tests archive the own feed and rebuild
@@ -707,5 +841,77 @@ rebuild_on_version_bump() ->
     %% state wiped and refolded from the log, exactly once per message
     ?assertEqual([1, 2], test_counter_view:entries(Id)),
     ?assertEqual(2, checkpoint(test_counter_view, Id)).
+
+%% The reason checkpoints are not written through: a flush costs one write
+%% per checkpoint that MOVED, not one per checkpoint held.  Steady state is
+%% an empty dirty set, and a single delivery dirties a single pair.
+only_changed_checkpoints_are_flushed() ->
+    ok = test_counter_view:ensure_table(),
+    ok = vm_ensure_manager(),
+    ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
+    {Pid, Id, Priv} = vm_make_peer(),
+    #message{id = M1} = vm_store_post(Pid, Id, Priv, null, 1),
+    ok = save(),
+    ?assertEqual(0, ets:info(?DIRTY, size)),
+    #message{} = vm_store_post(Pid, Id, Priv, M1, 2),
+    ?assert(ets:member(?DIRTY, {test_counter_view, Id})),
+    ok = save(),
+    ?assertEqual(0, ets:info(?DIRTY, size)),
+    ?assertEqual(2, checkpoint(test_counter_view, Id)).
+
+%% Durability must not depend on terminate/2 running.  Once save/0 has
+%% returned, a checkpoint survives the manager being killed outright —
+%% which is what a crash or a SIGKILL actually looks like.
+checkpoints_survive_a_hard_kill() ->
+    ok = test_counter_view:ensure_table(),
+    ok = vm_ensure_manager(),
+    ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
+    {Pid, Id, Priv} = vm_make_peer(),
+    #message{} = vm_store_post(Pid, Id, Priv, null, 1),
+    ok = save(),
+    VM = whereis(view_manager),
+    true = unlink(VM),               %% or the kill takes this test with it
+    exit(VM, kill),
+    ok = wait_gone(VM, 100),
+    {ok, _} = view_manager:start_link(),
+    ?assertEqual(1, checkpoint(test_counter_view, Id)).
+
+%% First boot after the port: checkpoints live in a legacy tab2file
+%% snapshot and the store has none.  They must be imported rather than
+%% thrown away — the alternative is refolding every view over the whole
+%% corpus — and written through, so the file is dead weight afterwards.
+imports_the_legacy_snapshot() ->
+    ok = vm_ensure_manager(),
+    {_Pid, Id, _Priv} = vm_make_peer(),
+    ok = save(),                     %% empty the dirty set before wiping
+    catch gen_server:stop(view_manager),
+    %% a snapshot in the old format: tab2file of the named table
+    File = ?b2l(<<(config:ssb_repo_loc())/binary, "views/checkpoints.tab">>),
+    ok = filelib:ensure_dir(File),
+    ?CKPT = ets:new(?CKPT, [named_table, public, set]),
+    ets:insert(?CKPT, {{test_counter_view, feed, Id}, 7}),
+    ok = ets:tab2file(?CKPT, File),
+    true = ets:delete(?CKPT),
+    %% both tables, or this is not a first boot: an empty view_checkpoint
+    %% alongside recorded versions means a view was reset and has folded
+    %% nothing yet, and importing over that would resurrect what the reset
+    %% just threw away
+    ok = ssb_store:exec("DELETE FROM view_checkpoint"),
+    ok = ssb_store:exec("DELETE FROM view_version"),
+    {ok, _} = view_manager:start_link(),
+    ?assertEqual(7, checkpoint(test_counter_view, Id)),
+    %% written through on import, so the file is now irrelevant
+    ok = file:delete(File),
+    ok = vm_restart_manager(),
+    ?assertEqual(7, checkpoint(test_counter_view, Id)).
+
+wait_gone(_Pid, 0)  -> error(still_alive);
+wait_gone(Pid, N) ->
+    case is_process_alive(Pid) of
+        false -> ok;
+        true  -> timer:sleep(10), wait_gone(Pid, N - 1)
+    end.
 
 -endif.
