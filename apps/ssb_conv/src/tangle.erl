@@ -212,7 +212,7 @@ setup() ->
 cleanup(Home) ->
     [catch gen_server:stop(Name)
      || Name <- [ssb_links, view_manager, ssb_store, ssb_feed_sup,
-                 mess_auth, keys, config]],
+                 mess_auth,  keys, config]],
     case Home of
         ignore -> ok;
         _ ->
@@ -325,6 +325,7 @@ get_msg_private() ->
 init() ->
     config:start_link("test/ssb.cfg"),
     keys:start_link(),
+    ssb_store:start_link(),
     mess_auth:start_link(),
     ssb_feed_sup:start_link(),
     ssb_store:start_link(),

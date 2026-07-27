@@ -478,6 +478,7 @@ vm_setup() ->
     application:set_env(ssb, ssb_home, Home),
     {ok, _} = config:start_link("no-such-cfg"),
     {ok, _} = keys:start_link(),
+    {ok, _} = ssb_store:start_link(),
     {ok, _} = mess_auth:start_link(),
     {ok, _} = blobs:start_link(),
     {ok, _} = ssb_feed_sup:start_link(),
@@ -487,7 +488,7 @@ vm_setup() ->
 vm_teardown(Home) ->
     application:unset_env(ssb, test_view_version),
     [catch gen_server:stop(Name)
-     || Name <- [view_manager, ssb_feed_sup, blobs, mess_auth, keys, config]],
+     || Name <- [view_manager, ssb_feed_sup, blobs, mess_auth, ssb_store, keys, config]],
     case Home of
         ignore -> ok;
         _ ->

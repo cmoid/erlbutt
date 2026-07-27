@@ -25,6 +25,9 @@ start_link() ->
 init([]) ->
     {ok, { {one_for_one, 5, 10},
            [?CHILD(config, worker),
+            %% Before anything that declares a schema against it —
+            %% mess_auth and the core views all do.
+            ?CHILD(ssb_store, worker),
             ?CHILD(plugin_registry, worker),
             ?CHILD(network_id_cache, worker),
             ?CHILD(heartbeat, worker),
@@ -35,9 +38,6 @@ init([]) ->
             ?CHILD(room_store, worker),
             ?CHILD(conn_db, worker),
             ?CHILD(ingest_journal, worker),
-            %% before view_manager and the core views: they declare their
-            %% schemas against it as they start
-            ?CHILD(ssb_store, worker),
             ?CHILD(ssb_feed_sup, supervisor),
             ?CHILD(view_manager, worker),
             %% core views (doc/persistence.md §5): the ssb app owns these
