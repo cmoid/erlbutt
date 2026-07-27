@@ -147,10 +147,15 @@ cmd_health(Peer) ->
                       [gv(<<"replicationHops">>, Props, 0),
                        onoff(gv(<<"dialerEnabled">>, Props, false))]),
             io:format("  views           ~p registered~n",
-                      [gv(<<"views">>, Props, 0)]);
+                      [gv(<<"views">>, Props, 0)]),
+            io:format("  invalid sigs    ~s~n", [sig_line(Props)]);
         Other ->
             io:format("  UNAVAILABLE: ~p~n", [Other])
     end,
+    BadSigs = case Status of
+                  {P0} -> gv(<<"invalidSignatures">>, P0, 0);
+                  _    -> 0
+              end,
 
     Views = admin_call(Peer, [<<"admin">>, <<"views">>, <<"list">>]),
     io:format("~n== views ==~n"),
@@ -172,13 +177,20 @@ cmd_health(Peer) ->
     end,
 
     io:format("~n"),
-    case {Lagging, EmptyStore} of
-        {[], false} ->
+    case {Lagging, EmptyStore, BadSigs} of
+        {[], false, 0} ->
             io:format("OK~n");
-        {[], true} ->
+        {[], false, N} ->
+            %% Not a failure in itself — during the measure phase this is
+            %% the number we are here to find — but it is exactly what a
+            %% gate should stop on rather than let scroll past.
+            io:format("WARNING: ~s message(s) failed the signature check~n",
+                      [num(N)]),
+            erlang:halt(2);
+        {[], true, _} ->
             io:format("WARNING: derived store has no rows yet~n"),
             erlang:halt(2);
-        {Mods, _} ->
+        {Mods, _, _} ->
             io:format("WARNING: still catching up: ~s~n",
                       [lists:join(", ", Mods)]),
             erlang:halt(2)
@@ -254,6 +266,25 @@ gv(Key, Props, Default) ->
 
 onoff(true) -> "on";
 onoff(_)    -> "off".
+
+%% Peer messages whose signature did not verify, since boot, plus which
+%% mode the node is in.  A count above zero during the measure phase is
+%% the whole point of the exercise, so it is stated plainly rather than
+%% only when something is wrong.
+sig_line(Props) ->
+    N    = gv(<<"invalidSignatures">>, Props, 0),
+    Mode = case gv(<<"requireValidSigs">>, Props, false) of
+               true -> "rejecting";
+               _    -> "warn only, still stored"
+           end,
+    %% Plain ASCII only: this escript formats with ~s throughout, and a
+    %% non-ASCII character in the format string (an em dash, say) is a
+    %% codepoint above 255 that ~s refuses.
+    case N of
+        0 -> io_lib:format("none (~s)", [Mode]);
+        _ -> io_lib:format("~s SEEN (~s); see the per-feed lines in the log",
+                           [num(N), Mode])
+    end.
 
 %% ~p does not accept a negative (left-justifying) field width, so numbers
 %% are rendered to a string first and padded with ~s.
