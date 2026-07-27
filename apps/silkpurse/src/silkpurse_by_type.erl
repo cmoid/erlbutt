@@ -6,15 +6,24 @@
 %% type (post, about, contact, vote, ...).  Serves `messagesByType`
 %% (JS: ssb-db), which clients use for type-scoped scans.
 %%
-%% Same shape as silkpurse_backlinks: an ssb_view over a named public
-%% ETS duplicate_bag {Type, MsgId} plus an ssb_plugin, in one
-%% gen_server.  duplicate_bag, NOT bag: nearly every row shares the one
-%% key <<"post">>, and a bag insert scans the key's bucket for an exact
-%% duplicate — restoring EarlButt's 263k-row snapshot was quadratic and
-%% pinned handle_continue for ~40 minutes, so the node served no
-%% messagesByType (and looked like a registration failure) until the
-%% grind finished.  Duplicates from a crash-window refold are possible
-%% and deduplicated at read time instead.
+%% An ssb_view over ssb_store — (type, msg) with type first — plus an
+%% ssb_plugin, in one gen_server.
+%%
+%% This index used to be an ETS duplicate_bag, and the reason is worth
+%% recording because the port removes it.  Nearly every row shares the one
+%% key <<"post">>, and a `bag` insert scans that key's whole bucket
+%% looking for an exact duplicate; restoring EarlButt's 263k-row snapshot
+%% was quadratic and pinned handle_continue for ~40 minutes, during which
+%% the node served no messagesByType and looked like it had failed to
+%% register.  The fix was duplicate_bag, which does not check — at the
+%% price of letting a crash-window refold insert repeats, deduplicated on
+%% every read instead.
+%%
+%% A primary key on (type, msg) gets uniqueness back without either cost:
+%% the dedup is an index probe rather than a bucket scan, so it is
+%% O(log n) on insert instead of O(bucket), and reads no longer sort a
+%% quarter of a million ids to undo duplicates that can no longer exist.
+%%
 %% Private (still-encrypted) content has no visible type and is not
 %% indexed.  live/old are honoured; a live stream emits a {sync: true}
 %% sentinel between the backlog and the live tail (ssb-db convention —
@@ -46,8 +55,14 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
          handle_info/2, terminate/2, code_change/3]).
 
--define(TAB, silkpurse_by_type).
--define(MARKER, '$complete').
+-define(SCHEMA_VERSION, 1).
+%% type first: every read is "all messages of this type", so the primary
+%% key is also the access path and no separate index is needed.
+-define(DDL,
+        ["CREATE TABLE IF NOT EXISTS msg_by_type("
+         "  type TEXT NOT NULL,"
+         "  msg  TEXT NOT NULL,"
+         "  PRIMARY KEY (type, msg)) WITHOUT ROWID;"]).
 
 %%%===================================================================
 %%% API
@@ -60,34 +75,42 @@ start_link() ->
 %%% ssb_view callbacks (run in the view_manager process)
 %%%===================================================================
 
-%% v2: table type bag -> duplicate_bag (the quadratic-restore fix); the
-%% bump discards old checkpoints so the new table is refolded in full.
+%% Still 2: the bump was for the ETS bag -> duplicate_bag change, which
+%% this port makes moot.  Bumping again would buy nothing, because a node
+%% arriving here has no recorded version for this view at all and so
+%% rebuilds anyway.
 view_version() -> 2.
 
 view_load() ->
-    Loaded = try ets:lookup(?TAB, ?MARKER) =/= []
-             catch error:badarg -> false
-             end,
-    case Loaded of
+    case ssb_store:complete(?MODULE) of
         true  -> ok;
         false -> empty
     end.
 
 view_reset() ->
-    ets:delete_all_objects(?TAB),
+    _ = ssb_store:clear_complete(?MODULE),
+    _ = ssb_store:exec("DELETE FROM msg_by_type;"),
     ok.
 
+%% Rows are already durable; the only thing to record is that this view's
+%% state is complete up to the manager's checkpoints.
 view_save() ->
-    ets:insert(?TAB, {?MARKER}),
-    File = table_file(),
-    filelib:ensure_dir(File),
-    ok = ets:tab2file(?TAB, ?b2l(File)),
+    _ = ssb_store:mark_complete(?MODULE),
     ok.
 
+%% One write per message, since nearly every message carries a type.
+%% Measured at ~11 us against ~1.5 us batched, which over a full refold of
+%% a 263k-message corpus is 2.8s versus 0.4s — both far below the file
+%% reads and signature checks already on this path, so it is not worth the
+%% complexity of batching (unlike view_manager's checkpoints, which move
+%% several times per message).
 view_entry(#message{id = MsgId, content = {Props}}) ->
     case ?pgv(~"type", Props) of
         Type when is_binary(Type) ->
-            ets:insert(?TAB, {Type, MsgId}),
+            catch ssb_store:write("INSERT INTO msg_by_type(type, msg)"
+                                  " VALUES(?1, ?2)"
+                                  " ON CONFLICT(type, msg) DO NOTHING",
+                                  [Type, MsgId]),
             {events, [{typed, Type, MsgId}]};
         _ ->
             ok
@@ -107,10 +130,11 @@ handle_rpc([~"messagesByType"], Args, _Caller) ->
         undefined ->
             {error, ~"messagesByType takes a type"};
         Type ->
-            %% usort: duplicate_bag can hold repeats after a
-            %% crash-window refold
-            Ids = lists:usort([Id || {_T, Id} <- ets:lookup(?TAB, Type),
-                                     is_binary(Id)]),
+            %% no dedup step: the primary key already guarantees it, and
+            %% the rows arrive in id order because that key is the scan
+            Ids = [Id || [Id] <- rows("SELECT msg FROM msg_by_type"
+                                      " WHERE type=?1", [Type]),
+                         is_binary(Id)],
             %% hydrate lazily — one message per sent frame.  Building the
             %% whole [{Id, Bin}] list up front meant a full store's worth
             %% of per-feed fetches before the first byte went out,
@@ -142,58 +166,14 @@ handle_rpc([~"messagesByType"], Args, _Caller) ->
 %%%===================================================================
 
 init([]) ->
-    %% Create the (empty) table now so it always exists, but defer the
-    %% snapshot restore to handle_continue: file2tab of a large snapshot
-    %% would otherwise block silkpurse_sup:start_link and thus the whole
-    %% node boot (and the shell).  The restores then run concurrently
-    %% across the views rather than serialized by the supervisor.
-    ets:new(?TAB, [duplicate_bag, named_table, public]),
+    ok = ssb_store:declare(?MODULE, ?SCHEMA_VERSION, ?DDL),
     {ok, #{}, {continue, register}}.
 
+%% Failures are loud and transient ones retried on a timer
+%% (ssb_view:ensure_registered) — the old silent noproc swallow here cost
+%% EarlButt its messagesByType method (July 2026).
 handle_continue(register, State) ->
-    %% Swap in the snapshot (if any), then register plugin + view.
-    %% Failures are loud and transient ones retried on a timer
-    %% (ssb_view:ensure_registered) — the old silent noproc swallow
-    %% here cost EarlButt its messagesByType method (July 2026).
-    maybe_restore(),
     ensure_registered(State).
-
-maybe_restore() ->
-    File = ?b2l(table_file()),
-    case snapshot_loadable(File) of
-        false ->
-            ok;                        %% no snapshot; keep the empty table
-        true ->
-            ets:delete(?TAB),
-            case (try ets:file2tab(File) catch _:_ -> error end) of
-                {ok, ?TAB} -> ok;
-                _          -> ets:new(?TAB, [duplicate_bag, named_table,
-                                             public])
-            end
-    end.
-
-%% Never file2tab an old-format (bag) snapshot: loading it is the
-%% quadratic grind itself.  Drop the file; the version bump makes
-%% view_manager rebuild the view from the feeds.
-snapshot_loadable(File) ->
-    case filelib:is_regular(File) of
-        false -> false;
-        true ->
-            case ets:tabfile_info(File) of
-                {ok, Info} ->
-                    case proplists:get_value(type, Info) of
-                        duplicate_bag -> true;
-                        Old ->
-                            ?SSB_INFO("by_type: discarding ~p snapshot "
-                                      "(old table type ~p)", [File, Old]),
-                            file:delete(File),
-                            false
-                    end;
-                _ ->
-                    file:delete(File),
-                    false
-            end
-    end.
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
@@ -216,7 +196,6 @@ ensure_registered(State) ->
     {noreply, State}.
 
 terminate(_Reason, _State) ->
-    catch view_save(),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -226,8 +205,12 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-table_file() ->
-    <<(config:ssb_repo_loc())/binary, "views/by_type.tab">>.
+rows(Sql, Params) ->
+    try ssb_store:q(Sql, Params) of
+        L when is_list(L) -> L;
+        _                 -> []
+    catch _:_ -> []          %% store down: no index, never a crash
+    end.
 
 %% Boolean option (live, old) from the request's option object.
 flag_of(Key, [{Props}], Default) ->
@@ -283,7 +266,9 @@ type_of_test() ->
 
 by_type_test_() ->
     {setup, fun bt_setup/0, fun bt_teardown/1,
-     fun(_) -> [?_test(index_and_read_by_type())] end}.
+     fun(_) -> [?_test(index_and_read_by_type()),
+                ?_test(refold_does_not_duplicate()),
+                ?_test(survives_a_restart())] end}.
 
 bt_setup() ->
     bt_teardown(ignore),
@@ -348,29 +333,34 @@ index_and_read_by_type() ->
                    Caller),
     ?assertEqual({[{~"sync", true}]}, utils:nat_decode(OnlySync)).
 
-%% An old-format (bag) snapshot must be discarded without loading it —
-%% file2tab of a bag whose rows share one key is quadratic (the
-%% EarlButt 40-minute boot grind); the version bump refolds instead.
-old_snapshot_discarded_test() ->
-    Home = bt_setup(),
-    try
-        gen_server:stop(silkpurse_by_type),
-        %% forge an old-style bag snapshot at the view's snapshot path
-        Old = ets:new(silkpurse_by_type, [bag, named_table, public]),
-        ets:insert(Old, {~"post", ~"%oldmsg.sha256"}),
-        File = ?b2l(table_file()),
-        filelib:ensure_dir(File),
-        ok = ets:tab2file(Old, File),
-        ets:delete(Old),
-        {ok, _} = silkpurse_by_type:start_link(),
-        %% a call syncs past handle_continue (runs before other messages)
-        _ = sys:get_state(silkpurse_by_type),
-        %% the bag snapshot was dropped, not loaded
-        ?assertEqual(duplicate_bag, ets:info(?TAB, type)),
-        ?assertEqual([], ets:lookup(?TAB, ~"post")),
-        ?assertNot(filelib:is_regular(File))
-    after
-        bt_teardown(Home)
-    end.
+%% The duplicate the ETS duplicate_bag could hold (and read-time usort
+%% had to remove) is now impossible: a refold re-inserting a message it
+%% already indexed is a no-op on the primary key.
+refold_does_not_duplicate() ->
+    OwnId  = keys:pub_key_disp(),
+    OwnPid = utils:find_or_create_feed_pid(OwnId),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"dup"},
+                                         {~"text", ~"indexed twice"}]}),
+    Msg = ssb_feed:fetch_last_msg(OwnPid),
+    %% deliver the same message a second time, as a crash-window refold
+    %% would
+    _ = view_entry(Msg),
+    ?assertEqual([[1]], ssb_store:q("SELECT count(*) FROM msg_by_type"
+                                    " WHERE type=?1", [~"dup"])),
+    Caller = #{class => owner, feed_id => OwnId},
+    {source, Funs} = handle_rpc([~"messagesByType"], [~"dup"], Caller),
+    ?assertEqual(1, length(Funs)).
+
+%% The point of the port: durable as written, with no snapshot step.
+survives_a_restart() ->
+    OwnId  = keys:pub_key_disp(),
+    OwnPid = utils:find_or_create_feed_pid(OwnId),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"persisted"},
+                                         {~"text", ~"still here"}]}),
+    #message{id = Id} = ssb_feed:fetch_last_msg(OwnPid),
+    ok = gen_server:stop(ssb_store),
+    {ok, _} = ssb_store:start_link(),
+    ?assertEqual([[Id]], ssb_store:q("SELECT msg FROM msg_by_type"
+                                     " WHERE type=?1", [~"persisted"])).
 
 -endif.
