@@ -7,11 +7,17 @@
 %% positive value is a like and a non-positive value retracts it.  The
 %% view tracks, per target, the set of authors who currently like it.
 %%
-%% An ssb_view over a named public ETS set  Target => #{Author => true}
-%% plus an ssb_plugin serving the patchwork.likes surface:
+%% An ssb_view over ssb_store — a row per (target, author) — plus an
+%% ssb_plugin serving the patchwork.likes surface:
 %%   likes.get({dest})                     async  -> [likerId]
 %%   likes.countStream({dest})             source -> live like count
 %%   likes.feedLikesMsgStream({msgId,feedId}) source -> live "you like it"
+%%
+%% A row per liker rather than a set per target: the two hot questions are
+%% "how many like this" and "does this one feed like it", and with the
+%% whole set in one value both had to materialise it — countStream rebuilt
+%% the entire liker list on every like event just to take its length.
+%% They are now a COUNT(*) and a primary-key probe.
 -module(silkpurse_likes).
 
 -ifdef(TEST).
@@ -30,8 +36,12 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
          handle_info/2, terminate/2, code_change/3]).
 
--define(TAB, silkpurse_likes).
--define(MARKER, '$complete').
+-define(SCHEMA_VERSION, 1).
+-define(DDL,
+        ["CREATE TABLE IF NOT EXISTS msg_like("
+         "  target TEXT NOT NULL,"
+         "  author TEXT NOT NULL,"
+         "  PRIMARY KEY (target, author)) WITHOUT ROWID;"]).
 
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
@@ -43,20 +53,20 @@ start_link() ->
 view_version() -> 1.
 
 view_load() ->
-    Loaded = try ets:lookup(?TAB, ?MARKER) =/= []
-             catch error:badarg -> false
-             end,
-    case Loaded of true -> ok; false -> empty end.
+    case ssb_store:complete(?MODULE) of
+        true  -> ok;
+        false -> empty
+    end.
 
 view_reset() ->
-    ets:delete_all_objects(?TAB),
+    _ = ssb_store:clear_complete(?MODULE),
+    _ = ssb_store:exec("DELETE FROM msg_like;"),
     ok.
 
+%% Rows are already durable; the only thing to record is that this view's
+%% state is complete up to the manager's checkpoints.
 view_save() ->
-    ets:insert(?TAB, {?MARKER}),
-    File = table_file(),
-    filelib:ensure_dir(File),
-    ok = ets:tab2file(?TAB, ?b2l(File)),
+    _ = ssb_store:mark_complete(?MODULE),
     ok.
 
 view_entry(#message{author = Author, content = {Props}}) ->
@@ -93,9 +103,9 @@ handle_rpc([~"patchwork", ~"likes", ~"get"], [{Opts}], _Caller) ->
 
 handle_rpc([~"patchwork", ~"likes", ~"countStream"], [{Opts}], _Caller) ->
     Dest = ?pgv(~"dest", Opts),
-    Initial = encode_json(length(likers(Dest))),
+    Initial = encode_json(like_count(Dest)),
     EventFun = fun({like, L}) when L =:= Dest ->
-                       {send, encode_json(length(likers(Dest)))};
+                       {send, encode_json(like_count(Dest))};
                   (_) -> skip
                end,
     {live_source, [{make_ref(), Initial}], ?MODULE, EventFun};
@@ -115,34 +125,14 @@ handle_rpc([~"patchwork", ~"likes", ~"feedLikesMsgStream"], [{Opts}], _Caller) -
 %%%===================================================================
 
 init([]) ->
-    %% Create the (empty) table now so it always exists, but defer the
-    %% snapshot restore to handle_continue: file2tab of a large snapshot
-    %% would otherwise block silkpurse_sup:start_link and thus the whole
-    %% node boot (and the shell).  The restores then run concurrently
-    %% across the views rather than serialized by the supervisor.
-    ets:new(?TAB, [set, named_table, public]),
+    ok = ssb_store:declare(?MODULE, ?SCHEMA_VERSION, ?DDL),
     {ok, #{}, {continue, register}}.
 
+%% Failures are loud and transient ones retried on a timer
+%% (ssb_view:ensure_registered) — the old silent noproc swallow here cost
+%% EarlButt its messagesByType method (July 2026).
 handle_continue(register, State) ->
-    %% Swap in the snapshot (if any), then register plugin + view.
-    %% Failures are loud and transient ones retried on a timer
-    %% (ssb_view:ensure_registered) — the old silent noproc swallow
-    %% here cost EarlButt its messagesByType method (July 2026).
-    maybe_restore(),
     ensure_registered(State).
-
-maybe_restore() ->
-    File = ?b2l(table_file()),
-    case filelib:is_regular(File) of
-        false ->
-            ok;                        %% no snapshot; keep the empty table
-        true ->
-            ets:delete(?TAB),
-            case (try ets:file2tab(File) catch _:_ -> error end) of
-                {ok, ?TAB} -> ok;
-                _          -> ets:new(?TAB, [set, named_table, public])
-            end
-    end.
 
 handle_call(_Request, _From, State) -> {reply, ok, State}.
 handle_cast(_Msg, State) -> {noreply, State}.
@@ -159,42 +149,60 @@ ensure_registered(State) ->
         retry -> erlang:send_after(2000, self(), ensure_registered)
     end,
     {noreply, State}.
-terminate(_Reason, _State) -> catch view_save(), ok.
+terminate(_Reason, _State) -> ok.
 code_change(_OldVsn, State, _Extra) -> {ok, State}.
 
 %%%===================================================================
 %%% Internal
 %%%===================================================================
 
-table_file() ->
-    <<(config:ssb_repo_loc())/binary, "views/likes.tab">>.
-
-apply_vote(Link, Author, Value) ->
-    Cur = case ets:lookup(?TAB, Link) of
-              [{Link, Set}] -> Set;
-              []            -> #{}
-          end,
-    New = case is_integer(Value) andalso Value > 0 of
-              true  -> Cur#{Author => true};
-              false -> maps:remove(Author, Cur)
-          end,
-    ets:insert(?TAB, {Link, New}).
+%% A vote restates the author's whole position on the target, so a
+%% positive value asserts the row and anything else removes it.  Both are
+%% idempotent, which is what makes a redelivered vote harmless.
+apply_vote(Link, Author, Value) when is_binary(Author) ->
+    case is_integer(Value) andalso Value > 0 of
+        true ->
+            catch ssb_store:write("INSERT INTO msg_like(target, author)"
+                                  " VALUES(?1, ?2)"
+                                  " ON CONFLICT(target, author) DO NOTHING",
+                                  [Link, Author]);
+        false ->
+            catch ssb_store:write("DELETE FROM msg_like"
+                                  " WHERE target=?1 AND author=?2",
+                                  [Link, Author])
+    end,
+    ok;
+apply_vote(_Link, _Author, _Value) ->
+    ok.
 
 likers(Dest) when is_binary(Dest) ->
-    case ets:lookup(?TAB, Dest) of
-        [{Dest, Set}] -> maps:keys(Set);
-        []            -> []
-    end;
+    [A || [A] <- rows("SELECT author FROM msg_like WHERE target=?1", [Dest])];
 likers(_) ->
     [].
 
-likes_it(MsgId, FeedId) when is_binary(MsgId), is_binary(FeedId) ->
-    case ets:lookup(?TAB, MsgId) of
-        [{MsgId, Set}] -> maps:is_key(FeedId, Set);
-        []             -> false
+%% Counted in SQL rather than by measuring likers/1: countStream asks this
+%% again on every like of the target, and the list it used to build was
+%% discarded immediately.
+like_count(Dest) when is_binary(Dest) ->
+    case rows("SELECT count(*) FROM msg_like WHERE target=?1", [Dest]) of
+        [[N]] when is_integer(N) -> N;
+        _                        -> 0
     end;
+like_count(_) ->
+    0.
+
+likes_it(MsgId, FeedId) when is_binary(MsgId), is_binary(FeedId) ->
+    rows("SELECT 1 FROM msg_like WHERE target=?1 AND author=?2",
+         [MsgId, FeedId]) =/= [];
 likes_it(_, _) ->
     false.
+
+rows(Sql, Params) ->
+    try ssb_store:q(Sql, Params) of
+        L when is_list(L) -> L;
+        _                 -> []
+    catch _:_ -> []          %% store down: no index, never a crash
+    end.
 
 encode_json(Term) ->
     iolist_to_binary(message:ssb_encoder(Term, fun message:ssb_encoder/3, [pretty])).
@@ -206,7 +214,9 @@ encode_json(Term) ->
 
 likes_test_() ->
     {setup, fun lk_setup/0, fun lk_teardown/1,
-     fun(_) -> [?_test(like_and_unlike())] end}.
+     fun(_) -> [?_test(like_and_unlike()),
+                ?_test(count_matches_the_likers()),
+                ?_test(survives_a_restart())] end}.
 
 lk_setup() ->
     lk_teardown(ignore),
@@ -222,7 +232,25 @@ lk_setup() ->
     {ok, _} = ssb_feed_sup:start_link(),
     {ok, _} = view_manager:start_link(),
     {ok, _} = silkpurse_likes:start_link(),
+    ok = wait_view_ready(silkpurse_likes),
     Home.
+
+%% Registration lands after start_link/0 returns, and registering a view
+%% whose state is not marked complete resets it — so a test asserting on
+%% the index must wait, or the reset arrives mid-test.  caught_up/1 alone
+%% answers true for a module that has not registered at all, which is the
+%% window being waited out.
+wait_view_ready(Mod) ->
+    wait_view_ready(Mod, 250).
+
+wait_view_ready(Mod, 0) ->
+    error({view_never_ready, Mod});
+wait_view_ready(Mod, N) ->
+    case lists:member(Mod, view_manager:views())
+        andalso view_manager:caught_up(Mod) of
+        true  -> ok;
+        false -> timer:sleep(20), wait_view_ready(Mod, N - 1)
+    end.
 
 lk_teardown(Home) ->
     [catch gen_server:stop(N)
@@ -255,5 +283,35 @@ like_and_unlike() ->
     _ = vote(Pid, Id, P, V1, 2, Target, 0),          %% retract
     ?assertEqual([], likers(Target)),
     ?assertNot(likes_it(Target, Id)).
+
+%% countStream serves like_count/1 while likes.get serves likers/1, so the
+%% two must not be able to disagree — and a restated vote must not make
+%% the count drift, which is what the primary key is for.
+count_matches_the_likers() ->
+    Target = ~"%counttargetxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=.sha256",
+    A = ~"@likera=.ed25519",
+    B = ~"@likerb=.ed25519",
+    ?assertEqual(0, like_count(Target)),
+    apply_vote(Target, A, 1),
+    apply_vote(Target, B, 1),
+    apply_vote(Target, A, 1),                    %% the same vote again
+    ?assertEqual(2, like_count(Target)),
+    ?assertEqual(2, length(likers(Target))),
+    apply_vote(Target, B, 0),                    %% retract
+    ?assertEqual(1, like_count(Target)),
+    ?assertEqual([A], likers(Target)),
+    %% retracting what was never asserted is also a no-op
+    apply_vote(Target, B, 0),
+    ?assertEqual(1, like_count(Target)).
+
+%% The point of the port: durable as written, with no snapshot step.
+survives_a_restart() ->
+    Target = ~"%persisttargetxxxxxxxxxxxxxxxxxxxxxxxxxxxx=.sha256",
+    A = ~"@persistliker=.ed25519",
+    apply_vote(Target, A, 1),
+    ok = gen_server:stop(ssb_store),
+    {ok, _} = ssb_store:start_link(),
+    ?assertEqual([A], likers(Target)),
+    ?assert(likes_it(Target, A)).
 
 -endif.

@@ -9,10 +9,23 @@
 %% name, a post count and last-activity timestamp, plus the owner's latest
 %% subscription state.
 %%
-%% An ssb_view over a named public ETS set (tagged keys {stat,Ch} and
-%% {sub,Ch}) plus an ssb_plugin serving the discovery surface:
+%% An ssb_view over ssb_store plus an ssb_plugin serving the discovery
+%% surface:
 %%   channels.suggest({text, limit})  async  -> [{id, count, subscribed}]
 %%   channels.recentStream({limit})    source -> live [channelName] by recency
+%%
+%% Two tables, where there was one ETS set holding both kinds of row under
+%% tagged keys ({stat, Ch} and {sub, Ch, Feed}).  That tagging is what a
+%% single-table store forces, and it had a cost: subscribers/1 could not
+%% look anything up, so listing one channel's subscribers meant folding
+%% every stat and every subscription in the index.  Separated, it is a
+%% primary-key prefix scan.
+%%
+%% Channel names are normalized (lowercased, '#' stripped) on the way in,
+%% so the suggest match can be an instr() in SQL rather than a fold: both
+%% sides have already been through Erlang's Unicode-aware lowercasing by
+%% the time they meet, which is what makes pushing it down equivalent
+%% rather than merely similar.
 %%
 %% channel.obs.subscribed (a feed's own subscriptions) is computed client
 %% side from its feed via createUserStream, and subscribing is a publish,
@@ -35,8 +48,20 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
          handle_info/2, terminate/2, code_change/3]).
 
--define(TAB, silkpurse_channels).
--define(MARKER, '$complete').
+-define(SCHEMA_VERSION, 1).
+-define(DDL,
+        ["CREATE TABLE IF NOT EXISTS channel_stat("
+         "  channel TEXT PRIMARY KEY,"
+         "  posts   INTEGER NOT NULL DEFAULT 0,"
+         "  last    INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;",
+         "CREATE INDEX IF NOT EXISTS ix_channel_last"
+         "  ON channel_stat(last DESC);",
+         "CREATE TABLE IF NOT EXISTS channel_sub("
+         "  channel    TEXT NOT NULL,"
+         "  feed       TEXT NOT NULL,"
+         "  subscribed INTEGER NOT NULL,"
+         "  ts         INTEGER NOT NULL,"
+         "  PRIMARY KEY (channel, feed)) WITHOUT ROWID;"]).
 
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
@@ -50,20 +75,21 @@ start_link() ->
 view_version() -> 2.
 
 view_load() ->
-    Loaded = try ets:lookup(?TAB, ?MARKER) =/= []
-             catch error:badarg -> false
-             end,
-    case Loaded of true -> ok; false -> empty end.
+    case ssb_store:complete(?MODULE) of
+        true  -> ok;
+        false -> empty
+    end.
 
 view_reset() ->
-    ets:delete_all_objects(?TAB),
+    _ = ssb_store:clear_complete(?MODULE),
+    [ssb_store:exec(["DELETE FROM ", T, ";"])
+     || T <- ["channel_stat", "channel_sub"]],
     ok.
 
+%% Rows are already durable; the only thing to record is that this view's
+%% state is complete up to the manager's checkpoints.
 view_save() ->
-    ets:insert(?TAB, {?MARKER}),
-    File = table_file(),
-    filelib:ensure_dir(File),
-    ok = ets:tab2file(?TAB, ?b2l(File)),
+    _ = ssb_store:mark_complete(?MODULE),
     ok.
 
 view_entry(#message{author = Author, timestamp = Ts, content = {Props}}) ->
@@ -146,34 +172,14 @@ toggle(Feed, Value) ->
 %%%===================================================================
 
 init([]) ->
-    %% Create the (empty) table now so it always exists, but defer the
-    %% snapshot restore to handle_continue: file2tab of a large snapshot
-    %% would otherwise block silkpurse_sup:start_link and thus the whole
-    %% node boot (and the shell).  The restores then run concurrently
-    %% across the views rather than serialized by the supervisor.
-    ets:new(?TAB, [set, named_table, public]),
+    ok = ssb_store:declare(?MODULE, ?SCHEMA_VERSION, ?DDL),
     {ok, #{}, {continue, register}}.
 
+%% Failures are loud and transient ones retried on a timer
+%% (ssb_view:ensure_registered) — the old silent noproc swallow here cost
+%% EarlButt its messagesByType method (July 2026).
 handle_continue(register, State) ->
-    %% Swap in the snapshot (if any), then register plugin + view.
-    %% Failures are loud and transient ones retried on a timer
-    %% (ssb_view:ensure_registered) — the old silent noproc swallow
-    %% here cost EarlButt its messagesByType method (July 2026).
-    maybe_restore(),
     ensure_registered(State).
-
-maybe_restore() ->
-    File = ?b2l(table_file()),
-    case filelib:is_regular(File) of
-        false ->
-            ok;                        %% no snapshot; keep the empty table
-        true ->
-            ets:delete(?TAB),
-            case (try ets:file2tab(File) catch _:_ -> error end) of
-                {ok, ?TAB} -> ok;
-                _          -> ets:new(?TAB, [set, named_table, public])
-            end
-    end.
 
 handle_call(_Request, _From, State) -> {reply, ok, State}.
 handle_cast(_Msg, State) -> {noreply, State}.
@@ -190,15 +196,12 @@ ensure_registered(State) ->
         retry -> erlang:send_after(2000, self(), ensure_registered)
     end,
     {noreply, State}.
-terminate(_Reason, _State) -> catch view_save(), ok.
+terminate(_Reason, _State) -> ok.
 code_change(_OldVsn, State, _Extra) -> {ok, State}.
 
 %%%===================================================================
 %%% Internal
 %%%===================================================================
-
-table_file() ->
-    <<(config:ssb_repo_loc())/binary, "views/channels.tab">>.
 
 owner() ->
     try keys:pub_key_disp() catch _:_ -> undefined end.
@@ -212,61 +215,89 @@ normalize_channel(_) ->
     undefined.
 
 bump(Ch, Ts) ->
-    {Count, Last} = case ets:lookup(?TAB, {stat, Ch}) of
-                        [{_, C, L}] -> {C, L};
-                        []          -> {0, 0}
-                    end,
-    ets:insert(?TAB, {{stat, Ch}, Count + 1, max(Last, sort_key(Ts))}).
+    _ = write("INSERT INTO channel_stat(channel, posts, last)"
+              " VALUES(?1, 1, ?2)"
+              " ON CONFLICT(channel) DO UPDATE SET"
+              "   posts = channel_stat.posts + 1,"
+              "   last  = max(channel_stat.last, excluded.last)",
+              [Ch, sort_key(Ts)]),
+    ok.
 
+%% Keep the newer toggle; on an equal timestamp the later-folded message
+%% wins (feeds fold in sequence order), so >= rather than >.
 set_sub(Ch, Feed, Subscribed, Ts) ->
-    T = sort_key(Ts),
-    case ets:lookup(?TAB, {sub, Ch, Feed}) of
-        %% keep the newer toggle; on an equal timestamp the later-folded
-        %% message wins (feeds fold in sequence order), so accept it
-        [{_, _Old, OldTs}] when OldTs > T -> ok;
-        _ -> ets:insert(?TAB, {{sub, Ch, Feed}, Subscribed =:= true, T})
-    end.
+    _ = write("INSERT INTO channel_sub(channel, feed, subscribed, ts)"
+              " VALUES(?1, ?2, ?3, ?4)"
+              " ON CONFLICT(channel, feed) DO UPDATE SET"
+              "   subscribed = excluded.subscribed, ts = excluded.ts"
+              " WHERE excluded.ts >= channel_sub.ts",
+              [Ch, Feed, bool(Subscribed), sort_key(Ts)]),
+    ok.
 
 sort_key(Ts) when is_integer(Ts) -> Ts;
 sort_key(_)                      -> 0.
 
+bool(true) -> 1;
+bool(_)    -> 0.
+
 %% Whether the node owner currently subscribes to Ch (for suggest).
 is_subscribed(Ch) ->
-    case ets:lookup(?TAB, {sub, Ch, owner()}) of
-        [{_, Sub, _}] -> Sub;
-        []            -> false
-    end.
+    is_subscribed(Ch, owner()).
 
-%% Feeds currently subscribed to Ch.
-subscribers(Ch) ->
-    ets:foldl(fun({{sub, C, F}, true, _}, Acc) when C =:= Ch -> [F | Acc];
-                 (_, Acc)                                    -> Acc
-              end, [], ?TAB).
+is_subscribed(Ch, Feed) when is_binary(Ch), is_binary(Feed) ->
+    rows("SELECT 1 FROM channel_sub"
+         " WHERE channel=?1 AND feed=?2 AND subscribed=1", [Ch, Feed]) =/= [];
+is_subscribed(_Ch, _Feed) ->
+    false.
+
+%% Feeds currently subscribed to Ch.  An indexed prefix scan now — this
+%% used to fold the whole index, stats included, for one channel.
+subscribers(Ch) when is_binary(Ch) ->
+    [F || [F] <- rows("SELECT feed FROM channel_sub"
+                      " WHERE channel=?1 AND subscribed=1", [Ch])];
+subscribers(_) ->
+    [].
 
 %% Channels whose name contains Text (empty text matches all), most posts
 %% first, capped at Limit, as [{id, count, subscribed}].
-suggest(Text, Limit) ->
+%%
+%% The owner's subscription comes back in the same query rather than a
+%% lookup per result: suggest is called per keystroke of the composer's
+%% channel autocomplete.
+suggest(Text, Limit) when is_integer(Limit), Limit >= 0 ->
     Needle = unicode:characters_to_binary(string:lowercase(Text)),
-    Matched = ets:foldl(
-                fun({{stat, Ch}, Count, _Last}, Acc) ->
-                        case string:find(Ch, Needle) of
-                            nomatch -> Acc;
-                            _       -> [{Ch, Count} | Acc]
-                        end;
-                   (_, Acc) -> Acc
-                end, [], ?TAB),
-    Sorted = lists:sort(fun({_, A}, {_, B}) -> A >= B end, Matched),
-    [ {[{~"id", Ch}, {~"count", Count}, {~"subscribed", is_subscribed(Ch)}]}
-      || {Ch, Count} <- lists:sublist(Sorted, Limit) ].
+    Owner = case owner() of undefined -> ~""; O -> O end,
+    Rows = rows(["SELECT s.channel, s.posts,"
+                 " EXISTS(SELECT 1 FROM channel_sub b"
+                 "        WHERE b.channel = s.channel AND b.feed = ?1"
+                 "          AND b.subscribed = 1)"
+                 " FROM channel_stat s"
+                 " WHERE instr(s.channel, ?2) > 0"
+                 " ORDER BY s.posts DESC, s.channel ASC"
+                 " LIMIT ", integer_to_list(Limit)],
+                [Owner, Needle]),
+    [{[{~"id", Ch}, {~"count", Count}, {~"subscribed", Sub =:= 1}]}
+     || [Ch, Count, Sub] <- Rows];
+suggest(_Text, _Limit) ->
+    [].
 
 %% The most recently active channel names, newest first, capped at Limit.
-recent(Limit) ->
-    Acts = ets:foldl(
-             fun({{stat, Ch}, _Count, Last}, Acc) -> [{Last, Ch} | Acc];
-                (_, Acc) -> Acc
-             end, [], ?TAB),
-    Sorted = lists:sort(fun({A, _}, {B, _}) -> A >= B end, Acts),
-    [Ch || {_Last, Ch} <- lists:sublist(Sorted, Limit)].
+recent(Limit) when is_integer(Limit), Limit >= 0 ->
+    [Ch || [Ch] <- rows(["SELECT channel FROM channel_stat"
+                         " ORDER BY last DESC, channel ASC LIMIT ",
+                         integer_to_list(Limit)], [])];
+recent(_Limit) ->
+    [].
+
+rows(Sql, Params) ->
+    try ssb_store:q(Sql, Params) of
+        L when is_list(L) -> L;
+        _                 -> []
+    catch _:_ -> []          %% store down: no index, never a crash
+    end.
+
+write(Sql, Params) ->
+    catch ssb_store:write(Sql, Params).
 
 encode_json(Term) ->
     iolist_to_binary(message:ssb_encoder(Term, fun message:ssb_encoder/3, [pretty])).
@@ -279,7 +310,10 @@ encode_json(Term) ->
 channels_test_() ->
     {setup, fun ch_setup/0, fun ch_teardown/1,
      fun(_) -> [?_test(index_suggest_recent()),
-                ?_test(subscription_tracked())] end}.
+                ?_test(subscription_tracked()),
+                ?_test(subscribers_are_per_channel()),
+                ?_test(older_toggle_does_not_win()),
+                ?_test(survives_a_restart())] end}.
 
 ch_setup() ->
     ch_teardown(ignore),
@@ -295,7 +329,25 @@ ch_setup() ->
     {ok, _} = ssb_feed_sup:start_link(),
     {ok, _} = view_manager:start_link(),
     {ok, _} = silkpurse_channels:start_link(),
+    ok = wait_view_ready(silkpurse_channels),
     Home.
+
+%% Registration lands after start_link/0 returns, and registering a view
+%% whose state is not marked complete resets it — so a test asserting on
+%% the index must wait, or the reset arrives mid-test.  caught_up/1 alone
+%% answers true for a module that has not registered at all, which is the
+%% window being waited out.
+wait_view_ready(Mod) ->
+    wait_view_ready(Mod, 250).
+
+wait_view_ready(Mod, 0) ->
+    error({view_never_ready, Mod});
+wait_view_ready(Mod, N) ->
+    case lists:member(Mod, view_manager:views())
+        andalso view_manager:caught_up(Mod) of
+        true  -> ok;
+        false -> timer:sleep(20), wait_view_ready(Mod, N - 1)
+    end.
 
 ch_teardown(Home) ->
     [catch gen_server:stop(N)
@@ -344,5 +396,53 @@ subscription_tracked() ->
     %% subscribe again and check the subscribers list
     sub_in(Pid, ~"#elm", true),
     ?assertEqual([keys:pub_key_disp()], subscribers(~"elm")).
+
+%% subscribers/1 used to fold the entire index — stats and every other
+%% channel's subscriptions included — to answer for one channel.  It must
+%% return that channel's subscribers and only those.
+subscribers_are_per_channel() ->
+    A = ~"@subaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=.ed25519",
+    B = ~"@subbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=.ed25519",
+    bump(~"scoped", 1),
+    bump(~"other", 1),
+    set_sub(~"scoped", A, true, 10),
+    set_sub(~"scoped", B, true, 10),
+    set_sub(~"other",  A, true, 10),
+    ?assertEqual([A, B], lists:sort(subscribers(~"scoped"))),
+    ?assertEqual([A], subscribers(~"other")),
+    ?assertEqual([], subscribers(~"never-seen")),
+    %% and an unsubscribe removes only that pair
+    set_sub(~"scoped", A, false, 20),
+    ?assertEqual([B], subscribers(~"scoped")),
+    ?assertEqual([A], subscribers(~"other")).
+
+%% Toggles are resolved on timestamp, so a stale one arriving late must
+%% not overwrite the current state.  An equal timestamp does win: feeds
+%% fold in sequence order, so the later-folded message is the later one.
+older_toggle_does_not_win() ->
+    Ch = ~"toggles",
+    F  = ~"@togglerrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr=.ed25519",
+    bump(Ch, 1),
+    set_sub(Ch, F, true, 100),
+    ?assert(is_subscribed(Ch, F)),
+    set_sub(Ch, F, false, 50),           %% stale: ignored
+    ?assert(is_subscribed(Ch, F)),
+    set_sub(Ch, F, false, 100),          %% same instant: accepted
+    ?assertNot(is_subscribed(Ch, F)),
+    set_sub(Ch, F, true, 150),           %% newer: accepted
+    ?assert(is_subscribed(Ch, F)).
+
+%% The point of the port: durable as written, with no snapshot step.
+survives_a_restart() ->
+    Ch = ~"persisted",
+    F  = ~"@persistsubbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=.ed25519",
+    bump(Ch, 7),
+    bump(Ch, 9),
+    set_sub(Ch, F, true, 9),
+    ok = gen_server:stop(ssb_store),
+    {ok, _} = ssb_store:start_link(),
+    ?assertMatch([{[{~"id", Ch}, {~"count", 2} | _]}], suggest(~"persist", 20)),
+    ?assertEqual([F], subscribers(Ch)),
+    ?assert(lists:member(Ch, recent(50))).
 
 -endif.

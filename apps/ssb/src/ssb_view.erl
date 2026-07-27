@@ -15,9 +15,10 @@
 %% from the view's own process — so a view backed by a gen_server must
 %% keep its tables public (or otherwise writable from the manager) and
 %% must not implement these callbacks as calls into itself while it is
-%% registering.  The convention (see ssb_social_graph) is: the view's gen_server
-%% owns named public ETS tables created (or file2tab-restored) in its
-%% init, and these callbacks are plain functions over those tables.
+%% registering.  The convention (see ssb_social_graph) is: the view's
+%% gen_server declares its tables in ssb_store in its init, and these
+%% callbacks are plain functions over the store — so the view's own
+%% process holds no state and cannot be the thing that blocks.
 %%
 %% Callbacks:
 %%   view_version() — bump to force a full rebuild after the fold logic
