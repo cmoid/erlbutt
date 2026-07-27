@@ -484,10 +484,10 @@ th_setup() ->
     application:set_env(ssb, ssb_home, Home),
     {ok, _} = config:start_link("no-such-cfg"),
     {ok, _} = keys:start_link(),
+    {ok, _} = ssb_store:start_link(),
     {ok, _} = mess_auth:start_link(),
     {ok, _} = blobs:start_link(),
     {ok, _} = ssb_feed_sup:start_link(),
-    {ok, _} = ssb_store:start_link(),
     {ok, _} = view_manager:start_link(),
     {ok, _} = ssb_social_graph:start_link(),
     {ok, _} = silkpurse_threads:start_link(),
@@ -496,7 +496,7 @@ th_setup() ->
 th_teardown(Home) ->
     [catch gen_server:stop(Name)
      || Name <- [silkpurse_threads, ssb_social_graph, view_manager,
-                 ssb_store, ssb_feed_sup, blobs, mess_auth, keys,
+                 ssb_store, ssb_feed_sup, blobs, mess_auth,  keys,
                  config]],
     case Home of
         ignore -> ok;

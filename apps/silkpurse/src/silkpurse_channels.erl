@@ -289,6 +289,7 @@ ch_setup() ->
     application:set_env(ssb, ssb_home, Home),
     {ok, _} = config:start_link("no-such-cfg"),
     {ok, _} = keys:start_link(),
+    {ok, _} = ssb_store:start_link(),
     {ok, _} = mess_auth:start_link(),
     {ok, _} = blobs:start_link(),
     {ok, _} = ssb_feed_sup:start_link(),
@@ -299,7 +300,7 @@ ch_setup() ->
 ch_teardown(Home) ->
     [catch gen_server:stop(N)
      || N <- [silkpurse_channels, view_manager, ssb_feed_sup, blobs,
-              mess_auth, keys, config]],
+              mess_auth, ssb_store, keys, config]],
     case Home of
         ignore -> ok;
         _ -> os:cmd("rm -rf " ++ Home), application:unset_env(ssb, ssb_home)
