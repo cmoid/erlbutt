@@ -83,9 +83,9 @@
          "CREATE TABLE IF NOT EXISTS view_version("
          "  view    TEXT PRIMARY KEY,"
          "  version INTEGER NOT NULL) WITHOUT ROWID;"]).
-%% Feeds folded per catch-up chunk, and the sweep count past which we stop
+%% Messages read per catch-up turn, and the sweep count past which we stop
 %% chasing a store that is growing faster than we can fold it.
--define(CATCH_UP_FEEDS, 64).
+-define(CATCH_UP_BUDGET, 2000).
 -define(CATCH_UP_MAX_PASSES, 8).
 
 %% Registered views as [{Mod, core | app}], in delivery order: every core
@@ -282,19 +282,58 @@ handle_call(save, _From, #vm_state{views = Views} = State) ->
 %% feeds are still being folded.
 
 start_catch_up(Mod, #vm_state{catching = Catching} = State) ->
-    self() ! {catch_up, Mod, feed_store:feed_dirs(), 0, 1,
+    self() ! {catch_up, Mod, {feed_store:feed_dirs(), none}, 0, 1,
               erlang:monotonic_time(millisecond)},
     State#vm_state{catching = Catching#{Mod => true}}.
 
-%% Fold one chunk of feeds, then either continue, sweep again, or finish.
-do_catch_up(Mod, Dirs, Delivered, Pass, T0, State) ->
-    {Chunk, Rest} = split_chunk(chunk_size(), Dirs),
-    N = lists:foldl(fun(Dir, Acc) -> Acc + fold_one_feed(Mod, Dir) end,
-                    0, Chunk),
-    case Rest of
-        [] -> finish_pass(Mod, Delivered + N, Pass, T0, State);
-        _  -> self() ! {catch_up, Mod, Rest, Delivered + N, Pass, T0},
-              State
+%% Fold until the message budget is spent, then either continue, sweep
+%% again, or finish.
+do_catch_up(Mod, Work, Delivered, Pass, T0, State) ->
+    case fold_budget(Mod, Work, budget(), 0) of
+        {done, N} ->
+            finish_pass(Mod, Delivered + N, Pass, T0, State);
+        {more, Rest, N} ->
+            self() ! {catch_up, Mod, Rest, Delivered + N, Pass, T0},
+            State
+    end.
+
+%% Read at most Budget messages, then yield with somewhere to resume.
+%%
+%% The budget counts MESSAGES, not feeds, and that is the whole point.
+%% It was feeds, which cannot bound how long a turn takes: feed sizes vary
+%% by orders of magnitude, so one busy feed outweighs a hundred quiet ones
+%% and a 64-feed chunk on a 105-feed node was most of the corpus in a
+%% single uninterrupted turn.  That starved everything sharing this
+%% process — including ssb_feed's synchronous ingest/1, so replication
+%% queued behind the rebuild — and made a 30-minute refold 30 minutes of
+%% unresponsive node rather than 30 minutes of background work.
+%%
+%% Resuming mid-feed is why this uses a cursor rather than fold_feed/3.
+%% Restarting the feed instead would re-decode everything already folded
+%% just to have deliver/2 discard it against the checkpoint, which is
+%% quadratic in the number of turns a feed takes.  A suspended cursor
+%% holds no file descriptor (the live log is read positionally), at the
+%% cost of one decompressed archive segment held per catching view.
+fold_budget(_Mod, {[], none}, _Budget, N) ->
+    {done, N};
+fold_budget(_Mod, Work, Budget, N) when Budget =< 0 ->
+    {more, Work, N};
+fold_budget(Mod, {[Dir | Rest], none}, Budget, N) ->
+    case caught_up_feed(Mod, Dir) of
+        %% a whole feed skipped on one tail read: charge that read, since
+        %% a node with many caught-up feeds is otherwise unbounded too
+        true  -> fold_budget(Mod, {Rest, none}, Budget - 1, N);
+        false -> fold_budget(Mod, {Rest, {Dir, feed_store:cursor_open(Dir)}},
+                             Budget, N)
+    end;
+fold_budget(Mod, {Dirs, {Dir, Cursor}}, Budget, N) ->
+    case feed_store:cursor_next(Cursor) of
+        eof ->
+            ok = feed_store:cursor_close(Cursor),
+            fold_budget(Mod, {Dirs, none}, Budget, N);
+        {Data, Next} ->
+            fold_budget(Mod, {Dirs, {Dir, Next}}, Budget - 1,
+                        N + deliver_raw(Mod, Data))
     end.
 
 %% A pass that delivered nothing means nothing was missed: done.  A pass
@@ -315,27 +354,17 @@ finish_pass(Mod, N, Pass, T0, State) when Pass >= ?CATCH_UP_MAX_PASSES ->
                "accepting it as caught up", [Mod, N, Pass]),
     finish_pass(Mod, 0, Pass, T0, State);
 finish_pass(Mod, _N, Pass, T0, State) ->
-    self() ! {catch_up, Mod, feed_store:feed_dirs(), 0, Pass + 1, T0},
+    self() ! {catch_up, Mod, {feed_store:feed_dirs(), none}, 0, Pass + 1, T0},
     State.
 
-fold_one_feed(Mod, Dir) ->
-    case caught_up_feed(Mod, Dir) of
-        true  -> 0;
-        false -> feed_store:fold_feed(
-                   fun(Data, Acc) -> Acc + deliver_raw(Mod, Data) end, 0, Dir)
-    end.
-
-split_chunk(N, List) ->
-    case length(List) =< N of
-        true  -> {List, []};
-        false -> lists:split(N, List)
-    end.
-
-%% Feeds per chunk.  Configurable so a test can force the fold to span
-%% several turns of the message loop, which is the only way to actually
-%% exercise a store landing mid-catch-up.
-chunk_size() ->
-    application:get_env(ssb, view_catch_up_feeds, ?CATCH_UP_FEEDS).
+%% Messages read per turn of the message loop.  Sized so a turn is roughly
+%% a tenth of a second — a message costs about 50 us to decode and fold —
+%% which keeps ingest and admin calls served while a rebuild runs.
+%%
+%% Configurable, which a test also uses to force the fold to span several
+%% turns; that is the only way to exercise a store landing mid-catch-up.
+budget() ->
+    application:get_env(ssb, view_catch_up_messages, ?CATCH_UP_BUDGET).
 
 %% Append Mod to its class group: core views ahead of every app view,
 %% within a group in registration order.
@@ -348,8 +377,8 @@ insert_view(Mod, app, Views) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({catch_up, Mod, Dirs, Delivered, Pass, T0}, State) ->
-    {noreply, do_catch_up(Mod, Dirs, Delivered, Pass, T0, State)};
+handle_info({catch_up, Mod, Work, Delivered, Pass, T0}, State) ->
+    {noreply, do_catch_up(Mod, Work, Delivered, Pass, T0, State)};
 
 handle_info(save_tick, #vm_state{views = Views} = State) ->
     save_all(Views),
@@ -767,9 +796,11 @@ no_gap_when_storing_during_catch_up() ->
             end, [null], lists:seq(1, 12)),
     {Pid2, Id2, Priv2} = vm_make_peer(),
     #message{} = vm_store_post(Pid2, Id2, Priv2, null, 1),
-    %% One feed per chunk, so the fold takes several turns of the message
-    %% loop and the store below genuinely lands in the middle of it.
-    application:set_env(ssb, view_catch_up_feeds, 1),
+    %% One message per turn, so the fold takes many turns of the message
+    %% loop and the store below genuinely lands in the middle of it —
+    %% including in the middle of a feed, which the budget must be able to
+    %% resume from.
+    application:set_env(ssb, view_catch_up_messages, 1),
     try
         %% rebuild forces a full refold of an already-registered view
         ok = rebuild(test_counter_view),
@@ -780,7 +811,7 @@ no_gap_when_storing_during_catch_up() ->
         ?assertEqual(lists:seq(1, 13), test_counter_view:entries(Id)),
         ?assertEqual(13, checkpoint(test_counter_view, Id))
     after
-        application:unset_env(ssb, view_catch_up_feeds)
+        application:unset_env(ssb, view_catch_up_messages)
     end.
 
 events_to_subscriber() ->
