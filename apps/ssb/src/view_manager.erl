@@ -230,6 +230,11 @@ handle_call({register_view, Mod}, _From, #vm_state{views = Views} = State) ->
 handle_call({rebuild, Mod}, _From, #vm_state{views = Views} = State) ->
     case lists:keymember(Mod, 1, Views) of
         true ->
+            %% Say so.  register_view logs when IT decides to rebuild, so a
+            %% log with a view's "caught up" but no matching start reads as
+            %% "this view was never rebuilt" — which is a real failure mode
+            %% and looks identical to a rebuild asked for by hand.
+            ?SSB_INFO("view_manager: rebuild of ~p requested", [Mod]),
             reset_view(Mod),
             {reply, ok, start_catch_up(Mod, State)};
         false ->
