@@ -287,20 +287,39 @@ handle_call(save, _From, #vm_state{views = Views, catching = Catching} = State) 
 %% where a feed the sweep has already passed gains a message while later
 %% feeds are still being folded.
 
+%% Start a fold, superseding any fold already running for this view.
+%%
+%% `catching` maps the view to a generation, and every catch_up message
+%% carries the generation it belongs to; do_catch_up drops one that no
+%% longer matches.  Without that, rebuild/1 on a view that was already
+%% catching up left BOTH chains running — they are independent self-sent
+%% messages, and the map key made it look like one job.  Two folds then
+%% raced for 34 minutes on EarlButt, and the first to finish removed the
+%% view from `catching`, marking it caught up and complete while the other
+%% was still going.  by_type survived only because its writes are
+%% idempotent on a primary key.
 start_catch_up(Mod, #vm_state{catching = Catching} = State) ->
-    self() ! {catch_up, Mod, {feed_store:feed_dirs(), none}, 0, 1,
+    Gen = maps:get(Mod, Catching, 0) + 1,
+    self() ! {catch_up, Mod, Gen, {feed_store:feed_dirs(), none}, 0, 1,
               erlang:monotonic_time(millisecond)},
-    State#vm_state{catching = Catching#{Mod => true}}.
+    State#vm_state{catching = Catching#{Mod => Gen}}.
 
 %% Fold until the message budget is spent, then either continue, sweep
 %% again, or finish.
-do_catch_up(Mod, Work, Delivered, Pass, T0, State) ->
-    Deadline = erlang:monotonic_time(millisecond) + turn_ms(),
-    case fold_budget(Mod, Work, budget(), Deadline, 0) of
-        {done, N} ->
-            finish_pass(Mod, Delivered + N, Pass, T0, State);
-        {more, Rest, N} ->
-            self() ! {catch_up, Mod, Rest, Delivered + N, Pass, T0},
+do_catch_up(Mod, Gen, Work, Delivered, Pass, T0,
+            #vm_state{catching = Catching} = State) ->
+    case maps:get(Mod, Catching, undefined) of
+        Gen ->
+            Deadline = erlang:monotonic_time(millisecond) + turn_ms(),
+            case fold_budget(Mod, Work, budget(), Deadline, 0) of
+                {done, N} ->
+                    finish_pass(Mod, Gen, Delivered + N, Pass, T0, State);
+                {more, Rest, N} ->
+                    self() ! {catch_up, Mod, Gen, Rest, Delivered + N, Pass, T0},
+                    State
+            end;
+        _ ->
+            %% superseded by a later rebuild, or already finished
             State
     end.
 
@@ -353,21 +372,22 @@ fold_step(Mod, {Dirs, {Dir, Cursor}}, Budget, Deadline, N) ->
 %% that delivered something may have raced with an append to a feed it
 %% had already visited, so sweep again — cheap, because caught_up_feed/2
 %% skips a whole feed on one tail read.
-finish_pass(Mod, 0, Pass, T0, #vm_state{catching = Catching} = State) ->
+finish_pass(Mod, _Gen, 0, Pass, T0, #vm_state{catching = Catching} = State) ->
     ?SSB_INFO("view_manager: ~p caught up in ~p ms (~p pass(es))",
               [Mod, erlang:monotonic_time(millisecond) - T0, Pass]),
     ok = Mod:view_save(),
     persist_ckpt(),
     State#vm_state{catching = maps:remove(Mod, Catching)};
-finish_pass(Mod, N, Pass, T0, State) when Pass >= ?CATCH_UP_MAX_PASSES ->
+finish_pass(Mod, Gen, N, Pass, T0, State) when Pass >= ?CATCH_UP_MAX_PASSES ->
     %% Still moving after this many sweeps: the store is being written
     %% faster than we fold.  Stop sweeping and let ingest take over —
     %% anything missed is picked up by the next run's catch-up.
     ?SSB_ERROR("view_manager: ~p still delivering (~p) after ~p passes; "
                "accepting it as caught up", [Mod, N, Pass]),
-    finish_pass(Mod, 0, Pass, T0, State);
-finish_pass(Mod, _N, Pass, T0, State) ->
-    self() ! {catch_up, Mod, {feed_store:feed_dirs(), none}, 0, Pass + 1, T0},
+    finish_pass(Mod, Gen, 0, Pass, T0, State);
+finish_pass(Mod, Gen, _N, Pass, T0, State) ->
+    self() ! {catch_up, Mod, Gen, {feed_store:feed_dirs(), none}, 0,
+              Pass + 1, T0},
     State.
 
 %% Messages read per turn of the message loop.
@@ -401,8 +421,8 @@ insert_view(Mod, app, Views) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({catch_up, Mod, Work, Delivered, Pass, T0}, State) ->
-    {noreply, do_catch_up(Mod, Work, Delivered, Pass, T0, State)};
+handle_info({catch_up, Mod, Gen, Work, Delivered, Pass, T0}, State) ->
+    {noreply, do_catch_up(Mod, Gen, Work, Delivered, Pass, T0, State)};
 
 handle_info(save_tick, #vm_state{views = Views, catching = Catching} = State) ->
     save_all(Views, Catching),
@@ -696,6 +716,7 @@ vm_test_() ->
               ?_test(checkpoints_survive_a_hard_kill()),
               ?_test(cold_start_rebuilds_from_logs()),
               ?_test(a_catching_view_is_not_marked_complete()),
+              ?_test(a_rebuild_supersedes_a_running_fold()),
               ?_test(a_turn_is_bounded_by_time()),
               ?_test(imports_the_legacy_snapshot())]
      end}.
@@ -1037,6 +1058,40 @@ a_catching_view_is_not_marked_complete() ->
     %% and the same call once it is not catching up
     save_all([{test_counter_view, app}], #{}),
     ?assertEqual(ok, test_counter_view:view_load()).
+
+%% Asking for a rebuild while a fold is already running must replace it,
+%% not run alongside it.  Both are self-sent message chains, so nothing
+%% about the `catching` map stops two coexisting — on EarlButt they raced
+%% for 34 minutes and each logged its own "caught up".
+a_rebuild_supersedes_a_running_fold() ->
+    ok = test_counter_view:ensure_table(),
+    ok = vm_ensure_manager(),
+    ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
+    {Pid, Id, Priv} = vm_make_peer(),
+    lists:foldl(fun(Seq, Prev) ->
+                        #message{id = New} =
+                            vm_store_post(Pid, Id, Priv, Prev, Seq),
+                        New
+                end, null, lists:seq(1, 8)),
+    %% one message per turn, so a fold is unambiguously still in flight
+    application:set_env(ssb, view_catch_up_messages, 1),
+    try
+        ok = rebuild(test_counter_view),
+        ?assertNot(caught_up(test_counter_view)),
+        %% a second rebuild lands while the first is still folding
+        ok = rebuild(test_counter_view),
+        ok = wait_caught_up(test_counter_view),
+        %% the superseded chain must not report separately, and the view
+        %% must be whole exactly once
+        ?assertEqual(lists:seq(1, 8), test_counter_view:entries(Id)),
+        ?assertEqual(8, checkpoint(test_counter_view, Id)),
+        %% and no stale chain is left to fire later
+        timer:sleep(100),
+        ?assert(caught_up(test_counter_view))
+    after
+        application:unset_env(ssb, view_catch_up_messages)
+    end.
 
 %% A message count cannot bound a turn's duration once a message can cost
 %% a synchronous store write, so the clock has to be able to stop it on
