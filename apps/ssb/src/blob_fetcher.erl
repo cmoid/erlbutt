@@ -15,8 +15,21 @@
 %% (ssb_peer calls peer_connected/1) and re-broadcast periodically so that
 %% blobs missing from the current peer set are eventually found.
 %%
-%% Wants are held in memory only; they are rediscovered from replicated
-%% messages after a restart.
+%% Wants are persisted in ssb_store, so a restart does not forget what the
+%% node was looking for.  They used to be memory-only, rebuilt either from
+%% newly arriving messages or from the optional startup scan — and that
+%% scan is a fold over every feed, decoding every message and attempting a
+%% decrypt on every encrypted one, which is the same order of work as
+%% rebuilding a view.  Paying that on every boot to recover a set of
+%% hashes was the wrong trade; the set is small and belongs on disk.
+%%
+%% The scan is now a recovery tool rather than the only way back: it finds
+%% refs from before wants were persisted, or after the table is lost.
+%%
+%% A want is durable from the moment it is recorded and removed when the
+%% blob is stored.  Failure leaves it in place — a fetch that failed
+%% should be retried against the next peer, which is what the rebroadcast
+%% is for.
 %%
 %% Note: references are only extracted from JSON structure (mention links,
 %% image fields, etc.), not from inside free-form markdown text — same as
@@ -51,6 +64,16 @@
 %% Delay before the optional startup scan of existing messages, giving the rest
 %% of the node (feeds, keys, peers) time to settle first.
 -define(SCAN_DELAY_MS, 30000).
+
+-define(SCHEMA_VERSION, 1).
+%% `added` is not read yet.  It is here because the obvious follow-up is
+%% expiring wants nothing has answered in a long time (a blob referenced
+%% by a message whose author is gone is wanted forever otherwise), and
+%% that needs an age — which cannot be reconstructed after the fact.
+-define(DDL,
+        ["CREATE TABLE IF NOT EXISTS blob_want("
+         "  id    TEXT PRIMARY KEY,"
+         "  added INTEGER NOT NULL) WITHOUT ROWID;"]).
 
 -record(state, {
           %% #{BlobId => true} — blobs we are looking for
@@ -91,7 +114,27 @@ wanted() ->
 init([]) ->
     erlang:send_after(?REBROADCAST_MS, self(), rebroadcast),
     maybe_schedule_scan(),
-    {ok, #state{}}.
+    {ok, #state{wants = load_wants()}}.
+
+%% Wants recorded by a previous run, minus any the node has since obtained
+%% by another route (blobs.add, or a fetch whose removal did not land).
+%% Those are cleared here rather than left to be re-advertised forever.
+%%
+%% A store that is unavailable costs the want set, not the process: this
+%% is exactly the state the scan exists to rebuild.
+load_wants() ->
+    case catch ssb_store:declare(?MODULE, ?SCHEMA_VERSION, ?DDL) of
+        ok ->
+            Ids = [Id || [Id] <- rows("SELECT id FROM blob_want", [])],
+            {Held, Want} = lists:partition(fun has_local/1, Ids),
+            forget_wants(Held),
+            maps:from_list([{Id, true} || Id <- Want]);
+        Err ->
+            ?SSB_ERROR("blob_fetcher: could not declare its schema (~p) — "
+                       "wants start empty and are rediscovered from arriving "
+                       "messages or a startup scan", [Err]),
+            #{}
+    end.
 
 %% Schedule a one-shot scan of existing on-disk messages when enabled in config.
 maybe_schedule_scan() ->
@@ -111,6 +154,7 @@ handle_cast({want, BlobId}, #state{wants = Wants} = State) ->
         true ->
             {noreply, State};
         false ->
+            remember_wants([BlobId]),
             broadcast_wants([BlobId], connected_peers()),
             {noreply, State#state{wants = Wants#{BlobId => true}}}
     end;
@@ -131,7 +175,8 @@ handle_cast({scan_results, Refs}, #state{wants = Wants} = State) ->
     NewWants = lists:foldl(fun(R, W) -> W#{R => true} end, Wants, New),
     case New of
         [] -> ok;
-        _  -> broadcast_wants(New, connected_peers())
+        _  -> remember_wants(New),
+              broadcast_wants(New, connected_peers())
     end,
     ?SSB_INFO("blob_fetcher: startup scan adds ~p new want(s) from ~p ref(s)~n",
               [length(New), length(Refs)]),
@@ -157,6 +202,7 @@ handle_info({have, BlobId, Size, PeerPid},
 handle_info({fetched, BlobId, ok},
             #state{wants = Wants, in_flight = InFlight} = State) ->
     ?SSB_INFO("blob_fetcher: stored ~p~n", [BlobId]),
+    forget_wants([BlobId]),
     {noreply, State#state{wants     = maps:remove(BlobId, Wants),
                           in_flight = maps:remove(BlobId, InFlight)}};
 
@@ -177,8 +223,16 @@ handle_info(scan, State) ->
     spawn(fun scan_log/0),
     {noreply, State};
 
-handle_info(rebroadcast, #state{wants = Wants} = State) ->
-    case maps:keys(Wants) of
+%% Drop anything we have since obtained before re-advertising.  Wants used
+%% to be cleared by a restart, which quietly covered a blob arriving by
+%% another route (blobs.add, or the converter); now that they are durable,
+%% such a want would be re-advertised forever.  One stat per want every
+%% five minutes is a cheap place to notice.
+handle_info(rebroadcast, #state{wants = Wants} = State0) ->
+    {Held, Want} = lists:partition(fun has_local/1, maps:keys(Wants)),
+    forget_wants(Held),
+    State = State0#state{wants = maps:without(Held, Wants)},
+    case Want of
         []  -> ok;
         Ids -> broadcast_wants(Ids, connected_peers())
     end,
@@ -205,6 +259,39 @@ has_local(BlobId) ->
 
 connected_peers() ->
     try [Pid || {_PubKey, Pid} <- peer_registry:all(), is_process_alive(Pid)]
+    catch _:_ -> []
+    end.
+
+%%%===================================================================
+%%% The durable want set
+%%%===================================================================
+%%
+%% Every one of these is guarded.  A want the store did not record is
+%% recovered by the next scan, and one it failed to delete is dropped by
+%% the next rebroadcast — whereas taking this process down loses the
+%% in-memory set as well, and with it any fetch in flight.
+
+remember_wants([]) ->
+    ok;
+remember_wants(Ids) ->
+    Now = erlang:system_time(millisecond),
+    _ = catch ssb_store:insert_many(
+                "INSERT INTO blob_want(id, added) VALUES(?1, ?2)"
+                " ON CONFLICT(id) DO NOTHING",
+                [[Id, Now] || Id <- Ids]),
+    ok.
+
+forget_wants([]) ->
+    ok;
+forget_wants(Ids) ->
+    [catch ssb_store:write("DELETE FROM blob_want WHERE id=?1", [Id])
+     || Id <- Ids],
+    ok.
+
+rows(Sql, Params) ->
+    try ssb_store:q(Sql, Params) of
+        L when is_list(L) -> L;
+        _                 -> []
     catch _:_ -> []
     end.
 
@@ -446,5 +533,75 @@ msg_blob_refs_test() ->
 
     case KeysStarted of true -> gen_server:stop(keys); false -> ok end,
     case ConfigStarted of true -> gen_server:stop(config); false -> ok end.
+
+%%% The durable want set ----------------------------------------------
+%%
+%% These need ssb_store, and an ssb_home of their own so the store and the
+%% blob dir do not outlive the test.  The other tests here deliberately
+%% run WITHOUT a store, which exercises the degraded path: no persistence,
+%% but a working fetcher.
+
+want_store_setup() ->
+    catch gen_server:stop(config),
+    Home = "/tmp/bfw_" ++ integer_to_list(erlang:system_time(microsecond)),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    application:set_env(ssb, ssb_home, Home),
+    {ok, _} = config:start_link("no-such-cfg"),
+    {ok, _} = ssb_store:start_link(),
+    {ok, _} = blobs:start_link(),
+    Home.
+
+want_store_cleanup(Home) ->
+    [catch gen_server:stop(N) || N <- [?SERVER, blobs, ssb_store, config]],
+    os:cmd("rm -rf " ++ Home),
+    application:unset_env(ssb, ssb_home),
+    ok.
+
+durable_wants_test_() ->
+    {setup, fun want_store_setup/0, fun want_store_cleanup/1,
+     fun(_) ->
+             [?_test(wants_survive_a_restart()),
+              ?_test(an_obtained_want_is_dropped())]
+     end}.
+
+%% The reason for persisting at all: recovering the set after a restart
+%% must not require the startup scan, which folds every feed and decodes
+%% every message.
+wants_survive_a_restart() ->
+    {ok, F1} = blob_fetcher:start_link(),
+    Missing = make_blob_id(unique_payload(~"persisted want")),
+    blob_fetcher:want(Missing),
+    ?assertEqual([Missing], blob_fetcher:wanted()),
+    ?assertEqual([[1]], ssb_store:q("SELECT count(*) FROM blob_want"
+                                    " WHERE id=?1", [Missing])),
+    ok = gen_server:stop(F1),
+    {ok, F2} = blob_fetcher:start_link(),
+    ?assertEqual([Missing], blob_fetcher:wanted()),
+    ok = gen_server:stop(F2).
+
+%% Durability introduced a way to want something forever: a blob that
+%% arrives by another route (blobs.add) used to be forgotten by the next
+%% restart clearing the set.  The rebroadcast drops it instead.
+an_obtained_want_is_dropped() ->
+    {ok, F} = blob_fetcher:start_link(),
+    Payload = unique_payload(~"obtained elsewhere"),
+    Id = make_blob_id(Payload),
+    Absent = make_blob_id(unique_payload(~"still missing")),
+    blob_fetcher:want(Id),
+    blob_fetcher:want(Absent),
+    ?assert(lists:member(Id, blob_fetcher:wanted())),
+    %% it shows up without a fetch
+    Id = blobs:store(Payload),
+    F ! rebroadcast,
+    _ = sys:get_state(F),                    %% let the message be handled
+    Wanted = blob_fetcher:wanted(),
+    ?assertNot(lists:member(Id, Wanted)),
+    %% and only the one we now hold — a want with no answer yet stays
+    ?assert(lists:member(Absent, Wanted)),
+    ?assertEqual([[0]], ssb_store:q("SELECT count(*) FROM blob_want"
+                                    " WHERE id=?1", [Id])),
+    ?assertEqual([[1]], ssb_store:q("SELECT count(*) FROM blob_want"
+                                    " WHERE id=?1", [Absent])),
+    ok = gen_server:stop(F).
 
 -endif.
