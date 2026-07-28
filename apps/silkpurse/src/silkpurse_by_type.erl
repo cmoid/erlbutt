@@ -25,10 +25,25 @@
 %% quarter of a million ids to undo duplicates that can no longer exist.
 %%
 %% Private (still-encrypted) content has no visible type and is not
-%% indexed.  live/old are honoured; a live stream emits a {sync: true}
+%% indexed.  live/old/gt are honoured; a live stream emits a {sync: true}
 %% sentinel between the backlog and the live tail (ssb-db convention —
-%% the silkpurse search indexer waits for it).  gt is NOT honoured:
-%% live callers get the full backlog and must skip below their cursor.
+%% the silkpurse search indexer waits for it).
+%%
+%% `gt` compares against the message's RECEIVED time — the envelope's
+%% top-level `timestamp`, the one message:encode/1 emits — and not the
+%% self-asserted content timestamp.  That is the field the client's cursor
+%% comes from (silkpurse's indexer stores `m.timestamp`), and it is the
+%% only one that means anything as a resume point: asserted timestamps are
+%% junk and are not monotonic in arrival order.
+%%
+%% Honouring it is not an optimisation.  Ignoring `gt` meant a reconnecting
+%% client asking for "posts since my cursor" was served the entire post
+%% backlog, one file read per message, on the connection's single
+%% rpc_processor — 45 s muxrpc timeouts, a dropped connection, and blob
+%% replication sharing that connection never getting anywhere.  Results are
+%% ordered by that timestamp for the same reason: a client advancing a
+%% cursor through an id-ordered stream ends up with the last id it saw
+%% rather than the highest timestamp, so its next resume point is wrong.
 -module(silkpurse_by_type).
 
 -ifdef(TEST).
@@ -55,14 +70,19 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
          handle_info/2, terminate/2, code_change/3]).
 
--define(SCHEMA_VERSION, 1).
-%% type first: every read is "all messages of this type", so the primary
-%% key is also the access path and no separate index is needed.
+-define(SCHEMA_VERSION, 2).
+%% type first: every read is "all messages of this type".  The primary key
+%% keeps a message from being indexed twice; the (type, ts) index is the
+%% actual access path, since every read is ordered by received time and
+%% most are bounded below by a cursor.
 -define(DDL,
         ["CREATE TABLE IF NOT EXISTS msg_by_type("
          "  type TEXT NOT NULL,"
          "  msg  TEXT NOT NULL,"
-         "  PRIMARY KEY (type, msg)) WITHOUT ROWID;"]).
+         "  ts   INTEGER NOT NULL DEFAULT 0,"
+         "  PRIMARY KEY (type, msg)) WITHOUT ROWID;",
+         "CREATE INDEX IF NOT EXISTS ix_by_type_ts"
+         "  ON msg_by_type(type, ts);"]).
 
 %%%===================================================================
 %%% API
@@ -75,11 +95,10 @@ start_link() ->
 %%% ssb_view callbacks (run in the view_manager process)
 %%%===================================================================
 
-%% Still 2: the bump was for the ETS bag -> duplicate_bag change, which
-%% this port makes moot.  Bumping again would buy nothing, because a node
-%% arriving here has no recorded version for this view at all and so
-%% rebuilds anyway.
-view_version() -> 2.
+%% 3: rows gained a received timestamp so `gt` can be served.  Existing
+%% rows have none, and the column's default of 0 would make them all sort
+%% first and pass every cursor — so this must refold rather than migrate.
+view_version() -> 3.
 
 view_load() ->
     case ssb_store:complete(?MODULE) of
@@ -104,19 +123,28 @@ view_save() ->
 %% reads and signature checks already on this path, so it is not worth the
 %% complexity of batching (unlike view_manager's checkpoints, which move
 %% several times per message).
-view_entry(#message{id = MsgId, content = {Props}}) ->
+view_entry(#message{id = MsgId, received = Recv, content = {Props}}) ->
     case ?pgv(~"type", Props) of
         Type when is_binary(Type) ->
-            catch ssb_store:write("INSERT INTO msg_by_type(type, msg)"
-                                  " VALUES(?1, ?2)"
-                                  " ON CONFLICT(type, msg) DO NOTHING",
-                                  [Type, MsgId]),
+            %% ts is updated on conflict: a refold re-deriving the same row
+            %% should correct a 0 left by an older schema, not preserve it.
+            catch ssb_store:write("INSERT INTO msg_by_type(type, msg, ts)"
+                                  " VALUES(?1, ?2, ?3)"
+                                  " ON CONFLICT(type, msg) DO UPDATE SET"
+                                  "   ts=excluded.ts",
+                                  [Type, MsgId, num(Recv)]),
             {events, [{typed, Type, MsgId}]};
         _ ->
             ok
     end;
 view_entry(_) ->
     ok.
+
+%% ts is NOT NULL because it is the sort key; a message with no usable
+%% received time floors at 0 rather than propagating null.
+num(Ts) when is_integer(Ts) -> Ts;
+num(Ts) when is_float(Ts)   -> trunc(Ts);
+num(_)                      -> 0.
 
 %%%===================================================================
 %%% ssb_plugin callbacks (run in each connection's rpc_processor)
@@ -130,10 +158,12 @@ handle_rpc([~"messagesByType"], Args, _Caller) ->
         undefined ->
             {error, ~"messagesByType takes a type"};
         Type ->
-            %% no dedup step: the primary key already guarantees it, and
-            %% the rows arrive in id order because that key is the scan
-            Ids = [Id || [Id] <- rows("SELECT msg FROM msg_by_type"
-                                      " WHERE type=?1", [Type]),
+            %% no dedup step: the primary key already guarantees it
+            {GtSql, GtP} = gt_clause(gt_of(Args)),
+            Ids = [Id || [Id] <- rows(["SELECT msg FROM msg_by_type"
+                                       " WHERE type=?1", GtSql,
+                                       " ORDER BY ts ASC, msg ASC"],
+                                      [Type | GtP]),
                          is_binary(Id)],
             %% hydrate lazily — one message per sent frame.  Building the
             %% whole [{Id, Bin}] list up front meant a full store's worth
@@ -166,8 +196,31 @@ handle_rpc([~"messagesByType"], Args, _Caller) ->
 %%%===================================================================
 
 init([]) ->
+    ok = ensure_ts_column(),
     ok = ssb_store:declare(?MODULE, ?SCHEMA_VERSION, ?DDL),
     {ok, #{}, {continue, register}}.
+
+%% Add `ts` to a table created before it existed.
+%%
+%% Not part of ?DDL, for two reasons.  SQLite has no ADD COLUMN IF NOT
+%% EXISTS, and ssb_store:declare/3 badmatches on a failed statement and
+%% rolls the whole schema back — so an unconditional ALTER would break
+%% every fresh node.  And it has to happen BEFORE declare/3, because the
+%% index that declare creates names the column.
+%%
+%% A missing table is the fresh-node case: nothing to alter, and the DDL
+%% is about to create it with the column already present.
+ensure_ts_column() ->
+    Cols = [C || [C] <- rows("SELECT name FROM pragma_table_info('msg_by_type')",
+                             [])],
+    case Cols =:= [] orelse lists:member(~"ts", Cols) of
+        true ->
+            ok;
+        false ->
+            _ = ssb_store:exec("ALTER TABLE msg_by_type"
+                               " ADD COLUMN ts INTEGER NOT NULL DEFAULT 0"),
+            ok
+    end.
 
 %% Failures are loud and transient ones retried on a timer
 %% (ssb_view:ensure_registered) — the old silent noproc swallow here cost
@@ -221,6 +274,23 @@ flag_of(Key, [{Props}], Default) ->
 flag_of(_Key, _Args, Default) ->
     Default.
 
+gt_clause(undefined) -> {"", []};
+gt_clause(Gt)        -> {" AND ts > ?2", [Gt]}.
+
+%% The cursor, which arrives as a JSON number or (as silkpurse sends it,
+%% straight back out of its own SQLite) a string.  Anything else is no
+%% cursor at all rather than a guess — serving the whole backlog is slow,
+%% but silently serving none of it would look like data loss.
+gt_of([{Props}]) ->
+    case ?pgv(~"gt", Props) of
+        N when is_integer(N) -> N;
+        N when is_float(N)   -> trunc(N);
+        B when is_binary(B)  -> try binary_to_integer(B) catch _:_ -> undefined end;
+        _                    -> undefined
+    end;
+gt_of(_) ->
+    undefined.
+
 %% JS accepts a bare type string or {type: T, live, ...}.
 type_of([Type]) when is_binary(Type) ->
     Type;
@@ -268,7 +338,10 @@ by_type_test_() ->
     {setup, fun bt_setup/0, fun bt_teardown/1,
      fun(_) -> [?_test(index_and_read_by_type()),
                 ?_test(refold_does_not_duplicate()),
-                ?_test(survives_a_restart())] end}.
+                ?_test(survives_a_restart()),
+                ?_test(gt_bounds_the_backlog()),
+                ?_test(results_are_in_timestamp_order()),
+                ?_test(adds_ts_to_an_older_table())] end}.
 
 bt_setup() ->
     bt_teardown(ignore),
@@ -380,5 +453,80 @@ survives_a_restart() ->
     {ok, _} = ssb_store:start_link(),
     ?assertEqual([[Id]], ssb_store:q("SELECT msg FROM msg_by_type"
                                      " WHERE type=?1", [~"persisted"])).
+
+%% Seed rows directly: the received timestamps have to be controlled, and
+%% posting real messages gives them all the same millisecond.
+seed(Type, Msg, Ts) ->
+    ok = ssb_store:write("INSERT INTO msg_by_type(type, msg, ts)"
+                         " VALUES(?1, ?2, ?3)"
+                         " ON CONFLICT(type, msg) DO UPDATE SET ts=excluded.ts",
+                         [Type, Msg, Ts]).
+
+ids_for(Args) ->
+    {source, Funs} = handle_rpc([~"messagesByType"], Args,
+                                #{class => owner,
+                                  feed_id => keys:pub_key_disp()}),
+    length(Funs).
+
+%% The bug this fixes: a reconnecting client that says "I have everything
+%% up to here" was served the whole backlog anyway, one file read each,
+%% which timed out the connection and starved blob replication with it.
+gt_bounds_the_backlog() ->
+    T = ~"gttype",
+    [seed(T, Id, Ts) || {Id, Ts} <- [{~"%g1.sha256", 100},
+                                     {~"%g2.sha256", 200},
+                                     {~"%g3.sha256", 300}]],
+    %% no cursor: everything
+    ?assertEqual(3, ids_for([{[{~"type", T}]}])),
+    %% a cursor: strictly newer only
+    ?assertEqual(1, ids_for([{[{~"type", T}, {~"gt", 200}]}])),
+    ?assertEqual(0, ids_for([{[{~"type", T}, {~"gt", 300}]}])),
+    %% silkpurse sends it as a string, out of its own SQLite
+    ?assertEqual(1, ids_for([{[{~"type", T}, {~"gt", ~"200"}]}])),
+    %% an unusable cursor serves everything rather than nothing — slow
+    %% beats looking like data loss
+    ?assertEqual(3, ids_for([{[{~"type", T}, {~"gt", ~"not-a-number"}]}])),
+    %% and it applies to the live snapshot too, which is where it matters
+    {live_source, Snapshot, ?MODULE, _} =
+        handle_rpc([~"messagesByType"],
+                   [{[{~"type", T}, {~"live", true}, {~"gt", 100}]}],
+                   #{class => owner, feed_id => keys:pub_key_disp()}),
+    ?assertEqual(3, length(Snapshot)).    %% 2 messages + the sync sentinel
+
+%% A client advancing a cursor through an id-ordered stream keeps the last
+%% id it saw, not the highest timestamp, so its next resume point is wrong.
+results_are_in_timestamp_order() ->
+    T = ~"ordtype",
+    %% ids sort opposite to timestamps, so id order cannot pass by luck
+    [seed(T, Id, Ts) || {Id, Ts} <- [{~"%a.sha256", 300},
+                                     {~"%b.sha256", 200},
+                                     {~"%c.sha256", 100}]],
+    ?assertEqual([~"%c.sha256", ~"%b.sha256", ~"%a.sha256"],
+                 [Id || [Id] <- ssb_store:q(
+                                  "SELECT msg FROM msg_by_type WHERE type=?1"
+                                  " ORDER BY ts ASC, msg ASC", [T])]).
+
+%% The upgrade path that runs on a node whose table predates the column.
+%% ALTER cannot be part of the DDL (no IF NOT EXISTS, and declare/3 rolls
+%% back the whole schema on a failed statement), so it is worth proving it
+%% works on a table of the old shape.
+adds_ts_to_an_older_table() ->
+    ok = ssb_store:exec("DROP TABLE IF EXISTS msg_by_type"),
+    ok = ssb_store:exec("CREATE TABLE msg_by_type("
+                        "  type TEXT NOT NULL,"
+                        "  msg  TEXT NOT NULL,"
+                        "  PRIMARY KEY (type, msg)) WITHOUT ROWID"),
+    ok = ssb_store:write("INSERT INTO msg_by_type(type, msg) VALUES(?1, ?2)",
+                         [~"old", ~"%old.sha256"]),
+    ok = ensure_ts_column(),
+    %% the column is there, the existing row kept, and the index the DDL
+    %% creates can now name it
+    ?assertEqual([[~"%old.sha256", 0]],
+                 ssb_store:q("SELECT msg, ts FROM msg_by_type WHERE type=?1",
+                             [~"old"])),
+    ok = ssb_store:exec("CREATE INDEX IF NOT EXISTS ix_by_type_ts"
+                        " ON msg_by_type(type, ts)"),
+    %% and it is idempotent
+    ok = ensure_ts_column().
 
 -endif.
