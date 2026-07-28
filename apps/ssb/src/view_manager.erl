@@ -86,6 +86,7 @@
 %% Messages read per catch-up turn, and the sweep count past which we stop
 %% chasing a store that is growing faster than we can fold it.
 -define(CATCH_UP_BUDGET, 2000).
+-define(CATCH_UP_MS, 100).
 -define(CATCH_UP_MAX_PASSES, 8).
 
 %% Registered views as [{Mod, core | app}], in delivery order: every core
@@ -257,8 +258,8 @@ handle_call({ingest, Msg}, _From,
                           not maps:is_key(Mod, Catching)],
     {reply, ok, State};
 
-handle_call(save, _From, #vm_state{views = Views} = State) ->
-    save_all(Views),
+handle_call(save, _From, #vm_state{views = Views, catching = Catching} = State) ->
+    save_all(Views, Catching),
     {reply, ok, State}.
 
 %%%===================================================================
@@ -289,7 +290,8 @@ start_catch_up(Mod, #vm_state{catching = Catching} = State) ->
 %% Fold until the message budget is spent, then either continue, sweep
 %% again, or finish.
 do_catch_up(Mod, Work, Delivered, Pass, T0, State) ->
-    case fold_budget(Mod, Work, budget(), 0) of
+    Deadline = erlang:monotonic_time(millisecond) + turn_ms(),
+    case fold_budget(Mod, Work, budget(), Deadline, 0) of
         {done, N} ->
             finish_pass(Mod, Delivered + N, Pass, T0, State);
         {more, Rest, N} ->
@@ -314,25 +316,31 @@ do_catch_up(Mod, Work, Delivered, Pass, T0, State) ->
 %% quadratic in the number of turns a feed takes.  A suspended cursor
 %% holds no file descriptor (the live log is read positionally), at the
 %% cost of one decompressed archive segment held per catching view.
-fold_budget(_Mod, {[], none}, _Budget, N) ->
+fold_budget(_Mod, {[], none}, _Budget, _Deadline, N) ->
     {done, N};
-fold_budget(_Mod, Work, Budget, N) when Budget =< 0 ->
+fold_budget(_Mod, Work, Budget, _Deadline, N) when Budget =< 0 ->
     {more, Work, N};
-fold_budget(Mod, {[Dir | Rest], none}, Budget, N) ->
+fold_budget(Mod, Work, Budget, Deadline, N) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true  -> {more, Work, N};
+        false -> fold_step(Mod, Work, Budget, Deadline, N)
+    end.
+
+fold_step(Mod, {[Dir | Rest], none}, Budget, Deadline, N) ->
     case caught_up_feed(Mod, Dir) of
         %% a whole feed skipped on one tail read: charge that read, since
         %% a node with many caught-up feeds is otherwise unbounded too
-        true  -> fold_budget(Mod, {Rest, none}, Budget - 1, N);
+        true  -> fold_budget(Mod, {Rest, none}, Budget - 1, Deadline, N);
         false -> fold_budget(Mod, {Rest, {Dir, feed_store:cursor_open(Dir)}},
-                             Budget, N)
+                             Budget, Deadline, N)
     end;
-fold_budget(Mod, {Dirs, {Dir, Cursor}}, Budget, N) ->
+fold_step(Mod, {Dirs, {Dir, Cursor}}, Budget, Deadline, N) ->
     case feed_store:cursor_next(Cursor) of
         eof ->
             ok = feed_store:cursor_close(Cursor),
-            fold_budget(Mod, {Dirs, none}, Budget, N);
+            fold_budget(Mod, {Dirs, none}, Budget, Deadline, N);
         {Data, Next} ->
-            fold_budget(Mod, {Dirs, {Dir, Next}}, Budget - 1,
+            fold_budget(Mod, {Dirs, {Dir, Next}}, Budget - 1, Deadline,
                         N + deliver_raw(Mod, Data))
     end.
 
@@ -357,14 +365,25 @@ finish_pass(Mod, _N, Pass, T0, State) ->
     self() ! {catch_up, Mod, {feed_store:feed_dirs(), none}, 0, Pass + 1, T0},
     State.
 
-%% Messages read per turn of the message loop.  Sized so a turn is roughly
-%% a tenth of a second — a message costs about 50 us to decode and fold —
-%% which keeps ingest and admin calls served while a rebuild runs.
+%% Messages read per turn of the message loop.
 %%
 %% Configurable, which a test also uses to force the fold to span several
 %% turns; that is the only way to exercise a store landing mid-catch-up.
 budget() ->
     application:get_env(ssb, view_catch_up_messages, ?CATCH_UP_BUDGET).
+
+%% Wall-clock ceiling on a turn, and the one that actually holds.
+%%
+%% A message budget alone assumes a message costs about what it cost when
+%% the number was picked.  That assumption broke as soon as a view wrote
+%% through to the store on every message: 2000 messages is 20 ms of ETS
+%% inserts but minutes of synchronous single-row commits on a slow disk
+%% with replication competing for the same writer.  view_manager then sat
+%% past the 45 s muxrpc timeout and every admin call and every ingest died
+%% with it.  A count cannot bound a duration when the per-item cost varies
+%% by orders of magnitude; a clock can.
+turn_ms() ->
+    application:get_env(ssb, view_catch_up_ms, ?CATCH_UP_MS).
 
 %% Append Mod to its class group: core views ahead of every app view,
 %% within a group in registration order.
@@ -380,16 +399,16 @@ handle_cast(_Msg, State) ->
 handle_info({catch_up, Mod, Work, Delivered, Pass, T0}, State) ->
     {noreply, do_catch_up(Mod, Work, Delivered, Pass, T0, State)};
 
-handle_info(save_tick, #vm_state{views = Views} = State) ->
-    save_all(Views),
+handle_info(save_tick, #vm_state{views = Views, catching = Catching} = State) ->
+    save_all(Views, Catching),
     erlang:send_after(?SAVE_EVERY_MS, self(), save_tick),
     {noreply, State};
 
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #vm_state{views = Views}) ->
-    save_all(Views),
+terminate(_Reason, #vm_state{views = Views, catching = Catching}) ->
+    save_all(Views, Catching),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -475,14 +494,27 @@ publish(Mod, Events) ->
     [Pid ! {view_event, Mod, Event} || Pid <- Members, Event <- Events],
     ok.
 
-save_all(Views) ->
+%% Save every view EXCEPT one still catching up.
+%%
+%% view_save/0 is what records a view as complete, and a view mid-rebuild
+%% is precisely the thing that is not.  Saving it anyway defeats the flag
+%% at the one moment it exists for: the fold gets interrupted (a restart,
+%% a crash), the view comes back claiming coverage it does not have, and
+%% because reset_view already stamped the new version nothing ever
+%% rebuilds it again.  That is a permanently half-built index, and it is
+%% silent — which is how silkpurse_by_type came back empty after a restart
+%% mid-refold and stayed that way.
+%%
+%% The catch-up path saves for itself in finish_pass/5, which is the only
+%% place that knows the fold actually finished.
+save_all(Views, Catching) ->
     [try Mod:view_save()
      catch C:R ->
              %% Routine at shutdown: views stop before this manager
              %% (reverse start order) and snapshot themselves in their
              %% own terminate; their tables are already gone here.
              ?SSB_DEBUG("view ~p save skipped: ~p:~p", [Mod, C, R])
-     end || {Mod, _Class} <- Views],
+     end || {Mod, _Class} <- Views, not maps:is_key(Mod, Catching)],
     persist_ckpt().
 
 %% Populate the in-memory table from the store at boot.  A store that is
@@ -658,6 +690,8 @@ vm_test_() ->
               ?_test(only_changed_checkpoints_are_flushed()),
               ?_test(checkpoints_survive_a_hard_kill()),
               ?_test(cold_start_rebuilds_from_logs()),
+              ?_test(a_catching_view_is_not_marked_complete()),
+              ?_test(a_turn_is_bounded_by_time()),
               ?_test(imports_the_legacy_snapshot())]
      end}.
 
@@ -974,6 +1008,48 @@ cold_start_rebuilds_from_logs() ->
     ok = wait_caught_up(test_counter_view),
     ?assertEqual([1, 2], test_counter_view:entries(Id)),
     ?assertEqual(2, checkpoint(test_counter_view, Id)).
+
+%% view_save/0 is what records a view as complete, so the periodic save
+%% must skip a view that is still folding.  Otherwise an interrupted
+%% rebuild comes back claiming coverage it does not have — and since
+%% reset_view already stamped the new version, nothing rebuilds it again.
+%%
+%% Called directly rather than through save/0 so there is no race over
+%% whether the fold happened to finish first; save/0 runs beforehand only
+%% to empty the dirty set, since persist_ckpt writes to tables this
+%% process does not own.
+a_catching_view_is_not_marked_complete() ->
+    ok = test_counter_view:ensure_table(),
+    ok = vm_ensure_manager(),
+    ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
+    ok = save(),
+    ok = test_counter_view:view_reset(),
+    ?assertEqual(empty, test_counter_view:view_load()),
+    %% the save_tick / terminate path, with the fold still running
+    save_all([{test_counter_view, app}], #{test_counter_view => true}),
+    ?assertEqual(empty, test_counter_view:view_load()),
+    %% and the same call once it is not catching up
+    save_all([{test_counter_view, app}], #{}),
+    ?assertEqual(ok, test_counter_view:view_load()).
+
+%% A message count cannot bound a turn's duration once a message can cost
+%% a synchronous store write, so the clock has to be able to stop it on
+%% its own — with budget to spare.
+a_turn_is_bounded_by_time() ->
+    ok = test_counter_view:ensure_table(),
+    ok = vm_ensure_manager(),
+    ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
+    Dirs = feed_store:feed_dirs(),
+    ?assert(Dirs =/= []),
+    Past = erlang:monotonic_time(millisecond) - 1,
+    ?assertEqual({more, {Dirs, none}, 0},
+                 fold_budget(test_counter_view, {Dirs, none}, 1000000, Past, 0)),
+    %% the same sweep, with time on the clock, runs to the end
+    Future = erlang:monotonic_time(millisecond) + 60000,
+    ?assertEqual({done, 0},
+                 fold_budget(test_counter_view, {Dirs, none}, 1000000, Future, 0)).
 
 %% First boot after the port: checkpoints live in a legacy tab2file
 %% snapshot and the store has none.  They must be imported rather than
