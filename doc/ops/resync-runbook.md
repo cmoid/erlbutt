@@ -271,6 +271,81 @@ Run it twice a minute apart. Climbing means it is working.
 completely invisible from silkpurse — the symptom there was only "stuck
 scuttling". The diagnosis lived entirely in the node's log.
 
+### When the node is too busy to answer, read the store directly
+
+`health` goes through muxrpc, `rpc_processor` and `view_manager`, so a
+node under load — a view rebuilding, replication pulling — can fail to
+answer it while being perfectly healthy. `admin.views.list` makes ten
+calls into `view_manager` and `admin.store.tables` scans every table, so
+those are the first two to time out.
+
+SQLite handles concurrent readers, so reading the file answers when the
+node cannot. This touches none of the node's processes:
+
+```
+cd _build/default/rel/ssb          # wherever .ssberl lives
+sqlite3 .ssberl/store.db "select name, complete from ssb_view_state;"
+sqlite3 .ssberl/store.db "select count(*) from msg_by_type;"
+```
+
+Read-only queries only — never write to the file under a running node.
+
+- **`complete = 0` for a view means it is mid-rebuild**, and that is the
+  correct state to be in while folding. It is set once, by the fold
+  itself, when it finishes. Seeing `0` after many minutes is progress
+  working as intended, not a stuck flag.
+- **Run the `count(*)` twice, a minute apart.** Climbing is the whole
+  answer: it separates "slow" from "stuck", which nothing else does while
+  the node is unresponsive.
+
+Two log-reading traps worth knowing, both of which read as failure and
+are not:
+
+- **`caught up in ~250 ms` does not mean it folded anything.** That is
+  `caught_up_feed/2` skipping every feed on one tail read (~2 ms each).
+  A genuine fold of a large corpus is minutes.
+- **All views report near-identical elapsed times** when several catch up
+  at once, because they interleave in one process — one slow view sets
+  everyone's number. Only the slowest is meaningful.
+
+### Blobs: check the topology before the blob code
+
+"Blobs are not replicating" is usually about who is connected, not about
+the blob machinery. Silkpurse in remote/thin mode has no embedded sbot
+and no blob store — its shim *fetches* blobs from erlbutt to render them
+— so it can never answer a `createWants`. With the dialer off, the node
+never dials out either, and outstanding wants sit forever.
+
+Nothing is logged in that case, which is the misleading part: a failed
+fetch logs `fetch of … failed`, and a fetch that is never attempted logs
+nothing at all. Silence means no peer ever answered, not that fetching
+broke.
+
+```erlang
+blob_fetcher:wanted().     %% empty = nothing is being asked for
+peer_registry:all().       %% who could actually answer
+```
+
+If wants are outstanding and no peer holds them, run silkpurse in LOCAL
+mode once — it has the blob store — and let the want queue drain, then
+switch back to remote. Or set `{peer_dialer, true}` so the node finds
+them unattended.
+
+Wants are persisted in `store.db`, so a restart does not forget them:
+
+```
+sqlite3 .ssberl/store.db "select count(*) from blob_want;"
+```
+
+The startup scan (`{blob_scan, true}`, off by default) is now a recovery
+tool rather than the only way back — it folds every feed and decodes every
+message, so reach for it when the table has been lost, not routinely.
+
+A want is dropped when the blob is stored, and also at the next
+rebroadcast if the blob turned up by some other route. A want with no
+answer stays outstanding indefinitely; there is no expiry yet, so a blob
+whose only holder is gone is re-advertised every five minutes forever.
+
 ## 6. When a feed stalls
 
 Symptom in the node's log:
