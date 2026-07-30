@@ -13,8 +13,6 @@
 
 -behaviour(ssb_plugin).
 
--include_lib("ssb/include/ssb.hrl").
-
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 -endif.
