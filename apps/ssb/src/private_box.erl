@@ -120,7 +120,7 @@ my_curve25519_sk() ->
 
 %% Convert a feed ID like <<"@base64pub.ed25519">> to a curve25519 pk.
 id_to_curve25519_pk(<<"@", Rest/binary>>) ->
-    PubB64 = hd(string:replace(Rest, ".ed25519", "")),
+    PubB64 = binary:replace(Rest, ~".ed25519", ~""),
     Ed25519Pk = base64:decode(PubB64),
     enacl:crypto_sign_ed25519_public_to_curve25519(Ed25519Pk).
 

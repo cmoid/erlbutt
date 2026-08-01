@@ -96,10 +96,7 @@ remember_pub(Host, Port, Key)
                   <<"@", Rest/binary>> -> Rest;
                   Rest                 -> Rest
               end,
-    %% binary:replace/3 rather than the hd(string:replace(...)) idiom used
-    %% elsewhere: KeyBody is a binary here, and this keeps the result a
-    %% binary instead of chardata, which is what the iolist below needs.
-    KeyB64 = binary:replace(KeyBody, ~".ed25519", ~""),
+    KeyB64 = utils:strip_suffix(KeyBody, ~".ed25519"),
     Addr = iolist_to_binary([~"net:", Host, ~":",
                              integer_to_binary(Port),
                              ~"~shs:", KeyB64]),

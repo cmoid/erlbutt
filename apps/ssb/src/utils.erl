@@ -24,6 +24,7 @@
          feed_dir/1,
          find_or_create_feed_pid/1,
          check_id/1,
+         strip_suffix/2,
          log/1,
          ping_req/1,
          whoami_req/1,
@@ -56,19 +57,33 @@ display_pub(PubKey) ->
     ?l2b("@" ++ ?b2l(PubKey) ++ ".ed25519").
 
 decode_id(<<"@",RemId/binary>>) ->
-    RawId = hd(string:replace(RemId,".ed25519","")),
+    RawId = strip_suffix(RemId, ~".ed25519"),
     decode_id1(RawId);
 
 decode_id(<<"%",RemId/binary>>) ->
-    RawId = hd(string:replace(RemId,".sha256","")),
+    RawId = strip_suffix(RemId, ~".sha256"),
     decode_id1(RawId);
 
 decode_id(<<"&",RemId/binary>>) ->
-    RawId = hd(string:replace(RemId,".sha256","")),
+    RawId = strip_suffix(RemId, ~".sha256"),
     decode_id1(RawId).
 
+-spec decode_id1(binary()) -> binary().
 decode_id1(RawId) ->
     integer_to_binary(binary:decode_unsigned(base64:decode(RawId)),16).
+
+%% Strip an SSB sigil suffix (".ed25519", ".sha256", ".sig.ed25519") off a
+%% reference, leaving the bare base64 body.
+%%
+%% binary:replace/3 rather than the older hd(string:replace(...)) idiom:
+%% string:replace/3 returns [unicode:chardata()], so the hd/1 is really
+%% "the part before the first match" and the result is chardata, not a
+%% binary — which then has to be re-converted before base64:decode or an
+%% iolist can take it.  Every reference here is already a binary, so
+%% binary:replace/3 says what is meant and stays in one type.
+-spec strip_suffix(binary(), binary()) -> binary().
+strip_suffix(Bin, Suffix) when is_binary(Bin), is_binary(Suffix) ->
+    binary:replace(Bin, Suffix, ~"").
 
 concat(ListOfBins) ->
     iolist_to_binary(ListOfBins).
@@ -201,8 +216,8 @@ check_id(<<"@",Id/binary>>) ->
                     ?LOG_DEBUG("Bad author ~p ~n", [Id]),
                     bad;
                 _Else ->
-                    RawId = hd(string:replace(Id,".ed25519","")),
-                    _DecodedId = integer_to_binary(binary:decode_unsigned(base64:decode(?b2l(RawId))),16),
+                    RawId = strip_suffix(Id, ~".ed25519"),
+                    _DecodedId = integer_to_binary(binary:decode_unsigned(base64:decode(RawId)),16),
                     ok
             end
         catch

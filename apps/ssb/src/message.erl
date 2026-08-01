@@ -159,8 +159,12 @@ validate(true, MsgProps) ->
         %% extract and decode the keys for the signature and the author
         Sig = ?pgv(~"signature", MsgProps),
         <<"@",KeySuf/binary>> = Author,
-        AuthorPk = base64:decode(hd(string:replace(KeySuf,".ed25519",""))),
-        SigDec = base64:decode(hd(string:replace(Sig,".sig.ed25519",""))),
+        %% Assertive match, like the author line above it: a signature that
+        %% is not a binary is not a signature, and drops into the catch
+        %% below as an unvalidatable message.
+        <<SigBody/binary>> = Sig,
+        AuthorPk = base64:decode(utils:strip_suffix(KeySuf, ~".ed25519")),
+        SigDec = base64:decode(utils:strip_suffix(SigBody, ~".sig.ed25519")),
 
         %% verify
         enacl:sign_verify_detached(SigDec, EncMsg, AuthorPk)

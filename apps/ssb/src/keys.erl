@@ -154,8 +154,10 @@ check_secret_file() ->
     end,
     SSBDir ++ "secret".
 
-key_only(Key) ->
-    hd(string:replace(Key,".ed25519","")).
+%% The guard is the check that the secret file actually held a string here:
+%% these come from json:decode/1 of an on-disk file a user may have edited.
+key_only(Key) when is_binary(Key) ->
+    binary:replace(Key, ~".ed25519", ~"").
 
 
 prelude() ->
