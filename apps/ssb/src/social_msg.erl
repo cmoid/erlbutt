@@ -70,33 +70,43 @@ dispatch(_) ->
     ok.
 
 dispatch_type(~"pub", _Author, Props) ->
+    %% `address` is a nested JSON object, so it decodes to the {PropList}
+    %% wrapper.  The is_list/1 guard is what makes the nested ?pgv calls
+    %% safe: a malformed `{"address": {...}}` whose payload is not a
+    %% proplist would otherwise reach proplists:get_value/2 and crash.
     case ?pgv(~"address", Props) of
-        {AddrProps} ->
-            Host = ?pgv(~"host", AddrProps),
-            Port = ?pgv(~"port", AddrProps),
-            Key  = ?pgv(~"key",  AddrProps),
-            case is_binary(Host) andalso is_integer(Port) andalso is_binary(Key) of
-                true ->
-                    KeyBody = case Key of
-                        <<"@", Rest/binary>> -> Rest;
-                        Rest                 -> Rest
-                    end,
-                    KeyB64 = hd(string:replace(KeyBody, ".ed25519", "")),
-                    Addr = iolist_to_binary([~"net:", Host, ~":",
-                                             integer_to_binary(Port),
-                                             ~"~shs:", KeyB64]),
-                    Meta = #{~"host" => Host, ~"port" => Port,
-                             ~"key"  => Key,  ~"type" => ~"pub"},
-                    conn_db:remember(Addr, Meta, ~"pub");
-                false ->
-                    ok
-            end;
+        {AddrProps} when is_list(AddrProps) ->
+            remember_pub(?pgv(~"host", AddrProps),
+                         ?pgv(~"port", AddrProps),
+                         ?pgv(~"key",  AddrProps));
         _ -> ok
     end;
 
 %% contact and about messages are folded into the social graph view by
 %% view_manager:ingest/1 (see ssb_social_graph:view_entry/1), not dispatched here.
 dispatch_type(_, _, _) ->
+    ok.
+
+%% Guards in the head rather than a combined is_binary/is_integer test in the
+%% body: same check, but it narrows Host/Port/Key from term() for the caller's
+%% benefit and for eqwalize.
+remember_pub(Host, Port, Key)
+  when is_binary(Host), is_integer(Port), is_binary(Key) ->
+    KeyBody = case Key of
+                  <<"@", Rest/binary>> -> Rest;
+                  Rest                 -> Rest
+              end,
+    %% binary:replace/3 rather than the hd(string:replace(...)) idiom used
+    %% elsewhere: KeyBody is a binary here, and this keeps the result a
+    %% binary instead of chardata, which is what the iolist below needs.
+    KeyB64 = binary:replace(KeyBody, ~".ed25519", ~""),
+    Addr = iolist_to_binary([~"net:", Host, ~":",
+                             integer_to_binary(Port),
+                             ~"~shs:", KeyB64]),
+    Meta = #{~"host" => Host, ~"port" => Port,
+             ~"key"  => Key,  ~"type" => ~"pub"},
+    conn_db:remember(Addr, Meta, ~"pub");
+remember_pub(_Host, _Port, _Key) ->
     ok.
 
 is_follow(#message{content = Val}) when is_binary(Val) ->
@@ -201,6 +211,31 @@ dispatch_pub_test() ->
         true -> gen_server:stop(config);
         false -> ok
     end.
+
+%% A `pub` whose address object is not a proplist must be ignored, not crash
+%% the dispatch: the payload comes off the wire, so its shape is not ours to
+%% trust.  Nothing runs here (conn_db is not started) — reaching it would
+%% already have thrown from proplists:get_value/2.
+dispatch_pub_malformed_address_test() ->
+    Mk = fun(Addr) ->
+        #message{id = ~"%bad.sha256", previous = null,
+                 author = ~"@author=.ed25519", sequence = 1,
+                 timestamp = 0, hash = ~"sha256", received = 0,
+                 validated = true, swapped = false, signature = ~"sig",
+                 content = {[{~"type", ~"pub"}, {~"address", Addr}]}}
+    end,
+    %% {Term} wrapper present but payload is not a proplist
+    ?assertEqual(ok, social_msg:dispatch(Mk({~"net:host:8008"}))),
+    ?assertEqual(ok, social_msg:dispatch(Mk({42}))),
+    %% no wrapper at all: legacy string form, and outright missing
+    ?assertEqual(ok, social_msg:dispatch(Mk(~"net:host:8008~shs:k="))),
+    ?assertEqual(ok, social_msg:dispatch(
+                       #message{id = ~"%none.sha256", previous = null,
+                                author = ~"@author=.ed25519", sequence = 1,
+                                timestamp = 0, hash = ~"sha256", received = 0,
+                                validated = true, swapped = false,
+                                signature = ~"sig",
+                                content = {[{~"type", ~"pub"}]}})).
 
 dispatch_contact_test() ->
     Msg = #message{id = ~"%c.sha256", previous = null,

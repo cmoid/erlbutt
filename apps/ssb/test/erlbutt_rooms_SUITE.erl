@@ -276,11 +276,12 @@ echo_loop(Owners) ->
         {tunnel_open, ReqNo, OwnerPid} ->
             echo_loop(Owners#{ReqNo => OwnerPid});
         {tunnel_data, ReqNo, Body} ->
-            case maps:find(ReqNo, Owners) of
-                {ok, OwnerPid} ->
+            case Owners of
+                #{ReqNo := OwnerPid} ->
                     ssb_peer:send_frame(OwnerPid, -ReqNo, <<"echo:", Body/binary>>);
-                error -> ok
+                #{} -> ok
             end,
+
             echo_loop(Owners)
     end.
 
