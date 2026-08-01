@@ -18,6 +18,13 @@ PROD_PKG := erlbutt-prod-$(VSN)-$(PLATFORM).tar.gz
 ## remote is named or whether its URL uses an SSH host alias).
 GH_REPO  ?= cmoid/erlbutt
 
+## Packaging post-step: on macOS the NIFs link Homebrew libraries by absolute
+## path, which no amount of bundling ERTS fixes; this copies them in and
+## repoints them at @loader_path.  It rewrites the tarball rather than the
+## assembled release because `rebar3 tar` re-copies every app dir, discarding
+## anything written into _build/<profile>/rel/ beforehand.  No-op off macOS.
+VENDOR   := ./scripts/vendor-macos-dylibs.sh
+
 compile:
 	$(REBAR) compile
 
@@ -46,7 +53,7 @@ prod: compile
 devpkg: compile
 	$(REBAR) as devpkg tar
 	@mkdir -p $(DIST)
-	@cp $$(ls -t _build/devpkg/rel/ssb/ssb-*.tar.gz | head -1) $(DIST)/$(DEV_PKG)
+	@$(VENDOR) $$(ls -t _build/devpkg/rel/ssb/ssb-*.tar.gz | head -1) $(DIST)/$(DEV_PKG)
 	@cd $(DIST) && shasum -a 256 $(DEV_PKG) > $(DEV_PKG).sha256
 	@echo "==> $(DIST)/$(DEV_PKG)"
 
@@ -54,7 +61,7 @@ devpkg: compile
 prodpkg: compile
 	$(REBAR) as prod tar
 	@mkdir -p $(DIST)
-	@cp $$(ls -t _build/prod/rel/ssb/ssb-*.tar.gz | head -1) $(DIST)/$(PROD_PKG)
+	@$(VENDOR) $$(ls -t _build/prod/rel/ssb/ssb-*.tar.gz | head -1) $(DIST)/$(PROD_PKG)
 	@cd $(DIST) && shasum -a 256 $(PROD_PKG) > $(PROD_PKG).sha256
 	@echo "==> $(DIST)/$(PROD_PKG)"
 
