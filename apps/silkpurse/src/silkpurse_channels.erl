@@ -240,16 +240,6 @@ sort_key(_)                      -> 0.
 bool(true) -> 1;
 bool(_)    -> 0.
 
-%% Whether the node owner currently subscribes to Ch (for suggest).
-is_subscribed(Ch) ->
-    is_subscribed(Ch, owner()).
-
-is_subscribed(Ch, Feed) when is_binary(Ch), is_binary(Feed) ->
-    rows("SELECT 1 FROM channel_sub"
-         " WHERE channel=?1 AND feed=?2 AND subscribed=1", [Ch, Feed]) =/= [];
-is_subscribed(_Ch, _Feed) ->
-    false.
-
 %% Feeds currently subscribed to Ch.  An indexed prefix scan now — this
 %% used to fold the whole index, stats included, for one channel.
 subscribers(Ch) when is_binary(Ch) ->
@@ -306,6 +296,23 @@ encode_json(Term) ->
 %%% Tests
 %%%===================================================================
 -ifdef(TEST).
+
+%% Whether Feed (default: the node owner) currently subscribes to Ch.
+%%
+%% Test-only.  suggest/2 used to call this per result; it now resolves the
+%% owner's subscription inside its own query, which left this with no
+%% production caller — and an unused function is a hard error under the
+%% prod profile's warnings_as_errors.  Kept here rather than deleted
+%% because the toggle tests below read better as a predicate than as
+%% lists:member/2 over subscribers/1.
+is_subscribed(Ch) ->
+    is_subscribed(Ch, owner()).
+
+is_subscribed(Ch, Feed) when is_binary(Ch), is_binary(Feed) ->
+    rows("SELECT 1 FROM channel_sub"
+         " WHERE channel=?1 AND feed=?2 AND subscribed=1", [Ch, Feed]) =/= [];
+is_subscribed(_Ch, _Feed) ->
+    false.
 
 channels_test_() ->
     {setup, fun ch_setup/0, fun ch_teardown/1,
