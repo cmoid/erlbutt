@@ -43,7 +43,8 @@
          fetch_msg/2,
          fetch_last_msg/1,
          foldl/3,
-         archive/1]).
+         archive/1,
+         reset_log_slots/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -57,6 +58,15 @@
 %% giving the fd back.  Long enough to span a replication burst, short
 %% enough that an idle node settles back to no open logs.
 -define(LOG_IDLE_MS, 30_000).
+
+%% Ceiling on log write handles held across the whole node, and the thing
+%% that actually bounds fd use — see log_fd/1.  Deliberately well under any
+%% plausible RLIMIT_NOFILE, because these compete with sockets, blobs and
+%% SQLite for the same budget: the handles are an optimisation, and running
+%% out of fds is not a degradation but an outage.  Override with
+%% {max_open_feed_logs, N} in the ssb app env.
+-define(MAX_OPEN_LOGS, 64).
+-define(LOG_SLOTS, {?MODULE, open_log_slots}).
 
 
 -record(state, {id,
@@ -473,6 +483,12 @@ write_msg(Msg, State0) ->
     %% One write, not two: the frame is contiguous, so splitting it only
     %% doubled the syscalls.
     ok = file:write(Fd, <<DataSiz:32, Msg/binary, DataSiz:32, Next:32>>),
+    %% A handle that could not be cached (the node is at its open-log cap)
+    %% is given back immediately; a cached one is left for the next write.
+    case State#state.fd of
+        undefined -> ok = file:close(Fd);
+        _         -> ok
+    end,
     {Offset, State}.
 
 %% The live log's write handle, opened on first use and kept.
@@ -502,16 +518,69 @@ write_msg(Msg, State0) ->
 %% buffered write would be invisible to them, so a fetch straight after a
 %% store could miss the message it just wrote.
 %% The handle is held for a burst, not forever: one fd per live feed would
-%% otherwise be one fd per feed the node has ever touched, and a node
-%% following a few thousand feeds would exhaust a default 1024 ulimit —
-%% surfacing as emfile on unrelated opens all over the node.  The timer is
-%% armed here, on open, so a closed feed leaves none pending.
+%% otherwise be one fd per feed the node has ever touched, and a bulk
+%% import touching thousands of feeds exhausts the limit in seconds —
+%% emfile, mid-write, taking the feed down with it.  An idle timer alone
+%% does NOT bound this: the handles are all claimed long before the first
+%% tick fires.  So the handles are a bounded pool, and the timer is only
+%% what returns a quiet feed's slot early.
+%%
+%% Past the cap a feed still writes — it just opens and closes around each
+%% write, which is where this code started, except still ~2x faster than
+%% the original thanks to `raw` and the dropped stats.  So the degradation
+%% is graceful: a working set that fits keeps the handles (replication,
+%% which writes a handful of feeds at a time), one that does not falls
+%% back per write (a full conversion).
 log_fd(#state{fd = Fd} = State) when Fd =/= undefined ->
     {Fd, State#state{fd_used = true}};
 log_fd(#state{feed = Feed} = State) ->
-    {ok, Fd} = file:open(Feed, [append, raw, binary]),
-    erlang:send_after(?LOG_IDLE_MS, self(), close_idle_log),
-    {Fd, State#state{fd = Fd, fd_used = true}}.
+    Fd = open_log(Feed),
+    case claim_log_slot() of
+        true ->
+            erlang:send_after(?LOG_IDLE_MS, self(), close_idle_log),
+            {Fd, State#state{fd = Fd, fd_used = true}};
+        false ->
+            %% not cached: write_msg/2 closes it again straight away
+            {Fd, State}
+    end.
+
+open_log(Feed) ->
+    case file:open(Feed, [append, raw, binary]) of
+        {ok, Fd}        -> Fd;
+        {error, Reason} -> error({log_open_failed, Feed, Reason})
+    end.
+
+%% Zero the open-handle count.  Called by ssb_feed_sup when it (re)starts,
+%% at which point no feed it supervises is alive to hold a handle.
+reset_log_slots() ->
+    Ref = log_slots(),
+    counters:put(Ref, 1, 0),
+    ok.
+
+%% Global count of cached log handles, as a lock-free counter: this is
+%% consulted on every cache miss, so it must not serialise feeds through a
+%% process.  Created by ssb_feed_sup before any feed exists; the lazy
+%% branch is for tests that start a feed on its own.
+log_slots() ->
+    case persistent_term:get(?LOG_SLOTS, undefined) of
+        undefined ->
+            Ref = counters:new(1, [write_concurrency]),
+            persistent_term:put(?LOG_SLOTS, Ref),
+            persistent_term:get(?LOG_SLOTS);
+        Ref ->
+            Ref
+    end.
+
+claim_log_slot() ->
+    Ref = log_slots(),
+    Max = application:get_env(ssb, max_open_feed_logs, ?MAX_OPEN_LOGS),
+    case counters:get(Ref, 1) < Max of
+        true  -> counters:add(Ref, 1, 1), true;
+        false -> false
+    end.
+
+release_log_slot() ->
+    counters:sub(log_slots(), 1, 1).
 
 %% Drop the write handle.  Called wherever the live log is replaced: an
 %% append handle on a deleted inode still accepts writes, and they go
@@ -520,6 +589,7 @@ close_log(#state{fd = undefined} = State) ->
     State;
 close_log(#state{fd = Fd} = State) ->
     _ = file:close(Fd),
+    release_log_slot(),
     State#state{fd = undefined, fd_used = false}.
 
 init_directories(FeedId) ->
@@ -722,7 +792,8 @@ feed_test_() ->
       fun restart_then_archive_naming_test/1,
       fun crash_window_recovery_test/1,
       fun frame_chain_is_walkable_test/1,
-      fun idle_releases_log_handle_test/1]}.
+      fun idle_releases_log_handle_test/1,
+      fun log_handles_are_capped_test/1]}.
 
 %% Fully isolated home per test: these tests archive and restart the
 %% own feed, and a home shared across eunit runs accumulates
@@ -759,6 +830,44 @@ feed_file(FeedId) ->
     DecId = utils:decode_id(FeedId),
     <<Dir:2/binary, Rest/binary>> = DecId,
     <<Location/binary, Dir/binary, "/", Rest/binary, "/log.offset">>.
+
+%% Writing to more feeds than the cap allows must not exhaust fds.
+%%
+%% Regression for an emfile that killed a feed mid-write during a bulk
+%% import: handles were held per feed with only an idle timer to release
+%% them, and an import claims thousands of them long before the first tick
+%% fires.  Feeds past the cap must still store — uncached, reopening per
+%% write — rather than crash.
+log_handles_are_capped_test({_Pid, _FeedId, _}) ->
+    fun() ->
+        Cap = 3,
+        application:set_env(ssb, max_open_feed_logs, Cap),
+        reset_log_slots(),
+        Feeds = [begin
+                     Id = <<"@", (base64:encode(crypto:hash(sha256,
+                              <<"cap feed ", (integer_to_binary(N))/binary>>)))/binary,
+                            ".ed25519">>,
+                     {ok, P} = ssb_feed:start_link(Id),
+                     {P, Id}
+                 end || N <- lists:seq(1, Cap * 3)],
+        %% every feed stores, whether or not it got a handle
+        [begin
+             M = message:new_msg(null, 1,
+                                 {[{~"type", ~"post"}, {~"text", ~"capped"}]},
+                                 {Id, keys:priv_key()}),
+             ?assertEqual(stored, ssb_feed:store_msg(P, M))
+         end || {P, Id} <- Feeds],
+        %% at most Cap of them kept one, and the count agrees with reality
+        Held = [P || {P, _} <- Feeds, feed_fd(P) =/= undefined],
+        ?assert(length(Held) =< Cap),
+        ?assertEqual(length(Held), counters:get(log_slots(), 1)),
+        %% and every message really landed
+        [?assertMatch(#message{sequence = 1}, ssb_feed:fetch_last_msg(P))
+         || {P, _} <- Feeds],
+        [gen_server:stop(P) || {P, _} <- Feeds],
+        application:unset_env(ssb, max_open_feed_logs),
+        reset_log_slots()
+    end.
 
 %% A quiet feed gives its log handle back, and writing again reopens it.
 %%

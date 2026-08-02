@@ -48,6 +48,12 @@ start_link() ->
         undefined ->
             %% Fresh start: set up registry then start the supervisor.
             ensure_registry(),
+            %% Reset the open-log-handle count before any feed can claim a
+            %% slot.  A restart of this supervisor kills every feed, so
+            %% their handles are gone with them and the count must go with
+            %% them — otherwise the leaked total ratchets up over restarts
+            %% until no feed can cache a handle at all.
+            ssb_feed:reset_log_slots(),
             supervisor:start_link({local, ?MODULE}, ?MODULE, []);
         Pid ->
             %% Already running (e.g. called repeatedly in unit tests).
