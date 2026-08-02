@@ -403,11 +403,21 @@ mentions_of(Props) ->
     case ?pgv(~"mentions", Props) of
         Ms when is_list(Ms) ->
             [Link || {MProps} <- Ms,
-                     (Link = ?pgv(~"link", MProps)) =/= undefined,
-                     is_binary(Link),
-                     binary:part(Link, 0, 1) =:= ~"@"];
+                     is_feed_ref(Link = ?pgv(~"link", MProps))];
         _ -> []
     end.
+
+%% A mention link counts as a feed reference only if it is a binary
+%% starting with "@".
+%%
+%% Matching the prefix rather than binary:part(Link, 0, 1): part/3 raises
+%% badarg on <<>>, which is_binary/1 does not exclude, so a mention whose
+%% link was the empty string took the whole view down for that message —
+%% and view_manager:deliver/2 advances the checkpoint even when
+%% view_entry/1 raises, so each one was silently dropped for good.
+%% Matching also covers the non-binary case, so no separate guard.
+is_feed_ref(<<"@", _/binary>>) -> true;
+is_feed_ref(_)                 -> false.
 
 
 %%%===================================================================
@@ -496,6 +506,27 @@ encode_json(Term) ->
 %%% Tests
 %%%===================================================================
 -ifdef(TEST).
+
+%% mentions_of/1 must survive whatever a mention holds: the links come off
+%% the wire.  Regression for an empty-string link, which is_binary/1 let
+%% through to binary:part(<<>>, 0, 1) -- badarg, killing the view for that
+%% message during a bulk import of a real log.
+mentions_of_tolerates_junk_links_test() ->
+    Mk = fun(Links) ->
+        [{~"mentions", [{[{~"link", L}]} || L <- Links]}]
+    end,
+    Feed = ~"@abc=.ed25519",
+    %% the crashing case, alone and mixed with a good one
+    ?assertEqual([], mentions_of(Mk([~""]))),
+    ?assertEqual([Feed], mentions_of(Mk([~"", Feed]))),
+    %% other shapes a link can take
+    ?assertEqual([Feed], mentions_of(Mk([Feed, ~"%msg.sha256", ~"&blob.sha256"]))),
+    ?assertEqual([], mentions_of(Mk([~"no-sigil"]))),
+    ?assertEqual([], mentions_of([{~"mentions", [{[{~"nolink", 1}]}]}])),
+    ?assertEqual([], mentions_of([{~"mentions", [{[{~"link", 42}]}]}])),
+    %% mentions absent or not a list at all
+    ?assertEqual([], mentions_of([])),
+    ?assertEqual([], mentions_of([{~"mentions", ~"nope"}])).
 
 classify_test() ->
     ?assertEqual(root, classify(~"post", undefined)),
