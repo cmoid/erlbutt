@@ -116,10 +116,24 @@ store(Msg, Sleep, Feeds, BlobSrc) ->
 
     if Belongs ->
             FeedPid = get_feed(AuthId, Sleep),
+            %% Blobs FIRST, then the message.  storing dispatches to
+            %% social_msg, which wants every blob the message references,
+            %% and blob_fetcher only skips a reference it can already see
+            %% in the local store (has_local/1 -> blobs:has/1).  Import
+            %% first and those wants are never raised; import after and
+            %% every imported blob is recorded as wanted and broadcast to
+            %% peers, because blobs:store_verified/2 has no way to retract
+            %% a want -- only blob_fetcher's own fetch path clears one.
+            %% (A restart repairs it, since load_wants/0 drops held ids,
+            %% but until then the node begs for blobs it is sitting on.)
+            %%
+            %% A blob missing from the source store still becomes a want,
+            %% which is what we want: that one really does have to come
+            %% from a peer.
+            copy_blobs(DecMsg, BlobSrc),
             ssb_feed:store_msg(FeedPid, DecMsg),
             %% Not needed, ssb_feed_store_msg already handles it
             %%gmess_auth:put(MsgId, AuthId),
-            copy_blobs(DecMsg, BlobSrc),
             if Valid ->
                     nop;
                true ->
@@ -184,6 +198,89 @@ report_blob_stats() ->
     end.
 
 -ifdef(TEST).
+
+%% Blobs must be imported BEFORE the message is stored, so that a blob the
+%% source store can supply never becomes a want.  Storing dispatches to
+%% social_msg, which wants every referenced blob unless blob_fetcher can
+%% already see it locally; in the reverse order every imported blob is
+%% recorded as wanted and broadcast to peers, and nothing retracts it
+%% (blobs:store_verified/2 cannot, and only the fetch path calls
+%% forget_wants/1).  A blob the source lacks SHOULD still be wanted.
+%% A fixture, not a bare test: a failed assertion skips whatever follows
+%% it, and these servers are registered names -- leaving them up makes
+%% every later test in the module fail on {already_started,_} instead of
+%% on its own merits.
+blob_import_precedes_store_test_() ->
+    {setup, fun conv_setup/0, fun conv_teardown/1,
+     fun(SrcRoot) -> [?_test(blob_import_precedes_store(SrcRoot))] end}.
+
+conv_setup() ->
+    conv_stop(),
+    Home = filename:join("/tmp", "conv_" ++
+                             integer_to_list(erlang:system_time(microsecond))),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    application:set_env(ssb, ssb_home, Home),
+    {ok, _} = config:start_link("no-such-cfg"),
+    {ok, _} = ssb_store:start_link(),
+    {ok, _} = mess_auth:start_link(),
+    {ok, _} = blobs:start_link(),
+    {ok, _} = blob_fetcher:start_link(),
+    {ok, _} = ssb_feed_sup:start_link(),
+    filename:join(Home, "srcblobs").
+
+conv_stop() ->
+    [catch gen_server:stop(P)
+     || P <- [ssb_feed_sup, blob_fetcher, blobs, mess_auth, ssb_store, config]],
+    ok.
+
+conv_teardown(SrcRoot) ->
+    erase(blob_stats),
+    conv_stop(),
+    os:cmd("rm -rf " ++ filename:dirname(SrcRoot)),
+    application:unset_env(ssb, ssb_home),
+    ok.
+
+blob_import_precedes_store(SrcRoot) ->
+    %% one blob the JS store has, one it does not
+    Payload  = <<"converter ordering payload ",
+                 (binary:encode_hex(crypto:strong_rand_bytes(8)))/binary>>,
+    Present  = <<"&", (base64:encode(crypto:hash(sha256, Payload)))/binary,
+                 ".sha256">>,
+    Absent   = <<"&", (base64:encode(crypto:hash(sha256,
+                     <<"absent ", (binary:encode_hex(
+                         crypto:strong_rand_bytes(8)))/binary>>)))/binary,
+                 ".sha256">>,
+    SrcPath  = src_blob_path(Present, SrcRoot),
+    ok = filelib:ensure_dir(SrcPath),
+    ok = file:write_file(SrcPath, Payload),
+
+    %% A raw frame as convert/4 would read it.  The signature is junk, so
+    %% validation fails -- store/4 stores anyway and only logs, which is
+    %% what makes this cheap to build.  The author must still be a real
+    %% key shape: utils:feed_dir/1 base64-decodes it to name the directory.
+    Author = <<"@", (base64:encode(crypto:hash(sha256,
+                                               ~"converter ordering author")))/binary,
+               ".ed25519">>,
+    Raw = iolist_to_binary(
+            ["{\"key\":\"%ordering.sha256\",\"value\":{",
+             "\"previous\":null,\"author\":\"", Author, "\",",
+             "\"sequence\":1,\"timestamp\":0,\"hash\":\"sha256\",",
+             "\"content\":{\"type\":\"post\",\"text\":\"pic\",\"mentions\":[",
+             "{\"link\":\"", Present, "\"},{\"link\":\"", Absent, "\"}]},",
+             "\"signature\":\"nope.sig.ed25519\"}}"]),
+
+    erase(blob_stats),
+    store(Raw, 0, [all], SrcRoot),
+
+    %% imported, and therefore never wanted -- this is the ordering
+    %% assertion.  assertEqual rather than assertNot: this is the one most
+    %% likely to fire, and rebar3's vendored eunit_progress crashes trying
+    %% to format an assertNot failure, burying the result.
+    ?assert(blobs:has(Present)),
+    ?assertEqual(false, lists:member(Present, blob_fetcher:wanted())),
+    %% not importable, so it must still be wanted
+    ?assertEqual(true, lists:member(Absent, blob_fetcher:wanted())),
+    erase(Author).
 
 %% copy_blob/2 imports a blob from a JS-layout source store into the local
 %% store, verifying the hash; a missing source blob is counted, not fatal.
