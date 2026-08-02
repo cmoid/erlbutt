@@ -53,6 +53,11 @@
 -import(utils, [load_term/1,
                  size/1]).
 
+%% How long a feed may hold its log write handle without writing before
+%% giving the fd back.  Long enough to span a replication burst, short
+%% enough that an idle node settles back to no open logs.
+-define(LOG_IDLE_MS, 30_000).
+
 
 -record(state, {id,
                 last_msg = null,
@@ -62,6 +67,14 @@
                 %% has the whole live log been indexed into msg_cache in
                 %% this run?  Reset whenever the live log is replaced.
                 indexed = false,
+                %% write handle for the live log, opened on first write and
+                %% held while the feed stays busy.  undefined whenever the
+                %% log it pointed at has been replaced (see close_log/1),
+                %% or after an idle period (see close_idle_log).
+                fd,
+                %% has fd been written to since the last idle tick?  Drives
+                %% the release of a quiet feed's handle.
+                fd_used = false,
                 %% undefined, or {FirstRejectedSeq, Count} while a peer is
                 %% offering messages that do not link our tail.  Keeps the
                 %% rejection log to one line per stall instead of one per
@@ -202,13 +215,26 @@ handle_cast(_Request, State) ->
 
 %% info
 
+%% Idle tick for the live log's write handle.  A feed written since the
+%% last tick keeps its handle and re-arms; a quiet one gives the fd back.
+%% Nothing re-arms once the handle is gone — the next write opens it and
+%% starts a fresh timer — so this cannot accumulate timers.
+handle_info(close_idle_log, #state{fd = undefined} = State) ->
+    {noreply, State};
+handle_info(close_idle_log, #state{fd_used = true} = State) ->
+    erlang:send_after(?LOG_IDLE_MS, self(), close_idle_log),
+    {noreply, State#state{fd_used = false}};
+handle_info(close_idle_log, State) ->
+    {noreply, close_log(State)};
+
 handle_info(Info, State) ->
     ?LOG_INFO("WTF: ~p ~n",[Info]),
     {noreply, State}.
 
 %%
 
-terminate(Reason, #state{id = FeedId}) ->
+terminate(Reason, #state{id = FeedId} = State) ->
+    _ = close_log(State),
     ?LOG_INFO("Closed gen_server: ~p ~n", [Reason]),
     case ets:info(ssb_feed_registry) of
         undefined -> ok;
@@ -268,6 +294,10 @@ do_archive(#state{id = FeedId, last_seq = LastSeq,
     _ = feed_store:write_hint(?b2l(ArchiveFile), LogData),
     BlobId = blobs:store(GzData),
     ok = file:delete(FeedFile),
+    %% The handle we hold points at the log just deleted; an append to it
+    %% would land on the unlinked inode and vanish.  Drop it so store/2
+    %% below opens the new live log.
+    State0 = close_log(State),
     Content = {[{~"type",          ~"archive"},
                 {~"archive",       BlobId},
                 {~"from_sequence", From},
@@ -275,7 +305,7 @@ do_archive(#state{id = FeedId, last_seq = LastSeq,
     NewSeq = LastSeq + 1,
     #message{id = NewId} = Msg =
         message:new_msg(null, NewSeq, Content, {FeedId, keys:priv_key()}),
-    State1 = store(Msg, State#state{indexed = true}),
+    State1 = store(Msg, State0#state{indexed = true}),
     {State1#state{last_msg = NewId,
                   last_seq = NewSeq}, BlobId}.
 
@@ -411,9 +441,9 @@ store(#message{sequence = Seq},
     %% Already have this sequence or earlier — skip silently.
     State;
 store(#message{id = Id, sequence = Seq, author = Auth} = Msg,
-      #state{feed = Feed, msg_cache = Messages} = State) ->
+      #state{msg_cache = Messages} = State0) ->
     mess_auth:put(Id, Auth),
-    Offset = write_msg(Msg, Feed),
+    {Offset, State} = write_msg(Msg, State0),
     %% Keep the offset index current on the write path, so a message just
     %% stored is readable by id without re-scanning the live log.
     ets:insert(Messages, {Id, Offset}),
@@ -423,26 +453,74 @@ store(#message{id = Id, sequence = Seq, author = Auth} = Msg,
     view_manager:ingest(Msg),
     State#state{last_msg = Id, last_seq = Seq}.
 
-write_msg(#message{} = DecMsg, Store) ->
-    Msg = message:encode(DecMsg),
-    write_msg(Msg, Store);
+write_msg(#message{} = DecMsg, State) ->
+    write_msg(message:encode(DecMsg), State);
 
 %% On-disk frame: <<Len:32, Msg:Len/binary, Len:32, NextOffset:32>>
 %% Trailing Len enables backward seek to find the last record.
 %% NextOffset is the absolute file position of the following record's Len field,
 %% used by scan/3 to step forward without re-reading the leading length.
-write_msg(Msg, Store) ->
+write_msg(Msg, State0) ->
     DataSiz = size(Msg),
+    {Fd, State} = log_fd(State0),
     %% The record starts where the file currently ends; returned so the
-    %% caller can index it without re-reading what it just wrote.
-    Offset = filelib:file_size(Store),
-    O = open_file(Store),
-    ok = file:write(O,
-               <<DataSiz:32, Msg/binary, DataSiz:32>>),
-    FileSize = filelib:file_size(Store) + 4,
-    ok = file:write(O, <<FileSize:32>>),
-    close_file(O),
-    Offset.
+    %% caller can index it without re-reading what it just wrote.  An lseek
+    %% on the handle we already hold, where this was a path-based stat.
+    {ok, Offset} = file:position(Fd, eof),
+    %% NextOffset is arithmetic rather than a second stat: the record is
+    %% the message plus its two 4-byte lengths and this 4-byte field.
+    Next = Offset + DataSiz + 12,
+    %% One write, not two: the frame is contiguous, so splitting it only
+    %% doubled the syscalls.
+    ok = file:write(Fd, <<DataSiz:32, Msg/binary, DataSiz:32, Next:32>>),
+    {Offset, State}.
+
+%% The live log's write handle, opened on first use and kept.
+%%
+%% This used to be an open and a close around every single message, with a
+%% filelib:file_size/1 stat on either side of the write — six syscalls per
+%% stored message, on the hottest path in the system.  Holding the handle
+%% costs one fd per live feed and removes all of it.
+%%
+%% `raw` matters as much as the reuse: a non-raw handle routes every
+%% operation through the file server process, making each write a message
+%% round trip rather than a syscall.  Raw handles may only be used by the
+%% process that opened them, which is exactly the case here — the feed
+%% gen_server is the sole writer of its own log.
+%%
+%% NOTE: do NOT add the `sync` flag.  It forces an fsync on every
+%% file:write, and a stored message can hit more than one file (the
+%% per-feed log, plus a references entry in each linked feed) — i.e.
+%% several fsyncs per stored message.  On Linux that is ~60ms each, which
+%% throttled EBT replication to ~4 msgs/sec and left peers stuck in
+%% "Downloading new messages"/"Scuttling…" during a full-DB sync.  Plain
+%% [append] still writes through to the OS, so the on-disk frame layout
+%% stays correct; the OS flushes lazily, and any messages lost in a crash
+%% are recovered by re-replication.
+%%
+%% Nor `delayed_write`: read_at/3 and scan/3 open their own handles, and a
+%% buffered write would be invisible to them, so a fetch straight after a
+%% store could miss the message it just wrote.
+%% The handle is held for a burst, not forever: one fd per live feed would
+%% otherwise be one fd per feed the node has ever touched, and a node
+%% following a few thousand feeds would exhaust a default 1024 ulimit —
+%% surfacing as emfile on unrelated opens all over the node.  The timer is
+%% armed here, on open, so a closed feed leaves none pending.
+log_fd(#state{fd = Fd} = State) when Fd =/= undefined ->
+    {Fd, State#state{fd_used = true}};
+log_fd(#state{feed = Feed} = State) ->
+    {ok, Fd} = file:open(Feed, [append, raw, binary]),
+    erlang:send_after(?LOG_IDLE_MS, self(), close_idle_log),
+    {Fd, State#state{fd = Fd, fd_used = true}}.
+
+%% Drop the write handle.  Called wherever the live log is replaced: an
+%% append handle on a deleted inode still accepts writes, and they go
+%% nowhere visible, so the next write must reopen.
+close_log(#state{fd = undefined} = State) ->
+    State;
+close_log(#state{fd = Fd} = State) ->
+    _ = file:close(Fd),
+    State#state{fd = undefined, fd_used = false}.
 
 init_directories(FeedId) ->
     FeedDir = utils:feed_dir(FeedId),
@@ -616,28 +694,6 @@ extract_key(Data) ->
 
 
 
-open_file(File) ->
-    %% NOTE: do NOT use the `sync` flag here. It forces an fsync on every
-    %% file:write, and a stored message can hit more than one file (the
-    %% per-feed log, plus a references entry in each linked feed) — i.e.
-    %% several fsyncs per stored message. On Linux that is ~60ms each, which
-    %% throttled EBT replication to ~4 msgs/sec and left peers stuck in
-    %% "Downloading new messages"/"Scuttling…" during a full-DB sync. Plain
-    %% [append] still writes through to the OS (so filelib:file_size and the
-    %% on-disk frame layout stay correct); the OS flushes lazily, and any
-    %% messages lost in a crash are recovered by re-replication.
-    Open = file:open(File, [append]),
-    case Open of
-        {ok, F} ->
-            F;
-        Else ->
-            ?LOG_INFO("Tried to open failed: ~p ~n",[Else]),
-            nil
-    end.
-
-close_file(File) ->
-    ok = file:close(File).
-
 -ifdef(TEST).
 
 feed_test_() ->
@@ -664,7 +720,9 @@ feed_test_() ->
       fun post_after_archive_test/1,
       fun second_archive_naming_test/1,
       fun restart_then_archive_naming_test/1,
-      fun crash_window_recovery_test/1]}.
+      fun crash_window_recovery_test/1,
+      fun frame_chain_is_walkable_test/1,
+      fun idle_releases_log_handle_test/1]}.
 
 %% Fully isolated home per test: these tests archive and restart the
 %% own feed, and a home shared across eunit runs accumulates
@@ -701,6 +759,64 @@ feed_file(FeedId) ->
     DecId = utils:decode_id(FeedId),
     <<Dir:2/binary, Rest/binary>> = DecId,
     <<Location/binary, Dir/binary, "/", Rest/binary, "/log.offset">>.
+
+%% A quiet feed gives its log handle back, and writing again reopens it.
+%%
+%% The handle is held so a burst of stores costs one open instead of one
+%% per message, but holding it forever would mean an fd per feed the node
+%% has ever written — emfile on a node following a few thousand.  Drives
+%% the tick directly rather than waiting ?LOG_IDLE_MS.
+idle_releases_log_handle_test({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"before idle"),
+        ?assertNotEqual(undefined, feed_fd(Pid)),
+        %% first tick: written since the last one, so the handle stays
+        Pid ! close_idle_log,
+        ?assertNotEqual(undefined, feed_fd(Pid)),
+        %% second tick with no write in between: released
+        Pid ! close_idle_log,
+        ?assertEqual(undefined, feed_fd(Pid)),
+        %% and the feed still writes, reopening as it goes
+        ok = ssb_feed:post_content(Pid, ~"after idle"),
+        ?assertNotEqual(undefined, feed_fd(Pid)),
+        #message{id = Key, sequence = 2} = ssb_feed:fetch_last_msg(Pid),
+        #message{content = ~"after idle"} = ssb_feed:fetch_msg(Pid, Key),
+        %% both records are on disk and the chain still walks
+        {ok, Bin} = file:read_file(feed_file(FeedId)),
+        ?assertEqual({2, byte_size(Bin)}, walk_frames(Bin, 0, 0))
+    end.
+
+%% The feed's current log handle, via a sys call so the assertions read
+%% real state rather than a value the test kept for itself.  element/2
+%% rather than record syntax, matching the other state peeks below.
+feed_fd(Pid) ->
+    element(#state.fd, sys:get_state(Pid)).
+
+%% Walk the live log using only the NextOffset field of each frame and
+%% land exactly on every record, then exactly on EOF.
+%%
+%% write_msg/2 computes NextOffset arithmetically (Offset + Len + 12);
+%% it used to re-stat the file after writing the record.  The two agree
+%% only if the frame really is Len + two 4-byte lengths + this 4-byte
+%% field, so this asserts that layout rather than trusting the sum —
+%% scan/3 steps through the log on these offsets, so an error here would
+%% surface far away, as a catch-up fold silently reading garbage.
+frame_chain_is_walkable_test({Pid, FeedId, _}) ->
+    fun() ->
+        [ok = ssb_feed:post_content(Pid, <<"frame ", (integer_to_binary(N))/binary>>)
+         || N <- lists:seq(1, 5)],
+        {ok, Bin} = file:read_file(feed_file(FeedId)),
+        ?assertEqual({5, byte_size(Bin)}, walk_frames(Bin, 0, 0))
+    end.
+
+%% Returns {RecordsSeen, FinalOffset}; crashes if a NextOffset does not
+%% point at a frame boundary.
+walk_frames(Bin, Pos, N) when Pos =:= byte_size(Bin) ->
+    {N, Pos};
+walk_frames(Bin, Pos, N) ->
+    <<_:Pos/binary, Len:32, _Msg:Len/binary, Len:32, Next:32, _/binary>> = Bin,
+    ?assertEqual(Pos + Len + 12, Next),
+    walk_frames(Bin, Next, N + 1).
 
 post_and_fetch_test({Pid, _, _}) ->
     fun() ->
