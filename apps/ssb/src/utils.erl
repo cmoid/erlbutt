@@ -19,6 +19,7 @@
          incr/1,
          combine/2,
          send_data/4,
+         send_data_checked/4,
          load_term/1,
          fold_log_file/3,
          feed_dir/1,
@@ -104,25 +105,40 @@ combine(Bin1, Bin2) ->
     Bin1Len = utils:size(Bin1),
     <<Bin1:Bin1Len/binary, Bin2/binary>>.
 
+%% Send and discard the outcome.  Most callers have nothing useful to do
+%% about a failed write: the socket error arrives separately as tcp_closed
+%% or tcp_error and tears the connection down anyway.
+send_data(Data, Socket, Nonce, SecretBoxKey) ->
+    {_, NewNonce} = send_data_checked(Data, Socket, Nonce, SecretBoxKey),
+    NewNonce.
+
+%% As send_data/4, but reports whether the write reached the socket, for the
+%% caller that is sending precisely in order to find out (see ssb_peer's
+%% anti-entropy clock, which is this connection's liveness probe).
+%%
+%% The nonce is returned either way: box-stream nonces advance per box, not
+%% per successful write, so a caller that keeps going after a failed send
+%% must still keep its nonce in step.
+%%
 %% Tunnel transport: inner-box the data, then hand the ciphertext to the
 %% room-facing peer as one muxrpc frame (it applies the outer box-stream).
-%% The room only ever relays this opaque inner ciphertext.
-send_data(Data, {tunnel, OwnerPid, ReqNo}, Nonce, SecretBoxKey) ->
+%% The room only ever relays this opaque inner ciphertext.  That hand-off is
+%% to another process, so the outcome is not knowable here and this answers
+%% ok; the room-facing peer reports its own socket errors.
+send_data_checked(Data, {tunnel, OwnerPid, ReqNo}, Nonce, SecretBoxKey) ->
     {EncBox, NewNonce} =
         boxstream:box(Data, Nonce, SecretBoxKey),
 
     ssb_peer:send_frame(OwnerPid, ReqNo, EncBox),
 
-    NewNonce;
+    {ok, NewNonce};
 
-send_data(Data, Socket, Nonce, SecretBoxKey) ->
+send_data_checked(Data, Socket, Nonce, SecretBoxKey) ->
 
     {EncBox, NewNonce} =
         boxstream:box(Data, Nonce, SecretBoxKey),
 
-    gen_tcp:send(Socket, EncBox),
-
-    NewNonce.
+    {gen_tcp:send(Socket, EncBox), NewNonce}.
 
 %% Specific to the SSB feed format, each message is prefixed with a 4 byte length
 %% field and followed by the same length field. This enables on to check that a message
