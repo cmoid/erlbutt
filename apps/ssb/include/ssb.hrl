@@ -22,8 +22,6 @@
 -define(DEFAULT_ARCHIVE_LENGTH, 10000).
 -define(DEFAULT_REPLICATION_HOPS, 2).
 -define(DEFAULT_CACHE_CAPACITY, 1000).
--define(DEFAULT_EBT_STALE_CHECK_MS,    60_000).  %% staleness poll interval
--define(DEFAULT_EBT_STALE_THRESHOLD_S,    120).  %% idle seconds before closing
 -define(DEFAULT_EBT_ENTROPY_MS,        30_000).  %% anti-entropy clock interval
 %%
 %% as this one that is for the current main SSB network
@@ -135,11 +133,6 @@
                 %% connection (either we initiated or the peer did) so that
                 %% request_ebt/1 does not open a duplicate stream.
                 ebt_active = false,
-                %% erlang:system_time(second) of the last message processed
-                %% while ebt_active = true.  Used to detect stale connections.
-                ebt_last_rx = undefined,
-                %% Timer ref for the periodic staleness check (undefined if EBT not yet active).
-                ebt_stale_ref = undefined,
                 %% The req number to use when sending clock updates to the peer.
                 %% Positive when we initiated EBT (client), negative when the peer did (server).
                 ebt_out_req = undefined,

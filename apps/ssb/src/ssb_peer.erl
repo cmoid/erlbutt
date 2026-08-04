@@ -43,8 +43,6 @@
                 send_data/4,
                 size/1]).
 
--define(EBT_STALE_CHECK_MS,    ?DEFAULT_EBT_STALE_CHECK_MS).
--define(EBT_STALE_THRESHOLD_S, ?DEFAULT_EBT_STALE_THRESHOLD_S).
 -define(EBT_ENTROPY_MS,        ?DEFAULT_EBT_ENTROPY_MS).
 
 %% connect to another peer on the default port (ssb app env or 8008).
@@ -427,20 +425,21 @@ handle_info({has_collected, Ref, Result},
     gen_server:reply(From, {ok, Result}),
     {noreply, State#sbox_state{pending_has = undefined}};
 
-handle_info(check_ebt_stale, #sbox_state{ebt_active = true,
-                                          ebt_last_rx = LastRx} = State) ->
-    Elapsed = erlang:system_time(second) - LastRx,
-    case Elapsed >= ?EBT_STALE_THRESHOLD_S of
-        true ->
-            ?SSB_INFO("EBT: connection stale (~ps idle), closing~n", [Elapsed]),
-            {stop, {shutdown, ebt_stale}, State};
-        false ->
-            {noreply, State#sbox_state{ebt_stale_ref = schedule_ebt_stale_check()}}
-    end;
-
-handle_info(check_ebt_stale, State) ->
-    {noreply, State};
-
+%% The anti-entropy clock doubles as the liveness probe for this connection.
+%%
+%% There used to be a separate check that closed the connection after 120s
+%% with nothing RECEIVED.  That measured how chatty a peer is, not whether
+%% it is there: a peer we are fully in sync with has nothing to say and
+%% correctly answers an unchanged clock with silence, so it was evicted
+%% every couple of minutes and immediately redialled.  On a node whose
+%% replication set is small (all of it in sync, most of the time) that was
+%% every peer, permanently — and each redial cost a full walk of the peer's
+%% clock, which for a pub is tens of thousands of entries.
+%%
+%% Whether the write reaches the socket is the honest signal, so that is
+%% what we act on.  A peer that is gone fails the send (or the socket
+%% reports tcp_closed/tcp_error first, handled above); a peer that is
+%% merely quiet is left alone.
 handle_info(ebt_anti_entropy, #sbox_state{ebt_active = true,
                                            ebt_out_req = OutReq,
                                            socket = Socket,
@@ -449,10 +448,16 @@ handle_info(ebt_anti_entropy, #sbox_state{ebt_active = true,
     Clock = utils:encode_rec(ebt:full_clock()),
     Flags = rpc_processor:create_flags(1, 0, 2),
     Header = rpc_processor:create_header(Flags, size(Clock), OutReq),
-    NewNonce = send_data(combine(Header, Clock), Socket, Nonce, Key),
-    ?SSB_DEBUG("EBT: sent anti-entropy clock~n", []),
-    {noreply, State#sbox_state{enc_nonce = NewNonce,
-                               ebt_entropy_ref = schedule_ebt_entropy()}};
+    case utils:send_data_checked(combine(Header, Clock), Socket, Nonce, Key) of
+        {ok, NewNonce} ->
+            ?SSB_DEBUG("EBT: sent anti-entropy clock~n", []),
+            {noreply, State#sbox_state{enc_nonce = NewNonce,
+                                       ebt_entropy_ref = schedule_ebt_entropy()}};
+        {{error, Reason}, NewNonce} ->
+            ?SSB_INFO("EBT: anti-entropy send failed (~p), closing~n", [Reason]),
+            {stop, {shutdown, {ebt_send_failed, Reason}},
+             State#sbox_state{enc_nonce = NewNonce}}
+    end;
 
 handle_info(ebt_anti_entropy, State) ->
     {noreply, State};
@@ -731,8 +736,6 @@ handle_cast({request_ebt}, #sbox_state{socket = Socket,
     {noreply, State1#sbox_state{enc_nonce = NewEncNonce,
                                 ebt_active = true,
                                 ebt_out_req = ReqNo,
-                                ebt_last_rx = erlang:system_time(second),
-                                ebt_stale_ref = schedule_ebt_stale_check(),
                                 ebt_entropy_ref = schedule_ebt_entropy()}};
 
 handle_cast(_Msg, State) ->
@@ -743,17 +746,13 @@ handle_cast(_Msg, State) ->
 %% peer, so only tear down our own resources.
 terminate(_Reason, #sbox_state{transport = tunnel,
                                rpc_proc = RpcProc,
-                               ebt_stale_ref = StaleRef,
                                ebt_entropy_ref = EntropyRef}) ->
-    cancel_ebt_timer(StaleRef),
     cancel_ebt_timer(EntropyRef),
     stop_rpc_proc(RpcProc),
     ok;
 terminate(_Reason, #sbox_state{rpc_proc = RpcProc,
                                remote_pk = RemotePk,
-                               ebt_stale_ref = StaleRef,
                                ebt_entropy_ref = EntropyRef}) when is_pid(RpcProc) ->
-    cancel_ebt_timer(StaleRef),
     cancel_ebt_timer(EntropyRef),
     peer_registry:unregister(RemotePk),
     stop_rpc_proc(RpcProc),
@@ -781,9 +780,6 @@ stop_rpc_proc(RpcProc) when is_pid(RpcProc) ->
     ok;
 stop_rpc_proc(_) ->
     ok.
-
-schedule_ebt_stale_check() ->
-    erlang:send_after(?EBT_STALE_CHECK_MS, self(), check_ebt_stale).
 
 cancel_ebt_timer(undefined) -> ok;
 cancel_ebt_timer(Ref)       -> erlang:cancel_timer(Ref), ok.
@@ -873,12 +869,10 @@ rpc_parse(Data, #sbox_state{socket = Socket,
                     %% request is answered in proc_request, but do NOT start a
                     %% second stream/entropy timer — that produced duplicate
                     %% anti-entropy clocks and repeated message sends.
-                    NewState0#sbox_state{ebt_last_rx = erlang:system_time(second)};
+                    NewState0;
                 false ->
                     NewState0#sbox_state{ebt_active = true,
                                          ebt_out_req = -ReqNo,
-                                         ebt_last_rx = erlang:system_time(second),
-                                         ebt_stale_ref = schedule_ebt_stale_check(),
                                          ebt_entropy_ref = schedule_ebt_entropy()}
             end;
         {attendants_stream, ReqNo} ->
@@ -892,10 +886,7 @@ rpc_parse(Data, #sbox_state{socket = Socket,
             room_attendants:subscribe(self()),
             NewState0#sbox_state{endpoints_req = ReqNo};
         _ ->
-            case NewState0#sbox_state.ebt_active of
-                true  -> NewState0#sbox_state{ebt_last_rx = erlang:system_time(second)};
-                false -> NewState0
-            end
+            NewState0
     end,
     case {size(NewRpcLeftOver) >= 9, Status} of
         {true, complete} ->
