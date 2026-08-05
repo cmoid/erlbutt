@@ -34,8 +34,11 @@ clean:
 distclean: clean
 	rm -rf $(DIST)
 
+## -o (overwrite), NOT -n: an interrupted run leaves a truncated file behind,
+## and -n would skip it on every run after, so the suite stays red until you
+## delete testdata/ by hand.  -n and -o together are contradictory; -n wins.
 test: compile
-	unzip -n -o testdata.zip
+	unzip -o testdata.zip
 	$(REBAR) eunit
 	rm -Rf testdata
 
