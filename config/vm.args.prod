@@ -4,7 +4,10 @@
 ## is reachable for `bin/ssb remote_console|stop|ping` from the same host
 ## while NOT accepting distribution connections from other machines.
 ##
-## Change the cookie per install and treat it as a secret.  To take the node
+## Set SSB_COOKIE per install and treat it as a secret — the default below is
+## a placeholder, and deliberately not a real value, because this file is in
+## git.  On a box with a public IP the cookie is the only thing between a
+## reachable distribution port and arbitrary code execution.  To take the node
 ## fully off distribution (no remsh, and bin/ssb stop|ping|remote_console
 ## stop working — you must then manage the OS process directly), comment out
 ## the -name and -setcookie lines below.
@@ -13,6 +16,14 @@
 
 ## Bind the distribution listener to loopback only.
 -kernel inet_dist_use_interface {127,0,0,1}
+
+## Pin the distribution listener port.  It is random by default, and a random
+## port cannot be forwarded: `ssh -L 9100:localhost:9100` is the only way to
+## reach a loopback-bound node from another machine (maxbutt/distel), so an
+## unpinned port means the tunnel breaks on every restart.  Setting min alone
+## is enough — inet_dist_listen_max defaults to min, pinning it exactly rather
+## than opening a range.  Do NOT open this port on the firewall.
+-kernel inet_dist_listen_min ${SSB_DIST_PORT:-9100}
 
 +K true
 +A 16

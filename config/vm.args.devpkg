@@ -12,5 +12,11 @@
 ## Extra code paths (e.g. the maxbutt package's ebin).  Harmless when unset.
 -pa ${SSB_EXTRA_PA:-.}
 
+## Pin the distribution listener port, for the same reason vm.args.src does:
+## the port is random by default, so a remote node can reach epmd (4369) but
+## not this one, and neither an ssh tunnel nor a LAN firewall rule can name a
+## port that changes every boot.  Setting min alone pins it exactly.
+-kernel inet_dist_listen_min ${SSB_DIST_PORT:-9100}
+
 +K true
 +A 16
