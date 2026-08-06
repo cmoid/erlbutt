@@ -35,8 +35,17 @@
 %% time (as backlinks/by_type do).
 %%
 %% A thread root is a type=post message with no `root` field; a reply
-%% is a type post|about carrying content.root.  Deferred: the live
-%% publicFeed.latest stream, fork handling, and patchwork's channel /
+%% is a type post|about carrying content.root.
+%%
+%% Forks are threads too.  Replying to a message part-way down a thread
+%% makes patchwork pin `root` to THAT message rather than to the thread's
+%% first one, so a fork's root is itself a reply and classify/2 never calls
+%% it a root.  Such a thread is created by add_reply/5 with a null author
+%% and has to be completed separately — see complete_root/4, which handles
+%% both arrival orders.  Before that it stayed null-author forever, which
+%% roots/2 reads as "root not replicated yet" and hides.
+%%
+%% Deferred: the live publicFeed.latest stream, and patchwork's channel /
 %% subscription filterResult policy.
 -module(silkpurse_threads).
 
@@ -116,7 +125,10 @@ start_link() ->
 %% 2: summaries gained participants/mentions/channel for the feed
 %% rollups (participating/mentions/profile/channel), so upgrading nodes
 %% must refold.
-view_version() -> 2.
+%% 3: fork roots are completed (see complete_root/4).  Threads already
+%% indexed under a null author would otherwise stay hidden forever, so
+%% upgrading nodes must refold to pick them up.
+view_version() -> 3.
 
 view_load() ->
     case ssb_store:complete(?MODULE) of
@@ -146,6 +158,10 @@ view_entry(#message{id = Id, author = Author, timestamp = Ts,
             {events, [{thread, Id}]};
         {reply, RootId} ->
             add_reply(RootId, Author, Id, Ts, Props),
+            %% This message may itself be something else forked off, in
+            %% which case a thread row keyed by OUR id is waiting for an
+            %% author that set_root/4 will never supply.
+            complete_root(Id, Author, Ts, Props),
             {events, [{thread, RootId}]};
         ignore ->
             ok
@@ -305,9 +321,22 @@ init([]) ->
 handle_continue(register, State) ->
     ensure_registered(State).
 
+%% Casts are delivered in order, so a reply to this means every
+%% complete_fork_root cast sent before it has already been applied.
+%% Exists for the tests; harmless in production.
+handle_call(sync, _From, State) ->
+    {reply, ok, State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
+%% Deferred out of view_entry/1 — see maybe_complete_fork_root/1 for why
+%% the message cannot be read on the ingest path.
+handle_cast({complete_fork_root, RootId}, State) ->
+    _ = case decoded(RootId) of
+            undefined -> ok;   %% not replicated yet; nothing to attribute
+            {Props}   -> complete_from_stored(RootId, Props)
+        end,
+    {noreply, State};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -372,7 +401,73 @@ add_reply(RootId, ReplyAuthor, ReplyId, Ts, Props) ->
               [RootId, num(Ts)]),
     add_actors(RootId, [ReplyAuthor], ?PARTICIPANT),
     add_actors(RootId, mentions_of(Props), ?MENTION),
+    maybe_complete_fork_root(RootId),
     ok.
+
+%% Reply to a message part-way down a thread and patchwork pins `root` to
+%% THAT message rather than to the thread's first one — a fork.  The row
+%% add_reply/5 just created is therefore keyed by a message that is itself
+%% a reply, so classify/2 will never call it a root and set_root/4 will
+%% never fill in its author.  A null author means "hidden" to roots/2, and
+%% for a fork that state is permanent rather than lasting until the root
+%% replicates.
+%%
+%% Two arrival orders, two repairs.  Here the forked-from message is
+%% already stored, so complete it from storage; when it arrives later,
+%% view_entry/1's reply branch does it instead.
+%%
+%% The fetch cannot happen inline.  view_entry/1 runs inside view_manager's
+%% synchronous ingest, which ssb_feed:store/2 called — so reading the
+%% message would gen_server:call back into the feed process that is blocked
+%% waiting on this very ingest, and deadlock until the call times out.
+%% Hand it to our own process instead, which is free to read.
+%%
+%% Guarded on the null author so this happens at most once per thread
+%% rather than once per reply.
+maybe_complete_fork_root(RootId) ->
+    case pending_root(RootId) of
+        false -> ok;
+        true  -> gen_server:cast(?MODULE, {complete_fork_root, RootId})
+    end.
+
+complete_from_stored(RootId, Props) ->
+    case ?pgv(~"value", Props) of
+        {VP} ->
+            do_complete_root(RootId, ?pgv(~"author", VP), ?pgv(~"timestamp", VP),
+                             content_props(?pgv(~"content", VP)));
+        _ ->
+            ok
+    end.
+
+content_props({CProps}) -> CProps;
+content_props(_)        -> [].
+
+%% Finish a thread row a reply created but no root ever claimed.  UPDATE,
+%% never INSERT: an ordinary reply must not manufacture a thread of its
+%% own, only complete one that something forked off it.
+complete_root(RootId, Author, Ts, Props) ->
+    case pending_root(RootId) of
+        false -> ok;
+        true  -> do_complete_root(RootId, Author, Ts, Props)
+    end.
+
+do_complete_root(RootId, Author, Ts, Props) ->
+    _ = write("UPDATE thread SET author=?, ts=?, channel=?"
+              " WHERE root=? AND author IS NULL",
+              [Author, num_or_null(Ts), channel_of(Props), RootId]),
+    add_actors(RootId, [Author], ?PARTICIPANT),
+    add_actors(RootId, mentions_of(Props), ?MENTION),
+    ok.
+
+%% A thread row exists but has never been attributed: either its root has
+%% not replicated yet, or the root is a fork target and never will be
+%% attributed by set_root/4.
+pending_root(RootId) ->
+    case ssb_store:q("SELECT 1 FROM thread WHERE root=? AND author IS NULL",
+                     [RootId]) of
+        [_ | _] -> true;
+        _       -> false
+    end.
 
 add_actors(RootId, Feeds, Kind) ->
     Rows = [[RootId, F, Kind] || F <- Feeds, is_binary(F)],
@@ -539,6 +634,9 @@ threads_test_() ->
     {foreach, fun th_setup/0, fun th_teardown/1,
      [fun(_) -> ?_test(rollup_counts_and_recent()) end,
       fun(_) -> ?_test(reply_before_root()) end,
+      fun(_) -> ?_test(fork_of_stored_message_is_showable()) end,
+      fun(_) -> ?_test(fork_before_forked_from_message()) end,
+      fun(_) -> ?_test(complete_root_does_not_create_threads()) end,
       fun(_) -> ?_test(block_filtering()) end,
       fun(_) -> ?_test(recent_replies_are_newest_first()) end,
       fun(_) -> ?_test(redelivery_does_not_inflate_the_count()) end,
@@ -633,6 +731,59 @@ reply_before_root() ->
     %% now complete, with the earlier reply counted and activity bumped
     %% past the root's own (older) timestamp
     ?assertEqual([[Fake, 100, 1]], showable()).
+
+%% Reply to a message part-way down a thread and patchwork pins `root` to
+%% that message, forking a new thread off it.  The fork's root is then a
+%% reply itself, so set_root/4 never runs for it — and before this was
+%% handled the fork stayed author-null and invisible in every feed.
+%%
+%% Forked-from message already stored: add_reply/5 completes the row from
+%% storage.  End to end, because that path reads a real message body.
+fork_of_stored_message_is_showable() ->
+    OwnPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    #message{id = RootId}   = post(OwnPid, {[{~"type", ~"post"},
+                                             {~"text", ~"root post"}]}),
+    #message{id = TargetId} = post(OwnPid, {[{~"type", ~"post"},
+                                             {~"text", ~"a reply"},
+                                             {~"root", RootId}]}),
+    _ = post(OwnPid, {[{~"type", ~"post"}, {~"text", ~"forked off the reply"},
+                       {~"root", TargetId}]}),
+    %% completion is deferred off the ingest path, so wait for our own
+    %% mailbox to drain before reading the index back
+    ok = gen_server:call(?MODULE, sync),
+    Keys = [proplists:get_value(~"key", P) || {P} <- roots()],
+    %% both the original thread and the fork are listed
+    ?assert(lists:member(RootId, Keys)),
+    ?assert(lists:member(TargetId, Keys)).
+
+%% The other order: the fork lands before we hold the message it forked
+%% from, so there is nothing to complete it from until that message
+%% arrives — as a reply, which is view_entry/1's complete_root/4 call.
+%% At the index level for the same reason as reply_before_root/0.
+fork_before_forked_from_message() ->
+    Target   = ~"%forktargetxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=.sha256",
+    Fork     = ~"%forkreplyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=.sha256",
+    Upstream = ~"%upstreamrootxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=.sha256",
+    add_reply(Target, ~"@forker=.ed25519", Fork, 200, []),
+    %% author unknown, so hidden — same state as a root not yet replicated
+    ?assertEqual([], showable()),
+    %% Now the forked-from message arrives.  Driven through view_entry/1
+    %% rather than calling complete_root/4 directly, so that dropping the
+    %% call site fails this test too.  Note it is a REPLY (it carries a
+    %% root of its own), which is exactly why set_root/4 never sees it.
+    view_entry(#message{id = Target, author = keys:pub_key_disp(),
+                        timestamp = 150,
+                        content = {[{~"type", ~"post"},
+                                    {~"text", ~"mid-thread message"},
+                                    {~"root", Upstream}]}}),
+    ?assertEqual([[Target, 200, 1]], showable()).
+
+%% complete_root/4 must not turn every reply into a thread of its own: with
+%% no row waiting on that id it is a no-op.
+complete_root_does_not_create_threads() ->
+    Orphan = ~"%noonelinkedherexxxxxxxxxxxxxxxxxxxxxxxxxxx=.sha256",
+    complete_root(Orphan, keys:pub_key_disp(), 100, []),
+    ?assertEqual([], showable()).
 
 %% root, last and reply count for every thread whose root has been seen.
 showable() ->
