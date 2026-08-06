@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Copyright (C) 2026 Charles Moid
+#
+# systemd unit for an erlbutt node running from the prod package.
+# See doc/ops/vps-migration.md for the layout this assumes:
+#
+#   /opt/erlbutt          the unpacked release, and SSB_HOME
+#   /opt/erlbutt/.ssberl  SYMLINK -> /var/lib/erlbutt/.ssberl (the real data)
+#   /etc/erlbutt/env      SSB_COOKIE and anything else secret
+#
+# Install:
+#   sudo cp doc/ops/erlbutt.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now erlbutt
+
+[Unit]
+Description=erlbutt SSB node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=erlbutt
+Group=erlbutt
+
+# ssb.cfg is read as a RELATIVE path (config:start_link/0 passes "ssb.cfg"),
+# so the working directory must be the release root or the node silently
+# falls back to compiled-in defaults.  The logger handlers in sys.config.src
+# write to a relative log/ too, so info.log/error.log/debug.log land here.
+WorkingDirectory=/opt/erlbutt
+
+# SSB_HOME decides where the DATA lives: config.erl derives
+# $SSB_HOME/.ssberl/{feeds,blobs,secret,...} from it.  It points AT the
+# release directory rather than at /var/lib, because sbutt.escript resolves
+# three different things from this one variable — the release's beams
+# ($SSB_HOME/lib/*/ebin), ssb.cfg, and .ssberl — so a node and a CLI that
+# disagree about it cannot both work.  The data still lives outside the
+# release: /opt/erlbutt/.ssberl is a symlink to /var/lib/erlbutt/.ssberl.
+# Re-create that symlink after every upgrade.
+Environment=SSB_HOME=/opt/erlbutt
+Environment=HOME=/var/lib/erlbutt
+# info, not notice: nearly all of erlbutt's logging goes through ?SSB_INFO
+# (= ?LOG_INFO), and the PRIMARY level gates before any handler is consulted —
+# so `notice` silently starves log/info.log and log/debug.log, and the node
+# looks dead when it is merely quiet.
+Environment=SSB_LOG_LEVEL=info
+Environment=SSB_NODE=ssb@127.0.0.1
+
+# Pins the distribution listener so an SSH tunnel can forward a known port.
+# REQUIRES the inet_dist_listen_min line in config/vm.args.prod — without it
+# this variable is read by nothing and the port is random on every boot.
+Environment=SSB_DIST_PORT=9100
+
+# epmd otherwise listens on 0.0.0.0:4369.  The firewall should already be
+# closing it; this makes that belt-and-braces rather than the only line.
+Environment=ERL_EPMD_ADDRESS=127.0.0.1
+
+# SSB_COOKIE=<something long and random>, mode 0600, root:erlbutt.
+EnvironmentFile=/etc/erlbutt/env
+
+ExecStart=/opt/erlbutt/bin/ssb foreground
+
+# The BEAM turns SIGTERM into init:stop() on its own, so this is not strictly
+# required — but it makes the graceful path explicit, and the node has real
+# work to do on the way down (SQLite checkpoints, the mess_auth flush).
+ExecStop=/opt/erlbutt/bin/ssb stop
+TimeoutStopSec=90
+
+Restart=always
+RestartSec=5
+
+# One file handle per open feed log, plus blobs, plus sockets.  The default
+# 1024 is not enough for a pub with a few hundred feeds.
+LimitNOFILE=65536
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+# The release directory needs to be writable: relx expands vm.args.src and
+# sys.config.src into releases/<vsn>/ at every boot, and the logger writes
+# to log/.  Set RELX_OUT_FILE_PATH instead if you want /opt read-only.
+ReadWritePaths=/var/lib/erlbutt /opt/erlbutt
+
+[Install]
+WantedBy=multi-user.target
