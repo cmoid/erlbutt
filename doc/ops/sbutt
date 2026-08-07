@@ -1,0 +1,50 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Copyright (C) 2026 Charles Moid
+#
+# sbutt — run the erlbutt CLI against the node on this host.
+#
+#   sbutt whoami
+#   sbutt health
+#   sbutt get %somekey=.sha256
+#
+# Install once:
+#   sudo install -m 0755 doc/ops/sbutt /usr/local/bin/sbutt
+#
+# sbutt.escript itself needs no installing — a relx overlay ships it at the
+# release root, so extracting the tarball puts it where `bin/ssb escript`
+# looks and the CLI is always the same vintage as the node.
+#
+# Three things this exists to get right, all of them easy to forget:
+#
+#  1. It runs as the SERVICE account.  .ssberl/secret is mode 600 owned by
+#     erlbutt, and keys:start_link/0 reads it, so every command that opens
+#     a connection fails as anyone else.  (`census encoding` is the lone
+#     exception — it folds the logs directly and needs no keys.)
+#
+#  2. It supplies the same environment systemd does.  Because vm.args.src
+#     exists, EVERY bin/ssb invocation re-expands vm.args from the current
+#     environment — so running without SSB_COOKIE silently rewrites the
+#     file with the placeholder cookie.  Harmless to the escript itself,
+#     but it leaves the node's args wrong on disk.  Sourcing the same
+#     EnvironmentFile the unit uses keeps the two from drifting.
+#
+#  3. It goes through `bin/ssb escript` rather than a system escript, so
+#     it uses the ERTS bundled in the release.  Nothing needs to be on
+#     PATH and it survives an OTP upgrade.  The script path is relative to
+#     the release root on purpose: relx_escript prepends $ROOTDIR.
+#
+# The env file is root:erlbutt 0640, so the service account reads it
+# itself — the cookie never passes through this script's arguments or
+# environment, where the process list would expose it.
+set -eu
+
+exec sudo -u erlbutt sh -c '
+    set -a
+    . /etc/erlbutt/env
+    set +a
+    : "${SSB_HOME:=/opt/erlbutt}"
+    export SSB_HOME
+    exec "$SSB_HOME/bin/ssb" escript sbutt.escript "$@"
+' sbutt "$@"
