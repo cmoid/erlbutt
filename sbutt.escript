@@ -22,6 +22,11 @@
 -define(INFO(Fmt, Args), io:format(Fmt, Args)).
 -define(PORT, 8008).
 
+%% Idle timeout while draining a source stream: how long to wait for the
+%% NEXT frame, not for the whole stream.  A long history keeps arriving, so
+%% a total timeout would abort a perfectly healthy fetch.
+-define(STREAM_IDLE_MS, 30000).
+
 main(["health"])          -> run(fun cmd_health/1);
 main(["census", "encoding" | Args]) ->
     run_local(fun() -> cmd_census_encoding(Args) end);
@@ -596,15 +601,42 @@ cmd_log(Peer) ->
             io:format("Error: ~p~n", [Err])
     end.
 
+%% Print each message as it arrives.  This used to use rpc_stream_call/3,
+%% which accumulates the whole history and returns it as one list — so
+%% nothing reached stdout until the last message had been fetched, and with
+%% `--limit` defaulting to -1 (unlimited) that is the entire feed.  At a
+%% terminal it looked slow; through a pipe it looked hung, because Erlang
+%% block-buffers stdout when it is not a tty, so the buffer did not even
+%% flush until the end.  rpc_stream_call also imposes a single 30s call
+%% timeout on the whole fetch, which a long feed will exceed.
+%%
+%% open_source/4 delivers frames as they arrive instead, so output starts
+%% immediately, memory stays flat, and the timeout below is per-frame
+%% (idle) rather than for the entire history.
 cmd_hist(Peer, Id, Limit) ->
     Args = [{[{<<"id">>, list_to_binary(Id)},
               {<<"limit">>, Limit},
               {<<"keys">>, true}]}],
-    case ssb_peer:rpc_stream_call(Peer, [<<"createHistoryStream">>], Args) of
-        {ok, Bodies} ->
-            lists:foreach(fun(B) -> io:format("~s~n", [B]) end, Bodies);
+    case ssb_peer:open_source(Peer, [<<"createHistoryStream">>], Args, self()) of
+        {ok, Ref} ->
+            stream_hist(Ref);
         Err ->
             io:format("Error: ~p~n", [Err])
+    end.
+
+stream_hist(Ref) ->
+    receive
+        {stream_data, Ref, Body} ->
+            io:format("~s~n", [Body]),
+            stream_hist(Ref);
+        {stream_done, Ref} ->
+            ok
+    after ?STREAM_IDLE_MS ->
+        %% stderr, so a stalled stream does not inject a non-JSON line into
+        %% a pipeline that is feeding jq
+        io:format(standard_error,
+                  "sbutt: no data for ~ps, giving up~n", [?STREAM_IDLE_MS div 1000]),
+        ok
     end.
 
 %%% Helpers ----------------------------------------------------------------
