@@ -1,0 +1,54 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Copyright (C) 2026 Charles Moid
+#
+# sbutt-console — attach an Erlang shell to the erlbutt node on this host.
+#
+#   sbutt-console
+#
+# Install:
+#   sudo install -m 0755 doc/ops/sbutt-console /usr/local/bin/sbutt-console
+#
+# Companion to `sbutt`, and it exists for the same reason: `bin/ssb` needs
+# the environment systemd gives it, and getting that wrong is worse here
+# than it looks.
+#
+# Because vm.args.src exists, EVERY bin/ssb invocation re-expands vm.args
+# from the current environment before doing anything else.  Run
+# `bin/ssb remote_console` bare and it rewrites releases/<vsn>/vm.args with
+# the `change-me-in-production` placeholder, reads that back as the cookie,
+# and fails to connect — having left the node's args file wrong on disk.
+# Sourcing the same EnvironmentFile the unit uses keeps them identical.
+#
+# Runs as the service account because the release directory is owned by
+# erlbutt and vm.args is regenerated there on every call.
+#
+# The env file is root:erlbutt 0640, so the service account reads it
+# itself — the cookie never passes through this script's arguments or
+# environment, where the process list would expose it.
+set -eu
+
+# Refresh the sudo timestamp as its own step, before the console takes over
+# the terminal, so the password prompt cannot be confused with the shell
+# failing to attach.
+sudo -v -p "sbutt-console: sudo password for %p: " || exit 1
+
+# The one that costs you a pub.  `q().` is evaluated on the REMOTE node —
+# it is init:stop() and it shuts the thing down.  Ctrl-G q quits only the
+# local shell job; Ctrl-C twice aborts the hidden remsh node, not the pub.
+printf 'sbutt-console: leave with Ctrl-G then q. Do NOT type q(). — it stops the node.\n' >&2
+
+exec sudo -u erlbutt sh -c '
+    set -a
+    . /etc/erlbutt/env
+    set +a
+    # Defaults mirror the systemd unit and vm.args.prod.  Anything defined
+    # in /etc/erlbutt/env wins, so moving those settings out of the unit
+    # and into the env file makes this agree automatically.
+    : "${SSB_HOME:=/opt/erlbutt}"
+    : "${SSB_NODE:=ssb@127.0.0.1}"
+    : "${SSB_DIST_PORT:=9100}"
+    export SSB_HOME SSB_NODE SSB_DIST_PORT
+    exec "$SSB_HOME/bin/ssb" remote_console "$@"
+' sbutt-console "$@"

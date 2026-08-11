@@ -1,7 +1,8 @@
 # Installing erlbutt as a pub on a VPS
 
 *Operational note, August 2026. Companion files in this directory:
-`erlbutt.service` (systemd unit) and `sbutt` (CLI wrapper).*
+`erlbutt.service` (systemd unit), `sbutt` (CLI wrapper) and
+`sbutt-console` (Erlang shell wrapper).*
 
 A pub's address is `net:<host>:8008~shs:<pubkey>`, and peers resolve the
 hostname at dial time. **The identity is the key, not the IP** — which is
@@ -200,7 +201,8 @@ sudo chown root:erlbutt /etc/erlbutt/env && sudo chmod 640 /etc/erlbutt/env
 ```
 sudo cp doc/ops/erlbutt.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable erlbutt
-sudo install -m 0755 doc/ops/sbutt /usr/local/bin/sbutt
+sudo install -m 0755 doc/ops/sbutt         /usr/local/bin/sbutt
+sudo install -m 0755 doc/ops/sbutt-console /usr/local/bin/sbutt-console
 ```
 
 Do **not** start it yet if you are bringing an existing identity (§6) —
@@ -316,21 +318,28 @@ inbound connections and `peer_dialer` off genuinely has nothing to say;
 silence is not a symptom.
 
 **An Erlang shell** needs no tunnel, since the node listens on loopback
-right there — but it needs the same environment systemd gives it, for the
-`vm.args` reason above:
+right there:
 
 ```
-sudo -u erlbutt env $(sudo cat /etc/erlbutt/env) \
-     SSB_NODE=ssb@127.0.0.1 SSB_DIST_PORT=9100 SSB_HOME=/opt/erlbutt \
-     /opt/erlbutt/bin/ssb remote_console
+sbutt-console
 ```
 
-Worth putting in `/usr/local/bin/ssb-console` alongside `sbutt`.
+It needs the same environment systemd gives it, which is what the wrapper
+is for. Because `vm.args.src` exists, **every** `bin/ssb` invocation
+re-expands `vm.args` from the current environment before doing anything
+else — so running `bin/ssb remote_console` by hand rewrites the file with
+the `change-me-in-production` placeholder, reads that back as the cookie,
+fails to connect, and leaves the node's args wrong on disk. The wrapper
+sources the same `EnvironmentFile` the unit does, as the `erlbutt` user, so
+the cookie never appears in a process listing.
 
 **Do not type `q().` in that shell.** It evaluates on the far side —
 `init:stop()` — and takes the pub down. Leave with `Ctrl-G` then `q`, which
 quits only the local shell job. `Ctrl-C` twice is also safe (it aborts the
 hidden remsh node, not the pub), but `Ctrl-G q` is the habit worth having.
+`sbutt-console` prints that reminder every time it attaches, because the
+cost of forgetting is a stopped pub and the cost of the reminder is a line
+of output.
 
 **maxbutt from a workstation** goes over an SSH tunnel:
 
