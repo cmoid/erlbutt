@@ -16,7 +16,7 @@ The message content can store other application specific data as well, .eg. conv
 Persistence
 -----------
 
-A key difference from the original `SSB` persistence is to store each feed's data separately, rather than one large log file. The idea is something like a log manager rather than a database. In erlbutt each feed maps to an erlang `gen_server`, which is responsible for fetching and storing the messages of that feed. Most OSes now support quite a few file handles open in memory, so erlbutt can support a few thousand `gen_server` objects, each managing a file or two. It would seem such a thing might run pretty slowly but experience shows it is fast enough. The assumption that drives this design is that dunbar's number limits the number of feeds a given user will care about at any point in time. On top of that a user may only wish to see the profile or access a couple of posts in a feed.
+A key difference between erlbutt and the original `SSB` persistence is to store each feed's data separately, rather than one large log file. The idea is something like a log manager rather than a database. In erlbutt each feed maps to an erlang `gen_server`, which is responsible for fetching and storing the messages of that feed. Most OSes now support quite a few file handles open in memory, so erlbutt can support a few thousand `gen_server` objects, each managing a file or two. It would seem such a thing might run pretty slowly but experience shows it is fast enough. The assumption that drives this design is that dunbar's number limits the number of feeds a given user will care about at any point in time. On top of that a user may only wish to see the profile or access a couple of posts in a feed.
 
 ### Two kinds of state
 
@@ -25,8 +25,6 @@ The organising idea is that a node holds exactly two kinds of state, and they wa
 **Truth** is the signed messages and the blobs. It is immutable, append-only and self-verifying: its integrity comes from the signature chain, not from any storage engine. It needs almost nothing from a database — don't lose bytes, don't reorder within a feed — and it needs to stay in SSB's own format, because that is what keeps erlbutt interoperable with the rest of the network. So it lives in flat files.
 
 **Derivation** is everything else: every index, graph, cache and checkpoint. All of it is reconstructable by refolding the logs, so durability is an optimisation rather than a correctness property, but it is mutable, random-access and query-shaped. So it lives in an embedded SQL store.
-
-Nearly every awkwardness in an SSB implementation comes from mixing these two up — from storing an index as a log because logs were what the system already had.
 
 ### The truth tier
 

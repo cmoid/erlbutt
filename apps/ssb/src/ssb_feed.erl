@@ -2,7 +2,7 @@
 %%
 %% Copyright (C) 2023 Charles Moid
 %%
-%% Per-feed gen_server.  Each SSB author gets one instance, managed by
+%% Per-feed gen_server.  Each SSB feed gets one instance, managed by
 %% ssb_feed_sup.  Owns one append-only file: log.offset, this feed's
 %% messages, plus the archived segments and hints beside it.
 %%
