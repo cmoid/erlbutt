@@ -5,22 +5,6 @@
 %% msg_id -> author.  The index that answers "whose feed is this message
 %% in", which every read by message id needs before it can open a feed.
 %%
-%% It lives in ssb_store (doc/persistence.md).  It was an ETS table with
-%% an ets:tab2file snapshot every 60 seconds, and that snapshot is the
-%% thing this port is about: its cost is O(total messages), not O(what
-%% changed, so a node holding a few million messages rewrote hundreds of
-%% megabytes a minute, forever, to persist a handful of new rows.  The
-%% whole table also had to fit in memory.
-%%
-%% The trade is real and worth stating: a point lookup went from about
-%% 1 us in ETS to about 5 us here, and roughly none of that difference is
-%% statement preparation — it is the NIF round trip, so a statement cache
-%% would not recover it.  It is judged acceptable because essentially
-%% every caller follows the lookup with ssb_feed:fetch_msg/2, which opens
-%% and reads a file; 5 us in front of that is noise.  If a caller ever
-%% appears that resolves ids in a tight loop without reading messages, an
-%% ETS cache in front of this is the answer, and should be added with
-%% that caller as the evidence.
 -module(mess_auth).
 
 -compile({no_auto_import,[put/2, get/1]}).

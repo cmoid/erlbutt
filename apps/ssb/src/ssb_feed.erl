@@ -6,22 +6,6 @@
 %% ssb_feed_sup.  Owns one append-only file: log.offset, this feed's
 %% messages, plus the archived segments and hints beside it.
 %%
-%% It used to own three more, all of them indexes wearing a log's clothes
-%% (doc/persistence.md §3):
-%%
-%%   profile     every `about` message, duplicated
-%%   contacts    every `contact` message, duplicated
-%%   references  tangle arcs, written into the TARGET author's directory
-%%
-%% profile and contacts fed a lazy loader that went away when the follow
-%% graph became an ssb_view; they were being written on every store and
-%% read by nobody.  references was a tangle-shaped index maintained by
-%% the foundation — the layering error §5 describes — and is now the
-%% ssb_links core view, which records references by shape and knows no
-%% message type at all.
-%%
-%% Stale profile/contacts/references files in existing feed directories
-%% are inert: nothing globs them, and they can be removed at leisure.
 -module(ssb_feed).
 
 -ifdef(TEST).
