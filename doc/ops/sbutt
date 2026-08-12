@@ -40,6 +40,13 @@
 # environment, where the process list would expose it.
 set -eu
 
+# Refresh the sudo timestamp FIRST, as its own step.  Otherwise the password
+# prompt lands in the middle of a pipeline — `sbutt hist ... | jq .` starts
+# jq immediately, which blocks reading an empty pipe while sudo waits on the
+# tty, and the whole thing reads as a hang rather than a prompt.  Doing it
+# here means the prompt appears before any data moves, clearly labelled.
+sudo -v -p "sbutt: sudo password for %p: " || exit 1
+
 exec sudo -u erlbutt sh -c '
     set -a
     . /etc/erlbutt/env
