@@ -610,6 +610,9 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"invite", ~"create"],
                              args = [Host, Port]}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     {ok, Code} = invite:create(binary_to_list(Host), Port),
+    %% The address only.  Code carries the seed that redeems it, so it is
+    %% the one part of an invite that must never reach the log.
+    ?SSB_INFO("invite.create: issued an invite for ~s:~p~n", [Host, Port]),
     Body = iolist_to_binary(message:ssb_encoder({[{~"invite", Code}]},
                               fun message:ssb_encoder/3, [])),
     Flags  = create_flags(0, 0, 2),   %% async reply: stream=0
@@ -633,6 +636,8 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [~"invite", ~"use"],
                     ?SSB_INFO("ROOMDBG invite.use granted room membership to ~p~n", [FeedId]),
                     ok = room_store:add_member(FeedId);
                 false ->
+                    ?SSB_INFO("invite.use: ~p redeemed an invite; following"
+                              " them back as a pub~n", [FeedId]),
                     OurId   = keys:pub_key_disp(),
                     FeedPid = utils:find_or_create_feed_pid(OurId),
                     FollowContent = {[{~"type",      ~"contact"},
@@ -649,7 +654,10 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [~"invite", ~"use"],
             Flags  = create_flags(0, 0, 2),
             Header = create_header(Flags, size(TrueBody), -ReqNo),
             utils:send_data(utils:combine(Header, TrueBody), Socket, Nonce, SecretBoxKey);
-        {error, _} ->
+        {error, Reason} ->
+            %% invite_store has already logged which invite was refused;
+            %% this says who was turned away, which it cannot see.
+            ?SSB_INFO("invite.use: refused ~p (~p)~n", [FeedId, Reason]),
             ErrMsg = utils:error_msg(~"Error", ~"invalid or expired invite"),
             Flags  = create_flags(0, 1, 2),
             Header = create_header(Flags, size(ErrMsg), -ReqNo),

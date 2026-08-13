@@ -11,9 +11,18 @@
 %% restart between issuing a code and its being redeemed must not silently
 %% invalidate it.  The table is small and changes only when an invite is
 %% issued or consumed, so it is written out on every mutation.
+%%
+%% Every mutation is logged with the resulting count.  An invite is a
+%% standing offer to a stranger, and "how many are outstanding, and which
+%% one did that peer use" is not answerable after the fact from anything
+%% else the node writes down — the table records what is still valid, not
+%% what happened to it.  The invite's public key identifies it; the seed
+%% it was derived from is the redeemable secret and is never logged.
 -module(invite_store).
 
 -behaviour(gen_server).
+
+-include_lib("ssb/include/ssb.hrl").
 
 -export([start_link/0, store/1, is_invite/1, validate_and_consume/1, list/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -54,6 +63,8 @@ init([]) ->
 handle_call({store, InvPk}, _From, #state{invites = Invites} = State) ->
     ets:insert(Invites, {InvPk, valid}),
     persist(State),
+    ?SSB_INFO("invite_store: issued invite ~s (~p outstanding)~n",
+              [disp(InvPk), count(Invites)]),
     {reply, ok, State};
 
 handle_call({is_invite, InvPk}, _From, #state{invites = Invites} = State) ->
@@ -64,8 +75,15 @@ handle_call({validate_and_consume, InvPk}, _From, #state{invites = Invites} = St
         [{InvPk, valid}] ->
             ets:delete(Invites, InvPk),
             persist(State),
+            ?SSB_INFO("invite_store: redeemed invite ~s (~p outstanding)~n",
+                      [disp(InvPk), count(Invites)]),
             ok;
         _ ->
+            %% Worth a line even though it is the expected answer to a
+            %% replayed or guessed code: on a public pub it is the only
+            %% sign that someone is trying codes that were never valid.
+            ?SSB_INFO("invite_store: rejected unknown or spent invite ~s"
+                      " (~p outstanding)~n", [disp(InvPk), count(Invites)]),
             {error, invalid}
     end,
     {reply, Result, State};
@@ -90,6 +108,19 @@ code_change(_OldVsn, State, _Extra) ->
 
 persist(#state{invites = Invites, file = File}) ->
     ets:tab2file(Invites, File).
+
+count(Invites) ->
+    ets:info(Invites, size).
+
+%% The invite's public key, in the @…​.ed25519 form it takes on the wire as
+%% the redeeming client's handshake identity.  Guarded because a malformed
+%% key must not turn a log line into a crash in the store.
+disp(InvPk) when is_binary(InvPk) ->
+    try utils:display_pub(base64:encode(InvPk))
+    catch _:_ -> <<"?">>
+    end;
+disp(_) ->
+    <<"?">>.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").

@@ -14,6 +14,8 @@
 %%   5. Post a contact (follow) message and a pub-address message to our feed.
 -module(invite).
 
+-include_lib("ssb/include/ssb.hrl").
+
 -compile({no_auto_import,[size/1]}).
 -import(utils, [combine/2, size/1, send_data/4]).
 
@@ -55,6 +57,10 @@ validate_and_consume(ClientPk) ->
 redeem(Code) ->
     {Host, Port, PubKey, Seed} = parse(Code),
     #{public := InvPk, secret := InvSk} = enacl:sign_seed_keypair(Seed),
+    %% Host, port and the pub's identity — never Code or Seed, either of
+    %% which is enough for anyone reading the log to redeem this invite.
+    ?SSB_INFO("invite: redeeming an invite to ~s:~p (~s)~n",
+              [Host, Port, utils:display_pub(base64:encode(PubKey))]),
     Socket = connect(Host, Port),
     {ok, {Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce}} =
         shs:client_shake_hands(Socket, PubKey, {InvPk, InvSk}),
@@ -80,6 +86,8 @@ redeem(Code) ->
     post_pub(list_to_binary(Host), Port, PubId),
 
     gen_tcp:close(Socket),
+    ?SSB_INFO("invite: redeemed ~s:~p; now following ~s~n",
+              [Host, Port, PubId]),
     {ok, FollowMsg}.
 
 %%%===================================================================
