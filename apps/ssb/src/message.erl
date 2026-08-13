@@ -292,6 +292,20 @@ ssb_encoder1({Key, Val}, Encoder, Options, Ind) ->
             [ssb_encoder1(Key, Encoder, Options, Ind), ~":", ssb_encoder1(Val, Encoder, Options, Ind), <<",">>]
     end;
 
+%% Strings are encoded here rather than by OTP's json module, which escapes
+%% control characters with UPPERCASE hex (\u001A) where JavaScript's
+%% JSON.stringify uses lowercase (\u001a).  Both are valid JSON and both
+%% decode to the same string — but SSB signs and hashes the bytes of the
+%% canonical encoding, so one byte of case difference makes a genuine
+%% message fail its own signature check and hash to the wrong id.
+%%
+%% Exactly nine codepoints in the BMP differ: the control characters whose
+%% escape contains a hex letter — U+000B, U+000E, U+000F, and U+001A
+%% through U+001F.  Everything else agrees, non-ASCII is not escaped by
+%% either, and astral characters pass through as UTF-8 on both sides.
+ssb_encoder1(Bin, Encoder, _Options, _Ind) when is_binary(Bin) ->
+    encode_string(Bin, Encoder);
+
 ssb_encoder1(Other, Encoder, Options, _Ind) ->
     GoodAtom = is_atom(Other) andalso ((Other == null)
                                        orelse
@@ -303,11 +317,41 @@ ssb_encoder1(Other, Encoder, Options, _Ind) ->
             json:encode_value(null, Encoder);
        true ->
             if is_atom(Other) andalso (not GoodAtom) ->
-                    json:encode_value(atom_to_binary(Other), Encoder);
+                    encode_string(atom_to_binary(Other), Encoder);
                true ->
                     json:encode_value(Other, Encoder)
             end
     end.
+
+%% Invalid UTF-8 is handed back to json:encode_value so it raises exactly
+%% the error it always did.  That symmetry is load-bearing: encode and
+%% decode reject the same bytes, which is what makes a stored message that
+%% cannot be re-encoded unreachable rather than silently corrupt.
+encode_string(Bin, Encoder) ->
+    case unicode:characters_to_binary(Bin, utf8, utf8) of
+        Valid when is_binary(Valid) -> [$", escape(Valid, <<>>), $"];
+        _NotUtf8                    -> json:encode_value(Bin, Encoder)
+    end.
+
+%% Byte-wise is correct here precisely because non-ASCII is never escaped:
+%% every byte of a multi-byte UTF-8 sequence is >= 16#80 and falls to the
+%% last clause untouched.
+escape(<<>>, Acc) ->
+    Acc;
+escape(<<$", Rest/binary>>, Acc)  -> escape(Rest, <<Acc/binary, "\\\"">>);
+escape(<<$\\, Rest/binary>>, Acc) -> escape(Rest, <<Acc/binary, "\\\\">>);
+escape(<<8,  Rest/binary>>, Acc)  -> escape(Rest, <<Acc/binary, "\\b">>);
+escape(<<9,  Rest/binary>>, Acc)  -> escape(Rest, <<Acc/binary, "\\t">>);
+escape(<<10, Rest/binary>>, Acc)  -> escape(Rest, <<Acc/binary, "\\n">>);
+escape(<<12, Rest/binary>>, Acc)  -> escape(Rest, <<Acc/binary, "\\f">>);
+escape(<<13, Rest/binary>>, Acc)  -> escape(Rest, <<Acc/binary, "\\r">>);
+escape(<<C,  Rest/binary>>, Acc) when C < 16#20 ->
+    escape(Rest, <<Acc/binary, "\\u00", (hex(C bsr 4)), (hex(C band 15))>>);
+escape(<<C,  Rest/binary>>, Acc) ->
+    escape(Rest, <<Acc/binary, C>>).
+
+hex(N) when N < 10 -> $0 + N;
+hex(N)             -> $a + N - 10.
 
 
 -ifdef(TEST).
@@ -335,6 +379,61 @@ bad_msg_test() ->
     F = Cwd ++ "/testdata/" ++ "bad.full",
     {ok, FilBin} = file:read_file(F),
     ?assert(FilBin == encode(decode(FilBin, true))).
+
+%% Control characters escape with LOWERCASE hex, as JSON.stringify does.
+%%
+%% OTP's json module uppercases them, and for the nine codepoints whose
+%% escape contains a hex letter that is a one-byte difference in the
+%% canonical form SSB signs and hashes over.  Every other control
+%% character escapes to digits only, or to a short form, and agrees.
+control_char_escaping_test() ->
+    Enc = fun(CP) ->
+                  iolist_to_binary(
+                    ssb_encoder(unicode:characters_to_binary([CP], utf8),
+                                fun ssb_encoder/3, [use_nil]))
+          end,
+    %% the nine that used to differ
+    [?assertEqual(Expect, Enc(CP))
+     || {CP, Expect} <- [{16#0B, ~"\"\\u000b\""}, {16#0E, ~"\"\\u000e\""},
+                         {16#0F, ~"\"\\u000f\""}, {16#1A, ~"\"\\u001a\""},
+                         {16#1B, ~"\"\\u001b\""}, {16#1C, ~"\"\\u001c\""},
+                         {16#1D, ~"\"\\u001d\""}, {16#1E, ~"\"\\u001e\""},
+                         {16#1F, ~"\"\\u001f\""}]],
+    %% short forms and the digit-only escapes are unchanged
+    [?assertEqual(Expect, Enc(CP))
+     || {CP, Expect} <- [{16#08, ~"\"\\b\""}, {16#09, ~"\"\\t\""},
+                         {16#0A, ~"\"\\n\""}, {16#0C, ~"\"\\f\""},
+                         {16#0D, ~"\"\\r\""}, {16#00, ~"\"\\u0000\""},
+                         {16#01, ~"\"\\u0001\""}, {16#19, ~"\"\\u0019\""}]],
+    %% quote and backslash, and non-ASCII left alone (never \u-escaped)
+    ?assertEqual(~"\"\\\"\"", Enc($")),
+    ?assertEqual(~"\"\\\\\"", Enc($\\)),
+    ?assertEqual(~"\"\x{202F}\"", Enc(16#202F)),
+    ?assertEqual(~"\"\x{1F600}\"", Enc(16#1F600)).
+
+%% Three real messages from feed @2h32wN… that erlbutt rejected in
+%% production: genuine messages whose `vote.expression` (278, 287) or post
+%% text (320) contains U+001A.  erlbutt re-encoded it as \u001A, so the
+%% signature it checked was one byte from the one the author signed, and
+%% the id it computed was not the id every other client had.
+%%
+%% Rejection wedged the feed: 278 failed, the tail stopped at 277, and the
+%% peer re-offered it every few seconds for as long as the node ran.  Both
+%% halves are asserted here — a fix that verified the signature but still
+%% hashed the wrong id would leave the message unreachable by its own name.
+control_char_real_messages_test() ->
+    {ok, Cwd} = file:get_cwd(),
+    Cases = [{278, ~"%/nDGVqr3W8CpA8OMxjapL5I5N1HV5KO61QoQq5s3vUY=.sha256"},
+             {287, ~"%EcCR+i/sjab0OK0+yGJWp6q1hxs7UpaujJ0ELbIQXBE=.sha256"},
+             {320, ~"%nX5A/A6DuSRPRlx0Q5yjWnZ68YHnaH6p4lWqhW6m6CY=.sha256"}],
+    [begin
+         F = Cwd ++ "/testdata/ctrl_" ++ integer_to_list(Seq) ++ ".value",
+         {ok, Json} = file:read_file(F),
+         Msg = decode_value(Json, true),
+         ?assertEqual(Seq, Msg#message.sequence),
+         ?assertEqual(true, Msg#message.validated),
+         ?assertEqual(Id, Msg#message.id)
+     end || {Seq, Id} <- Cases].
 
 %% A real post (feed @ASFlv8..., seq 11) authored in a JS client whose
 %% screenshot-filename mention contains U+202F (NARROW NO-BREAK SPACE, the
