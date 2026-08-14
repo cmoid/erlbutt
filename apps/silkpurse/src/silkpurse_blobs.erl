@@ -19,8 +19,6 @@
 
 -behaviour(ssb_plugin).
 
--include_lib("ssb/include/ssb.hrl").
-
 -export([manifest/0, handle_rpc/3]).
 
 manifest() ->
