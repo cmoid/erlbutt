@@ -82,16 +82,18 @@ handle_call(list, _From, #state{attendants = Att} = State) ->
     {reply, maps:keys(Att), State};
 
 handle_call({lookup, FeedId}, _From, #state{attendants = Att} = State) ->
-    Reply = case maps:find(FeedId, Att) of
-        {ok, {Pid, _Ref}} -> {ok, Pid};
-        error             -> miss
-    end,
+    Reply = case Att of
+       #{FeedId := {Pid, _Ref}} ->
+           {ok, Pid};
+       #{} ->
+           miss
+   end,
     {reply, Reply, State};
 
 handle_call({subscribe, Pid}, _From, #state{subscribers = Subs} = State) ->
     Subs1 = case maps:is_key(Pid, Subs) of
         true  -> Subs;
-        false -> maps:put(Pid, erlang:monitor(process, Pid), Subs)
+        false -> Subs#{Pid => erlang:monitor(process, Pid)}
     end,
     {reply, ok, State#state{subscribers = Subs1}};
 
