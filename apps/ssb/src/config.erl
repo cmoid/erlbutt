@@ -84,12 +84,31 @@ network_ids() ->
     Cfg = get_config(),
     [Cfg#config.net_id | Cfg#config.extra_network_ids].
 
-archive_length() ->
-    (get_config())#config.archive_length.
-
 %% Max hops from our own feed for EBT replication (the follow horizon).
 replication_hops() ->
     (get_config())#config.replication_hops.
+
+%% After how many of our OWN messages to freeze the live log into an
+%% archive segment, or `undefined` to never do it automatically.
+%%
+%% OFF by default, because archiving is not merely a disk saving — it
+%% removes early history from what this node can serve.  Nothing folds the
+%% frozen segments out to peers (ssb_feed:foldl/3, which both EBT and
+%% createHistoryStream use, reads only the live log), so after archiving,
+%% a peer holding nothing of the feed is offered the archive genesis
+%% first.  An erlbutt peer can adopt a validation floor and carry on from
+%% there; a client that cannot floor sees a first message with a real
+%% `previous` at a sequence above 1, which ssb-validate rejects outright.
+%%
+%% Existing followers are unaffected — they are already at the boundary's
+%% predecessor, so the genesis chains for them like any other message.
+%% It is people who try to start following AFTERWARDS who cannot.
+%%
+%% So this is a deliberate act, not a default: a node that wants the
+%% boundary sets a length, and a node that wants to stay followable by
+%% anyone leaves it off.  On a pub, leave it off.
+archive_length() ->
+    (get_config())#config.archive_length.
 
 %% Whether to fetch and retain the blob behind every archive boundary we
 %% learn of, for feeds we replicate.

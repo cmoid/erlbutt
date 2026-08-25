@@ -19,7 +19,8 @@
 
 %% This network id is almost the same
 -define(DEFAULT_NETWORK_ID, base64:decode("1KHLiKZvAvjbY1ziZEHMXawbCEIM6qwjCDm3VYnaR/s=")).
--define(DEFAULT_ARCHIVE_LENGTH, 10000).
+%% Auto-archive is OFF by default; see config:archive_length/0 for why.
+-define(DEFAULT_ARCHIVE_LENGTH, undefined).
 -define(DEFAULT_REPLICATION_HOPS, 2).
 -define(DEFAULT_CACHE_CAPACITY, 1000).
 -define(DEFAULT_EBT_ENTROPY_MS,        30_000).  %% anti-entropy clock interval

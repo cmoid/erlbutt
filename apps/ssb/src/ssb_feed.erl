@@ -854,8 +854,8 @@ fetch_uncached(Key, #state{feed = Feed, msg_cache = Messages} = State) ->
     do_fetch(Key, State#state{indexed = true}).
 
 %% Index every record in the live log as MsgId -> Offset.  One pass, held
-%% in memory: the live log is bounded by config:archive_length() (10k by
-%% default), so this is a few MB, and it only runs for feeds someone
+%% in memory: the live log is bounded by config:archive_length() when one
+%% is set, so this is a few MB, and it only runs for feeds someone
 %% actually reads from — doing it in init/1 instead would put a full scan
 %% of every feed on the boot path.
 build_index(Feed, Messages) ->
