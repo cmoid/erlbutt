@@ -357,6 +357,36 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = Name}
     Header = create_header(Flags, size(TrueEnd), -ReqNo),
     utils:send_data(utils:combine(Header, TrueEnd), Socket, NewNonce, SecretBoxKey);
 
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?archives, ?boundaries]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    %% Every archive boundary we know, so a peer starting one of these
+    %% feeds can begin at the boundary instead of fetching and validating
+    %% everything below it.
+    %%
+    %% The peer VOLUNTEERS its list rather than being asked feed by feed.
+    %% Almost no feeds are archived, so per-feed asking spends a round
+    %% trip to hear "no" nearly every time — and new feeds arrive in
+    %% batches when the replication set is recomputed, so feeds x peers is
+    %% the shape of a want storm.  This is one short stream per
+    %% connection, and usually an empty one.
+    %%
+    %% Every boundary is offered, not just the newest: a receiver
+    %% deliberately prefers a LOWER boundary, keeping more history and
+    %% staying a witness for longer, so the choice belongs to it.  What
+    %% goes on the wire is the author's own signed message — the receiver
+    %% verifies that signature and never has to trust us for any of it.
+    ets:insert(Calls, {ReqNo, noop}),
+    NewNonce = lists:foldl(
+        fun(#{raw := Raw}, N) ->
+            Flags  = create_flags(1, 0, 2),
+            Header = create_header(Flags, size(Raw), -ReqNo),
+            utils:send_data(utils:combine(Header, Raw), Socket, N, SecretBoxKey)
+        end, Nonce, ssb_archives:boundaries()),
+    TrueEnd = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+    EndFlags  = create_flags(1, 1, 2),
+    EndHeader = create_header(EndFlags, size(TrueEnd), -ReqNo),
+    utils:send_data(utils:combine(EndHeader, TrueEnd), Socket, NewNonce, SecretBoxKey);
+
 proc_request(Calls, ReqNo, #ssb_rpc{name = [?gossip, ?ping],
                              args = [{_Args}]}
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->

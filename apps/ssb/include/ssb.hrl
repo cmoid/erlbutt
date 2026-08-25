@@ -45,6 +45,8 @@
 -define(blobs, <<"blobs">>).
 -define(ebt, <<"ebt">>).
 -define(tunnel, <<"tunnel">>).
+-define(archives, <<"archives">>).
+-define(boundaries, <<"boundaries">>).
 -define(isRoom, <<"isRoom">>).
 -define(room, <<"room">>).
 -define(metadata, <<"metadata">>).

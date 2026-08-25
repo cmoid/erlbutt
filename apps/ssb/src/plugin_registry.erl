@@ -63,6 +63,10 @@
          {[?blobs, ?blobspush],         async,  owner},
          {[?blobs, ?createwants],       source, anyone},
          {[?ebt, ~"replicate"],         duplex, anyone},
+         %% Replication surface: a peer needs the boundary list before it
+         %% can decide where to start a feed, and every message it gets
+         %% back is signed by that feed's own author.
+         {[?archives, ?boundaries],     source, anyone},
          {[?tunnel, ?isRoom],           sync,   anyone},
          {[?tunnel, ?connect],          duplex, room},
          {[?tunnel, ?endpoints],        source, room},

@@ -48,6 +48,7 @@ init([]) ->
             ?CHILD(ssb_social_graph, worker),
             ?CHILD(ssb_feed_meta, worker),
             ?CHILD(ssb_links, worker),
+            ?CHILD(ssb_archives, worker),
             ?CHILD(ebt, worker),
             ?CHILD(peer_registry, worker),
             ?CHILD(room_attendants, worker),
