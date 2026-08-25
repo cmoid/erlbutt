@@ -62,6 +62,14 @@
 
 -define(SERVER, ?MODULE).
 -define(SCHEMA_VERSION, 1).
+
+%% How often a pinning node re-checks that it still holds the blob behind
+%% every boundary it knows.  want_refs/1 already wants one when the
+%% boundary message is stored, so this sweep is for the cases that path
+%% misses: boundaries learned before pinning was switched on, and wants
+%% that aged out before any peer could answer them.
+-define(PIN_FIRST_MS, 120_000).
+-define(PIN_SWEEP_MS, 3_600_000).
 -define(DDL,
         ["CREATE TABLE IF NOT EXISTS archive_boundaries("
          "  feed      TEXT NOT NULL,"
@@ -201,6 +209,7 @@ q(Sql, Params) ->
 
 init([]) ->
     ok = ssb_store:declare(?MODULE, ?SCHEMA_VERSION, ?DDL),
+    _ = erlang:send_after(?PIN_FIRST_MS, self(), pin_sweep),
     {ok, #{}, {continue, register_view}}.
 
 handle_continue(register_view, State) ->
@@ -209,11 +218,36 @@ handle_continue(register_view, State) ->
 handle_call(_Request, _From, State) -> {reply, ok, State}.
 handle_cast(_Msg, State)            -> {noreply, State}.
 
+handle_info(pin_sweep, State) ->
+    _ = spawn(fun pin_sweep/0),
+    _ = erlang:send_after(?PIN_SWEEP_MS, self(), pin_sweep),
+    {noreply, State};
 handle_info(ensure_registered, State) -> ensure_registered(State);
 handle_info(_Info, State)             -> {noreply, State}.
 
 terminate(_Reason, _State)       -> ok.
 code_change(_Old, State, _Extra) -> {ok, State}.
+
+%% Want the blob behind every boundary we know and do not already hold.
+%%
+%% Only on a node that has opted in.  Archiving moves history out of the
+%% feed, which every peer replicates, and into a blob, which nobody is
+%% obliged to keep — and boundaries propagate faster than the blobs behind
+%% them, because a node that adopted one re-advertises it.  Somebody has
+%% to be the one that keeps them, and this is how that node says so.
+pin_sweep() ->
+    case config:pin_archives() of
+        false -> ok;
+        true  -> lists:foreach(fun pin/1, boundaries())
+    end.
+
+pin(#{blob := Blob}) when is_binary(Blob) ->
+    case blobs:has(Blob) of
+        true  -> ok;
+        false -> blob_fetcher:want(Blob)
+    end;
+pin(_) ->
+    ok.
 
 %% Keep retrying until accepted; a silent skip means boundaries quietly
 %% stop being indexed and we start offering peers nothing.

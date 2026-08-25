@@ -152,7 +152,36 @@ want(BlobId) ->
 
 %% Walk decoded message content and want every blob reference found.
 want_refs(Content) ->
-    lists:foreach(fun want/1, extract_blob_refs(Content)).
+    lists:foreach(fun want/1, wantable_refs(Content)).
+
+%% Every blob a message refers to, minus the one an archive message names.
+%%
+%% An archive's blob IS the feed's frozen history.  Wanting it because we
+%% stored the signpost that names it means downloading the whole of a
+%% feed's past the moment we learn it exists — including on a node that
+%% just adopted a validation floor for that feed in order to skip exactly
+%% those messages.  The floor would save the validation and none of the
+%% bytes.
+%%
+%% So the archive blob is opt-in: a node that means to retain history sets
+%% {pin_archives, true} and gets the old behaviour back for these blobs
+%% (see config:pin_archives/0 for why a pub should).  Any OTHER blob an
+%% archive message happens to mention is still wanted normally.
+wantable_refs({Props} = Content) when is_list(Props) ->
+    Refs = extract_blob_refs(Content),
+    case ?pgv(~"type", Props) =:= ~"archive" andalso not pinning() of
+        true  -> Refs -- [?pgv(~"archive", Props)];
+        false -> Refs
+    end;
+wantable_refs(Content) ->
+    extract_blob_refs(Content).
+
+%% Config may be absent in isolated tests; not pinning is the safe answer,
+%% since it only ever means "do not download something large by itself".
+pinning() ->
+    try config:pin_archives()
+    catch _:_ -> false
+    end.
 
 %% Called by ssb_peer once a connection is up: advertise current wants.
 peer_connected(PeerPid) ->

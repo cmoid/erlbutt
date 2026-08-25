@@ -19,6 +19,8 @@
          replication_hops/0,
          dialer_enabled/0,
          archive_floors/0,
+         pin_archives/0,
+         set_pin_archives/1,
          require_valid_sigs/0,
          set_require_valid_sigs/1,
          blob_scan_enabled/0,
@@ -46,6 +48,7 @@
                  replication_hops = ?DEFAULT_REPLICATION_HOPS,
                  dialer = true,
                  archive_floors = true,
+                 pin_archives = false,
                  blob_scan = false,
                  %% Reject peer messages whose signature does not verify.
                  %% Off by default: a node runs in log-and-count mode first
@@ -87,6 +90,26 @@ archive_length() ->
 %% Max hops from our own feed for EBT replication (the follow horizon).
 replication_hops() ->
     (get_config())#config.replication_hops.
+
+%% Whether to fetch and retain the blob behind every archive boundary we
+%% learn of, for feeds we replicate.
+%%
+%% OFF by default, and the default is the important half: an archive blob
+%% holds the feed's own frozen history, so wanting it automatically
+%% downloads the very messages a reader is meant to CHOOSE to fetch — and
+%% downloads them even on a node that adopted a floor precisely to skip
+%% them.  Fetching history is a decision, not a side effect of storing a
+%% signpost.
+%%
+%% ON for a pub, and it matters more than it looks.  Archiving moves
+%% history OUT of the feed, which every peer replicates, and INTO a blob,
+%% which nobody is obliged to keep.  Boundaries propagate — a node that
+%% adopted one re-advertises it — so without somebody retaining the blobs,
+%% a feed's early history becomes unreachable while a signed commitment
+%% goes on pointing at it.  Set {pin_archives, true}. on a node with the
+%% disk to be that somebody.
+pin_archives() ->
+    (get_config())#config.pin_archives.
 
 %% Whether to adopt a validation floor when a peer offers an archive
 %% boundary for a feed we hold nothing of.  On by default — skipping
@@ -133,6 +156,11 @@ add_network_id(NetId) when is_binary(NetId) ->
 set_require_valid_sigs(Bool) when is_boolean(Bool) ->
     gen_server:call(?MODULE, {set_require_valid_sigs, Bool}, infinity).
 
+%% Turn pinning on or off on a running node — a pub deciding to start
+%% retaining archive history should not need a restart to do it.
+set_pin_archives(Bool) when is_boolean(Bool) ->
+    gen_server:call(?MODULE, {set_pin_archives, Bool}, infinity).
+
 set_archive_length(undefined) ->
     gen_server:call(?MODULE, {set_archive_length, undefined}, infinity);
 set_archive_length(Len) when is_integer(Len), Len > 0 ->
@@ -176,6 +204,8 @@ handle_call({add_network_id, NetId}, _From, #config{extra_network_ids = Extras}=
 handle_call({set_require_valid_sigs, Bool}, _From, Cfg) ->
     {reply, ok, publish(Cfg#config{require_valid_sigs = Bool})};
 
+handle_call({set_pin_archives, Bool}, _From, Cfg) ->
+    {reply, ok, publish(Cfg#config{pin_archives = Bool})};
 handle_call({set_archive_length, Len}, _From, Cfg) ->
     {reply, ok, publish(Cfg#config{archive_length = Len})}.
 
@@ -242,6 +272,8 @@ parse({require_valid_sigs, Bool}, Cfg) when is_boolean(Bool) ->
 parse({replication_hops, Hops}, Cfg) when is_integer(Hops), Hops >= 0 ->
     Cfg#config{replication_hops = Hops};
 
+parse({pin_archives, Bool}, Cfg) when is_boolean(Bool) ->
+    Cfg#config{pin_archives = Bool};
 parse({archive_floors, Bool}, Cfg) when is_boolean(Bool) ->
     Cfg#config{archive_floors = Bool};
 parse({peer_dialer, Bool}, Cfg) when is_boolean(Bool) ->
