@@ -958,6 +958,15 @@ feed_test_() ->
       fun archive_genesis_continues_chain_test/1,
       fun archive_blob_joins_at_the_seam_test/1,
       fun archive_reports_size_and_range_test/1,
+      fun floor_records_real_archive_genesis_test/1,
+      fun seed_floor_accepts_genesis_test/1,
+      fun seed_floor_refuses_non_empty_test/1,
+      fun seed_floor_refuses_null_previous_test/1,
+      fun seed_floor_refuses_unverified_test/1,
+      fun archive_boundary_test/1,
+      fun floor_survives_restart_test/1,
+      fun archive_typed_genesis_is_not_a_boundary_test/1,
+      fun archive_empty_feed_is_safe_test/1,
       fun fetch_archived_msg_test/1,
       fun archive_writes_hint_test/1,
       fun live_index_survives_stale_offset_test/1,
@@ -987,13 +996,14 @@ setup() ->
     {ok, _} = ssb_store:start_link(),
     {ok, _} = mess_auth:start_link(),
     {ok, _} = blobs:start_link(),
+    {ok, _} = feed_floor:start_link(),
     FeedId = keys:pub_key_disp(),
     {ok, Pid} = ssb_feed:start_link(FeedId),
     {Pid, FeedId, Home}.
 
 teardown(ignore) ->
     [catch gen_server:stop(Name)
-     || Name <- [blobs, mess_auth, ssb_store, keys, config]],
+     || Name <- [feed_floor, blobs, mess_auth, ssb_store, keys, config]],
     ok;
 teardown({Pid, _, Home}) ->
     catch gen_server:stop(Pid),
@@ -1251,6 +1261,164 @@ archive_genesis_continues_chain_test({Pid, _, _}) ->
         ?assertEqual(PrevSeq + 1, GenesisSeq),
         ?assertNotEqual(null, GenesisPrev)
     end.
+
+%% A floor taken from a REAL archive genesis, not a hand-built one: this is
+%% what pins feed_floor against do_archive's actual content shape, so a
+%% field rename on one side cannot pass unnoticed on the other.
+floor_records_real_archive_genesis_test({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"one"),
+        ok = ssb_feed:post_content(Pid, ~"two"),
+        {ok, Blob} = ssb_feed:archive(Pid),
+        #message{sequence = GenSeq, previous = GenPrev} =
+            ssb_feed:fetch_last_msg(Pid),
+        Verified = verified_copy(ssb_feed:fetch_last_msg(Pid)),
+
+        ?assertEqual(ok, feed_floor:set(FeedId, Verified)),
+        {ok, Floor} = feed_floor:get(FeedId),
+        ?assertEqual(GenSeq,  maps:get(floor_seq, Floor)),
+        ?assertEqual(GenPrev, maps:get(prev_id, Floor)),
+        ?assertEqual(Blob,    maps:get(blob, Floor)),
+        ?assertEqual(2,       maps:get(to_seq, Floor)),
+        ?assert(is_integer(maps:get(size, Floor))),
+        ?assertEqual(~"floored", maps:get(state, Floor))
+    end.
+
+%% A feed seeded at a floor accepts the archive genesis through the ORDINARY
+%% chain check — no special case, no relaxed validation.  That is the whole
+%% design: seeding {Seq-1, previous} makes the genesis an in-chain successor.
+seed_floor_accepts_genesis_test({Pid, FeedId, _}) ->
+    fun() ->
+        Genesis = archive_genesis(FeedId, ~"%earlier=.sha256", 5),
+
+        %% Empty feed: seq 5 chains onto a message we have never seen.
+        ?assertEqual(skipped, ssb_feed:store_msg_checked(Pid, Genesis)),
+        ?assertEqual(0, ssb_feed:current_seq(Pid)),
+
+        ok = ssb_feed:seed_floor(Pid, Genesis),
+        ?assertEqual(4, ssb_feed:current_seq(Pid)),
+
+        %% Now it is simply the next message in the chain.
+        ?assertEqual(stored, ssb_feed:store_msg_checked(Pid, Genesis)),
+        ?assertEqual(5, ssb_feed:current_seq(Pid))
+    end.
+
+%% A floor is only ever adopted onto an empty feed.  Taking one over history
+%% we already hold would discard validated messages; lowering one is what
+%% fetching the archive is for, not this.
+seed_floor_refuses_non_empty_test({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"held"),
+        Genesis = archive_genesis(FeedId, ~"%earlier=.sha256", 5),
+        ?assertMatch({error, {already_holding, 1}},
+                     ssb_feed:seed_floor(Pid, Genesis))
+    end.
+
+%% A pre-Aug-2026 archive genesis (previous = null) cannot serve as a floor:
+%% there is no predecessor to seed from and no seam to join the blob at.
+seed_floor_refuses_null_previous_test({Pid, FeedId, _}) ->
+    fun() ->
+        Legacy = archive_genesis(FeedId, null, 11),
+        ?assertEqual({error, no_previous}, ssb_feed:seed_floor(Pid, Legacy)),
+        ?assertEqual(0, ssb_feed:current_seq(Pid))
+    end.
+
+%% Never take a floor from an unverified signature — the boundary is only
+%% meaningful as the author's own statement about their own feed.
+seed_floor_refuses_unverified_test({Pid, FeedId, _}) ->
+    fun() ->
+        Unverified = message:new_msg(~"%earlier=.sha256", 5,
+                                     archive_content(), {FeedId, keys:priv_key()}),
+        ?assertEqual({error, unverified}, ssb_feed:seed_floor(Pid, Unverified))
+    end.
+
+%% archive_boundary/1 answers with the newest genesis for a feed that has
+%% archived, and `none` for one that has not — the first record of the live
+%% log is the boundary, so no index is needed to serve it.
+archive_boundary_test({Pid, _, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"plain"),
+        ?assertEqual(none, ssb_feed:archive_boundary(Pid)),
+        {ok, _} = ssb_feed:archive(Pid),
+        {ok, #message{content = {Props}} = Boundary} =
+            ssb_feed:archive_boundary(Pid),
+        ?assertEqual(~"archive", proplists:get_value(~"type", Props)),
+        ?assertEqual(ssb_feed:fetch_last_msg(Pid), Boundary),
+
+        %% A second archive moves the boundary forward.
+        ok = ssb_feed:post_content(Pid, ~"after"),
+        {ok, _} = ssb_feed:archive(Pid),
+        {ok, #message{sequence = SecondSeq}} = ssb_feed:archive_boundary(Pid),
+        ?assertEqual(ssb_feed:current_seq(Pid), SecondSeq)
+    end.
+
+%% A floor must survive a restart.  Forgetting it means advertising seq 0
+%% and asking a peer for the entire history we deliberately declined —
+%% which is the cost the floor exists to avoid.
+floor_survives_restart_test({Pid, FeedId, _}) ->
+    fun() ->
+        Genesis = archive_genesis(FeedId, ~"%earlier=.sha256", 5),
+        ok = ssb_feed:seed_floor(Pid, Genesis),
+        unlink(Pid),
+        gen_server:stop(Pid),
+
+        {ok, Again} = ssb_feed:start_link(FeedId),
+        try
+            ?assertEqual(4, ssb_feed:current_seq(Again)),
+            ?assertEqual(stored, ssb_feed:store_msg_checked(Again, Genesis))
+        after
+            unlink(Again), gen_server:stop(Again)
+        end
+    end.
+
+%% A genuine genesis carries previous = null, and a feed whose very FIRST
+%% message is typed "archive" therefore looks like a boundary while being
+%% unusable as one: nothing to chain onto, and no seam to join a blob at.
+%%
+%% Two independent guards, and both are wanted.  feed_floor:set/2 refuses
+%% it because a floor at seq 1 skips nothing and seeds last_msg to null;
+%% archive_boundary/1 refuses to advertise it in the first place, so a peer
+%% is never handed a boundary it can only discover is useless.
+archive_typed_genesis_is_not_a_boundary_test({Pid, FeedId, _}) ->
+    fun() ->
+        Weird = verified_copy(message:new_msg(null, 1, archive_content(),
+                                              {FeedId, keys:priv_key()})),
+        ?assertEqual(stored, ssb_feed:store_msg_checked(Pid, Weird)),
+        ?assertEqual(none, ssb_feed:archive_boundary(Pid)),
+        ?assertEqual({error, {bad_sequence, 1}}, feed_floor:set(FeedId, Weird)),
+        ?assertEqual(none, feed_floor:get(FeedId))
+    end.
+
+%% Archiving a feed with nothing in it must report an error, not badmatch on
+%% the absent log and take the process down — a feed process is shared by
+%% every caller, so one bad call would be an outage for that feed.
+archive_empty_feed_is_safe_test({Pid, _, _}) ->
+    fun() ->
+        ?assertEqual({error, nothing_to_archive}, ssb_feed:archive(Pid)),
+        ?assert(is_process_alive(Pid)),
+        %% and the feed still works afterwards
+        ok = ssb_feed:post_content(Pid, ~"still here"),
+        ?assertMatch(#message{sequence = 1}, ssb_feed:fetch_last_msg(Pid))
+    end.
+
+archive_content() ->
+    {[{~"type",           ~"archive"},
+      {~"archive",        ~"&abc=.sha256"},
+      {~"from_sequence",  1},
+      {~"to_sequence",    4},
+      {~"size",           1234},
+      {~"from_timestamp", 1000},
+      {~"to_timestamp",   2000}]}.
+
+%% An archive genesis as it would arrive from a peer: signed by the feed's
+%% own author and decoded through the VERIFYING path, since a floor is only
+%% ever taken from a checked signature.
+archive_genesis(FeedId, Prev, Seq) ->
+    verified_copy(message:new_msg(Prev, Seq, archive_content(),
+                                  {FeedId, keys:priv_key()})).
+
+verified_copy(#message{} = Msg) ->
+    message:decode(message:encode(Msg), true).
 
 %% The archive message must describe its archive well enough for a client
 %% to offer "fetch the earlier history" WITH a price attached.  The
