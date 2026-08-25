@@ -266,7 +266,7 @@ maybe_archive(#state{last_seq = Seq} = State) ->
 archive_length() ->
     config:archive_length().
 
-do_archive(#state{id = FeedId, last_seq = LastSeq,
+do_archive(#state{id = FeedId, last_seq = LastSeq, last_msg = PrevId,
                   feed = FeedFile, msg_cache = Messages} = State) ->
     {ok, LogData} = file:read_file(FeedFile),
     %% Every indexed offset points into the live log we are about to
@@ -297,8 +297,30 @@ do_archive(#state{id = FeedId, last_seq = LastSeq,
                 {~"from_sequence", From},
                 {~"to_sequence",   LastSeq}]},
     NewSeq = LastSeq + 1,
+    %% The genesis carries its REAL predecessor, not `null`.
+    %%
+    %% It used to be published with previous = null, on the reading that
+    %% archiving starts the feed over.  That cost two things:
+    %%
+    %%   Replication.  A peer already holding 1..LastSeq applies
+    %%   chain_continues/2 to this message, which requires
+    %%   `previous =:= last_msg` — a null there is a chain break, so
+    %%   archiving a feed anyone else replicates stopped their copy dead.
+    %%   Nothing in the ingest path ever special-cased type = archive.
+    %%
+    %%   The seam.  The point of the archive is deferred validation:
+    %%   hold the recent chain now, fetch the blob later and PROVE it is
+    %%   this feed's own history.  That proof is exactly
+    %%   `id(last message in the blob) =:= previous(genesis)`.  With a
+    %%   null there is nothing to check against, and the blob can only be
+    %%   shown to be internally consistent — not to be ours.
+    %%
+    %% Keeping the real previous makes this an ordinary message that
+    %% happens to carry an unknown `type`, which every SSB client already
+    %% ignores safely.  Starting a reader partway down the feed is then a
+    %% RECEIVER-side decision, not a property of what was written.
     #message{id = NewId} = Msg =
-        message:new_msg(null, NewSeq, Content, {FeedId, keys:priv_key()}),
+        message:new_msg(PrevId, NewSeq, Content, {FeedId, keys:priv_key()}),
     State1 = store(Msg, State0#state{indexed = true}),
     {State1#state{last_msg = NewId,
                   last_seq = NewSeq}, BlobId}.
