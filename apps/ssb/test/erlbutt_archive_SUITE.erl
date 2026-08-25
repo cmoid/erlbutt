@@ -59,12 +59,20 @@ auto_archive_test(Config) ->
 
     ok = rpc:call(Node, ssb_feed, post_content, [FeedPid, ~"msg 1"]),
     ok = rpc:call(Node, ssb_feed, post_content, [FeedPid, ~"msg 2"]),
+    %% This post takes the feed to archive_length and so triggers the
+    %% auto-archive; fetch_last_msg below already returns the genesis.
     ok = rpc:call(Node, ssb_feed, post_content, [FeedPid, ~"msg 3"]),
 
     #message{sequence = GenesisSeq,
-             previous = null,
+             previous = GenesisPrev,
              content  = {ContentProps}} =
         rpc:call(Node, ssb_feed, fetch_last_msg, [FeedPid]),
+
+    %% The genesis chains onto seq 3 rather than restarting the feed.  Its
+    %% exact id is pinned in ssb_feed's archive_genesis_continues_chain_test
+    %% and its join to the blob in archive_blob_joins_at_the_seam_test; here
+    %% we can only show it is not null, since seq 3 is gone from the live log.
+    ?assertNotEqual(null, GenesisPrev),
 
     ?assert(proplists:get_value(~"type", ContentProps) =:= ~"archive"),
     BlobId = proplists:get_value(~"archive", ContentProps),
@@ -88,16 +96,21 @@ manual_archive_test(Config) ->
 
     ok = rpc:call(Node, ssb_feed, post_content, [FeedPid, ~"manual 1"]),
     ok = rpc:call(Node, ssb_feed, post_content, [FeedPid, ~"manual 2"]),
-    #message{sequence = PreSeq} = rpc:call(Node, ssb_feed, fetch_last_msg, [FeedPid]),
+    #message{sequence = PreSeq, id = PreId} =
+        rpc:call(Node, ssb_feed, fetch_last_msg, [FeedPid]),
 
     {ok, BlobId} = rpc:call(Node, ssb_feed, archive, [FeedPid]),
     ?assert(rpc:call(Node, blobs, has, [BlobId]) =:= true),
 
     #message{sequence = GenesisSeq,
-             previous = null,
+             previous = GenesisPrev,
              content  = {ContentProps}} =
         rpc:call(Node, ssb_feed, fetch_last_msg, [FeedPid]),
 
+    %% The genesis continues the chain: a peer holding 1..PreSeq applies
+    %% chain_continues/2 to it, and a null previous is a chain break that
+    %% stops their copy of the feed dead.
+    ?assertEqual(PreId, GenesisPrev),
     ?assert(GenesisSeq =:= PreSeq + 1),
     ?assert(proplists:get_value(~"type", ContentProps) =:= ~"archive"),
     ?assert(proplists:get_value(~"to_sequence", ContentProps) =:= PreSeq).
