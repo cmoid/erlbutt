@@ -18,6 +18,7 @@
          set_archive_length/1,
          replication_hops/0,
          dialer_enabled/0,
+         archive_floors/0,
          require_valid_sigs/0,
          set_require_valid_sigs/1,
          blob_scan_enabled/0,
@@ -44,6 +45,7 @@
                  archive_length = ?DEFAULT_ARCHIVE_LENGTH,
                  replication_hops = ?DEFAULT_REPLICATION_HOPS,
                  dialer = true,
+                 archive_floors = true,
                  blob_scan = false,
                  %% Reject peer messages whose signature does not verify.
                  %% Off by default: a node runs in log-and-count mode first
@@ -85,6 +87,14 @@ archive_length() ->
 %% Max hops from our own feed for EBT replication (the follow horizon).
 replication_hops() ->
     (get_config())#config.replication_hops.
+
+%% Whether to adopt a validation floor when a peer offers an archive
+%% boundary for a feed we hold nothing of.  On by default — skipping
+%% history nobody asked us to hold is the point of archiving — but it
+%% changes what we replicate, so it is switchable without a rebuild.
+%% Set {archive_floors, false}. in ssb.cfg to replicate every feed whole.
+archive_floors() ->
+    (get_config())#config.archive_floors.
 
 %% Whether peer_dialer should dial automatically at startup.
 %% Set {peer_dialer, false}. in ssb.cfg to start with dialing off.
@@ -232,6 +242,8 @@ parse({require_valid_sigs, Bool}, Cfg) when is_boolean(Bool) ->
 parse({replication_hops, Hops}, Cfg) when is_integer(Hops), Hops >= 0 ->
     Cfg#config{replication_hops = Hops};
 
+parse({archive_floors, Bool}, Cfg) when is_boolean(Bool) ->
+    Cfg#config{archive_floors = Bool};
 parse({peer_dialer, Bool}, Cfg) when is_boolean(Bool) ->
     Cfg#config{dialer = Bool};
 

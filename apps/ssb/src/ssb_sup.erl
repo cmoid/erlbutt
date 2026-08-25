@@ -51,6 +51,7 @@ init([]) ->
             ?CHILD(ssb_archives, worker),
             ?CHILD(ebt, worker),
             ?CHILD(peer_registry, worker),
+            ?CHILD(boundary_discovery, worker),
             ?CHILD(room_attendants, worker),
             ?CHILD(tunnel_endpoint, worker),
             ?CHILD(blob_fetcher, worker),
