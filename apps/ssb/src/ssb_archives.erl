@@ -223,3 +223,138 @@ ensure_registered(State) ->
         retry -> erlang:send_after(2000, self(), ensure_registered)
     end,
     {noreply, State}.
+
+-ifdef(TEST).
+
+archives_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+             [?_test(indexes_an_archive_boundary()),
+              ?_test(ignores_ordinary_messages()),
+              ?_test(ignores_unusable_boundaries()),
+              ?_test(keeps_every_boundary_of_a_feed()),
+              ?_test(newest_skips_most_lowest_skips_least()),
+              ?_test(stored_value_still_verifies()),
+              ?_test(is_a_core_view())]
+     end}.
+
+setup() ->
+    cleanup(ignore),
+    Home = filename:join("/tmp", "archives_"
+                         ++ integer_to_list(erlang:system_time(microsecond))),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    application:set_env(ssb, ssb_home, Home),
+    {ok, _} = config:start_link("no-such-cfg"),
+    {ok, _} = ssb_store:start_link(),
+    {ok, _} = keys:start_link(),
+    ok = ssb_store:declare(?MODULE, ?SCHEMA_VERSION, ?DDL),
+    Home.
+
+cleanup(Home) ->
+    [catch gen_server:stop(N) || N <- [?MODULE, keys, ssb_store, config]],
+    case Home of
+        ignore -> ok;
+        _ -> os:cmd("rm -rf " ++ Home),
+             application:unset_env(ssb, ssb_home)
+    end,
+    ok.
+
+archive_msg(Author, Seq, Prev, FromSeq, ToSeq) ->
+    #message{author = Author, sequence = Seq, previous = Prev,
+             content = {[{~"type",           ~"archive"},
+                         {~"archive",        ~"&seg.sha256"},
+                         {~"from_sequence",  FromSeq},
+                         {~"to_sequence",    ToSeq},
+                         {~"size",           4242},
+                         {~"from_timestamp", 1000},
+                         {~"to_timestamp",   2000}]}}.
+
+%% Everything a peer or a client needs is carried across, including the
+%% predecessor a floor seeds from and the size a UI quotes as the price.
+indexes_an_archive_boundary() ->
+    Id = ~"@arc1.ed25519",
+    ok = view_entry(archive_msg(Id, 101, ~"%prev=.sha256", 1, 100)),
+    {ok, B} = newest(Id),
+    ?assertEqual(101,               maps:get(seq, B)),
+    ?assertEqual(~"%prev=.sha256",  maps:get(prev_id, B)),
+    ?assertEqual(~"&seg.sha256",    maps:get(blob, B)),
+    ?assertEqual(4242,              maps:get(size, B)),
+    ?assertEqual(1,                 maps:get(from_seq, B)),
+    ?assertEqual(100,               maps:get(to_seq, B)),
+    ?assertEqual(1000,              maps:get(from_ts, B)),
+    ?assertEqual(2000,              maps:get(to_ts, B)).
+
+ignores_ordinary_messages() ->
+    Id = ~"@arc2.ed25519",
+    ok = view_entry(#message{author = Id, sequence = 2, previous = ~"%p=.sha256",
+                             content = {[{~"type", ~"post"},
+                                         {~"text", ~"hello"}]}}),
+    ?assertEqual(none, newest(Id)),
+    %% content that is not even a property list must not crash the fold
+    ok = view_entry(#message{author = Id, sequence = 3, previous = ~"%p=.sha256",
+                             content = ~"an encrypted string"}),
+    ?assertEqual(none, newest(Id)).
+
+%% A boundary a reader could not start from is not indexed at all, so it is
+%% never offered to a peer who would only have to refuse it.
+ignores_unusable_boundaries() ->
+    Nulled = ~"@arc3.ed25519",
+    ok = view_entry(archive_msg(Nulled, 101, null, 1, 100)),
+    ?assertEqual(none, newest(Nulled)),
+
+    First = ~"@arc4.ed25519",
+    ok = view_entry(archive_msg(First, 1, null, 1, 1)),
+    ?assertEqual(none, newest(First)).
+
+%% A long-lived feed archives repeatedly; every boundary is kept, because
+%% serving wants the newest and choosing a floor wants the lowest.
+keeps_every_boundary_of_a_feed() ->
+    Id = ~"@arc5.ed25519",
+    ok = view_entry(archive_msg(Id, 101,  ~"%a=.sha256", 1,   100)),
+    ok = view_entry(archive_msg(Id, 201,  ~"%b=.sha256", 101, 200)),
+    ok = view_entry(archive_msg(Id, 301,  ~"%c=.sha256", 201, 300)),
+    ?assertEqual(3, length(for_feed(Id))),
+    %% re-folding the same message is idempotent
+    ok = view_entry(archive_msg(Id, 201, ~"%b=.sha256", 101, 200)),
+    ?assertEqual(3, length(for_feed(Id))).
+
+%% The conservative choice retains the most history: a node picking a floor
+%% takes `lowest` and stays a witness to everything above it.
+newest_skips_most_lowest_skips_least() ->
+    Id = ~"@arc6.ed25519",
+    ok = view_entry(archive_msg(Id, 501, ~"%x=.sha256", 401, 500)),
+    ok = view_entry(archive_msg(Id, 901, ~"%y=.sha256", 501, 900)),
+    {ok, Newest} = newest(Id),
+    {ok, Lowest} = lowest(Id),
+    ?assertEqual(901, maps:get(seq, Newest)),
+    ?assertEqual(501, maps:get(seq, Lowest)),
+    ?assert(lists:any(fun(#{feed := F}) -> F =:= Id end, boundaries())).
+
+%% What we serve a peer is the AUTHOR's signed message, so the stored copy
+%% must survive the round trip through the view and still verify.  If it
+%% did not, a peer would reject every boundary we offered — and it would
+%% look like a replication fault rather than an encoding one.
+stored_value_still_verifies() ->
+    FeedId = keys:pub_key_disp(),
+    Signed = message:new_msg(~"%prev=.sha256", 77,
+                             {[{~"type",           ~"archive"},
+                               {~"archive",        ~"&seg.sha256"},
+                               {~"from_sequence",  1},
+                               {~"to_sequence",    76},
+                               {~"size",           99},
+                               {~"from_timestamp", 1},
+                               {~"to_timestamp",   2}]},
+                             {FeedId, keys:priv_key()}),
+    ok = view_entry(Signed),
+    {ok, #{raw := Raw}} = newest(FeedId),
+    Decoded = message:decode_value(Raw, true),
+    ?assertEqual(true,   Decoded#message.validated),
+    ?assertEqual(FeedId, Decoded#message.author),
+    ?assertEqual(77,     Decoded#message.sequence),
+    ?assertEqual(Signed#message.id, Decoded#message.id).
+
+is_a_core_view() ->
+    ?assertEqual(core, view_class()),
+    ?assertEqual(core, ssb_view:class(?MODULE)).
+
+-endif.

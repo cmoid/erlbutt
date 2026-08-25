@@ -28,7 +28,8 @@
          two_node_blob_fetch_test/1,
          two_node_auto_blob_fetch_test/1,
          two_node_rpc_permissions_test/1,
-         two_node_repl_set_event_test/1]).
+         two_node_repl_set_event_test/1,
+         two_node_archive_boundaries_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -52,7 +53,8 @@ all() ->
      two_node_blob_fetch_test,
      two_node_auto_blob_fetch_test,
      two_node_rpc_permissions_test,
-     two_node_repl_set_event_test].
+     two_node_repl_set_event_test,
+     two_node_archive_boundaries_test].
 
 init_per_suite(Config) ->
     %% peer:start/1 requires the calling node to be distributed.
@@ -453,6 +455,48 @@ two_node_rpc_permissions_test(Config) ->
     ?assertEqual(undefined, proplists:get_value(~"publish", ManProps)),
     ?assertEqual(undefined, proplists:get_value(~"createLogStream", ManProps)),
     ?assertEqual(~"source", proplists:get_value(?createhistorystream, ManProps)),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Node A archives its feed; node B asks for boundaries and gets back the
+%% author's own signed archive genesis — the message it would seed a
+%% validation floor from.  This is the discovery half of onboarding: B
+%% learns where A's feed can be started without fetching anything below it.
+two_node_archive_boundaries_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    AId      = rpc:call(NodeA, keys, pub_key_disp, []),
+    AFeedPid = rpc:call(NodeA, utils, find_or_create_feed_pid, [AId]),
+    ok = rpc:call(NodeA, config, set_archive_length, [undefined]),
+    ok = rpc:call(NodeA, ssb_feed, post_content, [AFeedPid, ~"before one"]),
+    ok = rpc:call(NodeA, ssb_feed, post_content, [AFeedPid, ~"before two"]),
+    {ok, _Blob} = rpc:call(NodeA, ssb_feed, archive, [AFeedPid]),
+    #message{id = GenId, sequence = GenSeq, previous = GenPrev} =
+        rpc:call(NodeA, ssb_feed, fetch_last_msg, [AFeedPid]),
+
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                             ["localhost", ?PORT_A, ACurvePk]),
+
+    {ok, Bodies} = rpc:call(NodeB, ssb_peer, rpc_stream_call,
+                            [PeerPid, [?archives, ?boundaries], []]),
+    ?assert(length(Bodies) >= 1),
+
+    %% B verifies the AUTHOR's signature; it never takes A's word for it.
+    Decoded = [rpc:call(NodeB, message, decode_value, [Body, true])
+               || Body <- Bodies],
+    Ours = [M || #message{author = Auth} = M <- Decoded, Auth =:= AId],
+    ?assertMatch([_ | _], Ours),
+    [#message{id = Id, sequence = Seq, previous = Prev,
+              validated = Valid, content = {Props}} | _] = Ours,
+    ?assertEqual(true,   Valid),
+    ?assertEqual(GenId,  Id),
+    ?assertEqual(GenSeq, Seq),
+    ?assertEqual(GenPrev, Prev),
+    ?assertEqual(~"archive", proplists:get_value(~"type", Props)),
+    ?assert(is_integer(proplists:get_value(~"size", Props))),
 
     rpc:call(NodeB, gen_server, stop, [PeerPid]).
 
