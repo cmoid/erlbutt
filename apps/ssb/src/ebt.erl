@@ -288,10 +288,17 @@ send_clock_ack(FeedId, Seq, OutReqNo, Socket, Nonce, Key) ->
 %% and a default 5s gen_server:call timeout here used to crash the whole
 %% connection (full DB → many busy feeds).  Skipping a momentarily busy feed just
 %% omits it from this clock; it is re-advertised on the next clock/anti-entropy.
+%%
+%% Reads the feed's sequence from its STATE, not from the last stored
+%% message.  Two reasons: it is a gen_server reply rather than a disk read
+%% per feed per clock build, and — the correctness one — a feed carrying a
+%% validation floor has a sequence but no stored messages yet.  Asking the
+%% log would report 0 for such a feed and ask the peer to send the entire
+%% history we deliberately declined to fetch.
 clock_entry_for(FeedId, Pid) ->
-    try ssb_feed:fetch_last_msg(Pid) of
-        #message{sequence = S} -> {FeedId, ebt_vc:encode_clock_int(true, true, S)};
-        _                      -> {FeedId, ebt_vc:encode_clock_int(true, true, 0)}
+    try ssb_feed:current_seq(Pid) of
+        S when is_integer(S) -> {FeedId, ebt_vc:encode_clock_int(true, true, S)};
+        _                    -> {FeedId, ebt_vc:encode_clock_int(true, true, 0)}
     catch
         _:_ ->
             ?SSB_DEBUG("EBT: skipping busy/unavailable feed in clock: ~p~n", [FeedId]),

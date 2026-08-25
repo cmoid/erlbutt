@@ -38,6 +38,9 @@ init([]) ->
             ?CHILD(room_store, worker),
             ?CHILD(conn_db, worker),
             ?CHILD(ingest_journal, worker),
+            %% Before ssb_feed_sup: a feed consults its floor during init,
+            %% and must find the table declared.
+            ?CHILD(feed_floor, worker),
             ?CHILD(ssb_feed_sup, supervisor),
             ?CHILD(view_manager, worker),
             %% core views (doc/persistence.md §5): the ssb app owns these

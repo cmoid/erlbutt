@@ -28,6 +28,9 @@
          fetch_last_msg/1,
          foldl/3,
          archive/1,
+         archive_boundary/1,
+         seed_floor/2,
+         current_seq/1,
          reset_log_slots/0]).
 
 %% gen_server callbacks
@@ -119,6 +122,30 @@ foldl(FeedPid, Fun, Acc) ->
 archive(FeedPid) ->
     gen_server:call(FeedPid, archive, infinity).
 
+%% The newest archive boundary this feed can offer a peer, or `none`.
+%%
+%% do_archive/1 deletes the live log and writes the genesis as the first
+%% record of the new one, so the first record of log.offset IS the newest
+%% archive genesis — for a feed that has ever archived.  For any other feed
+%% the first record is just its ordinary seq 1.  No index needed, one pread.
+archive_boundary(FeedPid) ->
+    gen_server:call(FeedPid, archive_boundary, infinity).
+
+%% Adopt Genesis as this feed's validation floor: hold it from that
+%% sequence on, and never fetch what lies below.
+%%
+%% The mechanism is deliberately NOT a new case in chain validation.
+%% Seeding {last_seq, last_msg} with {Seq - 1, previous(Genesis)} makes the
+%% genesis an ordinary in-chain successor, so chain_continues/2 — and every
+%% guard built on it — keeps working untouched.  A floor is a statement
+%% about where we started, not a hole in validation.
+seed_floor(FeedPid, #message{} = Genesis) ->
+    gen_server:call(FeedPid, {seed_floor, Genesis}, infinity).
+
+%% This feed's current sequence, from state rather than from disk.
+current_seq(FeedPid) ->
+    gen_server:call(FeedPid, current_seq, infinity).
+
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -137,14 +164,32 @@ init([FeedId]) ->
     end,
     {ok, check_owner_feed(State)}.
 
-handle_call(archive, _From, #state{id = Id} = State) ->
+handle_call(archive, _From, #state{id = Id, last_seq = LastSeq} = State) ->
     CanPost = Id == keys:pub_key_disp(),
-    if CanPost ->
-            {NewState, BlobId} = do_archive(State),
-            {reply, {ok, BlobId}, NewState};
+    if not CanPost ->
+            {reply, {error, not_owner}, State};
+       LastSeq =:= 0 ->
+            %% Nothing to freeze.  This used to badmatch on the absent log
+            %% and take the feed process down with it — and a feed process
+            %% is shared by every caller, so one bad archive call was an
+            %% outage for that feed (cf. do_fetch/2's note).
+            {reply, {error, nothing_to_archive}, State};
        true ->
-            {reply, {error, not_owner}, State}
+            case do_archive(State) of
+                {error, Reason}    -> {reply, {error, Reason}, State};
+                {NewState, BlobId} -> {reply, {ok, BlobId}, NewState}
+            end
     end;
+
+handle_call(archive_boundary, _From, #state{feed = FeedFile} = State) ->
+    {reply, read_archive_boundary(FeedFile), State};
+
+handle_call({seed_floor, Genesis}, _From, State) ->
+    {Reply, NewState} = do_seed_floor(Genesis, State),
+    {reply, Reply, NewState};
+
+handle_call(current_seq, _From, #state{last_seq = Seq} = State) ->
+    {reply, Seq, State};
 
 handle_call(whoami, _From, #state{id = Id} = State) ->
     {reply, Id, State};
@@ -257,8 +302,10 @@ maybe_archive(#state{last_seq = Seq} = State) ->
         undefined ->
             State;
         Len when Seq rem Len =:= 0 ->
-            {NewState, _} = do_archive(State),
-            NewState;
+            case do_archive(State) of
+                {error, _}    -> State;
+                {NewState, _} -> NewState
+            end;
         _ ->
             State
     end.
@@ -268,7 +315,15 @@ archive_length() ->
 
 do_archive(#state{id = FeedId, last_seq = LastSeq, last_msg = PrevId,
                   feed = FeedFile, msg_cache = Messages} = State) ->
-    {ok, LogData} = file:read_file(FeedFile),
+    case file:read_file(FeedFile) of
+        {ok, LogData} when byte_size(LogData) > 0 ->
+            do_archive(LogData, FeedId, LastSeq, PrevId, FeedFile, Messages,
+                       State);
+        _ ->
+            {error, nothing_to_archive}
+    end.
+
+do_archive(LogData, FeedId, LastSeq, PrevId, FeedFile, Messages, State) ->
     %% Every indexed offset points into the live log we are about to
     %% delete, and the messages themselves are moving into the segment
     %% (where the hint file addresses them).  Drop the index and mark the
@@ -338,6 +393,76 @@ do_archive(#state{id = FeedId, last_seq = LastSeq, last_msg = PrevId,
     State1 = store(Msg, State0#state{indexed = true}),
     {State1#state{last_msg = NewId,
                   last_seq = NewSeq}, BlobId}.
+
+%% Read the first record of the live log and return it if it is an archive
+%% genesis.  One pread of the length prefix, one of the record.
+read_archive_boundary(FeedFile) ->
+    case file:open(FeedFile, [read, binary, raw]) of
+        {ok, Fd} ->
+            Res = try first_record(Fd) of
+                      {ok, Raw} -> classify_boundary(Raw);
+                      none      -> none
+                  catch _:_ -> none
+                  end,
+            _ = file:close(Fd),
+            Res;
+        _ ->
+            none
+    end.
+
+first_record(Fd) ->
+    case file:pread(Fd, 0, 4) of
+        {ok, <<Len:32>>} ->
+            case file:pread(Fd, 4, Len) of
+                {ok, Raw} when byte_size(Raw) =:= Len -> {ok, Raw};
+                _                                     -> none
+            end;
+        _ ->
+            none
+    end.
+
+%% An archive-typed record is only a usable boundary if a peer could
+%% actually seed from it: it needs a predecessor to chain onto and a
+%% sequence above 1.  A feed whose very FIRST message is typed "archive"
+%% satisfies neither — feed_floor:set/2 refuses it — so do not offer it
+%% and make a peer discover that for themselves.
+classify_boundary(Raw) ->
+    case message:decode(Raw, false) of
+        #message{} = Msg -> boundary_if_usable(Msg);
+        _                -> none
+    end.
+
+boundary_if_usable(#message{sequence = Seq, previous = Prev,
+                            content = {Props}} = Msg) when Seq > 1 ->
+    IsArchive = proplists:get_value(~"type", Props) =:= ~"archive",
+    case IsArchive andalso not message:is_null_ref(Prev) of
+        true  -> {ok, Msg};
+        false -> none
+    end;
+boundary_if_usable(_) ->
+    none.
+
+%% Seed the feed at a floor.  Only ever onto an EMPTY feed: raising a floor
+%% over history we already hold would be discarding validated messages, and
+%% lowering one is what fetching the archive is for.
+do_seed_floor(_Genesis, #state{last_seq = LastSeq} = State) when LastSeq > 0 ->
+    {{error, {already_holding, LastSeq}}, State};
+do_seed_floor(#message{author = Author}, #state{id = Id} = State)
+  when Author =/= Id ->
+    {{error, {wrong_author, Author}}, State};
+do_seed_floor(#message{sequence = Seq, previous = Prev} = Genesis,
+              #state{id = FeedId} = State) ->
+    case feed_floor:set(FeedId, Genesis) of
+        {error, Reason} ->
+            {{error, Reason}, State};
+        ok ->
+            ?SSB_INFO("feed ~s: floor at seq ~p (skipping 1..~p)",
+                      [FeedId, Seq, Seq - 1]),
+            %% The genesis itself is not stored here.  We claim to hold up
+            %% to Seq-1 so the chain check accepts it as the next message,
+            %% and it arrives by the ordinary ingest path like anything else.
+            {ok, State#state{last_seq = Seq - 1, last_msg = Prev}}
+    end.
 
 %% One pass over a raw log segment for the three things the archive
 %% message reports about it: the sequence it starts at, and the first and
@@ -473,12 +598,8 @@ chain_continues(#message{sequence = Seq, previous = Prev},
 %% Message-id equality that treats every "no previous" spelling (genesis) as
 %% equal to an empty tail, so a genuine genesis (previous = null) is accepted.
 same_ref(A, A) -> true;
-same_ref(A, B) -> is_null_ref(A) andalso is_null_ref(B).
-
-is_null_ref(null)      -> true;
-is_null_ref(nil)       -> true;
-is_null_ref(undefined) -> true;
-is_null_ref(_)         -> false.
+same_ref(A, B) ->
+    message:is_null_ref(A) andalso message:is_null_ref(B).
 
 store(#message{sequence = Seq},
       #state{last_seq = LastSeq} = State) when Seq =< LastSeq ->
@@ -644,15 +765,34 @@ check_owner_feed(#state{feed = Feed,
             %% deleted, genesis not yet stored): recover last_seq from
             %% the newest archive's content so we do not restart at 0
             %% and re-store duplicate sequences.
-            recover_from_archives(State);
+            maybe_restore_floor(recover_from_archives(State));
         done ->
-            State;
+            maybe_restore_floor(State);
         {Pos, Msg, Key} ->
             ets:insert(Messages, {Key, Pos}),
             #message{sequence = Seq} = message:decode(Msg, false),
             State#state{last_msg = Key,
                         last_seq = Seq}
     end.
+
+%% A feed with no history of its own may still have a floor: we adopted an
+%% archive boundary and have not yet received the genesis that sits on it.
+%% Without this the floor would be forgotten across a restart and the feed
+%% would advertise seq 0, asking a peer to send the whole history we
+%% deliberately declined.
+%%
+%% Only consulted when there is nothing in the log — once any message is
+%% stored, last_seq comes from the log itself and is authoritative.
+maybe_restore_floor(#state{last_seq = 0, id = FeedId} = State) ->
+    case feed_floor:get(FeedId) of
+        {ok, #{floor_seq := Seq, prev_id := Prev}} ->
+            ?SSB_INFO("feed ~s: restored floor at seq ~p", [FeedId, Seq]),
+            State#state{last_seq = Seq - 1, last_msg = Prev};
+        none ->
+            State
+    end;
+maybe_restore_floor(State) ->
+    State.
 
 recover_from_archives(#state{id = FeedId, feed = Feed} = State) ->
     Dir = filename:dirname(?b2l(Feed)),

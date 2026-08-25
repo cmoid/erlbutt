@@ -16,8 +16,22 @@
          encode_value_decrypted/2,
          encode_decrypted/2,
          ssb_encoder/3,
+         is_null_ref/1,
          new_msg/4]).
 
+
+%% Every spelling of "no reference" that reaches us: `null` from JSON,
+%% `nil` from the decoder's use_nil mode, `undefined` from an unset record
+%% field.  A genesis message's `previous` is the usual subject.
+%%
+%% It lives here, beside the decoding that produces those spellings, rather
+%% than in any one of its callers — ssb_feed compares refs with it, and
+%% feed_floor asks it of an archive genesis before taking a floor.  Two
+%% copies of the list would drift the moment a fourth spelling appears.
+is_null_ref(null)      -> true;
+is_null_ref(nil)       -> true;
+is_null_ref(undefined) -> true;
+is_null_ref(_)         -> false.
 
 new_msg(Previous, Sequence, Content, {PubKey, PrivKey}) ->
     Timestamp = current_time(),
