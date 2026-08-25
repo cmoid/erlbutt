@@ -636,6 +636,38 @@ is_blob_id_test() ->
     Bad = <<"&", (binary:copy(~"*", 44))/binary, ".sha256">>,
     ?assertNot(is_blob_id(Bad)).
 
+%% An archive's blob is the feed's own frozen history, so storing the
+%% signpost that names it must NOT pull the history down — least of all on
+%% a node that just adopted a floor to skip exactly those messages.
+%%
+%% Extraction still sees the ref; it is the WANT that is withheld, so the
+%% blob stays fetchable the moment somebody asks for it deliberately.
+archive_blob_is_not_wanted_by_default_test() ->
+    Archive = make_blob_id(~"a frozen segment"),
+    Content = {[{~"type",          ~"archive"},
+                {~"archive",       Archive},
+                {~"from_sequence", 1},
+                {~"to_sequence",   10000}]},
+    ?assertEqual([Archive], extract_blob_refs(Content)),
+    ?assertEqual([], wantable_refs(Content)).
+
+%% Any OTHER blob an archive message mentions is ordinary and still wanted;
+%% the exemption is for the segment itself, not for the message type.
+other_blobs_in_an_archive_message_are_still_wanted_test() ->
+    Archive = make_blob_id(~"the segment"),
+    Other   = make_blob_id(~"something else entirely"),
+    Content = {[{~"type",    ~"archive"},
+                {~"archive", Archive},
+                {~"note",    Other}]},
+    ?assertEqual([Other], wantable_refs(Content)).
+
+%% A message that merely mentions a blob keeps the old behaviour — the
+%% exemption must not leak into ordinary content.
+ordinary_message_refs_are_unaffected_test() ->
+    Blob = make_blob_id(~"an image"),
+    Content = {[{~"type", ~"post"}, {~"text", ~"look"}, {~"image", Blob}]},
+    ?assertEqual([Blob], wantable_refs(Content)).
+
 extract_blob_refs_test() ->
     Blob1 = make_blob_id(~"payload one"),
     Blob2 = make_blob_id(~"payload two"),
@@ -653,6 +685,31 @@ extract_blob_refs_dedup_test() ->
     ?assertEqual([Blob], extract_blob_refs(Content)),
     ?assertEqual([], extract_blob_refs({[{~"type", ~"post"}, {~"text", ~"plain"}]})),
     ?assertEqual([], extract_blob_refs(~"encrypted.box")).
+
+%% Pinning gives the old behaviour back for archive blobs, and only for
+%% them.  A node with the disk to keep other people's history says so with
+%% {pin_archives, true} — without somebody doing that, boundaries outlive
+%% the blobs they point at and early history stops being reachable.
+pinning_wants_the_archive_blob_test() ->
+    ConfigStarted = case whereis(config) of
+        undefined -> {ok, _} = config:start_link("test/ssb.cfg"), true;
+        _         -> false
+    end,
+    Archive = make_blob_id(unique_payload(~"a pinned segment")),
+    Content = {[{~"type", ~"archive"}, {~"archive", Archive}]},
+    Before = config:pin_archives(),
+    try
+        ok = config:set_pin_archives(false),
+        ?assertEqual([], wantable_refs(Content)),
+        ok = config:set_pin_archives(true),
+        ?assertEqual([Archive], wantable_refs(Content))
+    after
+        catch config:set_pin_archives(Before),
+        case ConfigStarted of
+            true -> gen_server:stop(config);
+            _    -> ok
+        end
+    end.
 
 %% want/1 tracks unknown blobs, ignores held ones, and advertises wants to
 %% peers handed to peer_connected/1.
