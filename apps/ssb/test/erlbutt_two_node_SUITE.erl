@@ -29,7 +29,8 @@
          two_node_auto_blob_fetch_test/1,
          two_node_rpc_permissions_test/1,
          two_node_repl_set_event_test/1,
-         two_node_archive_boundaries_test/1]).
+         two_node_archive_boundaries_test/1,
+         two_node_adopts_floor_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -54,7 +55,8 @@ all() ->
      two_node_auto_blob_fetch_test,
      two_node_rpc_permissions_test,
      two_node_repl_set_event_test,
-     two_node_archive_boundaries_test].
+     two_node_archive_boundaries_test,
+     two_node_adopts_floor_test].
 
 init_per_suite(Config) ->
     %% peer:start/1 requires the calling node to be distributed.
@@ -518,6 +520,95 @@ two_node_repl_set_event_test(Config) ->
     ?assert(wait_until(
               fun() -> rpc:call(NodeA, ebt, replicate_feed, [NewFeed]) end,
               20)).
+
+%% The whole onboarding path: B learns where a feed can be started and
+%% starts it there, instead of fetching everything below the boundary.
+%%
+%% The feed is a throwaway one that neither node has ever replicated, so
+%% the case does not depend on what earlier cases in this suite left
+%% behind — the nodes are shared across the suite, and B already holds
+%% A's own feed by the time this runs.
+%%
+%% It is placed at HOP TWO for B (B follows a middle feed, which follows
+%% it).  A direct follow is never floored — you are the witness of last
+%% resort for people you chose — so following it directly would exercise
+%% the exemption rather than the adoption.
+two_node_adopts_floor_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    %% A holds an archive boundary for some third feed, and can offer it.
+    {FeedId, GenSeq, PrevId} = plant_boundary(NodeA),
+    ?assert(wait_until(
+              fun() -> rpc:call(NodeA, ssb_archives, newest, [FeedId]) =/= none end,
+              20)),
+
+    %% Put that feed two hops from B.
+    Middle = via_feed(NodeB, FeedId),
+    ok = follow_feed(NodeB, Middle),
+    ok = rpc:call(NodeB, ebt, refresh_repl_set, []),
+    ?assert(wait_until(
+              fun() -> rpc:call(NodeB, ebt, replicate_feed, [FeedId]) end, 20)),
+
+    %% B holds nothing of it.
+    BFeedPid = rpc:call(NodeB, utils, find_or_create_feed_pid, [FeedId]),
+    ?assertEqual(0, rpc:call(NodeB, ssb_feed, current_seq, [BFeedPid])),
+
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                             ["localhost", ?PORT_A, ACurvePk]),
+    timer:sleep(300),
+
+    ok = rpc:call(NodeB, boundary_discovery, run_now, []),
+
+    %% B now claims everything below the boundary, so EBT will ask for the
+    %% genesis onward rather than for the whole feed — and the chain check
+    %% will accept it, because last_msg is the boundary's own predecessor.
+    ?assertEqual(GenSeq - 1,
+                 rpc:call(NodeB, ssb_feed, current_seq, [BFeedPid])),
+    {ok, Floor} = rpc:call(NodeB, feed_floor, get, [FeedId]),
+    ?assertEqual(GenSeq,  maps:get(floor_seq, Floor)),
+    ?assertEqual(PrevId,  maps:get(prev_id, Floor)),
+    ?assertEqual(4242,    maps:get(size, Floor)),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Store a signed archive genesis for a throwaway feed on Node, so Node can
+%% offer it as a boundary.  Only a feed's owner can archive, so the message
+%% is authored directly rather than produced by ssb_feed:archive/1.
+plant_boundary(Node) ->
+    #{public := Pub, secret := Priv} = enacl:sign_keypair(),
+    FeedId = <<"@", (base64:encode(Pub))/binary, ".ed25519">>,
+    PrevId = ~"%bm90aGluZyByZWFsIGhlcmUsIGp1c3QgYSBwcmV2aW91cw==.sha256",
+    Content = {[{~"type",           ~"archive"},
+                {~"archive",        ~"&cGxhbnRlZCBhcmNoaXZlIGJsb2IgaWQ=.sha256"},
+                {~"from_sequence",  1},
+                {~"to_sequence",    10},
+                {~"size",           4242},
+                {~"from_timestamp", 1000},
+                {~"to_timestamp",   2000}]},
+    Msg = rpc:call(Node, message, new_msg,
+                   [PrevId, 11, Content, {FeedId, base64:encode(Priv)}]),
+    Pid = rpc:call(Node, utils, find_or_create_feed_pid, [FeedId]),
+    stored = rpc:call(Node, ssb_feed, store_msg, [Pid, Msg]),
+    {FeedId, 11, PrevId}.
+
+%% A feed on Node that follows TargetId, so TargetId sits one hop further
+%% out than whoever follows this feed.  Signed with a throwaway key and
+%% stored directly — the point is the follow edge, not how it arrived.
+via_feed(Node, TargetId) ->
+    #{public := Pub, secret := Priv} = enacl:sign_keypair(),
+    MidId = <<"@", (base64:encode(Pub))/binary, ".ed25519">>,
+    Content = {[{~"type", ~"contact"}, {~"contact", TargetId},
+                {~"following", true}]},
+    %% new_msg base64-decodes the secret, so hand it the encoded form —
+    %% enacl returns raw bytes.
+    Msg = rpc:call(Node, message, new_msg,
+                   [null, 1, Content, {MidId, base64:encode(Priv)}]),
+    MidPid = rpc:call(Node, utils, find_or_create_feed_pid, [MidId]),
+    stored = rpc:call(Node, ssb_feed, store_msg, [MidPid, Msg]),
+    MidId.
 
 fresh_feed_id() ->
     #{public := Pub} = enacl:sign_keypair(),

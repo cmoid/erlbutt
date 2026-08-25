@@ -233,3 +233,64 @@ handle_info(_Info, State) ->
 
 terminate(_Reason, _State)       -> ok.
 code_change(_Old, State, _Extra) -> {ok, State}.
+
+-ifdef(TEST).
+
+-define(SELF,   ~"@self.ed25519").
+-define(FRIEND, ~"@friend.ed25519").
+-define(FAR,    ~"@far.ed25519").
+
+boundary(Feed, Seq) ->
+    #message{author = Feed, sequence = Seq, previous = ~"%p=.sha256",
+             validated = true,
+             content = {[{~"type", ~"archive"},
+                         {~"archive", ~"&s.sha256"}]}}.
+
+direct() -> sets:from_list([?FRIEND]).
+
+%% The conservative choice: when peers disagree, take the boundary that
+%% skips the LEAST, keeping more history and staying a witness longer.
+lowest_offer_wins_test() ->
+    Offers = [boundary(?FAR, 900), boundary(?FAR, 101), boundary(?FAR, 501)],
+    ?assertMatch({adopt, #message{sequence = 101}},
+                 decide(?FAR, Offers, ?SELF, direct(), true)),
+    %% order of arrival must not matter
+    ?assertMatch({adopt, #message{sequence = 101}},
+                 decide(?FAR, lists:reverse(Offers), ?SELF, direct(), true)).
+
+%% People you followed deliberately are people you are the witness of last
+%% resort for, so their history is never skipped.
+direct_follows_keep_their_history_test() ->
+    ?assertEqual({skip, direct_follow},
+                 decide(?FRIEND, [boundary(?FRIEND, 101)], ?SELF, direct(), true)).
+
+own_feed_is_never_floored_test() ->
+    ?assertEqual({skip, own_feed},
+                 decide(?SELF, [boundary(?SELF, 101)], ?SELF, direct(), true)).
+
+%% An offer for something outside the replication set is not a reason to
+%% start holding it.
+feeds_we_do_not_replicate_are_skipped_test() ->
+    ?assertEqual({skip, not_replicated},
+                 decide(?FAR, [boundary(?FAR, 101)], ?SELF, direct(), false)).
+
+%% A single offer is still the lowest offer.
+single_offer_is_adopted_test() ->
+    ?assertMatch({adopt, #message{sequence = 77}},
+                 decide(?FAR, [boundary(?FAR, 77)], ?SELF, direct(), true)).
+
+%% Nothing offered, nothing to do — and no crash on the empty round that
+%% is the normal case on a network where nobody archives.
+empty_round_is_a_noop_test() ->
+    ?assertEqual(ok, adopt_offers([])).
+
+%% Offers are grouped by their author, so two feeds in one round are both
+%% considered and neither shadows the other.
+grouping_keeps_feeds_apart_test() ->
+    Offers = [boundary(?FAR, 300), boundary(?FRIEND, 200), boundary(?FAR, 100)],
+    Grouped = by_feed(Offers),
+    ?assertEqual(2, maps:size(Grouped)),
+    ?assertMatch(#message{sequence = 100}, lowest(maps:get(?FAR, Grouped))),
+    ?assertMatch(#message{sequence = 200}, lowest(maps:get(?FRIEND, Grouped))).
+
+-endif.
