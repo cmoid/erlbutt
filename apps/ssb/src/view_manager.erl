@@ -57,6 +57,7 @@
          unsubscribe/1,
          notify/2,
          checkpoint/2,
+         refold_feed/1,
          views/0,
          views/1,
          info/0,
@@ -131,6 +132,25 @@ rebuild(Mod) when is_atom(Mod) ->
 ingest(#message{} = Msg) ->
     try gen_server:call(?SERVER, {ingest, Msg}, infinity)
     catch exit:{noproc, _} -> ok
+    end.
+
+%% Re-fold one feed's whole history into every registered view.
+%%
+%% For history that arrives BELOW a checkpoint, which the ordinary ingest
+%% path cannot handle: deliver/2 drops anything at or under the checkpoint
+%% it already holds, and importing an archive segment puts old sequences
+%% behind a cursor that has long since passed them.  Resetting this one
+%% feed's checkpoint and folding it again is the targeted version of a
+%% rebuild — one feed rather than the whole corpus, which is the
+%% difference between a moment and the half hour a full refold costs.
+%%
+%% Safe to run at any time: folds are idempotent per {feed, sequence}, so
+%% re-delivering messages a view already holds changes nothing.  The fold
+%% reads through feed_store's cursor, which walks archived segments before
+%% the live log, so imported history is exactly what it picks up.
+refold_feed(FeedId) when is_binary(FeedId) ->
+    try gen_server:call(?SERVER, {refold_feed, FeedId}, infinity)
+    catch exit:{noproc, _} -> {ok, 0}
     end.
 
 %% Receive {view_event, ViewMod, Event} messages for a view's changes.
@@ -257,6 +277,15 @@ handle_call(info, _From, #vm_state{views = Views} = State) ->
 %% would advance the checkpoint to this sequence, and every earlier
 %% message the fold has not reached yet would then be skipped as
 %% already-covered, leaving a permanent hole in the view.
+handle_call({refold_feed, FeedId}, _From,
+            #vm_state{views = Views, catching = Catching} = State) ->
+    Mods = [Mod || {Mod, _Class} <- Views, not maps:is_key(Mod, Catching)],
+    [ets:insert(?CKPT, {{Mod, feed, FeedId}, 0}) || Mod <- Mods],
+    N = fold_feed_into(Mods, FeedId),
+    ?SSB_INFO("view_manager: refolded ~s into ~p views (~p deliveries)",
+              [FeedId, length(Mods), N]),
+    {reply, {ok, N}, State};
+
 handle_call({ingest, Msg}, _From,
             #vm_state{views = Views, catching = Catching} = State) ->
     [deliver(Mod, Msg) || {Mod, _Class} <- Views,
@@ -512,6 +541,24 @@ deliver(Mod, #message{author = FeedId, sequence = Seq} = Msg) ->
             1;
         _ ->
             0
+    end.
+
+%% Walk one feed through feed_store's cursor (archives, then live log)
+%% and deliver every message to each of Mods.
+fold_feed_into(Mods, FeedId) ->
+    fold_cursor(feed_store:cursor_open(?b2l(utils:feed_dir(FeedId))), Mods, 0).
+
+fold_cursor(Cursor, Mods, N) ->
+    case feed_store:cursor_next(Cursor) of
+        eof ->
+            N;
+        {Bin, Next} ->
+            Delivered =
+                try message:decode(Bin, false) of
+                    #message{} = Msg -> lists:sum([deliver(M, Msg) || M <- Mods])
+                catch _:_ -> 0
+                end,
+            fold_cursor(Next, Mods, N + Delivered)
     end.
 
 publish(Mod, Events) ->
