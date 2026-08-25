@@ -787,6 +787,8 @@ feed_test_() ->
       fun no_profile_or_contacts_files_test/1,
       fun fetch_missing_msg_test/1,
       fun archive_manual_test/1,
+      fun archive_genesis_continues_chain_test/1,
+      fun archive_blob_joins_at_the_seam_test/1,
       fun fetch_archived_msg_test/1,
       fun archive_writes_hint_test/1,
       fun live_index_survives_stale_offset_test/1,
@@ -1049,14 +1051,68 @@ archive_manual_test({Pid, _, _}) ->
     fun() ->
         ok = ssb_feed:post_content(Pid, ~"x"),
         ok = ssb_feed:post_content(Pid, ~"y"),
+        #message{id = LastBefore} = ssb_feed:fetch_last_msg(Pid),
         {ok, BlobId} = ssb_feed:archive(Pid),
         ?assert(blobs:has(BlobId) =:= true),
         #message{sequence = 3,
-                 previous = null,
+                 previous = LastBefore,
                  content  = {Props}} = ssb_feed:fetch_last_msg(Pid),
         ?assert(proplists:get_value(~"type",        Props) =:= ~"archive"),
         ?assert(proplists:get_value(~"to_sequence", Props) =:= 2)
     end.
+
+%% The archive genesis must continue the chain, not restart it.
+%%
+%% It was published with previous = null, so a peer already holding
+%% 1..LastSeq saw a chain break on it and stopped accepting the feed —
+%% archiving a feed others replicated broke their copy.  The rule the
+%% genesis has to satisfy is the one store_msg_checked/2 enforces for
+%% every other message (see store_msg_checked_chain_test), so assert it
+%% directly: sequence follows, and previous is the id of the message the
+%% archive ends at.
+archive_genesis_continues_chain_test({Pid, _, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"one"),
+        ok = ssb_feed:post_content(Pid, ~"two"),
+        #message{id = PrevId, sequence = PrevSeq} = ssb_feed:fetch_last_msg(Pid),
+        {ok, _BlobId} = ssb_feed:archive(Pid),
+        #message{previous = GenesisPrev, sequence = GenesisSeq} =
+            ssb_feed:fetch_last_msg(Pid),
+        ?assertEqual(PrevId, GenesisPrev),
+        ?assertEqual(PrevSeq + 1, GenesisSeq),
+        ?assertNotEqual(null, GenesisPrev)
+    end.
+
+%% The seam: the archive blob's last message is the genesis's previous.
+%%
+%% This is what makes deferred validation sound.  A reader that skips
+%% 1..N now and fetches the blob later can PROVE the blob is this feed's
+%% own history by hashing its last record and comparing — rather than
+%% only showing the blob to be internally consistent.  A null previous
+%% threw that link away, so pin it.
+archive_blob_joins_at_the_seam_test({Pid, _, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"alpha"),
+        ok = ssb_feed:post_content(Pid, ~"omega"),
+        {ok, BlobId} = ssb_feed:archive(Pid),
+        #message{previous = GenesisPrev} = ssb_feed:fetch_last_msg(Pid),
+        {ok, Gz} = blobs:fetch(BlobId),
+        LastInBlob = last_msg_id_in_segment(zlib:gunzip(Gz)),
+        ?assertEqual(LastInBlob, GenesisPrev)
+    end.
+
+%% Walk a raw log segment and return the id of its final message.
+%% Frame is write_msg/2's: <<Len:32, Msg:Len/binary, Len:32, Next:32>>.
+%% Binding the trailing length to the same Len also checks the framing.
+last_msg_id_in_segment(Bin) ->
+    last_msg_id_in_segment(Bin, undefined).
+
+last_msg_id_in_segment(<<>>, Acc) ->
+    Acc;
+last_msg_id_in_segment(<<Len:32, Raw:Len/binary, Len:32, _Next:32, Rest/binary>>,
+                       _Acc) ->
+    #message{id = Id} = message:decode(Raw, false),
+    last_msg_id_in_segment(Rest, Id).
 
 post_after_archive_test({Pid, _, _}) ->
     fun() ->
