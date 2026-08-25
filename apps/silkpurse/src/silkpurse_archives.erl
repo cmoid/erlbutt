@@ -161,3 +161,119 @@ result(Status, FeedId, Blob, Reason) ->
 detail(undefined)            -> null;
 detail(R) when is_binary(R)  -> R;
 detail(R)                    -> ?l2b(io_lib:format("~p", [R])).
+
+-ifdef(TEST).
+
+archives_test_() ->
+    {foreach, fun setup/0, fun cleanup/1,
+     [fun history_of_an_unfloored_feed/1,
+      fun history_prices_the_archive/1,
+      fun fetch_restores_skipped_history/1,
+      fun fetch_without_a_floor_is_a_noop/1]}.
+
+setup() ->
+    cleanup(ignore),
+    Home = filename:join("/tmp", "sparch_"
+                         ++ integer_to_list(erlang:system_time(microsecond))),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    application:set_env(ssb, ssb_home, Home),
+    {ok, _} = config:start_link("no-such-cfg"),
+    {ok, _} = keys:start_link(),
+    {ok, _} = ssb_store:start_link(),
+    {ok, _} = mess_auth:start_link(),
+    {ok, _} = blobs:start_link(),
+    {ok, _} = feed_floor:start_link(),
+    ok = ssb_store:declare(ssb_archives, 1, ssb_archives_ddl()),
+    FeedId = keys:pub_key_disp(),
+    {ok, Pid} = ssb_feed:start_link(FeedId),
+    {Pid, FeedId, Home}.
+
+ssb_archives_ddl() ->
+    ["CREATE TABLE IF NOT EXISTS archive_boundaries("
+     "  feed TEXT NOT NULL, seq INTEGER NOT NULL, prev_id TEXT NOT NULL,"
+     "  blob TEXT NOT NULL, size INTEGER, from_seq INTEGER, to_seq INTEGER,"
+     "  from_ts INTEGER, to_ts INTEGER, raw BLOB NOT NULL,"
+     "  PRIMARY KEY (feed, seq)) WITHOUT ROWID;"].
+
+cleanup(ignore) ->
+    [catch gen_server:stop(N)
+     || N <- [feed_floor, blobs, mess_auth, ssb_store, keys, config]],
+    ok;
+cleanup({Pid, _, Home}) ->
+    catch gen_server:stop(Pid),
+    cleanup(ignore),
+    os:cmd("rm -rf " ++ Home),
+    application:unset_env(ssb, ssb_home),
+    ok.
+
+verified(#message{} = M) -> message:decode(message:encode(M), true).
+
+%% A feed nothing was skipped from reports floor 1, so a client knows there
+%% is nothing to offer.
+history_of_an_unfloored_feed({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"hello"),
+        {Props} = history(FeedId),
+        ?assertEqual(1, ?pgv(~"floor", Props)),
+        ?assertEqual(~"none", ?pgv(~"state", Props))
+    end.
+
+%% The whole reason size and the timestamp range are in the archive
+%% message: a client can quote the cost without fetching anything.
+history_prices_the_archive({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"one"),
+        ok = ssb_feed:post_content(Pid, ~"two"),
+        {ok, _Blob} = ssb_feed:archive(Pid),
+        Genesis = verified(ssb_feed:fetch_last_msg(Pid)),
+        ok = ssb_archives:view_entry(Genesis),
+        ok = feed_floor:set(FeedId, Genesis),
+
+        {Props} = history(FeedId),
+        ?assertEqual(3, ?pgv(~"floor", Props)),
+        [{Arc}] = ?pgv(~"archives", Props),
+        ?assert(is_integer(?pgv(~"size", Arc))),
+        ?assertEqual(1, ?pgv(~"fromSequence", Arc)),
+        ?assertEqual(2, ?pgv(~"toSequence", Arc)),
+        %% we still hold this blob, so fetching it is instant
+        ?assertEqual(true, ?pgv(~"held", Arc))
+    end.
+
+%% The paid-off floor: the segment is gone from disk, the node holds only
+%% the boundary onward, and fetching puts the history back where
+%% feed_store can find it again.
+fetch_restores_skipped_history({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"early one"),
+        #message{id = EarlyId} = ssb_feed:fetch_last_msg(Pid),
+        ok = ssb_feed:post_content(Pid, ~"early two"),
+        {ok, _} = ssb_feed:archive(Pid),
+        Genesis = verified(ssb_feed:fetch_last_msg(Pid)),
+        ok = feed_floor:set(FeedId, Genesis),
+
+        %% Stand in for a node that adopted the floor and never held the
+        %% segment: take it off disk, leaving only the blob and the
+        %% boundary that names it.
+        Dir = ?b2l(utils:feed_dir(FeedId)),
+        [Seg] = filelib:wildcard(filename:join(Dir, "log.offset.*.gz")),
+        ok = file:delete(Seg),
+        ?assertEqual(not_found, ssb_feed:fetch_msg(Pid, EarlyId)),
+
+        {Res} = fetch(FeedId),
+        ?assertEqual(~"imported", ?pgv(~"status", Res)),
+        ?assertEqual(1, ?pgv(~"floor", Res)),
+
+        %% the skipped history is readable again, and the floor is gone
+        ?assertMatch(#message{content = ~"early one"},
+                     ssb_feed:fetch_msg(Pid, EarlyId)),
+        ?assertEqual(none, feed_floor:get(FeedId))
+    end.
+
+fetch_without_a_floor_is_a_noop({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"nothing skipped"),
+        {Res} = fetch(FeedId),
+        ?assertEqual(~"nothing_to_fetch", ?pgv(~"status", Res))
+    end.
+
+-endif.

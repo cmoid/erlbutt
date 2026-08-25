@@ -126,3 +126,118 @@ install(FeedId, Gz, Raw, FromSeq, ToSeq) ->
             _  = feed_store:write_hint(Path, Raw),
             ok
     end.
+
+-ifdef(TEST).
+
+verify_test_() ->
+    {foreach, fun setup/0, fun cleanup/1,
+     [fun accepts_a_real_archive/1,
+      fun rejects_a_seam_mismatch/1,
+      fun rejects_a_broken_chain/1,
+      fun rejects_a_foreign_author/1,
+      fun install_is_idempotent/1]}.
+
+setup() ->
+    cleanup(ignore),
+    Home = filename:join("/tmp", "archverify_"
+                         ++ integer_to_list(erlang:system_time(microsecond))),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    application:set_env(ssb, ssb_home, Home),
+    {ok, _} = config:start_link("no-such-cfg"),
+    {ok, _} = keys:start_link(),
+    {ok, _} = ssb_store:start_link(),
+    {ok, _} = mess_auth:start_link(),
+    {ok, _} = blobs:start_link(),
+    FeedId = keys:pub_key_disp(),
+    {ok, Pid} = ssb_feed:start_link(FeedId),
+    {Pid, FeedId, Home}.
+
+cleanup(ignore) ->
+    [catch gen_server:stop(N)
+     || N <- [blobs, mess_auth, ssb_store, keys, config]],
+    ok;
+cleanup({Pid, _, Home}) ->
+    catch gen_server:stop(Pid),
+    cleanup(ignore),
+    os:cmd("rm -rf " ++ Home),
+    application:unset_env(ssb, ssb_home),
+    ok.
+
+%% Produce a real segment the only way one is ever produced, then read
+%% back exactly what a fetching node would have: the blob and the
+%% boundary that names it.
+archived(Pid) ->
+    ok = ssb_feed:post_content(Pid, ~"one"),
+    ok = ssb_feed:post_content(Pid, ~"two"),
+    {ok, Blob} = ssb_feed:archive(Pid),
+    #message{sequence = FloorSeq, previous = PrevId} =
+        ssb_feed:fetch_last_msg(Pid),
+    {ok, Gz} = blobs:fetch(Blob),
+    {Gz, zlib:gunzip(Gz), PrevId, FloorSeq}.
+
+%% The ordinary case: every signature checks, the chain is unbroken, and
+%% the last message hashes to the boundary's previous.
+accepts_a_real_archive({Pid, FeedId, _}) ->
+    fun() ->
+        {_Gz, Raw, PrevId, FloorSeq} = archived(Pid),
+        ?assertEqual({ok, 1, 2}, check(Raw, FeedId, PrevId, FloorSeq))
+    end.
+
+%% The seam is the whole proof that a segment is THIS feed's history and
+%% not a plausible-looking run of messages, so a wrong previous must be
+%% refused even though every message in the segment is genuine.
+rejects_a_seam_mismatch({Pid, FeedId, _}) ->
+    fun() ->
+        {_Gz, Raw, _PrevId, FloorSeq} = archived(Pid),
+        Wrong = <<"%", (binary:copy(~"A", 43))/binary, "=.sha256">>,
+        ?assertEqual({error, seam_mismatch},
+                     check(Raw, FeedId, Wrong, FloorSeq))
+    end.
+
+%% A segment whose records do not follow one another is refused before
+%% the seam is even reached.
+%%
+%% The gap has to be in the MIDDLE: dropping the first record just leaves
+%% a shorter segment that starts higher up, which is legitimate — an
+%% archive of an archive does exactly that — and check/4 accepts it.
+rejects_a_broken_chain({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"one"),
+        ok = ssb_feed:post_content(Pid, ~"two"),
+        ok = ssb_feed:post_content(Pid, ~"three"),
+        {ok, Blob} = ssb_feed:archive(Pid),
+        #message{sequence = FloorSeq, previous = PrevId} =
+            ssb_feed:fetch_last_msg(Pid),
+        {ok, Gz} = blobs:fetch(Blob),
+        [R1, _R2, R3] = frames(zlib:gunzip(Gz)),
+        ?assertMatch({error, {sequence_gap, 1, 3}},
+                     check(<<R1/binary, R3/binary>>, FeedId, PrevId, FloorSeq))
+    end.
+
+%% Split a segment back into whole frames, so a test can drop one.
+frames(<<>>) ->
+    [];
+frames(<<Len:32, Msg:Len/binary, Len:32, Next:32, Rest/binary>>) ->
+    [<<Len:32, Msg/binary, Len:32, Next:32>> | frames(Rest)].
+
+rejects_a_foreign_author({Pid, _FeedId, _}) ->
+    fun() ->
+        {_Gz, Raw, PrevId, FloorSeq} = archived(Pid),
+        Other = ~"@somebodyelse.ed25519",
+        ?assertMatch({error, {wrong_author, _}},
+                     check(Raw, Other, PrevId, FloorSeq))
+    end.
+
+%% Importing twice must not error or duplicate the segment — a client that
+%% retries a fetch should land in the same place.
+install_is_idempotent({Pid, FeedId, _}) ->
+    fun() ->
+        {Gz, Raw, _PrevId, _FloorSeq} = archived(Pid),
+        ok = install(FeedId, Gz, Raw, 1, 2),
+        ok = install(FeedId, Gz, Raw, 1, 2),
+        Dir = ?b2l(utils:feed_dir(FeedId)),
+        ?assertEqual(1, length(filelib:wildcard(
+                                 filename:join(Dir, "log.offset.1-2.gz"))))
+    end.
+
+-endif.
