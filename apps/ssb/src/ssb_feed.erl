@@ -279,7 +279,7 @@ do_archive(#state{id = FeedId, last_seq = LastSeq, last_msg = PrevId,
     %% of the live log.  (A tracked segment_start used to be guessed at
     %% restart and produced archives whose filenames lied about their
     %% ranges — content cannot.)
-    From = first_seq(LogData),
+    {From, FromTs, ToTs} = segment_bounds(LogData),
     GzData = zlib:gzip(LogData),
     ArchiveFile = archive_filename(FeedFile, From, LastSeq),
     ok = file:write_file(ArchiveFile, GzData),
@@ -292,10 +292,24 @@ do_archive(#state{id = FeedId, last_seq = LastSeq, last_msg = PrevId,
     %% would land on the unlinked inode and vanish.  Drop it so store/2
     %% below opens the new live log.
     State0 = close_log(State),
-    Content = {[{~"type",          ~"archive"},
-                {~"archive",       BlobId},
-                {~"from_sequence", From},
-                {~"to_sequence",   LastSeq}]},
+    %% Everything a reader needs to DECIDE about this archive without
+    %% fetching it.  Sequence range alone gives the message count but not
+    %% the cost, so a client offering "fetch the earlier history" could
+    %% only name a price by paying it first.
+    %%
+    %% `size` is the gzipped blob's byte count — what the fetch actually
+    %% costs on the wire.
+    %%
+    %% The timestamps are the first and last in the segment, and are
+    %% author-asserted like every SSB timestamp: fine for labelling a
+    %% range in a UI, not to be trusted for ordering or anything else.
+    Content = {[{~"type",           ~"archive"},
+                {~"archive",        BlobId},
+                {~"from_sequence",  From},
+                {~"to_sequence",    LastSeq},
+                {~"size",           byte_size(GzData)},
+                {~"from_timestamp", FromTs},
+                {~"to_timestamp",   ToTs}]},
     NewSeq = LastSeq + 1,
     %% The genesis carries its REAL predecessor, not `null`.
     %%
@@ -325,9 +339,23 @@ do_archive(#state{id = FeedId, last_seq = LastSeq, last_msg = PrevId,
     {State1#state{last_msg = NewId,
                   last_seq = NewSeq}, BlobId}.
 
-first_seq(<<Len:32, Msg:Len/binary, _/binary>>) ->
-    #message{sequence = Seq} = message:decode(Msg, false),
-    Seq.
+%% One pass over a raw log segment for the three things the archive
+%% message reports about it: the sequence it starts at, and the first and
+%% last timestamps.
+%%
+%% Frame is write_msg/2's <<Len:32, Msg:Len/binary, Len:32, Next:32>> —
+%% twelve bytes of framing, not four.  Binding the trailing length to the
+%% same Len checks the framing as it walks.  The cost of the walk is
+%% nothing beside the gzip of the same bytes.
+segment_bounds(<<Len:32, Msg:Len/binary, Len:32, _Next:32, Rest/binary>>) ->
+    #message{sequence = Seq, timestamp = Ts} = message:decode(Msg, false),
+    {Seq, Ts, last_timestamp(Rest, Ts)}.
+
+last_timestamp(<<>>, Ts) ->
+    Ts;
+last_timestamp(<<Len:32, Msg:Len/binary, Len:32, _Next:32, Rest/binary>>, _Ts) ->
+    #message{timestamp = Ts} = message:decode(Msg, false),
+    last_timestamp(Rest, Ts).
 
 archive_filename(FeedFile, From, To) ->
     <<FeedFile/binary, ".",
@@ -789,6 +817,7 @@ feed_test_() ->
       fun archive_manual_test/1,
       fun archive_genesis_continues_chain_test/1,
       fun archive_blob_joins_at_the_seam_test/1,
+      fun archive_reports_size_and_range_test/1,
       fun fetch_archived_msg_test/1,
       fun archive_writes_hint_test/1,
       fun live_index_survives_stale_offset_test/1,
@@ -1081,6 +1110,33 @@ archive_genesis_continues_chain_test({Pid, _, _}) ->
         ?assertEqual(PrevId, GenesisPrev),
         ?assertEqual(PrevSeq + 1, GenesisSeq),
         ?assertNotEqual(null, GenesisPrev)
+    end.
+
+%% The archive message must describe its archive well enough for a client
+%% to offer "fetch the earlier history" WITH a price attached.  The
+%% sequence range gives the message count; `size` gives the cost, and
+%% without it a UI could only name the price by paying it first.
+%%
+%% Pinned against the real blob and the real messages rather than against
+%% themselves: size is the stored blob's actual size, and the timestamps
+%% are the ones on the first and last archived messages.
+archive_reports_size_and_range_test({Pid, _, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"first"),
+        #message{timestamp = FirstTs} = ssb_feed:fetch_last_msg(Pid),
+        ok = ssb_feed:post_content(Pid, ~"second"),
+        #message{timestamp = LastTs} = ssb_feed:fetch_last_msg(Pid),
+        {ok, BlobId} = ssb_feed:archive(Pid),
+
+        #message{content = {Props}} = ssb_feed:fetch_last_msg(Pid),
+        ?assertEqual(1, proplists:get_value(~"from_sequence", Props)),
+        ?assertEqual(2, proplists:get_value(~"to_sequence",   Props)),
+        ?assertEqual(FirstTs, proplists:get_value(~"from_timestamp", Props)),
+        ?assertEqual(LastTs,  proplists:get_value(~"to_timestamp",   Props)),
+
+        %% size is the blob a fetcher would actually pull, not an estimate
+        {ok, Gz} = blobs:fetch(BlobId),
+        ?assertEqual(byte_size(Gz), proplists:get_value(~"size", Props))
     end.
 
 %% The seam: the archive blob's last message is the genesis's previous.

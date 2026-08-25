@@ -112,6 +112,14 @@ manual_archive_test(Config) ->
     %% stops their copy of the feed dead.
     ?assertEqual(PreId, GenesisPrev),
     ?assert(GenesisSeq =:= PreSeq + 1),
+
+    %% The archive message must carry the cost of fetching it, so a client
+    %% can offer the choice without first paying for it.  Checked against
+    %% the stored blob rather than against itself.
+    ?assertEqual({ok, proplists:get_value(~"size", ContentProps)},
+                 rpc:call(Node, blobs, size_of, [BlobId])),
+    ?assert(is_integer(proplists:get_value(~"from_timestamp", ContentProps))),
+    ?assert(is_integer(proplists:get_value(~"to_timestamp", ContentProps))),
     ?assert(proplists:get_value(~"type", ContentProps) =:= ~"archive"),
     ?assert(proplists:get_value(~"to_sequence", ContentProps) =:= PreSeq).
 
