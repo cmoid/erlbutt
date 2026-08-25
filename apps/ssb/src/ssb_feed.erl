@@ -967,6 +967,7 @@ feed_test_() ->
       fun floor_survives_restart_test/1,
       fun archive_typed_genesis_is_not_a_boundary_test/1,
       fun archive_empty_feed_is_safe_test/1,
+      fun archived_history_is_not_served_test/1,
       fun fetch_archived_msg_test/1,
       fun archive_writes_hint_test/1,
       fun live_index_survives_stale_offset_test/1,
@@ -1400,6 +1401,44 @@ archive_empty_feed_is_safe_test({Pid, _, _}) ->
         ok = ssb_feed:post_content(Pid, ~"still here"),
         ?assertMatch(#message{sequence = 1}, ssb_feed:fetch_last_msg(Pid))
     end.
+
+%% What a peer is served from an archived feed: the live log only.
+%%
+%% foldl/3 reads log.offset and nothing else, and it is what BOTH EBT
+%% (send_feed_msgs_after_ok/6) and createHistoryStream fold.  The archived
+%% segments beside it are not served — feed_store:fold_full/3 exists but
+%% has no callers.
+%%
+%% So archiving does not merely free the author's disk: it removes the
+%% early history from what anyone can replicate.  A peer holding nothing
+%% is sent the archive genesis first, which its chain check refuses,
+%% because a feed that starts at seq 1 is the only thing store_msg_checked
+%% accepts from empty.  Adopting a floor is what makes such a feed
+%% replicable at all — see feed_floor and boundary_discovery.
+archived_history_is_not_served_test({Pid, _, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"one"),
+        ok = ssb_feed:post_content(Pid, ~"two"),
+        {ok, _} = ssb_feed:archive(Pid),
+        ok = ssb_feed:post_content(Pid, ~"three"),
+        Seqs = lists:sort(
+                 ssb_feed:foldl(Pid,
+                   fun(Data, Acc) ->
+                       #message{sequence = S} = message:decode(Data, false),
+                       [S | Acc]
+                   end, [])),
+        %% seq 3 is the archive genesis, 4 the post after it; 1 and 2 are
+        %% in the segment and reachable only through the blob.
+        ?assertEqual([3, 4], Seqs),
+        %% they are still readable locally by id, via the segment
+        ?assertNotEqual(not_found,
+                        ssb_feed:fetch_msg(Pid, msg_id_at(Pid, 3)))
+    end.
+
+msg_id_at(Pid, Seq) ->
+    hd([Id || Data <- ssb_feed:foldl(Pid, fun(D, A) -> [D | A] end, []),
+              #message{id = Id, sequence = S} <- [message:decode(Data, false)],
+              S =:= Seq]).
 
 archive_content() ->
     {[{~"type",           ~"archive"},
