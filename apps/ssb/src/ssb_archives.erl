@@ -103,10 +103,29 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
-%% Every boundary we could offer a peer, newest first per feed.
+%% The boundary we can offer a peer for each feed: the NEWEST, and only
+%% the newest.
+%%
+%% Not a preference — the others are unusable.  A node serves peers from
+%% its live log alone (ssb_feed:foldl/3, which both EBT and
+%% createHistoryStream fold), and the live log begins at the newest
+%% boundary.  Everything below that is in frozen segments nobody serves.
+%%
+%% Offering an older boundary therefore invites a peer to start somewhere
+%% we cannot feed it: it floors there, asks for the next sequence, and we
+%% send the only thing we have — a message far above it, whose previous
+%% does not match, so its chain check refuses every one.  It sits stuck at
+%% a floor with no way forward and nothing in the logs but chain breaks.
+%%
+%% A receiver still takes the LOWEST of what several peers offer.  That
+%% remains the conservative choice; it just chooses between peers now,
+%% which is the disagreement it was meant for.
 boundaries() ->
-    [to_map(R) || R <- q("SELECT " ?COLS " FROM archive_boundaries"
-                         " ORDER BY feed, seq DESC", [])].
+    [to_map(R) || R <- q("SELECT " ?COLS " FROM archive_boundaries b"
+                         " WHERE b.seq = (SELECT MAX(b2.seq)"
+                         "                  FROM archive_boundaries b2"
+                         "                 WHERE b2.feed = b.feed)"
+                         " ORDER BY b.feed", [])].
 
 for_feed(FeedId) ->
     [to_map(R) || R <- q("SELECT " ?COLS " FROM archive_boundaries"
