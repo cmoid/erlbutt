@@ -821,7 +821,8 @@ vm_test_() ->
               ?_test(a_rebuild_supersedes_a_running_fold()),
               ?_test(a_turn_is_bounded_by_time()),
               ?_test(imports_the_legacy_snapshot()),
-]
+              ?_test(pause_drops_ingest_and_resume_folds_it_in()),
+              ?_test(a_pause_survives_a_manager_restart())]
      end}.
 
 %% Fully isolated home: these tests archive the own feed and rebuild
@@ -892,6 +893,60 @@ vm_store_post(FeedPid, AuthId, AuthPriv, Prev, Seq) ->
     Msg = message:new_msg(Prev, Seq, Content, {AuthId, AuthPriv}),
     _ = ssb_feed:store_msg(FeedPid, Msg),
     ssb_feed:fetch_last_msg(FeedPid).
+
+%% The bulk-load contract: while paused, storing a message updates the
+%% store but not the views; resuming folds the store and arrives at the
+%% same place ingest would have.
+pause_drops_ingest_and_resume_folds_it_in() ->
+    ok = test_counter_view:ensure_table(),
+    ok = vm_ensure_manager(),
+    ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
+    {Pid, Id, Priv} = vm_make_peer(),
+
+    {ok, _} = pause_ingest(),
+    #message{id = M1} = vm_store_post(Pid, Id, Priv, null, 1),
+    #message{}        = vm_store_post(Pid, Id, Priv, M1, 2),
+
+    %% stored, but the view has not seen them and its checkpoint has not moved
+    ?assertEqual([], test_counter_view:entries(Id)),
+    ?assertEqual(0, checkpoint(test_counter_view, Id)),
+
+    {ok, _} = resume_ingest(),
+    ok = wait_caught_up(test_counter_view),
+    ?assertEqual([1, 2], test_counter_view:entries(Id)),
+    ?assertEqual(2, checkpoint(test_counter_view, Id)),
+
+    %% and live ingest works again afterwards
+    #message{} = vm_store_post(Pid, Id, Priv, checkpoint_id(Pid), 3),
+    ?assertEqual([1, 2, 3], test_counter_view:entries(Id)).
+
+%% A pause needs no cleanup after a crash: registering a view always
+%% starts a catch-up, so the next boot folds whatever arrived while the
+%% manager was away — which is exactly what resume would have done.
+a_pause_survives_a_manager_restart() ->
+    ok = test_counter_view:ensure_table(),
+    ok = vm_ensure_manager(),
+    ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
+    {Pid, Id, Priv} = vm_make_peer(),
+
+    {ok, _} = pause_ingest(),
+    #message{id = M1} = vm_store_post(Pid, Id, Priv, null, 1),
+    #message{}        = vm_store_post(Pid, Id, Priv, M1, 2),
+    ?assertEqual([], test_counter_view:entries(Id)),
+
+    %% die without resuming
+    ok = gen_server:stop(?SERVER),
+    ok = vm_ensure_manager(),
+    ok = register_view(test_counter_view),
+    ok = wait_caught_up(test_counter_view),
+    ?assertEqual([1, 2], test_counter_view:entries(Id)).
+
+%% id of a feed's newest message, for chaining the next post onto
+checkpoint_id(FeedPid) ->
+    #message{id = Id} = ssb_feed:fetch_last_msg(FeedPid),
+    Id.
 
 ingest_and_checkpoint() ->
     ok = test_counter_view:ensure_table(),
