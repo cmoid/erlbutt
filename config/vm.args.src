@@ -21,3 +21,13 @@
 ## breaks the tunnel again; override with SSB_DIST_PORT, and forward/open
 ## both 4369 and this port (e.g. ssh -L 4369:localhost:4369 -L 9100:localhost:9100).
 -kernel inet_dist_listen_min ${SSB_DIST_PORT:-9100}
+
+## ...and a small range above it, because `bin/ssb remote_console` starts a
+## SECOND node that reads this same file.  Setting min alone pins the port
+## exactly (max defaults to min), so the remsh node tried to bind the port
+## the running node already held and died with eaddrinuse — reported as a
+## bare "Could not connect".  The node still takes SSB_DIST_PORT itself,
+## being the first free port in the range, so tunnels and firewall rules
+## are unaffected.  vm.args.prod keeps the exact pin on purpose: a box with
+## a public IP should not open a range.
+-kernel inet_dist_listen_max ${SSB_DIST_PORT_MAX:-9110}

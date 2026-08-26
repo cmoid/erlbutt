@@ -31,5 +31,11 @@
                     compress_on_rotate => true}}}
     ]}]},
  {ssb, [{ssb_log_level, ${SSB_LOG_LEVEL:-error}},
-        {ssb_home, "${SSB_HOME:-.}"}]}].
+        {ssb_home, "${SSB_HOME:-.}"},
+        %% The SSB listen port.  Overridable so that two nodes can run on
+        %% one machine, which is the only way to exercise anything that
+        %% needs a peer — replication, archive boundaries, adopting a
+        %% floor.  Without it, ssb_app fell back to a hardcoded 8008 and a
+        %% second node could not listen at all.
+        {port, ${SSB_PORT:-8008}}]}].
 
