@@ -15,6 +15,7 @@
          send/2,
          rpc_call/3,
          rpc_call/4,
+         rpc_call/5,
          rpc_stream_call/3,
          open_source/4,
          open_duplex/4,
@@ -167,7 +168,17 @@ rpc_call(Pid, Method, Type) ->
     gen_server:call(Pid, {rpc_call, Method, Type, []}, 10000).
 
 rpc_call(Pid, Method, Type, Args) ->
-    gen_server:call(Pid, {rpc_call, Method, Type, Args}, 10000).
+    rpc_call(Pid, Method, Type, Args, 10000).
+
+%% Some calls are legitimately slow and the caller knows which.
+%%
+%% `admin.store.tables` counts every row of every table, and SQLite has no
+%% cheaper way to answer that: on a converted store it is 3.1M link rows
+%% and 2.3M type rows, each a full scan. Ten seconds is right for asking a
+%% node a question; it is not right for asking it to count a corpus, and
+%% the difference belongs at the call site rather than in a global bound.
+rpc_call(Pid, Method, Type, Args, Timeout) ->
+    gen_server:call(Pid, {rpc_call, Method, Type, Args}, Timeout).
 
 %% Send a source RPC request and collect all response bodies until end-of-stream.
 %% Returns {ok, [Body]} in arrival order.

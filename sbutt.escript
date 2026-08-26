@@ -190,8 +190,13 @@ cmd_health(Peer) ->
     io:format("~n== views ==~n"),
     Lagging = report_views(Views),
 
-    %% count(*) over every table; on a large store this is the slow call
-    Tables = admin_call(Peer, [<<"admin">>, <<"store">>, <<"tables">>]),
+    %% count(*) over every table, and SQLite has no cheaper way: on a
+    %% converted store that is 3.1M link rows and 2.3M type rows, each a
+    %% full scan, which comfortably outruns the ten seconds that suit
+    %% every other call here.  It timed out and reported the store
+    %% UNAVAILABLE on a node that was perfectly healthy.
+    Tables = admin_call(Peer, [<<"admin">>, <<"store">>, <<"tables">>],
+                        120000),
     io:format("~n== store ==~n"),
     EmptyStore = report_tables(Tables),
 
@@ -449,7 +454,10 @@ report_tables(Other) ->
 %% A dropped connection or a slow reply must degrade this report, not end
 %% it — the sections already printed are the ones you came for.
 admin_call(Peer, Name) ->
-    try ssb_peer:rpc_call(Peer, Name, <<"async">>) of
+    admin_call(Peer, Name, 10000).
+
+admin_call(Peer, Name, Timeout) ->
+    try ssb_peer:rpc_call(Peer, Name, <<"async">>, [], Timeout) of
         {ok, Body} ->
             try utils:nat_decode(Body)
             catch _:_ -> {error, undecodable}
