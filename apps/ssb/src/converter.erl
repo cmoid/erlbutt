@@ -31,8 +31,9 @@ convert(OffsetLog, Sleep, Feeds, BlobSrc)->
 
     %% create initial store if needed, this info will come from config or
     %% environment at build time
-    {ok, [[Home]]} = init:get_argument(home),
-    File = Home ++ "/code/erlbutt/" ++ OffsetLog,
+    %%
+    {ok, Cwd} = file:get_cwd(),
+    File = Cwd ++ "/" ++ OffsetLog,
 
     case file:open(File, [read, binary]) of
         {ok, IoDev} ->

@@ -162,7 +162,8 @@ handle_rpc([~"messagesByType"], Args, _Caller) ->
             {GtSql, GtP} = gt_clause(gt_of(Args)),
             Ids = [Id || [Id] <- rows(["SELECT msg FROM msg_by_type"
                                        " WHERE type=?1", GtSql,
-                                       " ORDER BY ts ASC, msg ASC"],
+                                       " ORDER BY ts ASC, msg ASC",
+                                       limit_clause(limit_of(Args))],
                                       [Type | GtP]),
                          is_binary(Id)],
             %% hydrate lazily — one message per sent frame.  Building the
@@ -276,6 +277,34 @@ flag_of(_Key, _Args, Default) ->
 
 gt_clause(undefined) -> {"", []};
 gt_clause(Gt)        -> {" AND ts > ?2", [Gt]}.
+
+%% Cap on how many ids one request may answer with.
+%%
+%% Without it a caller can ask for more than the connection can deliver.
+%% A source is served inside a single 45-second muxrpc call — the sends
+%% are serialised because each advances the connection's nonce — so a
+%% request needing longer kills the connection it arrived on, and a client
+%% that reconnects and asks the same thing never makes progress. A cold
+%% search index asking for every post ever is exactly that request:
+%% 468,886 of them on a converted store, at one message fetch each.
+%%
+%% With a limit the caller pages instead, carrying `gt` forward from the
+%% last timestamp it saw. Ordering is by (ts, msg), so a page boundary is
+%% stable and resuming from the last ts cannot skip a row.
+%%
+%% Unlimited stays the default: existing callers ask for a type they know
+%% is small, and silently truncating them would be worse than the cost
+%% they already pay.
+limit_clause(undefined)                      -> "";
+limit_clause(N) when is_integer(N), N > 0    -> [" LIMIT ", integer_to_list(N)];
+limit_clause(_)                              -> "".
+
+limit_of([{Props}]) when is_list(Props) -> as_int(?pgv(~"limit", Props));
+limit_of(_)                             -> undefined.
+
+as_int(N) when is_integer(N) -> N;
+as_int(B) when is_binary(B)  -> try binary_to_integer(B) catch _:_ -> undefined end;
+as_int(_)                    -> undefined.
 
 %% The cursor, which arrives as a JSON number or (as silkpurse sends it,
 %% straight back out of its own SQLite) a string.  Anything else is no
@@ -479,6 +508,17 @@ gt_bounds_the_backlog() ->
     %% no cursor: everything
     ?assertEqual(3, ids_for([{[{~"type", T}]}])),
     %% a cursor: strictly newer only
+    %% A limit caps one request, so a caller can page instead of asking
+    %% for more than the connection can deliver in a single muxrpc call.
+    ?assertEqual(2, ids_for([{[{~"type", T}, {~"limit", 2}]}])),
+    ?assertEqual(1, ids_for([{[{~"type", T}, {~"limit", 1}]}])),
+    %% strings are accepted like gt's are, and nonsense is ignored rather
+    %% than truncating the answer to zero
+    ?assertEqual(1, ids_for([{[{~"type", T}, {~"limit", ~"1"}]}])),
+    ?assertEqual(3, ids_for([{[{~"type", T}, {~"limit", ~"lots"}]}])),
+    ?assertEqual(3, ids_for([{[{~"type", T}, {~"limit", 0}]}])),
+    %% limit composes with gt, which is what paging actually uses
+    ?assertEqual(1, ids_for([{[{~"type", T}, {~"gt", 100}, {~"limit", 1}]}])),
     ?assertEqual(1, ids_for([{[{~"type", T}, {~"gt", 200}]}])),
     ?assertEqual(0, ids_for([{[{~"type", T}, {~"gt", 300}]}])),
     %% silkpurse sends it as a string, out of its own SQLite
