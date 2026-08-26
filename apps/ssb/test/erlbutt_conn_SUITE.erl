@@ -26,6 +26,11 @@
 
 init_per_suite(Config) ->
     cover:start(),
+    %% Ephemeral listen port: this suite starts the app in the CT node
+    %% itself, and the default is a real, fixed port — so the whole
+    %% suite failed with eaddrinuse whenever a node happened to be
+    %% running on this machine.
+    application:set_env(ssb, port, 0),
     application:ensure_all_started(ssb),
     Config.
 

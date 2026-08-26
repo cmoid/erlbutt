@@ -20,6 +20,12 @@
 %% ===================================================================
 init_per_suite(_Config) ->
     cover:start(),
+    %% A high, unused port rather than the default.  This suite starts the
+    %% app in the CT node and then dials back into it — ssb_peer's 2-arity
+    %% start reads the same `port` env the listener does — so the two ends
+    %% agree, and neither collides with a real node running on 8008.
+    %% Ephemeral (0) will not do: the dial would have nothing to aim at.
+    application:set_env(ssb, port, 18009),
     application:ensure_all_started(ssb),
     _Config.
 

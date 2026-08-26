@@ -233,8 +233,11 @@ detail(R)                    -> ?l2b(io_lib:format("~p", [R])).
 archives_test_() ->
     {foreach, fun setup/0, fun cleanup/1,
      [fun history_of_an_unfloored_feed/1,
+      fun skipped_is_known_before_the_boundary_arrives/1,
+      fun skipped_is_null_without_a_floor/1,
       fun history_prices_the_archive/1,
       fun fetch_restores_skipped_history/1,
+      fun import_refloors_at_the_next_boundary/1,
       fun fetch_without_a_floor_is_a_noop/1]}.
 
 setup() ->
@@ -284,6 +287,35 @@ history_of_an_unfloored_feed({Pid, FeedId, _}) ->
         ?assertEqual(~"none", ?pgv(~"state", Props))
     end.
 
+%% A floor describes what was skipped even before the boundary message
+%% itself has replicated — which is the state a node is in for as long as
+%% it takes EBT to deliver, and exactly when a client is asking.
+skipped_is_known_before_the_boundary_arrives({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"one"),
+        ok = ssb_feed:post_content(Pid, ~"two"),
+        {ok, _} = ssb_feed:archive(Pid),
+        Genesis = verified(ssb_feed:fetch_last_msg(Pid)),
+        ok = feed_floor:set(FeedId, Genesis),
+        %% deliberately NOT folded into ssb_archives: stand in for a node
+        %% that took a floor from a peer's offer and has not yet received
+        %% the message it came from
+        {Props} = history(FeedId),
+        ?assertEqual([], ?pgv(~"archives", Props)),
+        {Skipped} = ?pgv(~"skipped", Props),
+        ?assertEqual(1, ?pgv(~"fromSequence", Skipped)),
+        ?assertEqual(2, ?pgv(~"toSequence", Skipped)),
+        ?assert(is_integer(?pgv(~"size", Skipped)))
+    end.
+
+%% Nothing skipped, so nothing to describe.
+skipped_is_null_without_a_floor({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"hello"),
+        {Props} = history(FeedId),
+        ?assertEqual(null, ?pgv(~"skipped", Props))
+    end.
+
 %% The whole reason size and the timestamp range are in the archive
 %% message: a client can quote the cost without fetching anything.
 history_prices_the_archive({Pid, FeedId, _}) ->
@@ -325,6 +357,14 @@ fetch_restores_skipped_history({Pid, FeedId, _}) ->
         ok = file:delete(Seg),
         ?assertEqual(not_found, ssb_feed:fetch_msg(Pid, EarlyId)),
 
+        %% A node that adopted a floor never stored these messages, so it
+        %% never learned who wrote them either.  Drop the mapping to match,
+        %% or the test proves nothing: the messages were authored here and
+        %% ssb_feed:store/2 recorded it on the way past.
+        _ = ssb_store:write("DELETE FROM msg_author WHERE msg_id = ?",
+                            [EarlyId]),
+        ?assertEqual(not_found, mess_auth:get(EarlyId)),
+
         {Res} = fetch(FeedId),
         ?assertEqual(~"imported", ?pgv(~"status", Res)),
         ?assertEqual(1, ?pgv(~"floor", Res)),
@@ -332,7 +372,45 @@ fetch_restores_skipped_history({Pid, FeedId, _}) ->
         %% the skipped history is readable again, and the floor is gone
         ?assertMatch(#message{content = ~"early one"},
                      ssb_feed:fetch_msg(Pid, EarlyId)),
-        ?assertEqual(none, feed_floor:get(FeedId))
+        ?assertEqual(none, feed_floor:get(FeedId)),
+
+        %% ...and reachable the way a CLIENT reaches it.  An index gives a
+        %% message id; resolving that id to a body goes through mess_auth
+        %% to find the author first.  Installing a segment bypasses
+        %% ssb_feed:store/2, which is what normally records that mapping,
+        %% so without it every restored message renders as nothing while
+        %% looking perfectly present in the store.
+        ?assertEqual(FeedId, mess_auth:get(EarlyId))
+    end.
+
+%% Archives chain: each one freezes only the live log of its day, so
+%% restoring one layer exposes the boundary below it.  The node must
+%% re-floor there, or it reports holding everything while actually
+%% starting partway down, and the client loses any way to ask for the rest.
+import_refloors_at_the_next_boundary({Pid, FeedId, _}) ->
+    fun() ->
+        %% two archives, so the second segment opens with the first's genesis
+        ok = ssb_feed:post_content(Pid, ~"oldest"),
+        {ok, _} = ssb_feed:archive(Pid),
+        FirstGenesis = verified(ssb_feed:fetch_last_msg(Pid)),
+        ok = ssb_feed:post_content(Pid, ~"middle"),
+        {ok, _} = ssb_feed:archive(Pid),
+        SecondGenesis = verified(ssb_feed:fetch_last_msg(Pid)),
+
+        %% index both boundaries, as a refold would
+        ok = ssb_archives:view_entry(FirstGenesis),
+        ok = ssb_archives:view_entry(SecondGenesis),
+
+        %% stand in for a node floored at the newest boundary
+        ok = feed_floor:set(FeedId, SecondGenesis),
+        {Res} = fetch(FeedId),
+        ?assertEqual(~"imported", ?pgv(~"status", Res)),
+
+        %% the floor moved DOWN to the older boundary rather than vanishing
+        {ok, #{floor_seq := Floor}} = feed_floor:get(FeedId),
+        ?assertEqual(FirstGenesis#message.sequence, Floor),
+        {Props} = history(FeedId),
+        ?assertNotEqual(null, ?pgv(~"skipped", Props))
     end.
 
 fetch_without_a_floor_is_a_noop({Pid, FeedId, _}) ->

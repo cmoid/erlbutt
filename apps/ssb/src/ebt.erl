@@ -541,4 +541,31 @@ repl_set_logic() ->
     ok = refresh_repl_set(),
     ?assertNot(replicate_feed(Member)).
 
+%% Only just gone quiet: start a clock, say nothing.  The first tick after
+%% a handshake always catches some peers before their stream is up.
+quiet_starts_a_clock_rather_than_warning_test() ->
+    Pid = self(),
+    ?assertEqual({1000, false}, maps:get(Pid, note(Pid, false, 1000, #{}, #{}))).
+
+%% Still quiet past the grace period: warn, and remember having warned.
+quiet_past_the_grace_period_warns_once_test() ->
+    Pid = self(),
+    Acc = note(Pid, false, ?QUIET_GRACE_MS + 1, #{Pid => {0, false}}, #{}),
+    ?assertEqual({0, true}, maps:get(Pid, Acc)),
+    Acc2 = note(Pid, false, ?QUIET_GRACE_MS * 10, Acc, #{}),
+    ?assertEqual({0, true}, maps:get(Pid, Acc2)).
+
+%% A peer that starts replicating drops out, so a later reconnect gets a
+%% fresh clock rather than an instant warning.
+replicating_peer_is_forgotten_test() ->
+    Pid = self(),
+    ?assertEqual(#{}, note(Pid, true, 999999, #{Pid => {0, true}}, #{})).
+
+%% Too busy to answer means mid-fold, writing messages to a socket. That
+%% is the opposite of the symptom and must never be reported as one.
+busy_peer_is_not_a_symptom_test() ->
+    Pid = self(),
+    ?assertEqual(#{}, note(Pid, unknown, ?QUIET_GRACE_MS * 10,
+                           #{Pid => {0, false}}, #{})).
+
 -endif.

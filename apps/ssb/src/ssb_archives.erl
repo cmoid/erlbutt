@@ -299,6 +299,8 @@ archives_test_() ->
               ?_test(keeps_every_boundary_of_a_feed()),
               ?_test(newest_skips_most_lowest_skips_least()),
               ?_test(stored_value_still_verifies()),
+              ?_test(only_the_servable_boundary_is_offered()),
+              ?_test(each_feed_offers_its_own_newest()),
               ?_test(is_a_core_view())]
      end}.
 
@@ -416,6 +418,34 @@ stored_value_still_verifies() ->
     ?assertEqual(FeedId, Decoded#message.author),
     ?assertEqual(77,     Decoded#message.sequence),
     ?assertEqual(Signed#message.id, Decoded#message.id).
+
+%% A feed that has archived twice has two boundaries, and only the newer
+%% one is servable: the live log starts there, and nothing serves the
+%% frozen segments.  Offering the older one would send a peer to a floor
+%% we cannot feed it from — it would ask for the next sequence and get a
+%% message whose previous does not match, forever.
+only_the_servable_boundary_is_offered() ->
+    Id = ~"@arc7.ed25519",
+    ok = view_entry(archive_msg(Id, 101, ~"%a=.sha256", 1,   100)),
+    ok = view_entry(archive_msg(Id, 201, ~"%b=.sha256", 101, 200)),
+    %% both are known...
+    ?assertEqual(2, length(for_feed(Id))),
+    %% ...but only the newest is put on the wire
+    Offered = [B || #{feed := F} = B <- boundaries(), F =:= Id],
+    ?assertEqual(1, length(Offered)),
+    [#{seq := Seq}] = Offered,
+    ?assertEqual(201, Seq).
+
+%% Other feeds are unaffected by one feed having several boundaries.
+each_feed_offers_its_own_newest() ->
+    A = ~"@arc8.ed25519",
+    B = ~"@arc9.ed25519",
+    ok = view_entry(archive_msg(A, 11, ~"%a=.sha256", 1,  10)),
+    ok = view_entry(archive_msg(A, 21, ~"%b=.sha256", 11, 20)),
+    ok = view_entry(archive_msg(B, 31, ~"%c=.sha256", 1,  30)),
+    Seqs = [{F, S} || #{feed := F, seq := S} <- boundaries(),
+                      F =:= A orelse F =:= B],
+    ?assertEqual([{A, 21}, {B, 31}], lists:sort(Seqs)).
 
 is_a_core_view() ->
     ?assertEqual(core, view_class()),

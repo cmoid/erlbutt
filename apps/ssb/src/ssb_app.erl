@@ -38,6 +38,11 @@ stop(_State) ->
 -ifdef(TEST).
 
 simple_test() ->
+    %% Port 0 asks the OS for an ephemeral one.  This used to take the real
+    %% listen port, so the whole suite failed with eaddrinuse whenever a
+    %% node happened to be running on the same machine — which is exactly
+    %% when you are most likely to be running the tests.
+    application:set_env(ssb, port, 0),
     application:ensure_all_started(ssb),
     ?assertNot(undefined == whereis(ssb_sup)),
     application:stop(ssb).
