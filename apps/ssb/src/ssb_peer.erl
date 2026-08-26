@@ -27,6 +27,7 @@
          tunnel_client_init/2,
          tunnel_server_init/3,
          request_ebt/1,
+         replicating/1,
          request_blob_wants/3,
          fetch_blob/2,
          has_blob/2,
@@ -210,6 +211,24 @@ send_frame(Pid, ReqNo, Body) ->
 
 request_ebt(Pid) ->
     gen_server:cast(Pid, {request_ebt}).
+
+%% Is an EBT stream open on this connection?
+%%
+%% A connection can be entirely healthy — handshake done, RPC answering,
+%% archive boundaries served — and still replicate nothing, because
+%% opening the socket and asking for replication are separate steps and
+%% only peer_dialer does both.  Nothing distinguished the two states from
+%% outside, so this exposes the one bit that does.
+%%
+%% Short timeout and never raises: a peer can be blocked inside a fold for
+%% seconds while it does EBT's socket writes, and a diagnostic must not be
+%% the thing that stalls or crashes its caller.  `unknown` for a peer that
+%% could not answer in time — it is busy replicating, which is its own
+%% answer.
+replicating(Pid) ->
+    try gen_server:call(Pid, ebt_active, 1000)
+    catch _:_ -> unknown
+    end.
 
 
 init([Ip, PubKey]) ->
@@ -533,6 +552,9 @@ drain_haves(Timeout, Acc) ->
     after Timeout ->
         lists:reverse(Acc)
     end.
+
+handle_call(ebt_active, _From, #sbox_state{ebt_active = Active} = State) ->
+    {reply, Active, State};
 
 handle_call({rpc_call, Method, Type, Args}, From,
             #sbox_state{socket = Socket,

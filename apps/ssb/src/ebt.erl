@@ -39,7 +39,17 @@
 %% The gen_server carries no state; all connection context arrives via args.
 %% debounce is the timer ref for a pending event-triggered repl-set
 %% refresh (undefined when none is queued).
--record(state, {debounce}).
+%% quiet: Pid => {FirstSeenQuiet, AlreadyWarned}.  A connection is allowed
+%% to be briefly quiet — the EBT stream is asked for just after the
+%% handshake — so the warning waits out ?QUIET_GRACE_MS and then fires
+%% once per connection.
+-record(state, {debounce, quiet = #{}}).
+
+%% How long a connection may sit with no EBT stream before it is worth
+%% mentioning.  Generous on purpose: the point is to catch connections
+%% that will NEVER replicate, not to nag about the moment after a
+%% handshake.
+-define(QUIET_GRACE_MS, 60000).
 
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
@@ -70,6 +80,49 @@ full_clock() ->
                        end
                end
        end, repl_set_feeds())}.
+
+%% Notice connections that are up but replicating nothing.
+%%
+%% Opening a connection and asking it to replicate are two steps, and only
+%% peer_dialer does both.  A hand-dialled peer therefore handshakes,
+%% answers RPC and serves archive boundaries while replicating NOTHING —
+%% with no error anywhere, and nothing to distinguish it from a working
+%% connection.  That has cost three debugging sessions; the state was
+%% readable throughout and simply nobody read it.
+%%
+%% Warns once per connection, then stays quiet: a signpost, not an alarm.
+%% A node deliberately holding a client connection should not have its log
+%% filled by it.
+check_replicating(Quiet) ->
+    Now  = erlang:monotonic_time(millisecond),
+    Live = [{Pid, ssb_peer:replicating(Pid)}
+            || {_PubKey, Pid} <- peer_registry:all(), is_process_alive(Pid)],
+    %% Rebuilt from the live set each tick, so a peer that starts
+    %% replicating, disconnects or dies falls out on its own.
+    lists:foldl(fun({Pid, St}, Acc) -> note(Pid, St, Now, Quiet, Acc) end,
+                #{}, Live).
+
+%% true -> replicating, forget it.  unknown -> too busy to answer within
+%% the timeout, which for a peer means it is mid-fold writing messages to
+%% a socket: the opposite of the symptom, so never counted as one.
+note(_Pid, true, _Now, _Was, Acc)    -> Acc;
+note(_Pid, unknown, _Now, _Was, Acc) -> Acc;
+note(Pid, false, Now, Was, Acc) ->
+    case maps:get(Pid, Was, undefined) of
+        undefined       -> Acc#{Pid => {Now, false}};
+        {Since, Warned} -> Acc#{Pid => {Since, warn_once(Pid, Now - Since, Warned)}}
+    end.
+
+warn_once(_Pid, _Elapsed, true) ->
+    true;
+warn_once(Pid, Elapsed, false) when Elapsed >= ?QUIET_GRACE_MS ->
+    ?SSB_INFO("ebt: peer ~p connected ~p s with no EBT stream; it will "
+              "replicate nothing until request_ebt/1 is called on it. "
+              "peer_dialer does that automatically, a hand-dialled "
+              "connection does not.~n", [Pid, Elapsed div 1000]),
+    true;
+warn_once(_Pid, _Elapsed, false) ->
+    false.
 
 %% Feed ids in our current replication set (see recompute_repl_set/0).
 repl_set_feeds() ->
@@ -142,10 +195,10 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Request, State) ->
     {noreply, State}.
 
-handle_info(refresh_repl_set, State) ->
+handle_info(refresh_repl_set, #state{quiet = Quiet} = State) ->
     recompute_repl_set(),
     schedule_repl_refresh(),
-    {noreply, State};
+    {noreply, State#state{quiet = check_replicating(Quiet)}};
 
 %% A follow or block changed in the social graph view.  Debounce: one
 %% recompute per second no matter how many contact messages land in a
