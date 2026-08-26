@@ -130,6 +130,15 @@ verify_and_import(FeedId, Blob, PrevId, FloorSeq, Gz) ->
                     %% checkpoint, so ingest cannot see them; a targeted
                     %% refold of this one feed is what makes them appear.
                     _ = view_manager:refold_feed(FeedId),
+                    %% Peeling one layer usually exposes another: an
+                    %% archive freezes only the live log of its day, so
+                    %% the first message of what we just restored is the
+                    %% PREVIOUS archive genesis.  Record that as the new
+                    %% floor or the trail goes cold here — the node would
+                    %% report holding everything while starting partway
+                    %% down, and a client would have no way to ask for the
+                    %% rest.
+                    ok = refloor(FeedId, FromSeq),
                     ?SSB_INFO("archives.fetch: imported ~p..~p for ~s",
                               [FromSeq, ToSeq, FeedId]),
                     result(~"imported", FeedId, Blob);
@@ -143,6 +152,32 @@ verify_and_import(FeedId, Blob, PrevId, FloorSeq, Gz) ->
             end
     catch _:_ ->
         result(~"failed", FeedId, Blob, ~"not a gzip archive")
+    end.
+
+%% After a restore that did not reach sequence 1, re-floor at whatever
+%% the restored history now starts from — if the author left a boundary
+%% there.  Runs after the refold, so ssb_archives has already indexed the
+%% genesis that arrived inside the segment.
+refloor(_FeedId, FromSeq) when FromSeq =< 1 ->
+    ok;
+refloor(FeedId, FromSeq) ->
+    case ssb_archives:boundary_at(FeedId, FromSeq) of
+        none ->
+            %% The feed starts partway down with no boundary to explain
+            %% it.  Nothing to offer, and nothing to record.
+            ok;
+        {ok, #{raw := Raw}} ->
+            case verified_boundary(Raw) of
+                {ok, Msg} -> _ = feed_floor:set(FeedId, Msg), ok;
+                error     -> ok
+            end
+    end.
+
+verified_boundary(Raw) ->
+    try message:decode_value(Raw, true) of
+        #message{validated = true} = Msg -> {ok, Msg};
+        _                                -> error
+    catch _:_ -> error
     end.
 
 result(Status, FeedId, Blob) ->

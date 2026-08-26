@@ -48,7 +48,8 @@
          boundaries/0,
          for_feed/1,
          newest/1,
-         lowest/1]).
+         lowest/1,
+         boundary_at/2]).
 
 -export([view_version/0,
          view_class/0,
@@ -135,6 +136,16 @@ for_feed(FeedId) ->
 newest(FeedId) ->
     one("SELECT " ?COLS " FROM archive_boundaries WHERE feed = ?"
         " ORDER BY seq DESC LIMIT 1", [FeedId]).
+
+%% The boundary sitting exactly at Seq, if we know one.
+%%
+%% Used after importing a segment: archives CHAIN, each one freezing only
+%% the live log of its day, so recovering one layer exposes the boundary
+%% below it — the first message of the restored segment is the previous
+%% archive genesis.  Finding it is what lets a reader keep walking back.
+boundary_at(FeedId, Seq) ->
+    one("SELECT " ?COLS " FROM archive_boundaries"
+        " WHERE feed = ? AND seq = ?", [FeedId, Seq]).
 
 %% The boundary that skips the least — the conservative choice when
 %% picking a floor, since it keeps us a witness to more of the feed.
