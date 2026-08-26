@@ -58,6 +58,8 @@
          notify/2,
          checkpoint/2,
          refold_feed/1,
+         pause_ingest/0,
+         resume_ingest/0,
          views/0,
          views/1,
          info/0,
@@ -95,6 +97,10 @@
 %% views are protocol infrastructure an app view may fold against, so they
 %% must see a message first (doc/persistence.md §5).
 -record(vm_state, {views = [],
+                   %% Bulk-load mode: ingest is dropped on the floor and
+                   %% the store is folded in afterwards.  See
+                   %% pause_ingest/0.
+                   paused = false,
                    %% #{Mod => true} for views whose catch-up fold is
                    %% still running; they receive no ingests until done.
                    catching = #{}}).
@@ -133,6 +139,30 @@ ingest(#message{} = Msg) ->
     try gen_server:call(?SERVER, {ingest, Msg}, infinity)
     catch exit:{noproc, _} -> ok
     end.
+
+%% Stop folding ingested messages, for a bulk load.
+%%
+%% Every message stored goes through ingest/1 synchronously, which fans it
+%% out to each registered view — ten of them now, each writing to SQLite.
+%% That is the right cost for a message arriving over the network and the
+%% wrong one for restoring a corpus, where it is paid a couple of million
+%% times over for an index that could be built once at the end. This is
+%% the database habit of dropping the indexes before a bulk load.
+%%
+%% Nothing is lost by pausing. Checkpoints do not move while ingest is
+%% dropped, so resume_ingest/0 folds the store from each view's checkpoint
+%% forward and arrives at the same place. A crash while paused is safe for
+%% the same reason and needs no cleanup: registering a view always starts
+%% a catch-up, so the next boot picks up exactly where this would have.
+%%
+%% The node keeps replicating and serving throughout; only the views stop
+%% being current, and every query against them is stale until resumed.
+pause_ingest() ->
+    gen_server:call(?SERVER, pause_ingest, infinity).
+
+%% Fold everything that arrived while paused, and go back to live ingest.
+resume_ingest() ->
+    gen_server:call(?SERVER, resume_ingest, infinity).
 
 %% Re-fold one feed's whole history into every registered view.
 %%
@@ -286,11 +316,28 @@ handle_call({refold_feed, FeedId}, _From,
               [FeedId, length(Mods), N]),
     {reply, {ok, N}, State};
 
+handle_call({ingest, _Msg}, _From, #vm_state{paused = true} = State) ->
+    %% Bulk load in progress: resume_ingest/0 will fold this from the
+    %% store, which is where store/2 has already put it.
+    {reply, ok, State};
+
 handle_call({ingest, Msg}, _From,
             #vm_state{views = Views, catching = Catching} = State) ->
     [deliver(Mod, Msg) || {Mod, _Class} <- Views,
                           not maps:is_key(Mod, Catching)],
     {reply, ok, State};
+
+handle_call(pause_ingest, _From, #vm_state{views = Views} = State) ->
+    ?SSB_INFO("view_manager: ingest PAUSED for ~p views — they are stale "
+              "until resume_ingest/0 is called", [length(Views)]),
+    {reply, {ok, length(Views)}, State#vm_state{paused = true}};
+
+handle_call(resume_ingest, _From, #vm_state{views = Views} = State) ->
+    ?SSB_INFO("view_manager: ingest resumed; folding the store into ~p "
+              "views", [length(Views)]),
+    State1 = lists:foldl(fun({Mod, _Class}, Acc) -> start_catch_up(Mod, Acc) end,
+                         State#vm_state{paused = false}, Views),
+    {reply, {ok, length(Views)}, State1};
 
 handle_call(save, _From, #vm_state{views = Views, catching = Catching} = State) ->
     save_all(Views, Catching),
@@ -453,8 +500,16 @@ handle_cast(_Msg, State) ->
 handle_info({catch_up, Mod, Gen, Work, Delivered, Pass, T0}, State) ->
     {noreply, do_catch_up(Mod, Gen, Work, Delivered, Pass, T0, State)};
 
-handle_info(save_tick, #vm_state{views = Views, catching = Catching} = State) ->
+handle_info(save_tick, #vm_state{views = Views, catching = Catching,
+                                 paused = Paused} = State) ->
     save_all(Views, Catching),
+    %% A pause nobody resumes looks exactly like a working node until
+    %% somebody queries a view, so keep saying it out loud.
+    case Paused of
+        true  -> ?SSB_INFO("view_manager: ingest is still PAUSED; views are "
+                           "not being updated", []);
+        false -> ok
+    end,
     erlang:send_after(?SAVE_EVERY_MS, self(), save_tick),
     {noreply, State};
 
@@ -765,7 +820,8 @@ vm_test_() ->
               ?_test(a_catching_view_is_not_marked_complete()),
               ?_test(a_rebuild_supersedes_a_running_fold()),
               ?_test(a_turn_is_bounded_by_time()),
-              ?_test(imports_the_legacy_snapshot())]
+              ?_test(imports_the_legacy_snapshot()),
+]
      end}.
 
 %% Fully isolated home: these tests archive the own feed and rebuild
