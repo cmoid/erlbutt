@@ -124,8 +124,34 @@ install(FeedId, Gz, Raw, FromSeq, ToSeq) ->
             ok = filelib:ensure_dir(Path),
             ok = file:write_file(Path, Gz),
             _  = feed_store:write_hint(Path, Raw),
+            ok = remember_authors(Raw),
             ok
     end.
+
+%% Record every restored message in the id -> author map.
+%%
+%% Installing a segment writes bytes where feed_store can find them, but it
+%% bypasses ssb_feed:store/2, and store/2 is what normally calls
+%% mess_auth:put/2.  Without this the messages are on disk, indexed by the
+%% hint, and folded into every view — and still unreadable to anything that
+%% resolves a message id through mess_auth first, which is how a client
+%% fetches a message body it found in an index.  The symptom is a view full
+%% of rows that all render as nothing.
+remember_authors(Raw) ->
+    walk_authors(Raw).
+
+walk_authors(<<>>) ->
+    ok;
+walk_authors(<<Len:32, Bin:Len/binary, Len:32, _Next:32, Rest/binary>>) ->
+    case message:decode(Bin, false) of
+        #message{id = Id, author = Author} -> mess_auth:put(Id, Author);
+        _                                  -> ok
+    end,
+    walk_authors(Rest);
+walk_authors(_) ->
+    %% check/4 has already validated the framing; a tail that does not
+    %% match here is not worth failing an otherwise good install over.
+    ok.
 
 -ifdef(TEST).
 
