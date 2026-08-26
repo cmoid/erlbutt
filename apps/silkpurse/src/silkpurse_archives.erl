@@ -65,16 +65,44 @@ feed_arg(_) ->
 %%%===================================================================
 
 history(FeedId) ->
-    {Floor, FloorState} =
-        case feed_floor:get(FeedId) of
-            {ok, #{floor_seq := Seq, state := St}} -> {Seq, St};
-            none                                   -> {1, ~"none"}
-        end,
+    Floor = feed_floor:get(FeedId),
     {[{~"feed",     FeedId},
       %% The lowest sequence this node holds.  1 means nothing was skipped.
-      {~"floor",    Floor},
-      {~"state",    FloorState},
+      {~"floor",    floor_seq(Floor)},
+      {~"state",    floor_state(Floor)},
+      %% What this node DECLINED to fetch, described from the floor's own
+      %% row rather than from the boundary message.
+      %%
+      %% They are not interchangeable, and the difference shows up exactly
+      %% when a client most needs the answer: a node adopts a floor from a
+      %% peer's offer and only receives the boundary message afterwards,
+      %% over ordinary replication.  In between — which can be a while —
+      %% ssb_archives knows nothing about the feed, and a client asking
+      %% "what am I missing" would be told nothing at all.  The floor row
+      %% was written from the same signed message and has every field.
+      {~"skipped",  skipped(Floor)},
+      %% Every boundary we have SEEN for this feed, whether or not we
+      %% skipped anything.  On a node holding the full history this is the
+      %% author's archive points and `skipped` is null.
       {~"archives", [descriptor(B) || B <- ssb_archives:for_feed(FeedId)]}]}.
+
+floor_seq({ok, #{floor_seq := Seq}}) -> Seq;
+floor_seq(none)                      -> 1.
+
+floor_state({ok, #{state := St}}) -> St;
+floor_state(none)                 -> ~"none".
+
+skipped(none) ->
+    null;
+skipped({ok, #{blob := Blob, size := Size, from_seq := FromSeq,
+               to_seq := ToSeq, from_ts := FromTs, to_ts := ToTs}}) ->
+    {[{~"blob",          Blob},
+      {~"size",          Size},
+      {~"fromSequence",  FromSeq},
+      {~"toSequence",    ToSeq},
+      {~"fromTimestamp", FromTs},
+      {~"toTimestamp",   ToTs},
+      {~"held",          is_binary(Blob) andalso blobs:has(Blob)}]}.
 
 descriptor(#{seq := Seq, blob := Blob, size := Size, from_seq := FromSeq,
              to_seq := ToSeq, from_ts := FromTs, to_ts := ToTs}) ->
@@ -186,12 +214,15 @@ result(Status, FeedId, Blob) ->
 result(Status, FeedId, Blob, Reason) ->
     {[{~"feed",   FeedId},
       {~"status", Status},
-      {~"blob",   Blob},
+      {~"blob",   nullable(Blob)},
       {~"reason", detail(Reason)},
       {~"floor",  case feed_floor:get(FeedId) of
                       {ok, #{floor_seq := S}} -> S;
                       none                    -> 1
                   end}]}.
+
+nullable(undefined) -> null;
+nullable(V)         -> V.
 
 detail(undefined)            -> null;
 detail(R) when is_binary(R)  -> R;
