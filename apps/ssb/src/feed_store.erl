@@ -29,7 +29,9 @@
          hint_file/1,
          write_hint/2,
          read_hint/1,
-         find_in_archives/2]).
+         find_in_archives/2,
+         archive_segments/1,
+         lowest_archived_seq/1]).
 
 %%%===================================================================
 %%% Folds
@@ -267,6 +269,20 @@ extract(Gz, Offset, Len, MsgId) ->
 %% Archived segment files, oldest first.  Names are
 %% log.offset.<From>-<To>.gz; sort numerically on From (lexicographic
 %% ordering breaks once sequence numbers gain a digit).
+%% The lowest sequence held in this feed's frozen segments, or `none` when
+%% there are none.
+%%
+%% Read from the filenames, which do not lie: do_archive/7 derives the range
+%% from the segment's own first record (an earlier version guessed it at
+%% restart and produced archives whose names disagreed with their contents).
+%% That keeps this a directory listing rather than a decompress of every
+%% segment, which matters because it is asked on the serving path.
+lowest_archived_seq(Dir) ->
+    case archive_segments(Dir) of
+        []           -> none;
+        [Oldest | _] -> try archive_from(Oldest) catch _:_ -> none end
+    end.
+
 archive_segments(Dir) ->
     Segs = filelib:wildcard(filename:join(Dir, "log.offset.*.gz")),
     [S || {_From, S} <- lists:sort([{archive_from(S), S} || S <- Segs])].

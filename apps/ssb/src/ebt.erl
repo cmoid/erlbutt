@@ -295,8 +295,8 @@ send_feed_msgs_after_ok(FeedId, AfterSeq, OutReqNo, Socket, Nonce, Key) ->
             Nonce;
         _ ->
             case ssb_feed:servable_from(Pid, AfterSeq) of
-                true            -> send_from(Pid, AfterSeq, OutReqNo, Socket,
-                                             Nonce, Key);
+                true            -> send_from(FeedId, Pid, AfterSeq, OutReqNo,
+                                             Socket, Nonce, Key);
                 {false, Lowest} -> refuse(FeedId, AfterSeq, Lowest, Nonce)
             end
     end.
@@ -313,8 +313,8 @@ refuse(FeedId, AfterSeq, Lowest, Nonce) ->
                [FeedId, AfterSeq, Lowest]),
     Nonce.
 
-send_from(Pid, AfterSeq, OutReqNo, Socket, Nonce, Key) ->
-            ssb_feed:foldl(Pid,
+send_from(FeedId, Pid, AfterSeq, OutReqNo, Socket, Nonce, Key) ->
+            ssb_feed:fold_servable(FeedId, Pid, AfterSeq,
                            fun(MsgData, NonceAcc) ->
                                    try
                                        #message{sequence = Seq} =

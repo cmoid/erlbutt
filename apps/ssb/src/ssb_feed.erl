@@ -33,6 +33,7 @@
          current_seq/1,
          lowest_seq/1,
          servable_from/2,
+         fold_servable/5,
          reset_log_slots/0]).
 
 %% gen_server callbacks
@@ -142,7 +143,35 @@ archive_boundary(FeedPid) ->
 %% collapse to the same question, which is why this asks the log rather
 %% than consulting feed_floor — the archiver has no floor record.
 lowest_seq(FeedPid) ->
-    gen_server:call(FeedPid, lowest_seq, infinity).
+    element(1, gen_server:call(FeedPid, seq_bounds, infinity)).
+
+%% Fold Fun(MsgBinary, Acc) over what we can serve for this feed, in
+%% sequence order, taking the cheapest read that covers the request.
+%%
+%% The live log alone whenever the caller is already at or above where it
+%% starts, which is the overwhelmingly common case and stays exactly as
+%% fast as it was: a gen_server call, consistent with concurrent writes.
+%%
+%% Segments plus live log only when the caller asks below that and archive
+%% serving is on.  That read deliberately does NOT go through the feed
+%% process: the segments are immutable once written, so no lock is needed,
+%% and decompressing one while holding the gen_server would block every
+%% store and every other reader for the duration.
+%%
+%% Callers still filter by sequence themselves — this decides which bytes
+%% to walk, not which to send.
+fold_servable(FeedId, FeedPid, AfterSeq, Fun, Acc) ->
+    {Lowest, LiveStart} = gen_server:call(FeedPid, seq_bounds, infinity),
+    %% Lowest < LiveStart is the only case where segments are both present
+    %% AND allowed: lowest_held_seq/2 has already applied the archive
+    %% serving policy, so this never has to ask it again — and a node with
+    %% serving off never touches a segment even though it has them.
+    case AfterSeq >= LiveStart - 1 orelse Lowest >= LiveStart of
+        true ->
+            foldl(FeedPid, Fun, Acc);
+        false ->
+            feed_store:fold_feed(Fun, Acc, ?b2l(utils:feed_dir(FeedId)))
+    end.
 
 %% May a peer that already holds AfterSeq be served from this feed?
 %%
@@ -225,9 +254,14 @@ handle_call({seed_floor, Genesis}, _From, State) ->
 handle_call(current_seq, _From, #state{last_seq = Seq} = State) ->
     {reply, Seq, State};
 
-handle_call(lowest_seq, _From, #state{feed = FeedFile,
+%% {lowest we can serve, where the live log starts}.  The first drives the
+%% servability guard, the second decides whether a read has to touch the
+%% frozen segments at all.  They differ only on a feed that has archived
+%% while archive serving is on.
+handle_call(seq_bounds, _From, #state{id = Id, feed = FeedFile,
                                       last_seq = LastSeq} = State) ->
-    {reply, first_seq(FeedFile, LastSeq), State};
+    Live = first_seq(FeedFile, LastSeq),
+    {reply, {lowest_held_seq(Id, Live), Live}, State};
 
 handle_call(whoami, _From, #state{id = Id} = State) ->
     {reply, Id, State};
@@ -446,6 +480,35 @@ read_archive_boundary(FeedFile) ->
             Res;
         _ ->
             none
+    end.
+
+%% The lowest sequence we can actually serve for this feed.
+%%
+%% With archive serving on, that is the start of the oldest frozen segment:
+%% the bytes are on disk and fold_feed/3 walks them, so an archived feed is
+%% servable from 1 again and the guard permits everyone.  This is where
+%% archiving becomes invisible to the network.
+%%
+%% With it off — or on a FLOORED feed, which has no segments because it
+%% never held that history — the answer is the live log's first record, and
+%% requests below it are refused.  That difference is the whole of the
+%% setting: one node declines to carry its history, the other never had it.
+lowest_held_seq(FeedId, Live) ->
+    case serving_archives() of
+        false -> Live;
+        true  ->
+            case feed_store:lowest_archived_seq(?b2l(utils:feed_dir(FeedId))) of
+                none                       -> Live;
+                Seq when is_integer(Seq)   -> min(Seq, Live)
+            end
+    end.
+
+%% Absent config (tests, tools) reads as on, matching the default.
+serving_archives() ->
+    try config:archive_serving() of
+        Bool when is_boolean(Bool) -> Bool;
+        _                          -> true
+    catch _:_ -> true
     end.
 
 %% Sequence of the first record in the live log.

@@ -274,7 +274,7 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [Method],
             utils:send_data(utils:combine(EHeader, ErrMsg), Socket, Nonce,
                             SecretBoxKey);
         true ->
-            {NewNonce, _} = ssb_feed:foldl(FeedPid,
+            {NewNonce, _} = ssb_feed:fold_servable(Id, FeedPid, Seq,
                 fun(MsgData, {N, Count}) ->
                     case Limit >= 0 andalso Count >= Limit of
                         true -> {N, Count};
