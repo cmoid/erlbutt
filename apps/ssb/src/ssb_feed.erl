@@ -1028,6 +1028,9 @@ feed_test_() ->
       fun archive_typed_genesis_is_not_a_boundary_test/1,
       fun archive_empty_feed_is_safe_test/1,
       fun archived_history_is_not_served_test/1,
+      fun archiver_refuses_below_its_live_log_test/1,
+      fun floored_feed_refuses_below_its_floor_test/1,
+      fun ordinary_feed_serves_from_one_test/1,
       fun fetch_archived_msg_test/1,
       fun archive_writes_hint_test/1,
       fun live_index_survives_stale_offset_test/1,
@@ -1493,6 +1496,66 @@ archived_history_is_not_served_test({Pid, _, _}) ->
         %% they are still readable locally by id, via the segment
         ?assertNotEqual(not_found,
                         ssb_feed:fetch_msg(Pid, msg_id_at(Pid, 3)))
+    end.
+
+%% The guard, from the ARCHIVER's side.
+%%
+%% After archiving, our live log starts at the genesis.  The first message
+%% we could send carries previous = id(genesis - 1), so only a peer already
+%% holding that predecessor can chain it.  An existing follower can; a
+%% newcomer asking from 0 cannot, and must be refused rather than sent
+%% messages it will either reject or — worse, if it does not check the
+%% chain — store and relay as though they were the feed.
+archiver_refuses_below_its_live_log_test({Pid, _, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"one"),
+        ok = ssb_feed:post_content(Pid, ~"two"),
+        {ok, _} = ssb_feed:archive(Pid),
+        ok = ssb_feed:post_content(Pid, ~"three"),
+
+        %% the genesis is seq 3, so that is the lowest we can serve
+        ?assertEqual(3, ssb_feed:lowest_seq(Pid)),
+
+        %% a newcomer, and a follower stuck below the boundary
+        ?assertEqual({false, 3}, ssb_feed:servable_from(Pid, 0)),
+        ?assertEqual({false, 3}, ssb_feed:servable_from(Pid, 1)),
+
+        %% a follower holding seq 2 chains onto the genesis, so serve it
+        ?assertEqual(true, ssb_feed:servable_from(Pid, 2)),
+        ?assertEqual(true, ssb_feed:servable_from(Pid, 3))
+    end.
+
+%% The guard, from the FLOORED REPLICATOR's side — the case no amount of
+%% segment-serving can fix, because we never held that history and have no
+%% segments to decompress.  The floor is otherwise contagious: we would
+%% advertise current_seq, which in EBT means "I hold 1..N".
+floored_feed_refuses_below_its_floor_test({Pid, FeedId, _}) ->
+    fun() ->
+        Genesis = archive_genesis(FeedId, ~"%earlier=.sha256", 5),
+        ok = ssb_feed:seed_floor(Pid, Genesis),
+
+        %% nothing replicated yet: the live log is empty and the floor says
+        %% the next thing we could hold is seq 5
+        ?assertEqual(5, ssb_feed:lowest_seq(Pid)),
+        ?assertEqual({false, 5}, ssb_feed:servable_from(Pid, 0)),
+        ?assertEqual(true, ssb_feed:servable_from(Pid, 4)),
+
+        %% and once the genesis itself lands, the answer is unchanged
+        ?assertEqual(stored, ssb_feed:store_msg_checked(Pid, Genesis)),
+        ?assertEqual(5, ssb_feed:lowest_seq(Pid)),
+        ?assertEqual({false, 5}, ssb_feed:servable_from(Pid, 0)),
+        ?assertEqual(true, ssb_feed:servable_from(Pid, 4))
+    end.
+
+%% The overwhelmingly common case must be unaffected: an ordinary feed
+%% serves anyone from the beginning.
+ordinary_feed_serves_from_one_test({Pid, _, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"one"),
+        ok = ssb_feed:post_content(Pid, ~"two"),
+        ?assertEqual(1, ssb_feed:lowest_seq(Pid)),
+        ?assertEqual(true, ssb_feed:servable_from(Pid, 0)),
+        ?assertEqual(true, ssb_feed:servable_from(Pid, 1))
     end.
 
 msg_id_at(Pid, Seq) ->

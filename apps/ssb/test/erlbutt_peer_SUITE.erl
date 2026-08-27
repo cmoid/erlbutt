@@ -17,7 +17,8 @@
          ebt_path_test/1,
          plugin_rpc_test/1,
          manifest_rpc_test/1,
-         log_stream_test/1]).
+         log_stream_test/1,
+         history_refused_below_boundary_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -33,7 +34,10 @@ all() ->
      ebt_path_test,
      plugin_rpc_test,
      manifest_rpc_test,
-     log_stream_test].
+     log_stream_test,
+     %% last: it archives the node's own feed, which removes early history
+     %% from what this node can serve for the rest of the suite
+     history_refused_below_boundary_test].
 
 init_per_suite(Config) ->
     DataDir = ?config(priv_dir, Config),
@@ -140,6 +144,47 @@ log_stream_test(_Config) ->
     {ok, Frames} = ssb_peer:rpc_stream_call(Peer, [~"createLogStream"], []),
     ?assert(lists:any(fun(F) -> binary:match(F, Marker) =/= nomatch end,
                       Frames)),
+    gen_server:stop(Peer).
+
+%% The servability guard, over a real socket.
+%%
+%% eunit pins the RULE (ssb_feed:servable_from/2); this pins the WIRING,
+%% which is the part inspection cannot show.  A rule the send path forgets
+%% to consult is a passing test and a broken feature.
+%%
+%% After archiving, the live log starts at the archive genesis, whose
+%% `previous` names a message we no longer serve.  A caller asking from the
+%% beginning therefore cannot chain anything we would send, so it must get
+%% nothing rather than orphans — a strict client rejects those, a lenient
+%% one stores and relays them.
+history_refused_below_boundary_test(_Config) ->
+    FeedPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    ok = ssb_feed:post_content(FeedPid, ~"before the boundary"),
+    {ok, _} = ssb_feed:archive(FeedPid),
+    Marker = base64:encode(crypto:strong_rand_bytes(12)),
+    ok = ssb_feed:post_content(FeedPid, Marker),
+
+    Lowest = ssb_feed:lowest_seq(FeedPid),
+    ?assert(Lowest > 1),
+
+    Id = keys:pub_key_disp(),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+
+    %% a newcomer asking from the beginning: refused.  Without the guard
+    %% this returns the archive genesis and everything after it.
+    {ok, None} = ssb_peer:rpc_stream_call(
+                   Peer, [~"createHistoryStream"],
+                   [{[{~"id", Id}, {~"seq", 0}]}]),
+    ?assertEqual([], None),
+
+    %% a peer already holding the genesis's predecessor: served normally,
+    %% so the guard refuses the unchainable case WITHOUT breaking the
+    %% followers archiving is supposed to leave undisturbed
+    {ok, Some} = ssb_peer:rpc_stream_call(
+                   Peer, [~"createHistoryStream"],
+                   [{[{~"id", Id}, {~"seq", Lowest - 1}]}]),
+    ?assert(lists:any(fun(F) -> binary:match(F, Marker) =/= nomatch end,
+                      Some)),
     gen_server:stop(Peer).
 
 %%% Helpers -------------------------------------------------------------
