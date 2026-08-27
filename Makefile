@@ -85,9 +85,9 @@ release:
 	$(MAKE) packages
 	@cd $(DIST) && \
 	  gh release create $(VSN) -R $(GH_REPO) --generate-notes --title $(VSN) \
-	      $(DEV_PKG) $(PROD_PKG) \
+	      $(DEV_PKG) $(DEV_PKG).sha256 $(PROD_PKG) $(PROD_PKG).sha256 \
 	  || gh release upload $(VSN) -R $(GH_REPO) --clobber \
-	      $(DEV_PKG) $(PROD_PKG)
+	      $(DEV_PKG) $(DEV_PKG).sha256 $(PROD_PKG) $(PROD_PKG).sha256
 	@echo "==> $(PLATFORM) assets attached to release $(VSN)"
 
 all:  clean compile test prod
