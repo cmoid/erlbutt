@@ -18,7 +18,7 @@
          plugin_rpc_test/1,
          manifest_rpc_test/1,
          log_stream_test/1,
-         history_refused_below_boundary_test/1]).
+         archive_serving_over_the_wire_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -37,7 +37,7 @@ all() ->
      log_stream_test,
      %% last: it archives the node's own feed, which removes early history
      %% from what this node can serve for the rest of the suite
-     history_refused_below_boundary_test].
+     archive_serving_over_the_wire_test].
 
 init_per_suite(Config) ->
     DataDir = ?config(priv_dir, Config),
@@ -157,34 +157,51 @@ log_stream_test(_Config) ->
 %% beginning therefore cannot chain anything we would send, so it must get
 %% nothing rather than orphans — a strict client rejects those, a lenient
 %% one stores and relays them.
-history_refused_below_boundary_test(_Config) ->
+archive_serving_over_the_wire_test(_Config) ->
     FeedPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
-    ok = ssb_feed:post_content(FeedPid, ~"before the boundary"),
+    Early = base64:encode(crypto:strong_rand_bytes(12)),
+    ok = ssb_feed:post_content(FeedPid, Early),
     {ok, _} = ssb_feed:archive(FeedPid),
-    Marker = base64:encode(crypto:strong_rand_bytes(12)),
-    ok = ssb_feed:post_content(FeedPid, Marker),
-
-    Lowest = ssb_feed:lowest_seq(FeedPid),
-    ?assert(Lowest > 1),
+    Late = base64:encode(crypto:strong_rand_bytes(12)),
+    ok = ssb_feed:post_content(FeedPid, Late),
 
     Id = keys:pub_key_disp(),
     {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    From0 = fun() ->
+                {ok, F} = ssb_peer:rpc_stream_call(
+                            Peer, [~"createHistoryStream"],
+                            [{[{~"id", Id}, {~"seq", 0}]}]),
+                F
+            end,
+    Holds = fun(Frames, M) ->
+                lists:any(fun(F) -> binary:match(F, M) =/= nomatch end, Frames)
+            end,
 
-    %% a newcomer asking from the beginning: refused.  Without the guard
-    %% this returns the archive genesis and everything after it.
-    {ok, None} = ssb_peer:rpc_stream_call(
-                   Peer, [~"createHistoryStream"],
-                   [{[{~"id", Id}, {~"seq", 0}]}]),
-    ?assertEqual([], None),
+    %% Serving ON (the default): the segment is decompressed and the
+    %% pre-boundary message is served, so a client that knows nothing about
+    %% boundaries sees an ordinary, complete feed.  This is the whole point
+    %% of archive serving, asserted over a real socket rather than inferred.
+    Served = From0(),
+    ?assert(Holds(Served, Early)),
+    ?assert(Holds(Served, Late)),
 
-    %% a peer already holding the genesis's predecessor: served normally,
-    %% so the guard refuses the unchainable case WITHOUT breaking the
-    %% followers archiving is supposed to leave undisturbed
-    {ok, Some} = ssb_peer:rpc_stream_call(
-                   Peer, [~"createHistoryStream"],
-                   [{[{~"id", Id}, {~"seq", Lowest - 1}]}]),
-    ?assert(lists:any(fun(F) -> binary:match(F, Marker) =/= nomatch end,
-                      Some)),
+    %% Serving OFF: the node declines to carry its own history and the
+    %% guard refuses rather than sending messages the caller cannot chain.
+    ok = config:set_archive_serving(false),
+    try
+        Refused = From0(),
+        ?assertEqual([], Refused),
+
+        %% but a peer already holding the genesis's predecessor is still
+        %% served, so the refusal is precise rather than a blanket no
+        Lowest = ssb_feed:lowest_seq(FeedPid),
+        {ok, Tail} = ssb_peer:rpc_stream_call(
+                       Peer, [~"createHistoryStream"],
+                       [{[{~"id", Id}, {~"seq", Lowest - 1}]}]),
+        ?assert(Holds(Tail, Late))
+    after
+        ok = config:set_archive_serving(true)
+    end,
     gen_server:stop(Peer).
 
 %%% Helpers -------------------------------------------------------------

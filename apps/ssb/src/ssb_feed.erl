@@ -1094,6 +1094,8 @@ feed_test_() ->
       fun archiver_refuses_below_its_live_log_test/1,
       fun floored_feed_refuses_below_its_floor_test/1,
       fun ordinary_feed_serves_from_one_test/1,
+      fun archived_history_is_servable_test/1,
+      fun archive_serving_off_restores_the_guard_test/1,
       fun fetch_archived_msg_test/1,
       fun archive_writes_hint_test/1,
       fun live_index_survives_stale_offset_test/1,
@@ -1576,16 +1578,25 @@ archiver_refuses_below_its_live_log_test({Pid, _, _}) ->
         {ok, _} = ssb_feed:archive(Pid),
         ok = ssb_feed:post_content(Pid, ~"three"),
 
-        %% the genesis is seq 3, so that is the lowest we can serve
-        ?assertEqual(3, ssb_feed:lowest_seq(Pid)),
+        %% Serving off: this node declines to carry its own history, so the
+        %% live log is all it will answer from.  (With serving ON — the
+        %% default — the segments make it servable from 1 again; that is
+        %% archived_history_is_servable_test.)
+        ok = config:set_archive_serving(false),
+        try
+            %% the genesis is seq 3, so that is the lowest we will serve
+            ?assertEqual(3, ssb_feed:lowest_seq(Pid)),
 
-        %% a newcomer, and a follower stuck below the boundary
-        ?assertEqual({false, 3}, ssb_feed:servable_from(Pid, 0)),
-        ?assertEqual({false, 3}, ssb_feed:servable_from(Pid, 1)),
+            %% a newcomer, and a follower stuck below the boundary
+            ?assertEqual({false, 3}, ssb_feed:servable_from(Pid, 0)),
+            ?assertEqual({false, 3}, ssb_feed:servable_from(Pid, 1)),
 
-        %% a follower holding seq 2 chains onto the genesis, so serve it
-        ?assertEqual(true, ssb_feed:servable_from(Pid, 2)),
-        ?assertEqual(true, ssb_feed:servable_from(Pid, 3))
+            %% a follower holding seq 2 chains onto the genesis, so serve it
+            ?assertEqual(true, ssb_feed:servable_from(Pid, 2)),
+            ?assertEqual(true, ssb_feed:servable_from(Pid, 3))
+        after
+            ok = config:set_archive_serving(true)
+        end
     end.
 
 %% The guard, from the FLOORED REPLICATOR's side — the case no amount of
@@ -1619,6 +1630,68 @@ ordinary_feed_serves_from_one_test({Pid, _, _}) ->
         ?assertEqual(1, ssb_feed:lowest_seq(Pid)),
         ?assertEqual(true, ssb_feed:servable_from(Pid, 0)),
         ?assertEqual(true, ssb_feed:servable_from(Pid, 1))
+    end.
+
+%% With archive serving on — the default — an archived feed is servable
+%% from the beginning again: the segments are on disk and fold_feed/3 walks
+%% them.  This is what makes archiving invisible to a client that knows
+%% nothing about boundaries.
+archived_history_is_servable_test({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"one"),
+        ok = ssb_feed:post_content(Pid, ~"two"),
+        {ok, _} = ssb_feed:archive(Pid),
+        ok = ssb_feed:post_content(Pid, ~"three"),
+
+        %% the live log starts at the genesis, but we hold 1 and 2 in a
+        %% segment, so the lowest we can SERVE is 1 again
+        ?assertEqual(1, ssb_feed:lowest_seq(Pid)),
+        ?assertEqual(true, ssb_feed:servable_from(Pid, 0)),
+
+        %% and a fold from the beginning really does produce them, in
+        %% sequence order, rather than starting at the boundary
+        Seqs = ssb_feed:fold_servable(FeedId, Pid, 0,
+                 fun(Data, Acc) ->
+                     #message{sequence = Sq} = message:decode(Data, false),
+                     Acc ++ [Sq]
+                 end, []),
+        ?assertEqual([1, 2, 3, 4], Seqs),
+
+        %% a caller already at the boundary takes the cheap path and gets
+        %% only the live log
+        Tail = ssb_feed:fold_servable(FeedId, Pid, 3,
+                 fun(Data, Acc) ->
+                     #message{sequence = Sq} = message:decode(Data, false),
+                     Acc ++ [Sq]
+                 end, []),
+        ?assertEqual([3, 4], Tail)
+    end.
+
+%% Turning serving off puts the guard back: the node declines to carry its
+%% own history rather than answering for it.  The segments are still on
+%% disk — this is a policy, not a deletion — so it is reversible.
+archive_serving_off_restores_the_guard_test({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"one"),
+        {ok, _} = ssb_feed:archive(Pid),
+        ok = ssb_feed:post_content(Pid, ~"two"),
+        ?assertEqual(1, ssb_feed:lowest_seq(Pid)),
+
+        ok = config:set_archive_serving(false),
+        try
+            ?assertEqual(2, ssb_feed:lowest_seq(Pid)),
+            ?assertEqual({false, 2}, ssb_feed:servable_from(Pid, 0)),
+            %% and the fold stops at the live log rather than the segment
+            Seqs = ssb_feed:fold_servable(FeedId, Pid, 0,
+                     fun(Data, Acc) ->
+                         #message{sequence = Sq} = message:decode(Data, false),
+                         Acc ++ [Sq]
+                     end, []),
+            ?assertEqual([2, 3], Seqs)
+        after
+            ok = config:set_archive_serving(true)
+        end,
+        ?assertEqual(1, ssb_feed:lowest_seq(Pid))
     end.
 
 msg_id_at(Pid, Seq) ->
