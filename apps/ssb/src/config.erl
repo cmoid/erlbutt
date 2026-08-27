@@ -412,3 +412,81 @@ default_blob_store(SSBHome) ->
 
 default_net_id() ->
     ?DEFAULT_NETWORK_ID.
+
+%%%===================================================================
+%%% Tests
+%%%===================================================================
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+%% A setting changed at runtime has to still be there after a restart.
+%% That is the whole point: peer_dialer:enable/0 used to flip only the
+%% running server, so a pub turned on by hand came back off after the next
+%% upgrade, weeks later, with nothing tying the two together.
+override_survives_a_restart_test() ->
+    Home = fresh_home(),
+    try
+        {ok, _} = config:start_link("no-such-cfg"),
+        ?assert(config:dialer_enabled()),
+        ok = gen_server:call(config, {set_dialer, false}, infinity),
+        ?assertNot(config:dialer_enabled()),
+        gen_server:stop(config),
+
+        {ok, _} = config:start_link("no-such-cfg"),
+        ?assertNot(config:dialer_enabled()),
+        gen_server:stop(config)
+    after
+        cleanup_home(Home)
+    end.
+
+%% The overrides file is rewritten, not appended to, so setting the same
+%% key repeatedly does not accumulate — and other keys are kept.
+overrides_do_not_accumulate_test() ->
+    Home = fresh_home(),
+    try
+        {ok, _} = config:start_link("no-such-cfg"),
+        ok = gen_server:call(config, {set_dialer, false}, infinity),
+        ok = gen_server:call(config, {set_pin_archives, true}, infinity),
+        ok = gen_server:call(config, {set_dialer, true}, infinity),
+        gen_server:stop(config),
+
+        {ok, Terms} = file:consult(filename:join(Home, ".ssberl/overrides.cfg")),
+        ?assertEqual(1, length([T || {peer_dialer, _} = T <- Terms])),
+        ?assertEqual([{peer_dialer, true}],
+                     [T || {peer_dialer, _} = T <- Terms]),
+        ?assertEqual([{pin_archives, true}],
+                     [T || {pin_archives, _} = T <- Terms])
+    after
+        cleanup_home(Home)
+    end.
+
+%% A corrupt overrides file must not stop the node: it would take a pub
+%% down over a settings change.
+unreadable_overrides_are_ignored_test() ->
+    Home = fresh_home(),
+    try
+        File = filename:join(Home, ".ssberl/overrides.cfg"),
+        ok = filelib:ensure_dir(File),
+        ok = file:write_file(File, ~"this is not erlang terms at all"),
+        {ok, _} = config:start_link("no-such-cfg"),
+        %% started anyway, on the built-in default
+        ?assert(config:dialer_enabled()),
+        gen_server:stop(config)
+    after
+        cleanup_home(Home)
+    end.
+
+fresh_home() ->
+    Home = filename:join("/tmp", "cfg_" ++
+                         integer_to_list(erlang:system_time(microsecond))),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    application:set_env(ssb, ssb_home, Home),
+    Home.
+
+cleanup_home(Home) ->
+    catch gen_server:stop(config),
+    os:cmd("rm -rf " ++ Home),
+    application:unset_env(ssb, ssb_home),
+    ok.
+
+-endif.
