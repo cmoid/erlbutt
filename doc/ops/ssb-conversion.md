@@ -29,15 +29,52 @@ that double-clicking the old client must not start a second writer.
 
 `default.vars` carries an almost-identical id that differs in its last few
 characters, so `make rel`, `make devpkg`, eunit and CT can never reach the
-real network by accident. **Building the prod profile is the deliberate act
-of joining it** — there is no config file to hand-edit, and editing one by
-hand is how you end up on a network of one.
+real network by accident. **Choosing a prod build is the deliberate act of
+joining it**, whether you build one or download one — there is no config
+file to hand-edit, and editing one by hand is how you end up on a network
+of one.
+
+The dev package is the other artifact on a release, and it is not this: it
+carries the development network id, so a node built or downloaded that way
+will talk to nobody on the real network no matter how it is configured.
 
 `default.vars` also sets `{peer_dialer, false}`, which is what makes the
 sequence below safe: a freshly installed node holds your identity but
 talks to nobody until you say so.
 
-## 1. Build and install
+## 1. Install a prod release
+
+Either download one or build one — the result is the same tarball.
+
+### Download it
+
+Prod packages are attached to each release on GitHub, named for the
+platform they were built on (`darwin-arm64`, `linux-x86_64`, …). They
+bundle their own Erlang runtime, so nothing needs to be installed first.
+
+```shell
+gh release download <tag> -R cmoid/erlbutt -p 'erlbutt-prod-*-darwin-arm64.tar.gz*'
+shasum -a 256 -c erlbutt-prod-*.sha256
+
+mkdir -p ~/erlbutt-ssb
+tar -xzf erlbutt-prod-*.tar.gz -C ~/erlbutt-ssb
+```
+
+**Extract from a terminal, not by double-clicking it.** macOS marks
+anything downloaded with a quarantine attribute, and Archive Utility
+copies that mark onto every file it unpacks — including the bundled VM and
+its native libraries, which Gatekeeper then refuses to load. Command-line
+`tar` does not propagate it. If you have already unpacked it the other
+way:
+
+```shell
+xattr -dr com.apple.quarantine ~/erlbutt-ssb
+```
+
+There is no code signature on these builds, so that is the only thing
+standing between a download and a node that starts.
+
+### Or build it
 
 ```shell
 cd <code-path>/erlbutt
@@ -47,10 +84,22 @@ mkdir -p ~/erlbutt-ssb
 tar -xzf dist/erlbutt-prod-*.tar.gz -C ~/erlbutt-ssb
 ```
 
-Anywhere outside the build tree will do. `_build/default/rel/ssb/` is a bad
+Building is a native build, not a cross-compile: the artifact carries the
+OS and CPU of the machine that made it.
+
+### Either way
+
+Install anywhere outside the build tree. `_build/default/rel/ssb/` is a bad
 home for an identity you cannot re-create: `SSB_HOME` defaults to `.`, so a
 node run from there puts its data *inside the release directory*, where the
 next `make rel` is one command away from confusing the two.
+
+`sbutt.escript` ships inside the release and defaults to the dev build's
+path, so set `SSB_HOME` when running it against this install:
+
+```shell
+cd ~/erlbutt-ssb && SSB_HOME=. ./sbutt.escript health
+```
 
 
 ## 2. Give it the identity
