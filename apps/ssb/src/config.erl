@@ -21,6 +21,8 @@
          archive_floors/0,
          pin_archives/0,
          set_pin_archives/1,
+         archive_serving/0,
+         set_archive_serving/1,
          set_dialer/1,
          require_valid_sigs/0,
          set_require_valid_sigs/1,
@@ -50,6 +52,7 @@
                  dialer = true,
                  archive_floors = true,
                  pin_archives = false,
+                 archive_serving = true,
                  blob_scan = false,
                  %% Reject peer messages whose signature does not verify.
                  %% Off by default: a node runs in log-and-count mode first
@@ -131,6 +134,26 @@ archive_length() ->
 pin_archives() ->
     (get_config())#config.pin_archives.
 
+%% Serve archived history to peers that ask for it, by decompressing the
+%% frozen segments on demand.
+%%
+%% ON by default, which makes archiving invisible to the network: a client
+%% that knows nothing about boundaries asks from sequence 1 and gets the
+%% whole feed, exactly as before.  It costs nothing in the common case —
+%% the segments are only touched when somebody asks below the live log —
+%% and it does not weaken the onboarding shortcut, because that is the
+%% REQUESTER's choice: a peer that adopts a boundary asks from there and
+%% never triggers a decompress.
+%%
+%% Turning it OFF is how a node declines to carry its own history: it then
+%% refuses requests below the boundary (see ssb_feed:servable_from/2)
+%% rather than answering them, and newcomers must get that history from
+%% some other peer.  Honest, and materially cheaper, but it makes the feed
+%% unfollowable by anyone who cannot floor — so it is a choice, not a
+%% default.
+archive_serving() ->
+    (get_config())#config.archive_serving.
+
 %% Whether to adopt a validation floor when a peer offers an archive
 %% boundary for a feed we hold nothing of.  On by default — skipping
 %% history nobody asked us to hold is the point of archiving — but it
@@ -193,6 +216,10 @@ set_dialer(Bool) when is_boolean(Bool) ->
 %% retaining archive history should not need a restart to do it.
 set_pin_archives(Bool) when is_boolean(Bool) ->
     gen_server:call(?MODULE, {set_pin_archives, Bool}, infinity).
+
+%% Start or stop serving archived history on a running node.
+set_archive_serving(Bool) when is_boolean(Bool) ->
+    gen_server:call(?MODULE, {set_archive_serving, Bool}, infinity).
 
 set_archive_length(undefined) ->
     gen_server:call(?MODULE, {set_archive_length, undefined}, infinity);
@@ -302,6 +329,10 @@ handle_call({set_archive_length, Len}, _From, Cfg) ->
     _ = persist(archive_length, Len, Cfg),
     {reply, ok, publish(Cfg#config{archive_length = Len})};
 
+handle_call({set_archive_serving, Bool}, _From, Cfg) ->
+    _ = persist(archive_serving, Bool, Cfg),
+    {reply, ok, publish(Cfg#config{archive_serving = Bool})};
+
 handle_call({set_dialer, Bool}, _From, Cfg) ->
     _ = persist(peer_dialer, Bool, Cfg),
     {reply, ok, publish(Cfg#config{dialer = Bool})}.
@@ -371,6 +402,8 @@ parse({replication_hops, Hops}, Cfg) when is_integer(Hops), Hops >= 0 ->
 
 parse({pin_archives, Bool}, Cfg) when is_boolean(Bool) ->
     Cfg#config{pin_archives = Bool};
+parse({archive_serving, Bool}, Cfg) when is_boolean(Bool) ->
+    Cfg#config{archive_serving = Bool};
 parse({archive_floors, Bool}, Cfg) when is_boolean(Bool) ->
     Cfg#config{archive_floors = Bool};
 parse({peer_dialer, Bool}, Cfg) when is_boolean(Bool) ->
