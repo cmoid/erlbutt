@@ -31,6 +31,8 @@
          archive_boundary/1,
          seed_floor/2,
          current_seq/1,
+         lowest_seq/1,
+         servable_from/2,
          reset_log_slots/0]).
 
 %% gen_server callbacks
@@ -131,6 +133,38 @@ archive(FeedPid) ->
 archive_boundary(FeedPid) ->
     gen_server:call(FeedPid, archive_boundary, infinity).
 
+%% The lowest sequence this node can serve for the feed — the sequence of
+%% the first record in the live log.
+%%
+%% 1 for an ordinary feed.  Above 1 whenever the early history is gone,
+%% which happens two ways: we archived it (the frozen segments are not
+%% served), or we adopted a validation floor and never fetched it.  Both
+%% collapse to the same question, which is why this asks the log rather
+%% than consulting feed_floor — the archiver has no floor record.
+lowest_seq(FeedPid) ->
+    gen_server:call(FeedPid, lowest_seq, infinity).
+
+%% May a peer that already holds AfterSeq be served from this feed?
+%%
+%% Our live log starts at Lowest, so the first message we would send
+%% carries previous = id(Lowest - 1).  A peer can only chain it if it
+%% already holds Lowest - 1; anyone below that receives messages it cannot
+%% link to anything.
+%%
+%% That is a correctness guard rather than a politeness.  A strict client
+%% rejects the orphans, which is merely noisy.  A LENIENT one — and not
+%% every client validates the previous-chain — stores them as though they
+%% were the feed and then relays them, which is how one truncated feed
+%% becomes several corrupted replicas.
+%%
+%% Expressed once, here, because EBT and createHistoryStream both need it
+%% and a rule stated twice is a rule that drifts.
+servable_from(FeedPid, AfterSeq) ->
+    case lowest_seq(FeedPid) of
+        Lowest when AfterSeq >= Lowest - 1 -> true;
+        Lowest                             -> {false, Lowest}
+    end.
+
 %% Adopt Genesis as this feed's validation floor: hold it from that
 %% sequence on, and never fetch what lies below.
 %%
@@ -190,6 +224,10 @@ handle_call({seed_floor, Genesis}, _From, State) ->
 
 handle_call(current_seq, _From, #state{last_seq = Seq} = State) ->
     {reply, Seq, State};
+
+handle_call(lowest_seq, _From, #state{feed = FeedFile,
+                                      last_seq = LastSeq} = State) ->
+    {reply, first_seq(FeedFile, LastSeq), State};
 
 handle_call(whoami, _From, #state{id = Id} = State) ->
     {reply, Id, State};
@@ -408,6 +446,28 @@ read_archive_boundary(FeedFile) ->
             Res;
         _ ->
             none
+    end.
+
+%% Sequence of the first record in the live log.
+%%
+%% An empty or unreadable log reports LastSeq + 1, which reads as "there is
+%% nothing here to serve" — true for a floor seeded before anything has
+%% replicated, and harmless for a feed we have never seen, where the fold
+%% would send nothing anyway.
+first_seq(FeedFile, LastSeq) ->
+    case file:open(FeedFile, [read, binary, raw]) of
+        {ok, Fd} ->
+            Res = try first_record(Fd) of
+                      {ok, Raw} ->
+                          #message{sequence = Seq} = message:decode(Raw, false),
+                          Seq;
+                      none -> LastSeq + 1
+                  catch _:_ -> LastSeq + 1
+                  end,
+            _ = file:close(Fd),
+            Res;
+        _ ->
+            LastSeq + 1
     end.
 
 first_record(Fd) ->

@@ -294,6 +294,26 @@ send_feed_msgs_after_ok(FeedId, AfterSeq, OutReqNo, Socket, Nonce, Key) ->
         bad ->
             Nonce;
         _ ->
+            case ssb_feed:servable_from(Pid, AfterSeq) of
+                true            -> send_from(Pid, AfterSeq, OutReqNo, Socket,
+                                             Nonce, Key);
+                {false, Lowest} -> refuse(FeedId, AfterSeq, Lowest, Nonce)
+            end
+    end.
+
+%% The peer is below what our live log can chain to.
+%%
+%% EBT has no per-feed error channel — a note is a vector clock and nothing
+%% else — so the honest answer is to send nothing and let the peer get that
+%% history from a node that holds it.  Sending anyway would deliver
+%% messages it cannot link; see ssb_feed:servable_from/2 for why that is
+%% worse than silence.
+refuse(FeedId, AfterSeq, Lowest, Nonce) ->
+    ?SSB_DEBUG("EBT: not serving ~p from ~p, live log starts at ~p~n",
+               [FeedId, AfterSeq, Lowest]),
+    Nonce.
+
+send_from(Pid, AfterSeq, OutReqNo, Socket, Nonce, Key) ->
             ssb_feed:foldl(Pid,
                            fun(MsgData, NonceAcc) ->
                                    try
@@ -311,8 +331,7 @@ send_feed_msgs_after_ok(FeedId, AfterSeq, OutReqNo, Socket, Nonce, Key) ->
                                            ?SSB_INFO("EBT: skipping bad stored msg: ~p~n", [Err]),
                                            NonceAcc
                                    end
-                           end, Nonce)
-    end.
+                           end, Nonce).
 
 %% Send a single raw message binary over the duplex stream.
 %% Only the "value" object is sent (not the full {key,value,timestamp} envelope),

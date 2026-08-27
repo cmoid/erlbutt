@@ -257,35 +257,53 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [Method],
     Keys  = proplists:get_value(~"keys",  ArgProps, true),
     ets:insert(Calls, {ReqNo, noop}),
     FeedPid = utils:find_or_create_feed_pid(Id),
-    {NewNonce, _} = ssb_feed:foldl(FeedPid,
-        fun(MsgData, {N, Count}) ->
-            case Limit >= 0 andalso Count >= Limit of
-                true -> {N, Count};
-                false ->
-                    try
-                        Msg = message:decode(MsgData, false),
-                        case Msg#message.sequence > Seq of
-                            true ->
-                                Body = case Keys of
-                                    true  -> message:encode(Msg);
-                                    false -> MsgData
-                                end,
-                                Flags  = create_flags(1, 0, 2),
-                                Header = create_header(Flags, size(Body), -ReqNo),
-                                N1 = utils:send_data(utils:combine(Header, Body),
-                                                     Socket, N, SecretBoxKey),
-                                {N1, Count + 1};
-                            false ->
-                                {N, Count}
-                        end
-                    catch _:_ -> {N, Count}
+    case ssb_feed:servable_from(FeedPid, Seq) of
+        {false, Lowest} ->
+            % Our live log starts above what this caller holds, so every
+            % message we could send is one it cannot chain.  Ending the
+            % stream normally would claim "that is the whole feed", which
+            % is a lie; an error says "not from here" and the caller can
+            % look elsewhere.  As with blobs.get, the error must carry the
+            % stream flag or a standard client never routes it and hangs.
+            Text = iolist_to_binary(
+                     ["history before sequence ", integer_to_list(Lowest),
+                      " is not available from this node"]),
+            ErrMsg  = utils:error_msg(~"Error", Text),
+            EFlags  = create_flags(1, 1, 2),
+            EHeader = create_header(EFlags, size(ErrMsg), -ReqNo),
+            utils:send_data(utils:combine(EHeader, ErrMsg), Socket, Nonce,
+                            SecretBoxKey);
+        true ->
+            {NewNonce, _} = ssb_feed:foldl(FeedPid,
+                fun(MsgData, {N, Count}) ->
+                    case Limit >= 0 andalso Count >= Limit of
+                        true -> {N, Count};
+                        false ->
+                            try
+                                Msg = message:decode(MsgData, false),
+                                case Msg#message.sequence > Seq of
+                                    true ->
+                                        Body = case Keys of
+                                            true  -> message:encode(Msg);
+                                            false -> MsgData
+                                        end,
+                                        Flags  = create_flags(1, 0, 2),
+                                        Header = create_header(Flags, size(Body), -ReqNo),
+                                        N1 = utils:send_data(utils:combine(Header, Body),
+                                                             Socket, N, SecretBoxKey),
+                                        {N1, Count + 1};
+                                    false ->
+                                        {N, Count}
+                                end
+                            catch _:_ -> {N, Count}
+                            end
                     end
-            end
-        end, {Nonce, 0}),
-    TrueEnd = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
-    Flags  = create_flags(1, 1, 2),
-    Header = create_header(Flags, size(TrueEnd), -ReqNo),
-    utils:send_data(utils:combine(Header, TrueEnd), Socket, NewNonce, SecretBoxKey);
+                end, {Nonce, 0}),
+            TrueEnd = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+            Flags  = create_flags(1, 1, 2),
+            Header = create_header(Flags, size(TrueEnd), -ReqNo),
+            utils:send_data(utils:combine(Header, TrueEnd), Socket, NewNonce, SecretBoxKey)
+    end;
 
 proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"publish"],
                              args = [Content]}
