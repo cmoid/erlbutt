@@ -21,6 +21,7 @@
          archive_floors/0,
          pin_archives/0,
          set_pin_archives/1,
+         set_dialer/1,
          require_valid_sigs/0,
          set_require_valid_sigs/1,
          blob_scan_enabled/0,
@@ -175,6 +176,19 @@ add_network_id(NetId) when is_binary(NetId) ->
 set_require_valid_sigs(Bool) when is_boolean(Bool) ->
     gen_server:call(?MODULE, {set_require_valid_sigs, Bool}, infinity).
 
+%% Turn automatic dialing on or off, now and after a restart.
+%%
+%% peer_dialer:enable/0 goes through here rather than only flipping the
+%% running server, because a dialer that quietly turns itself off on the
+%% next boot is the kind of thing you notice weeks later by wondering why
+%% a pub stopped finding peers.
+set_dialer(Bool) when is_boolean(Bool) ->
+    ok = gen_server:call(?MODULE, {set_dialer, Bool}, infinity),
+    %% Best effort: the setting is recorded either way, and a node with no
+    %% dialer running (tests, tools) still gets the persisted value.
+    catch peer_dialer:apply_enabled(Bool),
+    ok.
+
 %% Turn pinning on or off on a running node — a pub deciding to start
 %% retaining archive history should not need a restart to do it.
 set_pin_archives(Bool) when is_boolean(Bool) ->
@@ -215,18 +229,82 @@ init([Config]) ->
                               feed_loc = default_feed_store(SSBHome),
                               blob_loc = default_blob_store(SSBHome)}
           end,
-    {ok, publish(Cfg)}.
+    {ok, publish(load_overrides(Cfg))}.
+
+%% Settings changed at runtime, layered on top of ssb.cfg.
+%%
+%% They CANNOT live in ssb.cfg.  That file is a relx template rendered
+%% into the release directory, so it ships inside the tarball and the next
+%% `tar -xzf` over an install destroys anything written there — every
+%% setting reverting at once, on upgrade, silently.  This file lives with
+%% the DATA instead, where a redeploy cannot reach it.
+%%
+%% Read last so it wins: defaults, then ssb.cfg, then this.
+load_overrides(#config{repo_loc = RepoLoc} = Cfg) ->
+    File = overrides_file(RepoLoc),
+    case filelib:is_file(File) of
+        true ->
+            try load_and_parse(File, Cfg)
+            catch Class:Reason ->
+                    %% A corrupt overrides file must not stop the node —
+                    %% it would take a pub down over a settings change.
+                    ?SSB_ERROR("config: ignoring unreadable ~s: ~p:~p",
+                               [File, Class, Reason]),
+                    Cfg
+            end;
+        false ->
+            Cfg
+    end.
+
+overrides_file(RepoLoc) ->
+    filename:join(?b2l(RepoLoc), "overrides.cfg").
+
+%% Record one setting so it survives a restart.
+%%
+%% Rewrites the whole file from the terms it already held, with this key
+%% replaced — so hand-edits to other keys are kept, and a key set twice
+%% does not accumulate.
+persist(Key, Value, #config{repo_loc = RepoLoc}) ->
+    File = overrides_file(RepoLoc),
+    Existing = case file:consult(File) of
+                   {ok, Terms} -> [T || T <- Terms, element(1, T) =/= Key];
+                   _           -> []
+               end,
+    Body = [io_lib:format("~p.~n", [T]) || T <- Existing ++ [{Key, Value}]],
+    case file:write_file(File, ["%% Written by erlbutt at runtime.  Layered "
+                                "on top of ssb.cfg; survives a redeploy "
+                                "because it lives with the data.\n",
+                                Body]) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            %% Say so: the caller's change took effect in memory and will
+            %% be gone after a restart, which is exactly the surprise this
+            %% file exists to prevent.
+            ?SSB_ERROR("config: could not persist ~p to ~s: ~p — the change "
+                       "applies now but will NOT survive a restart",
+                       [Key, File, Reason]),
+            {error, Reason}
+    end.
 
 handle_call({add_network_id, NetId}, _From, #config{extra_network_ids = Extras}=Cfg) ->
     {reply, ok, publish(Cfg#config{extra_network_ids = Extras ++ [NetId]})};
 
 handle_call({set_require_valid_sigs, Bool}, _From, Cfg) ->
+    _ = persist(require_valid_sigs, Bool, Cfg),
     {reply, ok, publish(Cfg#config{require_valid_sigs = Bool})};
 
 handle_call({set_pin_archives, Bool}, _From, Cfg) ->
+    _ = persist(pin_archives, Bool, Cfg),
     {reply, ok, publish(Cfg#config{pin_archives = Bool})};
+
 handle_call({set_archive_length, Len}, _From, Cfg) ->
-    {reply, ok, publish(Cfg#config{archive_length = Len})}.
+    _ = persist(archive_length, Len, Cfg),
+    {reply, ok, publish(Cfg#config{archive_length = Len})};
+
+handle_call({set_dialer, Bool}, _From, Cfg) ->
+    _ = persist(peer_dialer, Bool, Cfg),
+    {reply, ok, publish(Cfg#config{dialer = Bool})}.
 
 %% casts
 

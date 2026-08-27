@@ -18,6 +18,7 @@
          trigger/0,
          enable/0,
          disable/0,
+         apply_enabled/1,
          is_enabled/0]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -51,11 +52,22 @@ trigger() ->
 
 %% Turn automatic dialing on (kicks an immediate pass) or off.  The poll
 %% timer keeps running while disabled; passes are skipped.
+%%
+%% Goes through config so the choice OUTLIVES A RESTART.  These used to
+%% flip only the running server, which meant a pub turned on by hand came
+%% back off after the next upgrade — visible weeks later as "why has it
+%% stopped finding peers", with nothing in the logs to connect it to.
 enable() ->
-    gen_server:call(?MODULE, {set_enabled, true}).
+    config:set_dialer(true).
 
 disable() ->
-    gen_server:call(?MODULE, {set_enabled, false}).
+    config:set_dialer(false).
+
+%% Apply a setting to the running server without recording it again.
+%% config:set_dialer/1 persists first, then calls this; going the other
+%% way round would loop.
+apply_enabled(Bool) when is_boolean(Bool) ->
+    gen_server:call(?MODULE, {set_enabled, Bool}).
 
 is_enabled() ->
     gen_server:call(?MODULE, is_enabled).
@@ -223,9 +235,9 @@ dial({Host, Port, RawKey}) ->
 enable_disable_test() ->
     {ok, Pid} = peer_dialer:start_link(),
     ?assert(peer_dialer:is_enabled()),
-    ok = peer_dialer:disable(),
+    ok = peer_dialer:apply_enabled(false),
     ?assertNot(peer_dialer:is_enabled()),
-    ok = peer_dialer:enable(),
+    ok = peer_dialer:apply_enabled(true),
     ?assert(peer_dialer:is_enabled()),
     ?assert(is_process_alive(Pid)),
     gen_server:stop(Pid).
@@ -247,7 +259,7 @@ responsive_during_dial_test() ->
     peer_dialer:trigger(),
     timer:sleep(50),
     ?assert(peer_dialer:is_enabled()),
-    ok = peer_dialer:disable(),
+    ok = peer_dialer:apply_enabled(false),
     ?assertNot(peer_dialer:is_enabled()),
     gen_server:stop(Pid),
     case HbStarted of

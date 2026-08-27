@@ -139,7 +139,7 @@ The dialer is off, so none of this touches the network.
 Only once the above looks right:
 
 ```erlang
-config:set_dialer(true).
+peer_dialer:enable().
 ```
 
 Then retire the old store, so it cannot become a second writer:
