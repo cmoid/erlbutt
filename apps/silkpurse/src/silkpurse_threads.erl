@@ -128,7 +128,7 @@ start_link() ->
 %% 3: fork roots are completed (see complete_root/4).  Threads already
 %% indexed under a null author would otherwise stay hidden forever, so
 %% upgrading nodes must refold to pick them up.
-view_version() -> 3.
+view_version() -> 4.
 
 view_load() ->
     case ssb_store:complete(?MODULE) of
@@ -149,15 +149,16 @@ view_save() ->
     ok.
 
 view_entry(#message{id = Id, author = Author, timestamp = Ts,
-                    content = {Props}}) ->
+                    received = Recv, content = {Props}}) ->
     Type = ?pgv(~"type", Props),
     Root = ?pgv(~"root", Props),
+    Sort = sort_ts(Ts, Recv),
     case classify(Type, Root) of
         root ->
-            set_root(Id, Author, Ts, Props),  %% the root's own id keys the thread
+            set_root(Id, Author, Ts, Sort, Props),  %% the root's own id keys the thread
             {events, [{thread, Id}]};
         {reply, RootId} ->
-            add_reply(RootId, Author, Id, Ts, Props),
+            add_reply(RootId, Author, Id, Sort, Props),
             %% This message may itself be something else forked off, in
             %% which case a thread row keyed by OUR id is waiting for an
             %% author that set_root/4 will never supply.
@@ -377,28 +378,28 @@ classify(_, _) ->
 %% add the author + its mentions as actors.  A reply may have created the
 %% thread row first, so this must not clobber `last` downwards — hence
 %% max() rather than assignment.
-set_root(RootId, Author, Ts, Props) ->
+set_root(RootId, Author, Ts, Sort, Props) ->
     _ = write("INSERT INTO thread(root, author, ts, last, channel)"
               " VALUES(?, ?, ?, ?, ?)"
               " ON CONFLICT(root) DO UPDATE SET"
               "   author=excluded.author, ts=excluded.ts,"
               "   channel=excluded.channel,"
               "   last=max(thread.last, excluded.last)",
-              [RootId, Author, num_or_null(Ts), num(Ts), channel_of(Props)]),
+              [RootId, Author, num_or_null(Ts), Sort, channel_of(Props)]),
     add_actors(RootId, [Author], ?PARTICIPANT),
     add_actors(RootId, mentions_of(Props), ?MENTION),
     ok.
 
-add_reply(RootId, ReplyAuthor, ReplyId, Ts, Props) ->
+add_reply(RootId, ReplyAuthor, ReplyId, Sort, Props) ->
     %% The reply row carries the dedup: redelivering a reply is a no-op on
     %% (root, msg), where the old counter incremented regardless.
     _ = write("INSERT INTO thread_reply(root, msg, ts) VALUES(?, ?, ?)"
               " ON CONFLICT(root, msg) DO UPDATE SET ts=excluded.ts",
-              [RootId, ReplyId, num(Ts)]),
+              [RootId, ReplyId, Sort]),
     _ = write("INSERT INTO thread(root, last) VALUES(?, ?)"
               " ON CONFLICT(root) DO UPDATE SET"
               "   last=max(thread.last, excluded.last)",
-              [RootId, num(Ts)]),
+              [RootId, Sort]),
     add_actors(RootId, [ReplyAuthor], ?PARTICIPANT),
     add_actors(RootId, mentions_of(Props), ?MENTION),
     maybe_complete_fork_root(RootId),
@@ -476,11 +477,35 @@ add_actors(RootId, Feeds, Kind) ->
           " ON CONFLICT(root, feed, kind) DO NOTHING", Rows),
     ok.
 
-%% Timestamps are self-asserted and may be missing or non-numeric; `last`
-%% is NOT NULL because it is the sort key, so it floors at 0.
-num(Ts) when is_integer(Ts) -> Ts;
-num(Ts) when is_float(Ts)   -> trunc(Ts);
-num(_)                      -> 0.
+%% The sort key for thread activity: min(claimed, received).
+%%
+%% `timestamp` is whatever the author put there.  Nothing validates it, and
+%% the network is full of clocks that were wrong — this store holds posts
+%% claiming 2038 and 2040, and seven from one feed written in MICROseconds,
+%% which are a thousand times too large.  Ordering on that alone puts a
+%% handful of 2019 posts permanently above everything a reader has ever
+%% received.
+%%
+%% `received` is when THIS node stored the message, so an author cannot
+%% claim to be newer than our own receipt.  Taking the minimum keeps the
+%% author's time whenever it is believable and caps it when it is not:
+%%
+%%   claimed 2040, received today  -> today   (the bad clock is contained)
+%%   claimed 2019, received today  -> 2019    (backfill stays old, as it
+%%                                             should — using `received`
+%%                                             alone would make nine years
+%%                                             of history look brand new)
+%%
+%% Either value may be missing or non-numeric, so fall back rather than
+%% floor: only when neither is usable does this reach 0.  `last` is NOT
+%% NULL because it is the sort key.
+sort_ts(Ts, Recv) ->
+    case {num_or_null(Ts), num_or_null(Recv)} of
+        {undefined, undefined} -> 0;
+        {undefined, R}         -> R;
+        {T, undefined}         -> T;
+        {T, R}                 -> min(T, R)
+    end.
 
 num_or_null(Ts) when is_integer(Ts) -> Ts;
 num_or_null(Ts) when is_float(Ts)   -> trunc(Ts);
@@ -842,6 +867,25 @@ scoped_feeds_select_their_threads() ->
 
 %% Root ids a feed tab selects, newest activity first — the query roots/2
 %% runs, without hydrating bodies (these roots have none stored).
+%% Tests predate the claimed/received split and pass one timestamp, which
+%% means "the author's clock agreed with ours" — the ordinary case.
+set_root(RootId, Author, Ts, Props) ->
+    set_root(RootId, Author, Ts, Ts, Props).
+
+sort_ts_test() ->
+    Now = 1787000000000,
+    %% a wrong clock cannot push a thread above everything
+    ?assertEqual(Now, sort_ts(2230701489347, Now)),
+    %% microseconds are a thousand times too large; receipt caps them
+    ?assertEqual(Now, sort_ts(1552496705591739, Now)),
+    %% backfill keeps the author's time — receipt alone would make nine
+    %% years of history look brand new
+    ?assertEqual(1552496705591, sort_ts(1552496705591, Now)),
+    %% either side missing falls back rather than flooring at 0
+    ?assertEqual(Now, sort_ts(undefined, Now)),
+    ?assertEqual(1234, sort_ts(1234, undefined)),
+    ?assertEqual(0, sort_ts(undefined, undefined)).
+
 scope_roots(Feed, Args) ->
     {Join, Where, ScopeP} = feed_scope(Feed, Args),
     [R || [R] <- ssb_store:q(["SELECT t.root FROM thread t", Join,
