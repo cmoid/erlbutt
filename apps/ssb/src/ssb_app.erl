@@ -21,6 +21,16 @@ start(_StartType, _StartArgs) ->
     logger:set_module_level(supervisor, error),
     ?LOG(LogLevel, "Log level ~p set from env ~n", [LogLevel]),
 
+    %% Before anything opens a socket or touches the store: refuse to run
+    %% against data written by a newer build.  Not binding the port is part
+    %% of not running — a half-started node that answers peers while
+    %% declining to read its own floors is worse than one that stopped.
+    case data_version:check() of
+        ok               -> start_node(LogLevel);
+        {error, _} = Err -> Err
+    end.
+
+start_node(_LogLevel) ->
     Port = application:get_env(ssb, port, 8008),
     catch ranch:stop_listener(erlbutt_listener),
     {ok, _} = ranch:start_listener(erlbutt_listener,
