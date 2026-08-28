@@ -3,7 +3,7 @@
 %% Copyright (C) 2023 Charles Moid
 {application, ssb,
  [{description, "ssb"},
-  {vsn, {cmd, "echo 0.1-`git describe --always --tags`"}},
+  {vsn, {cmd, "git describe --always --tags | sed 's/^v//'"}},
   {registered, []},
   %% Genuine runtime dependencies only.  GUI/tooling apps (observer, wx,
   %% debugger, tools, syntax_tools) are not needed to run a node; the devpkg

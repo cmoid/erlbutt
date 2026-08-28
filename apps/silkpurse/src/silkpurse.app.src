@@ -4,7 +4,7 @@
                 "indexes a silkpurse/patchwork-family UI needs, layered on "
                 "erlbutt's plugin registry and view manager.  The node "
                 "itself never depends on this app."},
-  {vsn, "0.0.1"},
+  {vsn, {cmd, "git describe --always --tags | sed 's/^v//'"}},
   {registered, [silkpurse_sup, silkpurse_backlinks, silkpurse_by_type,
                 silkpurse_about, silkpurse_threads,
                 silkpurse_likes]},

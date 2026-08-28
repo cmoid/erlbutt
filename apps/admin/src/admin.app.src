@@ -24,7 +24,7 @@
 %% the length of a full refold.
 {application, admin,
  [{description, "Owner-only control plane for operating an erlbutt node"},
-  {vsn, {cmd, "echo 0.1-`git describe --always --tags`"}},
+  {vsn, {cmd, "git describe --always --tags | sed 's/^v//'"}},
   {registered, [admin_sup]},
   {mod, {admin_app, []}},
   {applications, [kernel, stdlib, ssb]},

@@ -3,7 +3,7 @@
 %% Copyright (C) 2026 Charles Moid
 {application, plumtree,
  [{description, "Plumtree epidemic broadcast for erlbutt"},
-  {vsn, {cmd, "echo 0.1-`git describe --always --tags`"}},
+  {vsn, {cmd, "git describe --always --tags | sed 's/^v//'"}},
   {registered, []},
   {applications, [kernel, stdlib, sasl]},
   {env, [
