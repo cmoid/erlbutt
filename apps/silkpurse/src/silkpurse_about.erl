@@ -52,7 +52,7 @@
 -include_lib("ssb/include/ssb.hrl").
 
 %% API
--export([start_link/0, social_value/2, search_names/2]).
+-export([start_link/0, social_value/2, search_names/1, search_names/2]).
 
 %% ssb_view callbacks
 -export([view_version/0, view_load/0, view_reset/0, view_save/0,
@@ -360,33 +360,49 @@ social_value(Dest, Key) ->
         _              -> highest_rank(Values)
     end.
 
-%% Feeds whose resolved display name contains Text (case-insensitive),
-%% up to Limit, as [{FeedId, Name}] — the backing for mention
-%% autocomplete.  Uses the resolved social value, so pet-names the owner
-%% assigned are searchable too.
-%% Matching stays in Erlang rather than becoming a SQL LIKE: string:find
-%% on a string:lowercase'd binary is Unicode-aware, and SQLite's lower()
-%% is ASCII-only, so pushing it down would quietly stop matching any name
-%% that is not plain ASCII.  What the port does buy is the candidate set —
-%% an indexed scan for dests carrying a `name`, where this used to fold
-%% every entry in the whole index regardless of key.
+%% Feeds whose name contains Text (case-insensitive), as [{FeedId, Name}]
+%% — the backing for mention autocomplete.  Ranked and truncated by the
+%% caller, so this returns EVERY match rather than an arbitrary prefix of
+%% them: cutting the list here is what made a followed feed lose to a dead
+%% one that merely sorted earlier.
+%%
+%% One query, not one per feed.  This used to ask social_value/2 for every
+%% dest carrying a name — two queries each, and this store has 42,051 of
+%% them, so a single keystroke cost ~84,000 queries.  Now the raw
+%% assignments come back in one go and the filtering happens in memory.
+%%
+%% Filtering on the raw assignments is a safe PREFILTER, not the answer:
+%% the resolved name is always one of the assigned values, so anything
+%% whose display name matches must have some assignment that matches.  The
+%% reverse does not hold — a self-assigned name the owner has overridden
+%% still sits in the table — so the resolved name is re-checked below.
+%% Search matches what you can SEE, which is the property the old
+%% resolve-then-match code had and this keeps.
+%%
+%% Matching stays in Erlang rather than becoming a SQL LIKE: string:find on
+%% a lowercased binary is Unicode-aware, and SQLite's lower() is ASCII-only,
+%% so pushing it down would quietly stop matching any non-ASCII name.
 search_names(Text, Limit) ->
+    lists:sublist(search_names(Text), Limit).
+
+search_names(Text) ->
     Needle = string:lowercase(Text),
-    Dests = [D || [D] <- rows("SELECT DISTINCT dest FROM about_assign"
-                              " WHERE key=?1", [~"name"])],
-    Matches = lists:filtermap(
-                fun(Dest) ->
-                        case social_value(Dest, ~"name") of
-                            Name when is_binary(Name) ->
-                                case string:find(string:lowercase(Name),
-                                                 Needle) of
-                                    nomatch -> false;
-                                    _       -> {true, {Dest, Name}}
-                                end;
-                            _ -> false
-                        end
-                end, Dests),
-    lists:sublist(Matches, Limit).
+    %% Feeds only.  `about` names anything — this store has 4,917 named
+    %% MESSAGES (threads, gatherings) and a handful of dests that are not
+    %% ids at all, and suggesting a message id as a person is never right.
+    %% The (key, dest) index makes the prefix a range scan.
+    Rows = rows("SELECT dest, value FROM about_assign"
+                " WHERE key=?1 AND dest LIKE '@%'", [~"name"]),
+    Dests = lists:usort(
+              [D || [D, V] <- Rows,
+                    is_binary(V),
+                    string:find(string:lowercase(V), Needle) =/= nomatch]),
+    %% Resolve the DISPLAY name only for feeds that survived the prefilter —
+    %% the expensive call, paid once per hit instead of once per feed — and
+    %% keep only those whose resolved name matches too.
+    [{D, N} || D <- Dests,
+               is_binary(N = social_value(D, ~"name")),
+               string:find(string:lowercase(N), Needle) =/= nomatch].
 
 %% The most common extractable value across assigners, or null.
 highest_rank(Values) ->
@@ -469,6 +485,7 @@ resolution_test_() ->
               ?_test(restating_a_value_is_not_a_change()),
               ?_test(remove_deletes_the_row()),
               ?_test(search_finds_the_resolved_name()),
+              ?_test(search_only_returns_feeds()),
               ?_test(survives_a_restart())]
      end}.
 
@@ -647,6 +664,17 @@ search_finds_the_resolved_name() ->
     %% other keys are not candidates
     put_about(Dest, ~"description", Yours, ~"petname too"),
     ?assertEqual(1, length(search_names(~"petname", 10))).
+
+%% `about` names messages and gatherings too, and a mention suggester that
+%% offers a message id as a person is simply wrong.  4,917 of this store's
+%% 42,051 named dests were messages before this filter existed.
+search_only_returns_feeds() ->
+    Yours = keys:pub_key_disp(),
+    Feed  = ~"@feedfindmeddddddddddddddddddddddddddddddd=.ed25519",
+    Msg   = ~"%msgfindmedddddddddddddddddddddddddddddddd=.sha256",
+    put_about(Feed, ~"name", Yours, ~"findme feed"),
+    put_about(Msg,  ~"name", Yours, ~"findme thread"),
+    ?assertEqual([{Feed, ~"findme feed"}], search_names(~"findme", 10)).
 
 %% The point of the port: durable as written, with no snapshot step.
 survives_a_restart() ->
