@@ -446,6 +446,55 @@ responsive_during_dial_test() ->
         HbPid -> exit(HbPid, kill)
     end.
 
+backoff_ms_test() ->
+    ?assertEqual(?BACKOFF_BASE_MS, backoff_ms(1)),
+    ?assertEqual(?BACKOFF_BASE_MS * 2, backoff_ms(2)),
+    ?assertEqual(?BACKOFF_BASE_MS * 4, backoff_ms(3)),
+    %% Bounded, and no bignum for an address that has failed all year.
+    ?assertEqual(?BACKOFF_MAX_MS, backoff_ms(100)),
+    ?assertEqual(?BACKOFF_MAX_MS, backoff_ms(100000)).
+
+due_test() ->
+    Now = 1_000_000_000,
+    A = ~"net:example.com:8008~shs:AAAA=",
+    %% Never tried.
+    ?assert(due(A, #{}, Now)),
+    %% A success wrote attempts = 0; it must not be held back.
+    ?assert(due(A, #{A => {0, Now}}, Now)),
+    %% One failure just now: held until the base wait elapses.
+    ?assertNot(due(A, #{A => {1, Now}}, Now)),
+    ?assertNot(due(A, #{A => {1, Now}}, Now + ?BACKOFF_BASE_MS - 1)),
+    ?assert(due(A, #{A => {1, Now}}, Now + ?BACKOFF_BASE_MS)),
+    %% Backed off further after repeated failures.
+    ?assertNot(due(A, #{A => {3, Now}}, Now + ?BACKOFF_BASE_MS * 2)),
+    ?assert(due(A, #{A => {3, Now}}, Now + ?BACKOFF_BASE_MS * 4)).
+
+attempts_test() ->
+    A = ~"net:example.com:8008~shs:AAAA=",
+    ?assertEqual(0, attempts(A, #{})),
+    ?assertEqual(7, attempts(A, #{A => {7, 0}})).
+
+%% The address is the conn.json key, so the two entries that share
+%% pub.cmoid.org — the live pub and a stale one for a key it no longer
+%% uses — back off independently.  Keying on the host would have suppressed
+%% the working pub along with the dead address.
+addr_test() ->
+    Key1 = base64:decode(~"ASFlv8MHXcuHeRMruDnUPZwMkFTx+t1fYvoP7xWkXRo="),
+    Key2 = base64:decode(~"r3Rf1DPAWGi/FBXP7GCpcDBzB1VFy7tbSANC6Hi/s0c="),
+    A1 = addr({~"pub.cmoid.org", 8008, Key1}),
+    A2 = addr({~"pub.cmoid.org", 8008, Key2}),
+    ?assertEqual(~"net:pub.cmoid.org:8008~shs:ASFlv8MHXcuHeRMruDnUPZwMkFTx+t1fYvoP7xWkXRo=",
+                 A1),
+    ?assertNotEqual(A1, A2),
+    %% Same identity reachable on another host is a separate address too.
+    ?assertNotEqual(A1, addr({~"other.example", 8008, Key1})),
+    %% Host forms that reach the dialer: binary from conn.json, string and
+    %% IP tuple from the LAN heartbeat.
+    ?assertEqual(addr({~"192.168.2.59", 8008, Key1}),
+                 addr({"192.168.2.59", 8008, Key1})),
+    ?assertEqual(addr({~"192.168.2.59", 8008, Key1}),
+                 addr({{192,168,2,59}, 8008, Key1})).
+
 %% {peer_dialer, false} in the config file starts the dialer disabled.
 config_startup_test() ->
     Cfg = "test/dialer_test.cfg",
@@ -463,5 +512,77 @@ config_startup_test() ->
         false -> ok
     end,
     file:delete(Cfg).
+
+%% The tests above deliberately run WITHOUT a store, exercising the
+%% degraded path: no backoff, but a working dialer.  These run with one.
+
+dial_backoff_setup() ->
+    catch gen_server:stop(config),
+    Home = "/tmp/pdt_" ++ integer_to_list(erlang:system_time(microsecond)),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    application:set_env(ssb, ssb_home, Home),
+    {ok, _} = config:start_link("no-such-cfg"),
+    {ok, _} = ssb_store:start_link(),
+    ok = declare_schema(),
+    Home.
+
+dial_backoff_cleanup(Home) ->
+    [catch gen_server:stop(N) || N <- [ssb_store, config]],
+    os:cmd("rm -rf " ++ Home),
+    application:unset_env(ssb, ssb_home),
+    ok.
+
+durable_backoff_test_() ->
+    {setup, fun dial_backoff_setup/0, fun dial_backoff_cleanup/1,
+     fun(_) ->
+             [?_test(a_failed_dial_backs_off()),
+              ?_test(a_success_clears_the_history()),
+              ?_test(an_aged_row_is_pruned())]
+     end}.
+
+%% The whole point: an address that fails stops being dialed on every
+%% pass.  This is the stale pub.cmoid.org entry — one that peers keep
+%% re-announcing, so deleting it does not make it stay gone.
+a_failed_dial_backs_off() ->
+    Addr = addr({~"pub.cmoid.org", 8008,
+                 base64:decode(~"r3Rf1DPAWGi/FBXP7GCpcDBzB1VFy7tbSANC6Hi/s0c=")}),
+    Now = erlang:system_time(millisecond),
+    ?assert(due(Addr, load_backoff(), Now)),
+    record_fail(Addr, 1, Now),
+    B = load_backoff(),
+    ?assertEqual({1, Now}, maps:get(Addr, B)),
+    ?assertNot(due(Addr, B, Now)),
+    ?assert(due(Addr, B, Now + ?BACKOFF_BASE_MS)),
+    ?assertEqual([[1]], ssb_store:q("SELECT attempts FROM peer_dial_try"
+                                    " WHERE addr=?1", [Addr])).
+
+%% A pub that comes back must not inherit the backoff it earned while it
+%% was down, and a later failure must not erase the record of when it last
+%% actually worked.
+a_success_clears_the_history() ->
+    Addr = addr({~"pub.example.org", 8008, <<1:256>>}),
+    Now = erlang:system_time(millisecond),
+    record_fail(Addr, 6, Now),
+    ?assertNot(due(Addr, load_backoff(), Now)),
+    record_ok(Addr, Now),
+    ?assert(due(Addr, load_backoff(), Now)),
+    ?assertEqual(0, attempts(Addr, load_backoff())),
+    ?assertEqual([[Now]], ssb_store:q("SELECT last_ok FROM peer_dial_try"
+                                      " WHERE addr=?1", [Addr])),
+    record_fail(Addr, 1, Now + 1000),
+    ?assertEqual([[Now]], ssb_store:q("SELECT last_ok FROM peer_dial_try"
+                                      " WHERE addr=?1", [Addr])).
+
+%% Rows for addresses that have dropped out of conn.json are not kept for
+%% the life of the node.
+an_aged_row_is_pruned() ->
+    Addr = addr({~"gone.example", 8008, <<2:256>>}),
+    Stale = erlang:system_time(millisecond) - ?ROW_TTL_MS - 1,
+    record_fail(Addr, 3, Stale),
+    ?assertEqual([[3]], ssb_store:q("SELECT attempts FROM peer_dial_try"
+                                    " WHERE addr=?1", [Addr])),
+    ok = prune_rows(),
+    ?assertEqual([], ssb_store:q("SELECT attempts FROM peer_dial_try"
+                                 " WHERE addr=?1", [Addr])).
 
 -endif.
