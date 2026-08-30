@@ -936,15 +936,39 @@ network_error(Reason, State) ->
 %% or a peer dialing a stale/wrong key for this node. Log one concise line
 %% rather than letting the raw exit produce a full crash report.
 %%   - no_matching_network_id : hello matched none of our network ids
+%%   - {identity_rejected, R} : outbound only — the peer took our network id and
+%%                              then refused the key we dialed for it
 %%   - {badmatch, <<"bad">>}  : right network id, but the identity/signature box
 %%                              failed to verify (shs:open_box returns <<"bad">>)
+%%
+%% "unknown network id" used to be reported for EVERY outbound handshake
+%% failure: try_net_ids caught all exceptions, tried the next network id, and
+%% raised no_matching_network_id once the list ran out — so with a single id
+%% configured, which is the normal case, one failure of any kind produced that
+%% message.  The commonest real cause was a stale key in conn.json, which the
+%% message actively pointed away from.  The two directions no longer share a
+%% clause, because the same atom does not mean the same thing in each.
 %%
 %% Who is an iodata fragment identifying the remote end. For inbound failures the
 %% key the peer dialed for us is unrecoverable — SHS folds it into a DH secret and
 %% never sends it on the wire — so the peer's IP:port is the only handle we have
 %% on who keeps dialing a stale key. For outbound we log the key we dialed.
-log_handshake_failure(Dir, no_matching_network_id, Who) ->
-    ?SSB_INFO("~p handshake rejected: unknown network id (~s)~n", [Dir, Who]);
+%% Inbound we have the peer's hello in hand and checked it against every id
+%% we have, so the name is exact.
+log_handshake_failure(inbound, no_matching_network_id, Who) ->
+    ?SSB_INFO("inbound handshake rejected: unknown network id (~s)~n", [Who]);
+%% Outbound we only know the peer hung up on our hello and never said why.
+%% That is a network mismatch or a port not speaking SHS, and the message
+%% says so rather than picking one.
+log_handshake_failure(outbound, no_matching_network_id, Who) ->
+    ?SSB_INFO("outbound handshake failed: no configured network id was "
+              "accepted (~s; peer is on another network, or is not an SSB "
+              "peer)~n", [Who]);
+log_handshake_failure(Dir, {identity_rejected, Reason}, Who) ->
+    ?SSB_INFO("~p handshake rejected: peer took our network id then refused "
+              "the identity we dialed (~s; ~p after our auth box — the key is "
+              "stale, or that host now answers as someone else)~n",
+              [Dir, Who, Reason]);
 log_handshake_failure(Dir, {badmatch, <<"bad">>}, Who) ->
     ?SSB_INFO("~p handshake rejected: identity verification failed "
               "(~s; peer dialed a stale/wrong key, or bad handshake)~n",
@@ -1052,6 +1076,11 @@ ordered_net_ids(PubKey) ->
         miss          -> All
     end.
 
+%% Only reasons that a different network id could plausibly fix are worth
+%% another pass round this loop.  Everything else fails now, carrying the
+%% reason it actually failed for: retrying a wrong key against each of our
+%% network ids costs a connect and a backoff sleep apiece and then reports
+%% the one cause we had already ruled out.
 try_net_ids(_Ip, _Port, _PubKey, [], _Attempt) ->
     error(no_matching_network_id);
 try_net_ids(Ip, Port, PubKey, [NetId | Rest], Attempt) ->
@@ -1065,6 +1094,13 @@ try_net_ids(Ip, Port, PubKey, [NetId | Rest], Attempt) ->
             network_id_cache:record(PubKey, NetId),
             {ok, build_outbound_state(Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce, PubKey)}
     catch
+        %% Our network id was accepted and the identity refused — the other
+        %% ids cannot change that answer.
+        error:{auth_rejected, Reason} ->
+            gen_tcp:close(Socket),
+            error({identity_rejected, Reason});
+        %% Hung up on our hello, or answered under a different id: the next
+        %% network id is worth a try.
         _:_ ->
             gen_tcp:close(Socket),
             try_net_ids(Ip, Port, PubKey, Rest, Attempt + 1)

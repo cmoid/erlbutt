@@ -100,8 +100,8 @@ client_shake_hands_tunnel(Send, Recv, RemotePubKey) ->
 do_client_shake_hands(Send, Recv, RemotePubKey, NetId, OurPubKey, OurPrivKey) ->
     {Eph_sk, Hmac, DecNonce} = gen_hello(NetId),
     Send(Hmac),
-    {ok, ServerHmac} = Recv(64),
-    {true, ServEph_pk, EncNonce} = check_hello(ServerHmac, NetId),
+    ServerHmac = recv_or_fail(Recv, 64, hello_rejected),
+    {ServEph_pk, EncNonce} = client_check_hello(ServerHmac, NetId),
     Shared_ab = mult(Eph_sk, ServEph_pk),
     Shared_aB = mult(Eph_sk, pk_to_curve25519(RemotePubKey)),
     ShaSab = crypto:hash(sha256, Shared_ab),
@@ -110,7 +110,7 @@ do_client_shake_hands(Send, Recv, RemotePubKey, NetId, OurPubKey, OurPrivKey) ->
     Box = create_box(Msg, concat([NetId, Shared_ab, Shared_aB])),
     Send(Box),
     Shared_Ab = mult(sk_to_curve25519(OurPrivKey), ServEph_pk),
-    {ok, ServData} = Recv(80),
+    ServData = recv_or_fail(Recv, 80, auth_rejected),
     DetSigB = open_box(ServData, ?SHS_NONCE,
                        crypto:hash(sha256, concat([NetId, Shared_ab, Shared_aB, Shared_Ab]))),
     M = concat([NetId, DetSigA, OurPubKey, ShaSab]),
@@ -121,6 +121,35 @@ do_client_shake_hands(Send, Recv, RemotePubKey, NetId, OurPubKey, OurPrivKey) ->
     DecBoxKey = crypto:hash(sha256, concat([SharedKey, OurPubKey])),
     EncBoxKey = crypto:hash(sha256, concat([SharedKey, RemotePubKey])),
     {ok, {DecBoxKey, DecNonce, EncBoxKey, EncNonce}}.
+
+%% Where the client gives up says what went wrong, and the two points mean
+%% very different things:
+%%
+%%   hello_rejected — the peer hung up on our hello.  It never told us why,
+%%     so this is the ambiguous one: a different network id, or a port that
+%%     is not speaking SHS at all.  Trying our other network ids is worth
+%%     something here.
+%%
+%%   auth_rejected  — the peer read our hello and answered it, then refused
+%%     our auth box.  It ACCEPTED this network id; what it rejected is the
+%%     identity we dialed.  Retrying with other network ids cannot help.
+%%
+%% Collapsing both into a bare badmatch is what made every outbound failure
+%% read as "unknown network id" no matter the cause.
+recv_or_fail(Recv, N, Tag) ->
+    case Recv(N) of
+        {ok, Data}      -> Data;
+        {error, Reason} -> error({Tag, Reason})
+    end.
+
+%% The peer answered, but its hello does not verify under the network id we
+%% sent.  A well-behaved peer echoes back the id it accepted, so unlike a
+%% dropped connection this is a mismatch we have actually observed.
+client_check_hello(ServerHmac, NetId) ->
+    case check_hello(ServerHmac, NetId) of
+        {true, Eph_pk, Nonce} -> {Eph_pk, Nonce};
+        _                     -> error(network_id_mismatch)
+    end.
 
 server_shake_hands(Data, Socket, Transport) ->
     server_shake_hands(Data, Socket, Transport, config:network_ids()).
@@ -249,5 +278,49 @@ run_inmem_handshake() ->
     ?assertMatch({complete, ~"ping", _, _}, boxstream:unbox(SDec, SDecN, B1)),
     {B2, _} = boxstream:box(~"pong", SEncN, SEnc),
     ?assertMatch({complete, ~"pong", _, _}, boxstream:unbox(CDec, CDecN, B2)).
+
+%% Where a failing client handshake gives up is the whole diagnosis, and the
+%% outbound log now depends on telling these three apart.  They used to be
+%% one indistinguishable badmatch, which is why every outbound failure was
+%% reported as "unknown network id".
+handshake_failure_classification_test_() ->
+    {setup, fun setup_node/0, fun cleanup_node/1,
+     fun(_) ->
+             [?_test(hello_drop_is_hello_rejected()),
+              ?_test(auth_drop_is_auth_rejected()),
+              ?_test(wrong_net_id_is_a_mismatch())]
+     end}.
+
+%% Hung up without answering: could be another network, could be a port that
+%% is not SSB.  Ambiguous, and the caller is told only that much.
+hello_drop_is_hello_rejected() ->
+    ServerPk = base64:decode(keys:pub_key()),
+    Send = fun(_) -> ok end,
+    Recv = fun(_) -> {error, closed} end,
+    ?assertError({hello_rejected, closed},
+                 client_shake_hands_tunnel(Send, Recv, ServerPk)).
+
+%% Answered our hello — so it accepted the network id — and then refused the
+%% auth box.  This is the stale-key case: the identity is wrong, the network
+%% is fine, and no other network id could have helped.
+auth_drop_is_auth_rejected() ->
+    ServerPk = base64:decode(keys:pub_key()),
+    {_Sk, ServerHello, _N} = gen_hello(config:network_id()),
+    Send = fun(_) -> ok end,
+    Recv = fun(64) -> {ok, ServerHello};
+              (80) -> {error, closed}
+           end,
+    ?assertError({auth_rejected, closed},
+                 client_shake_hands_tunnel(Send, Recv, ServerPk)).
+
+%% Answered under a network id that is not the one we sent — the only case
+%% where the client has actually observed a mismatch rather than guessed one.
+wrong_net_id_is_a_mismatch() ->
+    ServerPk = base64:decode(keys:pub_key()),
+    {_Sk, OtherHello, _N} = gen_hello(crypto:strong_rand_bytes(32)),
+    Send = fun(_) -> ok end,
+    Recv = fun(_) -> {ok, OtherHello} end,
+    ?assertError(network_id_mismatch,
+                 client_shake_hands_tunnel(Send, Recv, ServerPk)).
 
 -endif.
