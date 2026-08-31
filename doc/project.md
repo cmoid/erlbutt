@@ -94,7 +94,7 @@ Some views remain on ETS with periodic snapshots. That is a matter of which shap
 
 Because the truth tier is immutable and everything else is derived, a node can throw away its entire derived state and rebuild it from the logs. That makes the store safe to change: a schema is a decision that can be revised, not a migration to be feared. It also means the only thing that genuinely needs backing up is `feeds/`, `blobs/` and `secret`.
 
-The historical design note, including the survey that led here and the measurements behind the engine choice, is kept separately as research.
+The historical design note, including the survey that led here and the measurements behind the engine choice, is kept separately as [research][9].
 
 
 ----
@@ -107,3 +107,4 @@ The historical design note, including the survey that led here and the measureme
 [6]: https://github.com/flumedb/flumedb
 [7]: https://ssbc.github.io/scuttlebutt-protocol-guide/
 [8]: https://ssbc.github.io/scuttlebutt-protocol-guide/#message-format
+[9]: https://github.com/cmoid/erlbutt/blob/main/doc/research/persistence.md
