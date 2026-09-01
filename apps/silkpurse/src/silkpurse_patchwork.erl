@@ -28,9 +28,8 @@ manifest() ->
      %% (patchwork.suggest.profile is real — silkpurse_db;
      %%  patchwork.profile.avatar is real — silkpurse_about.)
      %% Message rendering.  (patchwork.likes.* is real — silkpurse_likes.)
-     %% (backlinks.referencesStream + liveBacklinks.stream are real —
-     %%  silkpurse_backlinks.)
-     {[~"patchwork", ~"backlinks", ~"forksStream"],    source, owner},
+     %% (backlinks.referencesStream + backlinks.forksStream +
+     %%  liveBacklinks.stream are real — silkpurse_backlinks.)
      {[~"patchwork", ~"liveBacklinks", ~"subscribe"],  async,  owner},
      {[~"patchwork", ~"liveBacklinks", ~"unsubscribe"], async, owner},
      %% (patchwork.thread.sorted is real — silkpurse_thread.)

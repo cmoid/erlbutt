@@ -30,6 +30,7 @@
          private_get_test/1,
          private_feed_test/1,
          backlinks_streams_test/1,
+         forks_and_references_are_disjoint_test/1,
          recent_feeds_test/1,
          subscriptions_test/1,
          contacts_state_stream_test/1,
@@ -68,6 +69,7 @@ all() ->
      private_get_test,
      private_feed_test,
      backlinks_streams_test,
+     forks_and_references_are_disjoint_test,
      recent_feeds_test,
      subscriptions_test,
      contacts_state_stream_test,
@@ -187,6 +189,56 @@ live_backlinks_test(_Config) ->
         error(no_live_frame)
     end,
     gen_server:stop(Peer).
+
+%% Patchwork splits a message's backlinks in two and renders them
+%% separately, so the two streams must be disjoint: an overlap shows the
+%% same reply twice, once as a fork and once as a mention.
+%%
+%% While forksStream was a stub, a reply to a mid-thread post fell
+%% through to referencesStream (which filtered nothing) and rendered as
+%% "X referenced this message" instead of as a fork.
+forks_and_references_are_disjoint_test(_Config) ->
+    OwnPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", ~"fork root"}]}),
+    #message{id = R} = ssb_feed:fetch_last_msg(OwnPid),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", ~"reply A"},
+                                         {~"root", R}, {~"branch", R}]}),
+    #message{id = A} = ssb_feed:fetch_last_msg(OwnPid),
+    %% F forks A: rooted AT A
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", ~"fork of A"},
+                                         {~"root", A}, {~"branch", A}]}),
+    #message{id = F} = ssb_feed:fetch_last_msg(OwnPid),
+    %% S is the next reply in the SAME thread, merely branching from A --
+    %% this is the one that used to produce a spurious "referenced this
+    %% message" line on every reply in a linear thread
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", ~"sibling"},
+                                         {~"root", R}, {~"branch", A}]}),
+    #message{id = S} = ssb_feed:fetch_last_msg(OwnPid),
+
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    Forks = collect_summary_ids(Peer, [~"patchwork", ~"backlinks", ~"forksStream"], A),
+    Refs  = collect_summary_ids(Peer, [~"patchwork", ~"backlinks", ~"referencesStream"], A),
+
+    ?assert(lists:member(F, Forks)),        %% the fork is a fork
+    ?assertNot(lists:member(S, Forks)),     %% the sibling is not
+    ?assertNot(lists:member(F, Refs)),      %% and neither shows as a reference
+    ?assertNot(lists:member(S, Refs)),      %% (both live inside A's thread)
+    gen_server:stop(Peer).
+
+%% Ids from a live summary stream, drained for a bounded window (these
+%% streams stay open, so there is no end-of-stream to wait for).
+collect_summary_ids(Peer, Method, Id) ->
+    {ok, Ref} = ssb_peer:open_source(Peer, Method, [{[{~"id", Id}]}], self()),
+    drain_summary_ids(Ref, []).
+
+drain_summary_ids(Ref, Acc) ->
+    receive
+        {stream_data, Ref, Frame} ->
+            {P} = utils:nat_decode(Frame),
+            drain_summary_ids(Ref, [proplists:get_value(~"id", P) | Acc])
+    after 1000 ->
+        Acc
+    end.
 
 %% thread.sorted streams the root, its replies, and a sync sentinel.
 thread_sorted_test(_Config) ->
@@ -370,17 +422,27 @@ backlinks_streams_test(_Config) ->
     %% top level; a message envelope left it undefined and crashed the page, so
     %% assert the fields it actually uses, not just the id.
     OwnId = keys:pub_key_disp(),
+    %% A reference is a link from OUTSIDE the target's thread, so the
+    %% mention below is rooted in a thread of its own.  ReplyId (rooted at
+    %% RootId) is deliberately NOT a reference of RootId — it is part of
+    %% that thread and thread.sorted already shows it; see
+    %% forks_and_references_are_disjoint_test.
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"},
+                                         {~"text", ~"a mention"},
+                                         {~"mentions", [{[{~"link", RootId}]}]}]}),
+    #message{id = MentionId} = ssb_feed:fetch_last_msg(OwnPid),
     {ok, _R} = ssb_peer:open_source(
                  Peer, [~"patchwork", ~"backlinks", ~"referencesStream"],
                  [{[{~"id", RootId}]}], self()),
     receive
         {stream_data, _, F} ->
             {Ref} = utils:nat_decode(F),
-            ?assertEqual(ReplyId, proplists:get_value(~"id", Ref)),
-            ?assertEqual(OwnId,   proplists:get_value(~"author", Ref)),
+            ?assertEqual(MentionId, proplists:get_value(~"id", Ref)),
+            ?assertEqual(OwnId,     proplists:get_value(~"author", Ref)),
             ?assert(is_integer(proplists:get_value(~"timestamp", Ref)))
     after 3000 -> error(no_reference)
     end,
+    ?assert(is_binary(ReplyId)),
     %% liveBacklinks.stream: open, post a new backlink, receive it dest-tagged.
     %% (the referencesStream above is still open and also delivers the reply,
     %% so skip frames without a dest field.)

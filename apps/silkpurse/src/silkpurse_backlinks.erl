@@ -54,6 +54,7 @@ refs(Target) ->
 manifest() ->
     [{[~"backlinks", ~"read"],                          source, owner},
      {[~"patchwork", ~"backlinks", ~"referencesStream"], source, owner},
+     {[~"patchwork", ~"backlinks", ~"forksStream"],      source, owner},
      {[~"patchwork", ~"liveBacklinks", ~"stream"],      source, owner}].
 
 handle_rpc([~"backlinks", ~"read"], Args, _Caller) ->
@@ -95,38 +96,19 @@ handle_rpc([~"backlinks", ~"read"], Args, _Caller) ->
 %% took the page down).  liveBacklinks.stream below keeps the envelope —
 %% backlinks.obs.for sorts whole messages there.
 handle_rpc([~"patchwork", ~"backlinks", ~"referencesStream"], [{Opts}], _Caller) ->
-    case ?pgv(~"id", Opts) of
-        Id when is_binary(Id) ->
-            Since = ?pgv(~"since", Opts),
-            Snapshot =
-                lists:filtermap(
-                  fun(MsgId) ->
-                          case fetch_encoded(MsgId) of
-                              undefined -> false;
-                              Bin ->
-                                  case after_since(Bin, Since)
-                                      andalso ref_summary(Bin) of
-                                      false     -> false;
-                                      undefined -> false;
-                                      Sum       -> {true, {MsgId, Sum}}
-                                  end
-                          end
-                  end, refs(Id)),
-            EventFun = fun({link, T, MsgId}) when T =:= Id ->
-                               case fetch_encoded(MsgId) of
-                                   undefined -> skip;
-                                   Bin ->
-                                       case ref_summary(Bin) of
-                                           undefined -> skip;
-                                           Sum       -> {send, MsgId, Sum}
-                                       end
-                               end;
-                          (_) -> skip
-                       end,
-            {live_source, Snapshot, ssb_links, EventFun};
-        _ ->
-            {error, ~"referencesStream needs an id"}
-    end;
+    summary_stream(Opts, fun is_reference/3, ~"referencesStream needs an id");
+
+%% forksStream({id, since}): the replies rooted AT id — the sub-thread
+%% that forked off it — in the same flat summary shape.
+%%
+%% Patchwork splits a message's backlinks in two, and message/html/forks.js
+%% renders this half as "N forked this discussion".  While this was stubbed
+%% empty a fork fell through to referencesStream, which filtered nothing,
+%% so replying to a mid-thread post rendered as a bare "X referenced this
+%% message" — the reply was on the right thread, but shown as a passing
+%% mention of it.
+handle_rpc([~"patchwork", ~"backlinks", ~"forksStream"], [{Opts}], _Caller) ->
+    summary_stream(Opts, fun is_fork/3, ~"forksStream needs an id");
 
 %% liveBacklinks.stream(): every new backlink, tagged with the dest it
 %% references, for the whole connection.  The client routes each frame by
@@ -145,6 +127,110 @@ handle_rpc([~"patchwork", ~"liveBacklinks", ~"stream"], _Args, _Caller) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+%% referencesStream and forksStream are one query over one edge set,
+%% separated by a single predicate on the referencing message.  Sharing
+%% the machinery is what keeps the two halves DISJOINT: if both were to
+%% match the same message the client would render it twice, once as a
+%% fork and once as a mention, which is the failure the split exists to
+%% avoid.
+summary_stream(Opts, Pred, ErrMsg) ->
+    case ?pgv(~"id", Opts) of
+        Id when is_binary(Id) ->
+            Since  = ?pgv(~"since", Opts),
+            Thread = thread_of(Id),
+            Keep   = fun(Bin) -> Pred(root_of(Bin), Id, Thread) end,
+            Snapshot =
+                lists:filtermap(
+                  fun(MsgId) ->
+                          case fetch_encoded(MsgId) of
+                              undefined -> false;
+                              Bin ->
+                                  case Keep(Bin)
+                                      andalso after_since(Bin, Since)
+                                      andalso ref_summary(Bin) of
+                                      false     -> false;
+                                      undefined -> false;
+                                      Sum       -> {true, {MsgId, Sum}}
+                                  end
+                          end
+                  end, refs(Id)),
+            EventFun = fun({link, T, MsgId}) when T =:= Id ->
+                               case fetch_encoded(MsgId) of
+                                   undefined -> skip;
+                                   Bin ->
+                                       case Keep(Bin)
+                                           andalso ref_summary(Bin) of
+                                           false     -> skip;
+                                           undefined -> skip;
+                                           Sum       -> {send, MsgId, Sum}
+                                       end
+                               end;
+                          (_) -> skip
+                       end,
+            {live_source, Snapshot, ssb_links, EventFun};
+        _ ->
+            {error, ErrMsg}
+    end.
+
+%% Rooted AT the target: the sub-thread that forked off it.
+is_fork(Root, Id, _Thread) ->
+    Root =:= Id.
+
+%% Names the target from OUTSIDE the target's own thread.
+%%
+%% Excluding the thread is what stops this being noise.  In a linear
+%% thread each reply branches from the one before it, so a plain "not
+%% rooted at the target" filter would hang an "X referenced this message"
+%% line off EVERY reply, pointing at its own successor — messages already
+%% on screen a few pixels below.  A reference worth showing is one from
+%% somewhere else.
+is_reference(Root, Id, Thread) ->
+    Root =/= Id andalso Root =/= Thread.
+
+%% The thread a message belongs to: its root if it has one, otherwise
+%% itself (a thread root is its own thread).  Falling back to Id also
+%% covers a target we cannot fetch, which then admits only references
+%% that are genuinely rooted elsewhere.
+thread_of(Id) ->
+    case fetch_encoded(Id) of
+        undefined -> Id;
+        Bin ->
+            case root_of(Bin) of
+                undefined -> Id;
+                Root      -> Root
+            end
+    end.
+
+%% The referencing message's content.root, or undefined.
+root_of(Bin) ->
+    try
+        {Env} = utils:nat_decode(Bin),
+        {Val} = ?pgv(~"value", Env),
+        root_of_content(?pgv(~"content", Val))
+    catch _:_ -> undefined
+    end.
+
+%% A private message's content is a box, so its root is legible only if
+%% the message is addressed to us — the same decrypt silkpurse_thread
+%% does to place a DM reply in its thread.  Without it a private fork
+%% would be filed as a plain mention, which is the asymmetry that made
+%% DM replies invisible in threads before.
+root_of_content({Props}) when is_list(Props) ->
+    ?pgv(~"root", Props);
+root_of_content(Box) when is_binary(Box) ->
+    case private_box:is_private(Box) andalso private_box:decrypt(Box) of
+        {ok, Plain} ->
+            try utils:nat_decode(Plain) of
+                {Props} when is_list(Props) -> ?pgv(~"root", Props);
+                _                           -> undefined
+            catch _:_ -> undefined
+            end;
+        _ ->
+            undefined
+    end;
+root_of_content(_) ->
+    undefined.
 
 %% The stored (encoded) form of a message by id, via the id->author
 %% index and the author's feed.
