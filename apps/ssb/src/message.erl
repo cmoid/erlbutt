@@ -108,7 +108,9 @@ decode_value(ValueJson, CheckValid) ->
              hash      = ?pgv(~"hash",      ValueProps),
              content   = ?pgv(~"content",   ValueProps),
              signature = ?pgv(~"signature", ValueProps),
-             received  = integer_to_binary(current_time()),
+             %% Arriving now, so now IS the arrival time.  This used to be
+             %% integer_to_binary/1 — see received_num/2.
+             received  = current_time(),
              validated = IsValid,
              swapped   = IsSwapped}.
 
@@ -126,9 +128,69 @@ decode(Msg, CheckValid) ->
              hash = ?pgv(~"hash", ValueProps),
              content = ?pgv(~"content", ValueProps),
              signature = ?pgv(~"signature", ValueProps),
-             received = ?pgv(~"timestamp", DecDataProps),
+             received = received_num(?pgv(~"timestamp", DecDataProps),
+                                     ?pgv(~"timestamp", ValueProps)),
              validated = IsValid,
              swapped = IsSwapped}.
+
+%% #message.received has ONE shape: a NUMBER of milliseconds.
+%%
+%% It did not used to.  Three paths wrote three types — new_msg/4 an
+%% integer, decode_value/2 a BINARY (integer_to_binary/1), and decode/2
+%% whatever the stored envelope held, which across this store is an
+%% integer, a float or nothing at all.  Erlang does not coerce, but
+%% neither does it complain: comparison is total across types, so a mixed
+%% set sorts by term order — every number, then atoms, then binaries —
+%% rather than by time, and silently, since `<` on a binary and an
+%% integer is simply true.  Sorting a thread by arrival was therefore
+%% sorting by type.
+%%
+%% A NUMBER, not an integer, and the difference matters.  The floats are
+%% not sloppiness: flume wrote a fractional part to order messages that
+%% arrived within the same millisecond, so 1525368113120.001 precedes
+%% .003 precedes .005.  180 of the 245 messages in testdata/ carry one.
+%% Truncating to whole milliseconds would throw that ordering away and
+%% collapse those into ties — losing exactly the information this field
+%% exists to provide.  Integers and floats compare correctly against each
+%% other in Erlang, so both are left as they are and only the shapes that
+%% cannot be compared are converted.
+%%
+%% Leaving numbers untouched also keeps encode(decode(X)) == X byte-exact
+%% for every message in testdata/, which roundtrip_test/0 asserts.
+%%
+%% Normalising here rather than at each read site is safe precisely
+%% because `received` is NOT signed (see canonical_sign_props/1): it is
+%% envelope metadata, so rewriting it cannot disturb a message id or a
+%% signature.  The asserted `timestamp` inside `value` IS signed and must
+%% keep whatever shape it was signed with.
+%%
+%% Doing it in decode/2 also repairs the messages already on disk, which
+%% an ingest-only fix would leave broken — their stored bytes keep the
+%% odd shape, but no caller ever sees it.
+received_num(Received, AssertedFallback) ->
+    case to_num(Received) of
+        undefined ->
+            %% No arrival time recorded.  "When the author says they wrote
+            %% it" approximates it far better than 0, which would sort
+            %% every such message to the front of the thread.  This is the
+            %% same fallback get-timestamp.js makes client-side.
+            case to_num(AssertedFallback) of
+                undefined -> 0;
+                Num       -> Num
+            end;
+        Num ->
+            Num
+    end.
+
+to_num(N) when is_number(N) -> N;
+to_num(B) when is_binary(B) ->
+    try binary_to_integer(B)
+    catch _:_ ->
+            try binary_to_float(B)
+            catch _:_ -> undefined
+            end
+    end;
+to_num(_) -> undefined.
 
 is_swapped(PropList) ->
     SecondElement = lists:nth(2, PropList),
@@ -481,5 +543,44 @@ non_ascii_message_id_test() ->
     #message{id = Id} = decode_value(Value, false),
     ?assertEqual(<<"%EWthyyv7gnqzXKx0PFjwuEaui1StcwVoQpo9fR1T8ak=.sha256">>, Id).
 
+
+
+%% #message.received must come out of decode/2 as integer milliseconds
+%% whatever the stored envelope held, because it is a sort key and Erlang
+%% compares across types without complaining.
+received_num_normalises_every_shape_test() ->
+    ?assertEqual(1787796169351, received_num(1787796169351, 1)),
+    ?assertEqual(1787796169351, received_num(~"1787796169351", 1)),
+    %% absent falls back to the asserted timestamp, not to 0
+    ?assertEqual(4242, received_num(undefined, 4242)),
+    ?assertEqual(4242, received_num(null, 4242)),
+    ?assertEqual(4242, received_num(~"junk", 4242)),
+    %% only when BOTH are unusable is it 0
+    ?assertEqual(0, received_num(undefined, undefined)),
+    %% and the fallback itself is coerced
+    ?assertEqual(1787580763554, received_num(undefined, ~"1787580763554")).
+
+%% flume put a fractional part on the arrival time to order messages that
+%% landed in the same millisecond.  Truncating would tie them, so floats
+%% pass through untouched and still compare against integers.
+subsecond_ordering_is_preserved_test() ->
+    ?assertEqual(1525368113120.001, received_num(1525368113120.001, 1)),
+    ?assertEqual(1525368113120.005, received_num(~"1525368113120.005", 1)),
+    ?assert(received_num(1525368113120.001, 1) < received_num(1525368113120.003, 1)),
+    %% and a float still orders correctly against a whole-millisecond integer
+    ?assert(received_num(1525368113120, 1) < received_num(1525368113120.001, 1)),
+    ?assert(received_num(1525368113120.005, 1) < received_num(1525368113121, 1)).
+
+%% Normalising received must not disturb the id or the signature: it is
+%% envelope metadata, outside the six fields SSB signs over.
+received_is_not_signed_test() ->
+    Signed = canonical_sign_props(#message{previous = null, author = ~"@a",
+                                           sequence = 1, timestamp = 99,
+                                           hash = ~"sha256", content = {[]},
+                                           received = 12345}),
+    ?assertEqual([~"previous", ~"author", ~"sequence", ~"timestamp",
+                  ~"hash", ~"content"],
+                 [K || {K, _} <- Signed]),
+    ?assertNot(lists:keymember(~"received", 1, Signed)).
 
 -endif.

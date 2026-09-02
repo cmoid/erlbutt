@@ -575,11 +575,19 @@ item(RootId, Total, Last) ->
     end.
 
 %% The newest few reply ids, which the capped in-memory list used to hold
-%% directly.
+%% directly — returned OLDEST FIRST.
+%%
+%% The DESC is not the display order, it is how the LIMIT picks the most
+%% recent ?RECENT_SHOW rather than the first ever posted.  The rollup
+%% renders latestReplies in list order (feed/html/rollup.js), so handing
+%% it the DESC list showed a thread running backwards: a new reply
+%% appeared ABOVE the message it was replying to.  Select newest-first,
+%% then reverse.
 recent_replies(RootId) ->
-    [Id || [Id] <- rows(["SELECT msg FROM thread_reply WHERE root = ?"
-                         " ORDER BY ts DESC, msg DESC LIMIT ",
-                         integer_to_list(?RECENT_SHOW)], [RootId])].
+    lists:reverse(
+      [Id || [Id] <- rows(["SELECT msg FROM thread_reply WHERE root = ?"
+                           " ORDER BY ts DESC, msg DESC LIMIT ",
+                           integer_to_list(?RECENT_SHOW)], [RootId])]).
 
 rows(Sql, Params) ->
     try ssb_store:q(Sql, Params) of
@@ -663,7 +671,7 @@ threads_test_() ->
       fun(_) -> ?_test(fork_before_forked_from_message()) end,
       fun(_) -> ?_test(complete_root_does_not_create_threads()) end,
       fun(_) -> ?_test(block_filtering()) end,
-      fun(_) -> ?_test(recent_replies_are_newest_first()) end,
+      fun(_) -> ?_test(recent_replies_are_newest_few_oldest_first()) end,
       fun(_) -> ?_test(redelivery_does_not_inflate_the_count()) end,
       fun(_) -> ?_test(scoped_feeds_select_their_threads()) end,
       fun(_) -> ?_test(survives_a_restart()) end]}.
@@ -740,7 +748,21 @@ rollup_counts_and_recent() ->
     ?assertEqual(RootId, proplists:get_value(~"key", Props)),
     ?assertEqual(2, proplists:get_value(~"totalReplies", Props)),
     Replies = proplists:get_value(~"latestReplies", Props),
-    ?assertEqual(2, length(Replies)).
+    ?assertEqual(2, length(Replies)),
+    %% Both replies are present.  Their ORDER is not asserted here: posted
+    %% back to back they share a millisecond, so ts ties and the tiebreak
+    %% falls to the message id, which is content-derived and arbitrary
+    %% between them.  Ordering is asserted in
+    %% recent_replies_are_newest_few_oldest_first/0, where the timestamps
+    %% are explicit and distinct.
+    ?assertEqual([~"r1", ~"r2"],
+                 lists:sort(
+                   [begin
+                        {R} = Reply,
+                        {V} = proplists:get_value(~"value", R),
+                        {C} = proplists:get_value(~"content", V),
+                        proplists:get_value(~"text", C)
+                    end || Reply <- Replies])).
 
 %% A reply ingested before its root: the thread row is created with a null
 %% author (hidden from every feed) and completed when the root arrives.
@@ -817,17 +839,23 @@ showable() ->
                 " FROM thread t WHERE t.author IS NOT NULL"
                 " ORDER BY t.last DESC").
 
-%% latestReplies is the newest few, which the capped in-memory list gave
-%% by construction and an ORDER BY has to be asked for.
-recent_replies_are_newest_first() ->
+%% Two separate properties, which the previous version of this test ran
+%% together: latestReplies SELECTS the newest few (the cap the in-memory
+%% list gave by construction), and RETURNS them oldest-first, because the
+%% rollup renders the list in order and a newest-first list ran the thread
+%% backwards on screen.
+recent_replies_are_newest_few_oldest_first() ->
     Root = ~"%recentrootxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=.sha256",
     A    = ~"@rr=.ed25519",
     set_root(Root, keys:pub_key_disp(), 1, []),
     [add_reply(Root, A, Id, Ts, [])
      || {Id, Ts} <- [{~"%old.sha256", 10}, {~"%new.sha256", 30},
                      {~"%mid.sha256", 20}, {~"%older.sha256", 5}]],
-    %% capped at RECENT_SHOW, newest first
-    ?assertEqual([~"%new.sha256", ~"%mid.sha256", ~"%old.sha256"],
+    %% capped at RECENT_SHOW: the oldest reply is dropped, not shown
+    ?assertNot(lists:member(~"%older.sha256", recent_replies(Root))),
+    ?assertEqual(?RECENT_SHOW, length(recent_replies(Root))),
+    %% and what survives reads oldest -> newest
+    ?assertEqual([~"%old.sha256", ~"%mid.sha256", ~"%new.sha256"],
                  recent_replies(Root)).
 
 %% The old counter incremented on every delivery, so a message redelivered

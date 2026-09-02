@@ -192,21 +192,25 @@ meta(#message{timestamp = Asserted, received = Received}, ContentObj) ->
       asserted => num(Asserted),
       links    => [T || {T, _Field, msg} <- ssb_links:links_of(ContentObj)]}.
 
-%% Timestamps in this store are NOT reliably integers.  Real values seen
-%% on live data: integers, floats (1787580763554.0059), binaries
-%% (<<"1787796169351">>) and absent — the store predates a conversion and
-%% nothing has ever normalised it.
+%% `received` arrives already normalised to a number (message:decode/2),
+%% but the ASSERTED timestamp cannot be — it lives inside the signed
+%% value, so it keeps whatever shape it was signed with: integer, float,
+%% binary or absent.  This coerces that one.
 %%
-%% Coercing matters because these are sort keys: mapping every odd shape
-%% to 0 (which the first cut did) does not merely lose precision, it
-%% sorts those messages to the FRONT of every tie, which is the ordering
-%% bug this function exists to avoid.  0 stays only for genuinely absent.
-num(N) when is_integer(N) -> N;
-num(N) when is_float(N)   -> trunc(N);
-num(B) when is_binary(B)  ->
+%% Floats are preserved rather than truncated.  flume wrote a fractional
+%% part to separate messages that landed in the same millisecond, so
+%% rounding would tie exactly the messages the fraction exists to order.
+%% Integers and floats compare correctly against each other, so there is
+%% nothing to gain by flattening them.
+%%
+%% 0 is reserved for genuinely absent: it sorts to the front of a tie, so
+%% handing it to every unrecognised shape (which the first cut did) is
+%% itself the ordering bug this function exists to prevent.
+num(N) when is_number(N) -> N;
+num(B) when is_binary(B) ->
     try binary_to_integer(B)
     catch _:_ ->
-            try trunc(binary_to_float(B))
+            try binary_to_float(B)
             catch _:_ -> 0
             end
     end;
@@ -303,9 +307,12 @@ cycle_terminates_without_losing_messages_test() ->
 %% of every tie rather than into their real position.
 timestamp_shapes_are_coerced_test() ->
     ?assertEqual(1787796169351, num(1787796169351)),
-    ?assertEqual(1787580763554, num(1787580763554.0059)),
     ?assertEqual(1787796169351, num(~"1787796169351")),
-    ?assertEqual(1787580763554, num(~"1787580763554.0059")),
+    %% floats keep their fraction — it is flume's same-millisecond order
+    ?assertEqual(1787580763554.0059, num(1787580763554.0059)),
+    ?assertEqual(1787580763554.0059, num(~"1787580763554.0059")),
+    ?assert(num(1525368113120.001) < num(1525368113120.003)),
+    ?assert(num(1525368113120) < num(1525368113120.001)),
     %% genuinely absent still sorts first, which is all 0 should mean
     ?assertEqual(0, num(undefined)),
     ?assertEqual(0, num(null)),
