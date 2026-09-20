@@ -125,16 +125,17 @@ handle_rpc([~"patchwork", ~"privateFeed", ~"roots"], Args, _Caller) ->
                   %% the thread is not showable yet
                   " WHERE t.author IS NOT NULL", ResumeSql,
                   order_sql(Reverse), limit_sql(Limit)], ResumeP),
-    {source, [{json, encode_json(Item)}
-              || [RootId, Last, Total] <- Found,
-                 (Item = item(RootId, Total, Last)) =/= undefined]};
+    Items = [{json, encode_json(Item)}
+             || [RootId, _Last, Total] <- Found,
+                (Item = item(RootId, Total)) =/= undefined],
+    {source, Items ++ resume_marker(Found, Limit)};
 
 handle_rpc([~"patchwork", ~"privateFeed", ~"latest"], _Args, _Caller) ->
     EventFun =
         fun({priv, RootId}) ->
                 case summary(RootId) of
-                    {Total, Last} ->
-                        case item(RootId, Total, Last) of
+                    {Total, _Last} ->
+                        case item(RootId, Total) of
                             undefined -> skip;
                             Item      -> {send, encode_json(Item)}
                         end;
@@ -270,17 +271,34 @@ rows(Sql, Params) ->
 write(Sql, Params) ->
     catch ssb_store:write(Sql, Params).
 
+%% The trailing cursor frame for the next page, on the same terms as
+%% silkpurse_threads:resume_marker/2 -- see the reasoning there.
+resume_marker(_Found, undefined) ->
+    [];
+resume_marker(Found, Limit) when length(Found) < Limit ->
+    [];
+resume_marker(Found, _Limit) ->
+    case lists:last(Found) of
+        [_Root, Last, _Total] when is_integer(Last), Last > 0 ->
+            [{json, encode_json({[{~"marker", true}, {~"resume", Last}]})}];
+        _ ->
+            []
+    end.
+
 %% The roots item with decrypted root + recent replies, or undefined if
 %% the root body can no longer be decrypted.
-item(RootId, Total, Last) ->
+%%
+%% No `rts`: it is the field the client prefers when printing a message's
+%% time, so the thread's activity time riding along here dated every root
+%% to its newest reply.  silkpurse_threads:item/2 has the long version.
+item(RootId, Total) ->
     case decrypted(RootId) of
         {RootProps} ->
             Replies = [R || Id <- recent_replies(RootId),
                             (R = decrypted(Id)) =/= undefined],
             {RootProps ++ [{~"totalReplies", Total},
                            {~"latestReplies", Replies},
-                           {~"bumps", []},
-                           {~"rts", Last}]};
+                           {~"bumps", []}]};
         undefined ->
             undefined
     end.

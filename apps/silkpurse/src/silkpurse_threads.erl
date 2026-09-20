@@ -225,17 +225,18 @@ roots(Feed, Args) ->
            " WHERE t.author IS NOT NULL", Where, BlockSql, ResumeSql,
            order_sql(Reverse), limit_sql(Limit)],
     Found = rows(Sql, ScopeP ++ BlockP ++ ResumeP),
-    {source, [{json, encode_json(Item)}
-              || [RootId, Last, Total] <- Found,
-                 (Item = item(RootId, Total, Last)) =/= undefined]}.
+    Items = [{json, encode_json(Item)}
+             || [RootId, _Last, Total] <- Found,
+                (Item = item(RootId, Total)) =/= undefined],
+    {source, Items ++ resume_marker(Found, Limit)}.
 
 %% Live prepend: a root item each time a thread in scope gains activity.
 latest(Feed) ->
     EventFun =
         fun({thread, RootId}) ->
                 case in_scope(Feed, RootId) of
-                    {true, Total, Last} ->
-                        case item(RootId, Total, Last) of
+                    {true, Total, _Last} ->
+                        case item(RootId, Total) of
                             undefined -> skip;
                             Item      -> {send, encode_json(Item)}
                         end;
@@ -557,10 +558,51 @@ opts([{Props}]) ->
 opts(_) ->
     #{}.
 
+%% The trailing cursor frame that lets the client ask for the next page.
+%%
+%% pull-resume (lib/pull-resume.js) takes the cursor off the LAST frame of
+%% a batch as `resume`, and filters that frame out before rendering.
+%% Upstream produced it server-side in pullResume.source, which erlbutt
+%% does not run, so without one written here `Next` sees no resume on the
+%% batch it just read and ends the stream: every rollup tab loaded its
+%% first page and then would not scroll.
+%%
+%% Only for a page that came back full.  A short page is the end of the
+%% index and a cursor there would send the client after a page that cannot
+%% exist.  The cursor is the last ROW's activity time rather than the last
+%% ITEM's: a row whose root body would not decode is dropped from the
+%% batch but was still consumed, so resuming past it has to skip it too.
+%%
+%% A 0 is not a usable cursor -- it is the NOT NULL default for a thread
+%% whose every timestamp was unreadable, it would ask for `last < 0`, and
+%% the client tests the field for truthiness, so a 0 would be rendered as
+%% a message rather than consumed.  Ending the stream is the better of the
+%% two wrong answers.
+resume_marker(_Found, undefined) ->
+    [];
+resume_marker(Found, Limit) when length(Found) < Limit ->
+    [];
+resume_marker(Found, _Limit) ->
+    case lists:last(Found) of
+        [_Root, Last, _Total] when is_integer(Last), Last > 0 ->
+            [{json, encode_json({[{~"marker", true}, {~"resume", Last}]})}];
+        _ ->
+            []
+    end.
+
 %% Build the roots item: the root message envelope extended with
-%% totalReplies, latestReplies (full messages) and bumps, plus rts (the
-%% activity time) as the pagination cursor.
-item(RootId, Total, Last) ->
+%% totalReplies, latestReplies (full messages) and bumps.
+%%
+%% The activity time is deliberately NOT attached here.  It used to ride
+%% along as `rts`, which looked like the obvious name for a cursor and is
+%% in fact the one field the client prefers over everything else when it
+%% decides what time to PRINT on a message (lib/get-timestamp.js), so a
+%% thread bumped by a reply today rendered its root as posted today --
+%% above replies correctly dated weeks earlier.  Upstream's `rts` is one
+%% message's received time, read off the raw index row before the item
+%% became the root, so the rendered object never carried one.  Neither
+%% does this one; the cursor is a frame of its own, see resume_marker/2.
+item(RootId, Total) ->
     case decoded(RootId) of
         {RootProps} ->
             Replies = [R || Id <- recent_replies(RootId),
@@ -568,8 +610,7 @@ item(RootId, Total, Last) ->
             Bumps = [bump(R) || R <- Replies],
             {RootProps ++ [{~"totalReplies", Total},
                            {~"latestReplies", Replies},
-                           {~"bumps", Bumps},
-                           {~"rts", Last}]};
+                           {~"bumps", Bumps}]};
         undefined ->
             undefined                    %% root body not fetchable; skip
     end.
@@ -674,6 +715,8 @@ threads_test_() ->
       fun(_) -> ?_test(recent_replies_are_newest_few_oldest_first()) end,
       fun(_) -> ?_test(redelivery_does_not_inflate_the_count()) end,
       fun(_) -> ?_test(scoped_feeds_select_their_threads()) end,
+      fun(_) -> ?_test(root_item_carries_no_activity_time()) end,
+      fun(_) -> ?_test(cursor_frame_only_when_the_page_is_full()) end,
       fun(_) -> ?_test(survives_a_restart()) end]}.
 
 th_setup() ->
@@ -731,8 +774,11 @@ post(Pid, Content) ->
     ssb_feed:fetch_last_msg(Pid).
 
 roots() ->
+    roots([]).
+
+roots(Opts) ->
     {source, Items} =
-        handle_rpc([~"patchwork", ~"publicFeed", ~"roots"], [{[]}],
+        handle_rpc([~"patchwork", ~"publicFeed", ~"roots"], [{Opts}],
                    #{class => owner, feed_id => keys:pub_key_disp()}),
     [utils:nat_decode(B) || {json, B} <- Items].
 
@@ -873,6 +919,60 @@ redelivery_does_not_inflate_the_count() ->
 
 %% Each feed tab is a different scope over the same threads; the ones
 %% keyed on an actor are why thread_actor exists.
+%% The root item must not carry the thread's activity time.  Sent as
+%% `rts` it took over the time the client PRINTS on the root
+%% (lib/get-timestamp.js prefers that field over everything else), so a
+%% thread bumped by a new reply showed its root as posted today, sitting
+%% above replies correctly dated weeks earlier.
+root_item_carries_no_activity_time() ->
+    OwnPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    #message{id = RootId} = post(OwnPid, {[{~"type", ~"post"},
+                                           {~"text", ~"root post"}]}),
+    _ = post(OwnPid, {[{~"type", ~"post"}, {~"text", ~"a much later reply"},
+                       {~"root", RootId}]}),
+    %% the reply is the thread's activity time, and well after the root
+    _ = write("UPDATE thread SET last=? WHERE root=?", [9000, RootId]),
+    [{Props}] = roots(),
+    ?assertEqual(RootId, proplists:get_value(~"key", Props)),
+    ?assertEqual(undefined, proplists:get_value(~"rts", Props)),
+    %% and what is left for the client to read is the root's own time
+    {Value} = proplists:get_value(~"value", Props),
+    ?assert(is_integer(proplists:get_value(~"timestamp", Value))).
+
+%% pull-resume reads the next page's cursor off the last frame of this
+%% one, so a full page has to end with a marker frame -- without it the
+%% client loaded one page per tab and would not scroll -- and a short page
+%% must not, because there is nothing after it to ask for.
+cursor_frame_only_when_the_page_is_full() ->
+    OwnPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    Ids = [begin
+               #message{id = Id} = post(OwnPid, {[{~"type", ~"post"},
+                                                  {~"text", T}]}),
+               Id
+           end || T <- [~"one", ~"two", ~"three"]],
+    %% Posted back to back these share a millisecond, and activity order
+    %% has no tiebreak, so the page boundary would be arbitrary.  Spread
+    %% them out.
+    [Older, Middle, Newest] = Ids,
+    _ = [write("UPDATE thread SET last=? WHERE root=?", [Ts, Id])
+         || {Id, Ts} <- lists:zip(Ids, [1000, 2000, 3000])],
+
+    %% a full page: two items, then the cursor at the last row's activity
+    [{First}, {Second}, {Marker}] = roots([{~"limit", 2}]),
+    ?assertEqual(Newest, proplists:get_value(~"key", First)),
+    ?assertEqual(Middle, proplists:get_value(~"key", Second)),
+    ?assertEqual(true, proplists:get_value(~"marker", Marker)),
+    ?assertEqual(2000, proplists:get_value(~"resume", Marker)),
+
+    %% resuming from it yields the rest, and ends without a cursor
+    [{Third}] = roots([{~"limit", 2}, {~"resume", 2000}]),
+    ?assertEqual(Older, proplists:get_value(~"key", Third)),
+
+    %% a page that was never full does not get one either
+    ?assertEqual([Newest, Middle, Older],
+                 [proplists:get_value(~"key", P)
+                  || {P} <- roots([{~"limit", 5}])]).
+
 scoped_feeds_select_their_threads() ->
     Owner = keys:pub_key_disp(),
     Other = ~"@scopedotherrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr=.ed25519",
