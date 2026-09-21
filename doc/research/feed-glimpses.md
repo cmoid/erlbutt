@@ -3,10 +3,20 @@
 *A way to know enough about a feed at the edge of your follow graph to
 decide whether you want it, without replicating it first.*
 
-**Status: design only. Nothing below is implemented.** The companion piece,
-[archive boundaries](archive-boundaries.md), is implemented and deployed;
-this is not. I am writing it down before building it because the last one
-taught me that the design errors are cheaper to find in prose.
+**Status: implemented, September 2026.** Built in a day against this
+document, which is the case for writing the thing down first. What
+follows is the design as written, with `Built:` notes where the
+implementation went somewhere the design did not, and a revised set of
+open questions at the end — three of the five were answered by building
+it, and not always in the direction I expected.
+
+Running on two nodes; not yet on the public pub. The modules are
+[`ssb_glimpses`](../../apps/ssb/src/ssb_glimpses.erl),
+[`glimpse_discovery`](../../apps/ssb/src/glimpse_discovery.erl),
+[`feed_pins`](../../apps/ssb/src/feed_pins.erl) and
+[`silkpurse_glimpses`](../../apps/silkpurse/src/silkpurse_glimpses.erl);
+the two-node procedure is [glimpse
+testing](../ops/glimpse-testing.md).
 
 ---
 
@@ -123,6 +133,42 @@ for. **The contents are deliberately unspecified here.** That is the
 author's editorial decision, and a protocol that dictates it is a protocol
 that will be wrong for somebody.
 
+> **Built: the profile and a statement, and nothing the node worked out
+> for itself.**
+>
+> The first implementation did assemble a summary — five recent thread
+> roots and twelve subscribed channels, on top of the profile — and it
+> was wrong in two different ways, which is how I know the second way is
+> the one that matters.
+>
+> The lists were bad. On a real feed the channels *subscribed to* and the
+> channels *posted in* had **no overlap at all**, and the subscriptions
+> were years stale; a stranger was being told about reading habits from
+> 2019 and shown writing from last week, with nothing to distinguish
+> them. That is fixable by picking better queries.
+>
+> The mechanism was worse than either list, and is not. A summary
+> assembled out of somebody's behaviour and printed in their voice is not
+> a self-description — and a reader cannot tell which parts of it the
+> author chose. My own renderer put the heading *"From this feed"* above
+> three posts that the *node* had selected, which reads as curation and
+> was not. The paragraph above says a protocol that dictates the contents
+> will be wrong for somebody; I had written a client that dictated them
+> and got it wrong for the first author who looked.
+>
+> So: profile (from `about`, which the author wrote) plus a statement
+> (which the author typed), and an author who wants to feature a post can
+> quote it in the statement, where everything is theirs. A reader ignores
+> payload fields it does not know, so another implementation is free to
+> disagree.
+>
+> The size bound is a convention on the **reading** side —
+> `?GLIMPSE_MAX_SIZE`, 256KB, above which a receiver declines the offer.
+> The publisher warns and publishes anyway rather than refusing or
+> truncating: those are the author's words, and a node deciding what a
+> person may say about themselves is the thing this section just stopped
+> doing.
+
 The message is small and the blob is bounded by convention rather than by
 rule. If glimpses become large enough to matter, the design has failed and
 the correct response is to replicate the feed.
@@ -234,6 +280,32 @@ Where boundary discovery takes the **lowest** offer, glimpse discovery
 takes the **highest sequence** — the newest self-description on offer.
 Same staging logic, opposite end.
 
+> **Built: the peer volunteers, the receiver filters.** Nobody names a
+> feed on the wire.
+>
+> "Ask which glimpses it holds *for feeds in my boundary set*" assumes
+> the boundary set is something you can put in a question. It is not: on
+> a node replicating 2,596 feeds at hops=2, the set at hops+1 is **36,112
+> feeds**, and that is a laptop, not a pub. Sending tens of thousands of
+> ids per peer per round, to hear "no" about nearly all of them, is the
+> want storm `archives.boundaries` was shaped to avoid.
+>
+> So `glimpses.offers` is a bare source, exactly like the boundary list:
+> the peer streams what it holds, and the receiver drops everything
+> outside its own boundary set on arrival. While glimpses are rare the
+> stream is short. If they ever become universal this needs revisiting —
+> but the candidacy rule, and therefore the spam defence, is unchanged
+> either way, because it was always the *receiver's* test.
+>
+> One thing the design did not anticipate, and the implementation had to
+> decide: **we serve the view, not the edge.** A node offers glimpses for
+> feeds it actually replicates — chain-validated, the sealed-envelope
+> case this document argues for. It does *not* relay glimpses it merely
+> staged for its own use. Doing so would propagate self-descriptions for
+> feeds nobody at either end carries, which is how a bounded feature
+> turns into a gossip network of its own. A feed's glimpse reaches a new
+> node when somebody who actually replicates that feed offers it.
+
 ## Why this cannot ride EBT
 
 EBT clocks express a **prefix**: "I have feed X up to sequence N". A
@@ -267,6 +339,37 @@ the glimpse message, its sequence, and the blob reference. Explicitly not
 the feed store. Promotion to full replication then means adding the feed
 to the replication set and letting the ordinary path run from scratch; the
 glimpse is discarded, having done its job.
+
+> **Built: two tables, and only one of them is a view.**
+>
+> `glimpses` is an ordinary core view: the glimpse of every feed we
+> replicate, folded out of the log, rebuildable at any time, and the only
+> thing we serve. `glimpse_edge` holds what peers offered for feeds at
+> our boundary — and a rebuild would erase those rows with no way to
+> recreate them, since nothing in the log mentions those feeds. So
+> `view_reset/0` clears the first and leaves the second alone. Treating
+> the edge table as a view would silently lose it on every schema bump.
+>
+> Losing it is survivable, which is the nicer half of this. The rows come
+> back from the next round, and that turns out to be load-bearing for
+> promotion: `promote` forgets the staged glimpse, and if you later
+> change your mind and unpin, the feed returns to the boundary and the
+> next round re-stages it. The stand-in is disposable state that rebuilds
+> itself from the network.
+>
+> **Promotion is a local pin, not a follow.** The design says "adding the
+> feed to the replication set" without saying how, and the obvious answer
+> — publish a `contact` — is wrong: following is a public statement about
+> a stranger, and un-following is a second one. The whole argument that a
+> glimpse is *advisory* rests on the decision being cheap in both
+> directions. So `feed_pins` is a private table unioned into the
+> replication set beside follows and room members, undone by deleting a
+> row, and a block still outranks it. Following is the right thing to do
+> once a feed has earned it; a pin is what you do while finding out.
+>
+> Unpinning stops *asking* for a feed; it does not delete what already
+> arrived. Conflating the two would make "try this feed for a week"
+> quietly destructive.
 
 ## What it costs
 
@@ -315,41 +418,73 @@ it ranks rather than something it replaces.
 
 ## Open questions
 
-The ones I would most like argued with:
+Three of the five below were answered by building it. The two that
+remain are the two I most wanted argued with, which is either a good sign
+or a sign that they are the ones a prototype cannot settle.
 
-1. **Is author-curated actually sufficient?** I have argued a glimpse need
-   only be as trustworthy as a profile. If there is a case where that
-   reasoning fails — where a self-description does real damage that an
-   `about` message could not — I want to know before building it.
+1. **Is author-curated actually sufficient?** *(still open.)* I have
+   argued a glimpse need only be as trustworthy as a profile. If there is
+   a case where that reasoning fails — where a self-description does real
+   damage that an `about` message could not — I want to know.
 
-2. **Is "advisory, not authoritative" doing too much work?** It is the
-   load-bearing claim that lets me accept an unanchored message. It holds
-   only if promotion is genuinely cheap and reversible, and I have not
-   costed that carefully. `ssb-ooo` sharpens this rather than settles it:
-   it shows an anchored alternative exists wherever a validated feed
-   happens to cite the message. Is there a shape where a glimpse could
-   acquire an anchor — some message in the replicated set that references
-   a boundary feed's glimpse by hash — that I have not thought of? I could
-   not find a natural one, since nobody has a reason to cite a stranger's
-   self-description, but that is an absence of imagination rather than a
-   proof.
+   Building it sharpened the question rather than answering it. The
+   payload shrank to profile-plus-statement precisely because everything
+   else was the node speaking in the author's voice; what is left is as
+   trustworthy as an `about`, because most of it *is* one. That makes the
+   claim narrower and easier to defend, and it does not test it.
 
-3. **Does the boundary set need to be hops+1 exactly?** Everything reached
-   at hops+1 is a large set in its own right. It may need its own bound,
-   and I do not know what that bound should be derived from.
+2. **Is "advisory, not authoritative" doing too much work?** *(still
+   open, and now costed.)* It is the load-bearing claim that lets me
+   accept an unanchored message. It holds only if promotion is genuinely
+   cheap and reversible — and that part I *have* now costed: promotion is
+   one row in a private table, reversal is deleting it, neither is
+   published, and nothing is destroyed on the way back. Cheaper than I
+   assumed when I wrote this.
 
-4. **Should a glimpse be a single message or a mutable pointer?** As
-   written, a new glimpse is a new message and the newest wins. That is
-   simple and append-only, but it means the feed accumulates glimpses
-   forever, which is mildly ironic in a document adjacent to archiving.
+   What remains open is whether cheap reversal is *sufficient*, which is
+   a question about people rather than rows. `ssb-ooo` still sharpens it:
+   an anchored alternative exists wherever a validated feed happens to
+   cite the message, and I still cannot find a natural anchor for a
+   stranger's self-description, which is an absence of imagination rather
+   than a proof.
 
-5. **Is this worth specifying, or is it an erlbutt-local feature?** As
-   with archive boundaries, "keep it local" is a perfectly good answer.
+3. ~~**Does the boundary set need to be hops+1 exactly?**~~ *Dissolved.*
+   The set is never enumerated on the wire — the peer volunteers what it
+   holds and the receiver filters — so its size costs a membership test
+   and nothing else. It is large (36,112 feeds against a 2,596-feed
+   replication set) and that turns out not to matter. If glimpses ever
+   become common enough that the offered stream is the expensive half,
+   this comes back as a different question: how to bound what a peer
+   *offers*, not what a receiver *considers*.
+
+4. ~~**Should a glimpse be a single message or a mutable pointer?**~~
+   *Settled: a message, newest wins.* Both stores keep one row per feed
+   and take the highest sequence, so a republished glimpse supersedes its
+   predecessor everywhere that matters. The feed does accumulate
+   glimpses, as predicted, and the irony stands — but they are small, and
+   a mutable pointer would have needed a second source of truth for
+   something the feed already holds.
+
+   Worth stating plainly, because it is the cost of that choice: **a
+   glimpse can be superseded but not retracted.** The old message stays
+   on the feed and the old blob stays fetchable, so a peer holding it can
+   still serve it. Both ends prefer the newest; neither can guarantee it.
+   That is the staleness hole in [What it costs](#staleness), seen from
+   the author's side.
+
+5. **Is this worth specifying, or is it an erlbutt-local feature?**
+   *(still open, but the shape of an answer is clearer.)* Everything here
+   is additive: one message type, one source method, no change to
+   replication, and a payload whose fields a reader is expected to ignore
+   when it does not know them. There is very little to specify and a lot
+   to simply do, which argues for "keep it local, describe it honestly,
+   and see whether anybody copies it."
 
 ---
 
-*Charles Moid — erlbutt. No implementation yet. The pattern this follows
-is
+*Charles Moid — erlbutt. Implemented September 2026; see the `Built:`
+notes above for where the implementation diverged. The pattern this
+follows is
 [boundary_discovery.erl](https://github.com/cmoid/erlbutt/blob/main/apps/ssb/src/boundary_discovery.erl);
 the companion design is
 [archive-boundaries.md](https://github.com/cmoid/erlbutt/blob/main/doc/research/archive-boundaries.md).*
