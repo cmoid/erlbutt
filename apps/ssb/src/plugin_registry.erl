@@ -67,6 +67,9 @@
          %% can decide where to start a feed, and every message it gets
          %% back is signed by that feed's own author.
          {[?archives, ?boundaries],     source, anyone},
+         %% Discovery surface: what feeds we carry say about themselves,
+         %% for a peer deciding whether to carry one of them too.
+         {[?glimpses, ?offers],         source, anyone},
          {[?tunnel, ?isRoom],           sync,   anyone},
          {[?tunnel, ?connect],          duplex, room},
          {[?tunnel, ?endpoints],        source, room},

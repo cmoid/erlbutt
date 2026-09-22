@@ -229,15 +229,20 @@ code_change(_OldVsn, State, _Extra) ->
 schedule_repl_refresh() ->
     erlang:send_after(?REPL_REFRESH_MS, self(), refresh_repl_set).
 
-%% Replication set = {self} ∪ follows(self, hops) ∪ room members − blocks(self).
-%% A block wins even over membership.
+%% Replication set = {self} ∪ follows(self, hops) ∪ room members ∪ local
+%% pins − blocks(self).  A block wins even over membership or a pin.
+%%
+%% Pins are the only member of that union not derived from something
+%% published: they are how this node's operator says "carry this one
+%% anyway", which is what promoting a glimpse does (see feed_pins).
 recompute_repl_set() ->
     try
         Self    = keys:pub_key_disp(),
         Follows = ssb_social_graph:follows(Self, config:replication_hops()),
         Members = room_store:members(),
+        Pinned  = feed_pins:all(),
         Blocked = ssb_social_graph:blocks(Self),
-        Combined = lists:usort([Self | Follows] ++ Members),
+        Combined = lists:usort([Self | Follows] ++ Members ++ Pinned),
         Set = [F || F <- Combined, not lists:member(F, Blocked)],
         ets:delete_all_objects(?REPL_SET),
         [ets:insert(?REPL_SET, {F}) || F <- Set],

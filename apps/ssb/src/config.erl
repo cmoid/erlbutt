@@ -23,6 +23,7 @@
          set_pin_archives/1,
          archive_serving/0,
          set_archive_serving/1,
+         glimpses/0,
          set_dialer/1,
          require_valid_sigs/0,
          set_require_valid_sigs/1,
@@ -53,6 +54,7 @@
                  archive_floors = true,
                  pin_archives = false,
                  archive_serving = true,
+                 glimpses = true,
                  blob_scan = false,
                  %% Reject peer messages whose signature does not verify.
                  %% Off by default: a node runs in log-and-count mode first
@@ -161,6 +163,17 @@ archive_serving() ->
 %% Set {archive_floors, false}. in ssb.cfg to replicate every feed whole.
 archive_floors() ->
     (get_config())#config.archive_floors.
+
+%% Whether to ask peers what the feeds just outside the replication set
+%% say about themselves (doc/research/feed-glimpses.md).
+%%
+%% ON by default.  A round is one short stream per connected peer, and on
+%% a network where nobody publishes a glimpse it is an empty one; serving
+%% is unconditional for the same reason boundaries are.  What the round
+%% collects is never replicated and never acted on by itself — it waits
+%% for a person.  Set {glimpses, false}. in ssb.cfg to stop asking.
+glimpses() ->
+    (get_config())#config.glimpses.
 
 %% Whether peer_dialer should dial automatically at startup.
 %% Set {peer_dialer, false}. in ssb.cfg to start with dialing off.
@@ -406,6 +419,8 @@ parse({archive_serving, Bool}, Cfg) when is_boolean(Bool) ->
     Cfg#config{archive_serving = Bool};
 parse({archive_floors, Bool}, Cfg) when is_boolean(Bool) ->
     Cfg#config{archive_floors = Bool};
+parse({glimpses, Bool}, Cfg) when is_boolean(Bool) ->
+    Cfg#config{glimpses = Bool};
 parse({peer_dialer, Bool}, Cfg) when is_boolean(Bool) ->
     Cfg#config{dialer = Bool};
 

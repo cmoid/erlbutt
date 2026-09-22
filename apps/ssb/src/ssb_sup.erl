@@ -49,9 +49,13 @@ init([]) ->
             ?CHILD(ssb_feed_meta, worker),
             ?CHILD(ssb_links, worker),
             ?CHILD(ssb_archives, worker),
+            ?CHILD(ssb_glimpses, worker),
+            %% Before ebt: its replication set unions the pins in.
+            ?CHILD(feed_pins, worker),
             ?CHILD(ebt, worker),
             ?CHILD(peer_registry, worker),
             ?CHILD(boundary_discovery, worker),
+            ?CHILD(glimpse_discovery, worker),
             ?CHILD(room_attendants, worker),
             ?CHILD(tunnel_endpoint, worker),
             ?CHILD(blob_fetcher, worker),

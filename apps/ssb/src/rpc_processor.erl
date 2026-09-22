@@ -66,6 +66,26 @@ create_header(Flags, BodySize, ReqNo) ->
       BodySize:4/big-unsigned-integer-unit:8,
       ReqNo:4/big-signed-integer-unit:8>>.
 
+%% Stream a list of stored, already-signed messages down a source request
+%% and close it.
+%%
+%% Each row is sent as the author signed it: these answers are offers
+%% ABOUT feeds, so the receiver checks the author's signature and never
+%% has to believe anything we say.  Shared by archives.boundaries and
+%% glimpses.offers, which differ only in which table they read.
+stream_raw(Calls, ReqNo, Rows, Socket, Nonce, SecretBoxKey) ->
+    ets:insert(Calls, {ReqNo, noop}),
+    NewNonce = lists:foldl(
+        fun(#{raw := Raw}, N) ->
+            Flags  = create_flags(1, 0, 2),
+            Header = create_header(Flags, size(Raw), -ReqNo),
+            utils:send_data(utils:combine(Header, Raw), Socket, N, SecretBoxKey)
+        end, Nonce, Rows),
+    TrueEnd = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+    EndFlags  = create_flags(1, 1, 2),
+    EndHeader = create_header(EndFlags, size(TrueEnd), -ReqNo),
+    utils:send_data(utils:combine(EndHeader, TrueEnd), Socket, NewNonce, SecretBoxKey).
+
 init([]) ->
     process_flag(trap_exit, true),
     ?LOG_INFO("Started rpc processor ~n", []),
@@ -393,17 +413,29 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [?archives, ?boundaries]}
     %% staying a witness for longer, so the choice belongs to it.  What
     %% goes on the wire is the author's own signed message — the receiver
     %% verifies that signature and never has to trust us for any of it.
-    ets:insert(Calls, {ReqNo, noop}),
-    NewNonce = lists:foldl(
-        fun(#{raw := Raw}, N) ->
-            Flags  = create_flags(1, 0, 2),
-            Header = create_header(Flags, size(Raw), -ReqNo),
-            utils:send_data(utils:combine(Header, Raw), Socket, N, SecretBoxKey)
-        end, Nonce, ssb_archives:boundaries()),
-    TrueEnd = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
-    EndFlags  = create_flags(1, 1, 2),
-    EndHeader = create_header(EndFlags, size(TrueEnd), -ReqNo),
-    utils:send_data(utils:combine(EndHeader, TrueEnd), Socket, NewNonce, SecretBoxKey);
+    stream_raw(Calls, ReqNo, ssb_archives:boundaries(), Socket, Nonce,
+               SecretBoxKey);
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?glimpses, ?offers]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    %% Every feed we replicate that has said something about itself, so a
+    %% peer can read a self-description for a feed at the edge of its own
+    %% graph without replicating it first.  See
+    %% doc/research/feed-glimpses.md.
+    %%
+    %% Volunteered whole, for the same reason boundaries are: the asker
+    %% would otherwise have to name the feeds it is curious about, and at
+    %% hops+1 that list runs to tens of thousands of ids — per peer, per
+    %% round, to hear "no" about nearly all of them.  What we hold is
+    %% short by comparison, and the receiver drops everything outside its
+    %% own boundary set on arrival.
+    %%
+    %% Only glimpses of feeds we actually replicate go out.  Relaying
+    %% glimpses we merely staged for ourselves would propagate
+    %% self-descriptions for feeds nobody involved carries; see the note
+    %% in ssb_glimpses.
+    stream_raw(Calls, ReqNo, ssb_glimpses:offers(), Socket, Nonce,
+               SecretBoxKey);
 
 proc_request(Calls, ReqNo, #ssb_rpc{name = [?gossip, ?ping],
                              args = [{_Args}]}

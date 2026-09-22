@@ -48,6 +48,8 @@
 -define(tunnel, <<"tunnel">>).
 -define(archives, <<"archives">>).
 -define(boundaries, <<"boundaries">>).
+-define(glimpses, <<"glimpses">>).
+-define(offers, <<"offers">>).
 -define(isRoom, <<"isRoom">>).
 -define(room, <<"room">>).
 -define(metadata, <<"metadata">>).
@@ -65,6 +67,17 @@
 %% (and the limit ssb-blob-files enforces client-side), so a file the
 %% client would refuse to send is also one we refuse to buffer.
 -define(BLOB_MAX_SIZE, 5242880).
+
+%% Largest glimpse payload this node will fetch on a peer's say-so.
+%%
+%% The design doc bounds a glimpse "by convention rather than by rule",
+%% and this is what that convention looks like from the receiving end: a
+%% self-description is a page about a person, and an author who needs
+%% more than this to introduce themselves is asking us to replicate their
+%% feed, which is the thing a glimpse exists to avoid.  Nothing stops
+%% them publishing a larger one; we simply decline to fetch it, and the
+%% feed stays as invisible at our boundary as it was before.
+-define(GLIMPSE_MAX_SIZE, 262144).
 
 -record(ssb_conn,
         { socket,
