@@ -30,7 +30,9 @@
          two_node_rpc_permissions_test/1,
          two_node_repl_set_event_test/1,
          two_node_archive_boundaries_test/1,
-         two_node_adopts_floor_test/1]).
+         two_node_adopts_floor_test/1,
+         two_node_glimpse_offers_test/1,
+         two_node_stages_and_promotes_a_glimpse_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -56,7 +58,9 @@ all() ->
      two_node_rpc_permissions_test,
      two_node_repl_set_event_test,
      two_node_archive_boundaries_test,
-     two_node_adopts_floor_test].
+     two_node_adopts_floor_test,
+     two_node_glimpse_offers_test,
+     two_node_stages_and_promotes_a_glimpse_test].
 
 init_per_suite(Config) ->
     %% peer:start/1 requires the calling node to be distributed.
@@ -613,6 +617,146 @@ via_feed(Node, TargetId) ->
 fresh_feed_id() ->
     #{public := Pub} = enacl:sign_keypair(),
     <<"@", (base64:encode(Pub))/binary, ".ed25519">>.
+
+%% A glimpse crosses the wire as the author signed it, and B checks that
+%% signature itself.
+%%
+%% This is the carriage half of the design: A is relaying a sealed
+%% envelope for a feed it happens to hold, and B is entitled to read it
+%% because a feed id IS an ed25519 public key — no chain, no predecessor,
+%% no prior knowledge of the feed required to verify.
+two_node_glimpse_offers_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    #{feed := FeedId, blob := Blob} = plant_glimpse(NodeA, ~"a feed about boats"),
+    ?assert(wait_until(
+              fun() -> rpc:call(NodeA, ssb_glimpses, for_feed, [FeedId]) =/= none end,
+              20)),
+
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                             ["localhost", ?PORT_A, ACurvePk]),
+
+    {ok, Bodies} = rpc:call(NodeB, ssb_peer, rpc_stream_call,
+                            [PeerPid, [?glimpses, ?offers], []]),
+    Decoded = [rpc:call(NodeB, message, decode_value, [Body, true])
+               || Body <- Bodies],
+    Ours = [M || #message{author = Auth} = M <- Decoded, Auth =:= FeedId],
+    ?assertMatch([_ | _], Ours),
+    [#message{validated = Valid, content = {Props}} | _] = Ours,
+    ?assertEqual(true,      Valid),
+    ?assertEqual(~"glimpse", proplists:get_value(~"type", Props)),
+    ?assertEqual(Blob,      proplists:get_value(~"blob", Props)),
+    ?assert(is_integer(proplists:get_value(~"size", Props))),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% The whole discovery path: B learns who somebody at the edge of its
+%% graph is, without replicating them, and then decides to.
+%%
+%% The feed is placed at HOPS+1 for B — three hops with the default
+%% hops=2 — which takes two throwaway identities in the middle.  That is
+%% the arrangement the feature exists for and the one that is easy to get
+%% wrong: a feed the peer itself follows would sit at hops 2 and already
+%% be replicated, and the round would correctly skip it.
+%%
+%% Also asserted here, and NOT coverable by the unit tests: a glimpse
+%% offered in the same round for a feed nobody B replicates has ever
+%% followed is refused.  decide/4 is tested against a hand-built set;
+%% this tests that boundary_set/0 computes the set that argument assumes,
+%% from a real follow graph.
+two_node_stages_and_promotes_a_glimpse_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    #{feed := FeedId, blob := Blob, payload := Payload} =
+        plant_glimpse(NodeA, ~"slow software, boats"),
+    #{feed := Stranger} = plant_glimpse(NodeA, ~"nobody sent me"),
+    ?assert(wait_until(
+              fun() -> rpc:call(NodeA, ssb_glimpses, for_feed, [Stranger]) =/= none end,
+              20)),
+
+    %% Put the feed three hops from B: B -> Mid1 -> Mid2 -> FeedId.
+    Mid2 = via_feed(NodeB, FeedId),
+    Mid1 = via_feed(NodeB, Mid2),
+    ok = follow_feed(NodeB, Mid1),
+    ?assert(wait_until(
+              fun() -> rpc:call(NodeB, ebt, replicate_feed, [Mid2]) end, 20)),
+
+    %% It is at the boundary: reachable, and deliberately not replicated.
+    ?assertNot(rpc:call(NodeB, ebt, replicate_feed, [FeedId])),
+    Boundary = rpc:call(NodeB, glimpse_discovery, boundary_set, []),
+    ?assert(sets:is_element(FeedId, Boundary)),
+    ?assertNot(sets:is_element(Stranger, Boundary)),
+
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                             ["localhost", ?PORT_A, ACurvePk]),
+    timer:sleep(300),
+
+    ok = rpc:call(NodeB, glimpse_discovery, run_now, []),
+
+    %% Staged, and marked as what it is: a peer's copy for a feed we do
+    %% not carry.
+    ?assertMatch({ok, #{source := edge, seq := 1, blob := Blob}},
+                 rpc:call(NodeB, ssb_glimpses, for_feed, [FeedId])),
+
+    %% We don't want nobody that nobody sent.
+    ?assertEqual(none, rpc:call(NodeB, ssb_glimpses, for_feed, [Stranger])),
+
+    %% Staged is not served: a glimpse we hold for a feed we do not
+    %% replicate is ours to look at, not ours to relay.
+    ?assertNot(lists:member(
+                 FeedId,
+                 [F || #{feed := F} <- rpc:call(NodeB, ssb_glimpses, offers, [])])),
+
+    %% The pointer and the payload travel separately; wanting the blob is
+    %% what makes the second one arrive.
+    ?assert(wait_until(
+              fun() -> rpc:call(NodeB, blobs, has, [Blob]) =:= true end, 40)),
+    ?assertEqual({ok, Payload}, rpc:call(NodeB, blobs, fetch, [Blob])),
+
+    %% Promotion: a local pin, and the graph-derived set is unchanged.
+    ok = rpc:call(NodeB, feed_pins, pin, [FeedId, ~"glimpse"]),
+    ?assert(wait_until(
+              fun() -> rpc:call(NodeB, ebt, replicate_feed, [FeedId]) end, 20)),
+    ok = rpc:call(NodeB, ssb_glimpses, forget, [FeedId]),
+    ?assertEqual(none, rpc:call(NodeB, ssb_glimpses, for_feed, [FeedId])),
+
+    %% And undone as cheaply as it was done.
+    ok = rpc:call(NodeB, feed_pins, unpin, [FeedId]),
+    ?assert(wait_until(
+              fun() -> not rpc:call(NodeB, ebt, replicate_feed, [FeedId]) end, 20)),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Store a signed glimpse for a throwaway feed on Node, together with the
+%% payload blob it names, so Node can offer both.
+%%
+%% Authored directly rather than published: only a feed's owner can write
+%% its glimpse, and this feed exists nowhere but in the test.  Sequence 1
+%% with previous = null is a valid one-message feed and needs no chain
+%% behind it.
+plant_glimpse(Node, Statement) ->
+    #{public := Pub, secret := Priv} = enacl:sign_keypair(),
+    FeedId = <<"@", (base64:encode(Pub))/binary, ".ed25519">>,
+    Payload = iolist_to_binary(
+                ["{\"version\":1,\"feed\":\"", FeedId,
+                 "\",\"statement\":\"", Statement, "\"}"]),
+    Blob = rpc:call(Node, blobs, store, [Payload]),
+    Content = {[{~"type",    ~"glimpse"},
+                {~"blob",    Blob},
+                {~"size",    byte_size(Payload)},
+                {~"updated", 1789000000000}]},
+    %% new_msg base64-decodes the secret, so hand it the encoded form.
+    Msg = rpc:call(Node, message, new_msg,
+                   [null, 1, Content, {FeedId, base64:encode(Priv)}]),
+    Pid = rpc:call(Node, utils, find_or_create_feed_pid, [FeedId]),
+    stored = rpc:call(Node, ssb_feed, store_msg, [Pid, Msg]),
+    #{feed => FeedId, blob => Blob, payload => Payload}.
 
 %%% Helpers -------------------------------------------------------------
 
