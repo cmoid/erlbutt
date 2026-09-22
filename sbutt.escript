@@ -12,6 +12,7 @@
 %%   id              Alias for whoami
 %%   ping            Ping the local node
 %%   about           Set own profile name/description/avatar image
+%%   glimpse         Publish, read or promote a feed glimpse
 %%   health          Node, view and derived-store health report
 %%   census encoding Count stored messages that cannot be encoded for a client
 %%
@@ -35,6 +36,18 @@ main(["id"])              -> run(fun cmd_whoami/1);
 main(["ping"])            -> run(fun cmd_ping/1);
 main(["publish" | Args])  -> run(fun(P) -> cmd_publish(P, Args) end);
 main(["about" | Args])    -> run(fun(P) -> cmd_about(P, Args) end);
+main(["glimpse", "publish" | Args]) ->
+    run(fun(P) -> cmd_glimpse_publish(P, Args) end);
+main(["glimpse", "show", Id]) ->
+    run(fun(P) -> cmd_glimpse_show(P, Id) end);
+main(["glimpse", "show"]) ->
+    run(fun(P) -> cmd_glimpse_show(P, keys:pub_key_disp()) end);
+main(["glimpse", "edge"]) ->
+    run(fun cmd_glimpse_edge/1);
+main(["glimpse", "promote", Id]) ->
+    run(fun(P) -> cmd_glimpse_act(P, <<"promote">>, Id) end);
+main(["glimpse", "demote", Id]) ->
+    run(fun(P) -> cmd_glimpse_act(P, <<"demote">>, Id) end);
 main(["get", Key])        -> run(fun(P) -> cmd_get(P, Key) end);
 main(["invite", "create", Host, PortStr]) ->
     run(fun(P) -> cmd_invite_create(P, Host, list_to_integer(PortStr)) end);
@@ -563,6 +576,51 @@ cmd_about(Peer, Args) ->
             end
     end.
 
+%%% Glimpses ---------------------------------------------------------------
+%%
+%% A glimpse is what this feed says about itself, for somebody at the edge
+%% of the graph deciding whether to replicate it.  The node assembles the
+%% payload (profile, recent posts, channels); the only thing that has to
+%% come from a person is the statement, which is the part no index can
+%% write for them.
+%%
+%% Publishing again replaces nothing: each glimpse is an ordinary message
+%% and the newest wins, so `glimpse publish` is safe to re-run whenever
+%% the statement stops being true.
+
+cmd_glimpse_publish(Peer, Args) ->
+    KVs  = parse_kv(Args, []),
+    Opts = opt_field(<<"statement">>, proplists:get_value(statement, KVs)),
+    case rpc_json(Peer, [<<"glimpses">>, <<"publish">>], [{Opts}]) of
+        {ok, Body} -> io:format("~s~n", [Body]);
+        Err        -> io:format("Error: ~p~n", [Err])
+    end.
+
+cmd_glimpse_show(Peer, Id) ->
+    case rpc_json(Peer, [<<"glimpses">>, <<"get">>],
+                  [list_to_binary_id(Id)]) of
+        {ok, Body} -> io:format("~s~n", [Body]);
+        Err        -> io:format("Error: ~p~n", [Err])
+    end.
+
+cmd_glimpse_edge(Peer) ->
+    case rpc_json(Peer, [<<"glimpses">>, <<"edge">>], []) of
+        {ok, Body} -> io:format("~s~n", [Body]);
+        Err        -> io:format("Error: ~p~n", [Err])
+    end.
+
+cmd_glimpse_act(Peer, Method, Id) ->
+    case rpc_json(Peer, [<<"glimpses">>, Method], [list_to_binary_id(Id)]) of
+        {ok, Body} -> io:format("~s~n", [Body]);
+        Err        -> io:format("Error: ~p~n", [Err])
+    end.
+
+rpc_json(Peer, Name, Args) ->
+    ssb_peer:rpc_call(Peer, Name, <<"async">>, Args).
+
+list_to_binary_id(Id) when is_list(Id)   -> list_to_binary(Id);
+list_to_binary_id(Id) when is_binary(Id) -> Id.
+
 opt_field(_Key, undefined) -> [];
 opt_field(Key, Value)      -> [{Key, list_to_binary(Value)}].
 
@@ -654,6 +712,7 @@ parse_kv(["--text", V | Rest], Acc)        -> parse_kv(Rest, [{text, V} | Acc]);
 parse_kv(["--name", V | Rest], Acc)        -> parse_kv(Rest, [{name, V} | Acc]);
 parse_kv(["--description", V | Rest], Acc) -> parse_kv(Rest, [{description, V} | Acc]);
 parse_kv(["--image", V | Rest], Acc)       -> parse_kv(Rest, [{image, V} | Acc]);
+parse_kv(["--statement", V | Rest], Acc)   -> parse_kv(Rest, [{statement, V} | Acc]);
 parse_kv([_ | Rest], Acc)                  -> parse_kv(Rest, Acc);
 parse_kv([], Acc)                          -> Acc.
 
@@ -666,6 +725,12 @@ usage() ->
     io:format("  publish --type T --text TEXT  Publish a message~n"),
     io:format("  about [--name N] [--description D] [--image PATH]~n"),
     io:format("                                Set own profile name/description/avatar~n"),
+    io:format("  glimpse publish [--statement S]~n"),
+    io:format("                                Publish what this feed says about itself~n"),
+    io:format("  glimpse show [FEEDID]         Show a glimpse (default: your own)~n"),
+    io:format("  glimpse edge                  Glimpses staged from the graph's edge~n"),
+    io:format("  glimpse promote FEEDID        Start replicating a feed, locally~n"),
+    io:format("  glimpse demote FEEDID         Stop replicating it~n"),
     io:format("  get MSGKEY                    Fetch a message by key~n"),
     io:format("  invite create HOST PORT       Mint a pub invite code~n"),
     io:format("  log                           Stream all messages~n"),
