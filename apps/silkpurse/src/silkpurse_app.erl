@@ -22,6 +22,7 @@ start(_StartType, _StartArgs) ->
     ok = plugin_registry:register_plugin(silkpurse_thread),
     ok = plugin_registry:register_plugin(silkpurse_patchwork),
     ok = plugin_registry:register_plugin(silkpurse_archives),
+    ok = plugin_registry:register_plugin(silkpurse_glimpses),
     ok = plugin_registry:register_plugin(silkpurse_blobs),
     silkpurse_sup:start_link().
 
