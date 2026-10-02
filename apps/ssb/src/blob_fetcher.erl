@@ -73,6 +73,7 @@
          want/1,
          want_refs/1,
          extract_blob_refs/1,
+         msg_blob_refs/1,
          peer_connected/1,
          wanted/0]).
 
@@ -560,7 +561,8 @@ scan_log() ->
     gen_server:cast(?SERVER, {scan_results, maps:keys(RefSet)}).
 
 %% Blob refs reachable from a stored message: directly from public content, or
-%% from the decrypted body of a private message addressed to us.
+%% from the decrypted body of a private message addressed to us.  Also used
+%% by feed_export to decide which blobs travel with a feed.
 msg_blob_refs(#message{content = {Props}}) ->
     extract_blob_refs({Props});
 msg_blob_refs(#message{content = Content}) when is_binary(Content) ->

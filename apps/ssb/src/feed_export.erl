@@ -1,0 +1,383 @@
+%% SPDX-License-Identifier: GPL-2.0-only
+%%
+%% Copyright (C) 2026 Charles Moid
+%%
+%% Writing feeds and their blobs out as a self-contained bundle.  Your
+%% data is not sovereign if it is not portable: this is how a feed leaves
+%% the node that holds it — onto a USB stick, into another client, into
+%% another network.
+%%
+%% The packaging idea is borrowed from sneakerweb's drop format (one
+%% directory, a manifest, an optional human-readable preview); the data
+%% model is not.  Willow's entries are a set, and a receiver of a set
+%% cannot tell whether anything was withheld.  An SSB feed is a signed
+%% hash chain, so a bundle holding messages 1..N provably IS the whole of
+%% that feed up to N.  The bundle keeps the chain exactly as signed.
+%%
+%% LAYOUT
+%%
+%%   <dir>/manifest.json            what is here (see manifest/5)
+%%   <dir>/feeds/<hex>.jsonl.gz     one {"key","value","timestamp"} per
+%%                                  line, sequence order, from 1
+%%   <dir>/blobs/<hex>              every blob the exported messages
+%%                                  reference that this node holds
+%%   <dir>/index.html               a plain preview, for a person who
+%%                                  does not run SSB at all
+%%
+%% <hex> is the lowercase hex of the 32 key/hash bytes — always 64 chars,
+%% unlike the store's own directory names (utils:decode_id/1 drops
+%% leading zeros), which are an erlbutt detail and stay out of here.
+%%
+%% The lines are the stored records verbatim.  They are what
+%% createHistoryStream({keys: true}) yields, so nothing erlbutt-specific
+%% leaks into the bundle: the log framing is dropped, and the archive
+%% hint files are a local cache an importer rebuilds for itself.  The
+%% outer `timestamp` is this node's receive time — useful, but unsigned,
+%% so an importer must not trust it.
+%%
+%% WHAT IS REFUSED.  A feed is exported only if this node holds it from
+%% sequence 1 as one unbroken chain.  A floored feed holds a suffix, and a
+%% suffix is exactly the case EBT clocks cannot express
+%% (doc/research/archive-boundaries.md); exporting one would push that
+%% problem onto every importer.  Refusals are recorded in the manifest
+%% rather than failing the whole export.
+%%
+%% Private messages are exported as they sit in the feed: still
+%% encrypted.  Their blob references are found by decrypting with our
+%% key (as the blob fetcher does), so attachments in our own private
+%% messages travel with the bundle.
+%%
+%% Network keys are deliberately NOT in the manifest.  A private network's
+%% key is an access credential, and a bundle is made to be handed to
+%% someone.
+-module(feed_export).
+
+-include_lib("ssb/include/ssb.hrl").
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
+
+-export([export/2,
+         manifest_json/1,
+         describe_error/1]).
+
+-define(FORMAT, ~"erlbutt-export").
+-define(VERSION, 1).
+
+%% Export Opts#{feeds} (default: our own feed) into OutDir, which must
+%% not exist yet.
+%%
+%% The bundle is assembled in OutDir ++ ".partial" and renamed into place
+%% at the end, so OutDir only ever appears complete.
+%%
+%% {ok, Manifest} | {error, Reason}.  The manifest is returned as the
+%% same EJSON that was written to manifest.json.
+export(OutDir0, Opts) ->
+    OutDir = filename:absname(OutDir0),
+    Feeds  = maps:get(feeds, Opts, [keys:pub_key_disp()]),
+    Tmp    = OutDir ++ ".partial",
+    case filelib:is_file(OutDir) of
+        true ->
+            {error, {exists, ?l2b(OutDir)}};
+        false ->
+            %% a .partial is only ever ours, left by an export that died
+            _  = file:del_dir_r(Tmp),
+            ok = filelib:ensure_dir(filename:join([Tmp, "feeds", "x"])),
+            ok = filelib:ensure_dir(filename:join([Tmp, "blobs", "x"])),
+            try build(Tmp, lists:usort(Feeds)) of
+                {ok, Manifest} ->
+                    ok = file:rename(Tmp, OutDir),
+                    {ok, Manifest};
+                {error, _} = E ->
+                    _ = file:del_dir_r(Tmp),
+                    E
+            catch C:R:St ->
+                    _ = file:del_dir_r(Tmp),
+                    ?SSB_ERROR("feed_export: ~p:~p ~p", [C, R, St]),
+                    {error, {C, R}}
+            end
+    end.
+
+build(Tmp, FeedIds) ->
+    Results = [{Id, export_feed(Id, Tmp)} || Id <- FeedIds],
+    Done    = [{Id, Info, Refs, Rows} || {Id, {ok, Info, Refs, Rows}} <- Results],
+    Refused = [{Id, Why} || {Id, {refused, Why}} <- Results],
+    case Done of
+        [] ->
+            {error, {nothing_exported,
+                     [#{id => Id, reason => reason(Why)} || {Id, Why} <- Refused]}};
+        _ ->
+            AllRefs = lists:usort(lists:append([R || {_, _, R, _} <- Done])),
+            {Blobs, Missing} = copy_blobs(AllRefs, Tmp),
+            Manifest = manifest([Info || {_, Info, _, _} <- Done],
+                                Blobs, Missing, Refused,
+                                erlang:system_time(millisecond)),
+            ok = file:write_file(filename:join(Tmp, "manifest.json"),
+                                 manifest_json(Manifest)),
+            ok = file:write_file(filename:join(Tmp, "index.html"),
+                                 preview(Manifest,
+                                         [{Info, Rows} || {_, Info, _, Rows} <- Done])),
+            {ok, Manifest}
+    end.
+
+%%%===================================================================
+%%% One feed
+%%%===================================================================
+
+-record(walk, {feed,
+               fd,
+               seq    = 0,
+               last   = null,
+               refs   = #{},
+               rows   = [],
+               name   = null}).
+
+%% {ok, Info, BlobRefs, PreviewRows} | {refused, Reason}
+export_feed(FeedId, Tmp) ->
+    case feed_dir(FeedId) of
+        {ok, Dir} ->
+            Rel  = filename:join("feeds", ?b2l(hex_of(FeedId)) ++ ".jsonl.gz"),
+            Path = filename:join(Tmp, Rel),
+            {ok, Fd} = file:open(Path, [write, binary, compressed]),
+            Result = try feed_store:fold_feed(fun line/2,
+                                              #walk{feed = FeedId, fd = Fd},
+                                              Dir)
+                     catch throw:{refused, _} = Refused -> Refused
+                     after file:close(Fd)
+                     end,
+            finish(Result, FeedId, Rel, Path);
+        refused ->
+            {refused, not_held}
+    end.
+
+finish({refused, _} = Refused, _FeedId, _Rel, Path) ->
+    _ = file:delete(Path),
+    Refused;
+finish(#walk{seq = 0}, _FeedId, _Rel, Path) ->
+    _ = file:delete(Path),
+    {refused, empty};
+finish(#walk{seq = Seq, last = Last, refs = Refs, rows = Rows, name = Name},
+       FeedId, Rel, Path) ->
+    Info = #{id     => FeedId,
+             name   => Name,
+             file   => ?l2b(Rel),
+             from   => 1,
+             to     => Seq,
+             latest => Last,
+             sha256 => file_sha256(Path)},
+    {ok, Info, maps:keys(Refs), lists:reverse(Rows)}.
+
+%% One stored record.  Checked as a chain — no signature checks, which
+%% are the importer's job and were paid when the message was stored —
+%% because a feed that does not chain here is a bundle an importer would
+%% reject, and it is better to say so now.
+line(Data, #walk{feed = FeedId, fd = Fd, seq = Seq, last = Last} = W) ->
+    #message{id = Id, author = Author, sequence = MsgSeq,
+             previous = Prev} = Msg = message:decode(Data, false),
+    if
+        Author =/= FeedId -> throw({refused, {wrong_author, Author}});
+        MsgSeq =/= Seq + 1, Seq =:= 0 -> throw({refused, {starts_at, MsgSeq}});
+        MsgSeq =/= Seq + 1 -> throw({refused, {sequence_gap, Seq, MsgSeq}});
+        Seq > 0, Prev =/= Last -> throw({refused, {broken_chain, MsgSeq}});
+        true               -> ok
+    end,
+    Seq > 0 orelse message:is_null_ref(Prev)
+        orelse throw({refused, {broken_chain, MsgSeq}}),
+    %% Stored records are compact JSON, so one never holds a raw newline;
+    %% if one ever did, the line format would silently split it.
+    nomatch = binary:match(Data, <<"\n">>),
+    ok = file:write(Fd, [Data, $\n]),
+    W#walk{seq  = MsgSeq,
+           last = Id,
+           refs = lists:foldl(fun(R, A) -> A#{R => true} end,
+                              W#walk.refs, blob_refs(Msg)),
+           rows = [row(Msg) | W#walk.rows],
+           name = name_of(Msg, W#walk.name)}.
+
+%% No private key here (or no keys server at all) just means private
+%% messages contribute no refs.
+blob_refs(Msg) ->
+    try blob_fetcher:msg_blob_refs(Msg) catch _:_ -> [] end.
+
+feed_dir(FeedId) ->
+    try utils:feed_dir(FeedId) of
+        Dir ->
+            case filelib:is_dir(Dir) of
+                true  -> {ok, ?b2l(Dir)};
+                false -> refused
+            end
+    catch _:_ -> refused
+    end.
+
+%%%===================================================================
+%%% Blobs
+%%%===================================================================
+
+%% Copy every referenced blob we hold.  The ones we do not hold are
+%% listed, not fetched: an export is a snapshot of this node, and a
+%% bundle that waited on the network could wait forever.
+copy_blobs(Refs, Tmp) ->
+    lists:foldr(
+      fun(Ref, {Have, Miss}) ->
+              Src = blobs:file_of(Ref),
+              Rel = filename:join("blobs", ?b2l(hex_of(Ref))),
+              case Src =/= error andalso filelib:is_regular(Src) of
+                  true ->
+                      {ok, Size} = file:copy(Src, filename:join(Tmp, Rel)),
+                      {[#{id => Ref, file => ?l2b(Rel), size => Size} | Have],
+                       Miss};
+                  false ->
+                      {Have, [Ref | Miss]}
+              end
+      end, {[], []}, Refs).
+
+%%%===================================================================
+%%% Manifest
+%%%===================================================================
+
+manifest(Feeds, Blobs, Missing, Refused, Now) ->
+    #{format       => ?FORMAT,
+      version      => ?VERSION,
+      created      => Now,
+      feeds        => [maps:remove(name, F) || F <- Feeds],
+      blobs        => Blobs,
+      missingBlobs => Missing,
+      refused      => [#{id => Id, reason => reason(Why)}
+                       || {Id, Why} <- Refused]}.
+
+reason(not_held)               -> ~"not held on this node";
+reason(empty)                  -> ~"no messages";
+reason({starts_at, Seq})       -> fmt("held from sequence ~b, not 1 "
+                                      "(floored feed)", [Seq]);
+reason({sequence_gap, A, B})   -> fmt("sequence gap after ~b (next is ~b)",
+                                      [A, B]);
+reason({broken_chain, Seq})    -> fmt("previous does not match at ~b", [Seq]);
+reason({wrong_author, Author}) -> <<"contains a message by ", Author/binary>>.
+
+%% The manifest as JSON text: what manifest.json holds, and what
+%% admin.export answers with.
+manifest_json(Manifest) ->
+    iolist_to_binary(json:encode(ejson(Manifest))).
+
+%% An export/2 error as one line for a person.
+describe_error({exists, Dir}) ->
+    <<Dir/binary, " already exists">>;
+describe_error({nothing_exported, Refused}) ->
+    iolist_to_binary(["nothing exported: ",
+                      lists:join(~"; ", [[Id, ~" (", Why, ~")"]
+                                         || #{id := Id, reason := Why}
+                                                <- Refused])]);
+describe_error(Other) ->
+    fmt("~p", [Other]).
+
+%% Atom-keyed maps -> the binary-keyed maps json:encode/1 takes.
+ejson(M) when is_map(M) ->
+    #{atom_to_binary(K) => ejson(V) || K := V <- M};
+ejson(L) when is_list(L) ->
+    [ejson(V) || V <- L];
+ejson(V) ->
+    V.
+
+%%%===================================================================
+%%% Preview
+%%%===================================================================
+
+%% {Seq, ClaimedTimestamp, Type, Text}.  Text is only what a reader
+%% would want at a glance; everything else is in the feed file.
+row(#message{sequence = Seq, timestamp = Ts, content = {Props}}) ->
+    Type = case ?pgv(~"type", Props) of
+               T when is_binary(T) -> T;
+               _                   -> ~"?"
+           end,
+    Text = case ?pgv(~"text", Props) of
+               X when is_binary(X) -> X;
+               _                   -> ~""
+           end,
+    {Seq, Ts, Type, Text};
+row(#message{sequence = Seq, timestamp = Ts}) ->
+    {Seq, Ts, ~"private", ~"(encrypted)"}.
+
+%% The feed's own latest self-assigned name, if it has one.
+name_of(#message{author = A, content = {Props}}, Name) ->
+    case {?pgv(~"type", Props), ?pgv(~"about", Props), ?pgv(~"name", Props)} of
+        {~"about", A, N} when is_binary(N) -> N;
+        _                                  -> Name
+    end;
+name_of(_, Name) ->
+    Name.
+
+preview(Manifest, FeedRows) ->
+    #{created := Now, blobs := Blobs, missingBlobs := Missing,
+      refused := Refused} = Manifest,
+    ["<!doctype html>\n<html><head><meta charset=\"utf-8\">"
+     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+     "<title>SSB feed export</title><style>"
+     "body{font:15px/1.5 system-ui,sans-serif;max-width:60rem;margin:auto;"
+     "padding:1rem}td,th{text-align:left;vertical-align:top;padding:.2rem .6rem}"
+     "tr:nth-child(even){background:#8881}code{font-size:.85em;word-break:break-all}"
+     "</style></head><body>\n<h1>SSB feed export</h1>\n<p>Created ",
+     esc(iso8601(Now)),
+     ". The signed messages are in <code>feeds/</code>; this page is only "
+     "a preview of them.</p>\n",
+     [feed_section(Info, Rows) || {Info, Rows} <- FeedRows],
+     ~"<h2>Blobs</h2>\n<p>",
+     integer_to_binary(length(Blobs)), ~" included",
+     case Missing of
+         [] -> ~"";
+         _  -> [~", ", integer_to_binary(length(Missing)),
+                ~" referenced but not held by the exporting node"]
+     end,
+     ~".</p>\n",
+     case Refused of
+         [] -> ~"";
+         _  -> [~"<h2>Not exported</h2>\n<ul>",
+                [[~"<li><code>", esc(Id), ~"</code>: ", esc(Why), ~"</li>"]
+                 || #{id := Id, reason := Why} <- Refused],
+                ~"</ul>\n"]
+     end,
+     ~"</body></html>\n"].
+
+feed_section(#{id := Id, name := Name, to := To}, Rows) ->
+    [~"<h2>", esc(case Name of null -> Id; _ -> Name end), ~"</h2>\n",
+     ~"<p><code>", esc(Id), ~"</code> &mdash; messages 1 to ",
+     integer_to_binary(To), ~"</p>\n",
+     ~"<table><tr><th>#</th><th>date</th><th>type</th><th>text</th></tr>\n",
+     [[~"<tr><td>", integer_to_binary(Seq), ~"</td><td>",
+       esc(iso8601(Ts)), ~"</td><td>", esc(Type), ~"</td><td>",
+       esc(Text), ~"</td></tr>\n"]
+      || {Seq, Ts, Type, Text} <- Rows],
+     ~"</table>\n"].
+
+esc(Bin) when is_binary(Bin) ->
+    lists:foldl(fun({From, To}, B) -> binary:replace(B, From, To, [global]) end,
+                Bin, [{~"&", ~"&amp;"}, {~"<", ~"&lt;"}, {~">", ~"&gt;"},
+                      {~"\"", ~"&quot;"}]).
+
+%% The claimed timestamp, as a date.  Anything unusable renders blank
+%% rather than failing the export: it is the author's assertion, not ours.
+iso8601(Ms) when is_integer(Ms) ->
+    try ?l2b(calendar:system_time_to_rfc3339(Ms, [{unit, millisecond},
+                                                  {offset, "Z"}]))
+    catch _:_ -> ~""
+    end;
+iso8601(Ms) when is_float(Ms) ->
+    iso8601(trunc(Ms));
+iso8601(_) ->
+    ~"".
+
+%%%===================================================================
+%%% Internal
+%%%===================================================================
+
+%% "@<b64>.ed25519" / "&<b64>.sha256" -> 64 lowercase hex chars
+hex_of(<<_Sigil, Rest/binary>>) ->
+    [B64 | _] = binary:split(Rest, ~"."),
+    binary:encode_hex(base64:decode(B64), lowercase).
+
+file_sha256(Path) ->
+    {ok, Bin} = file:read_file(Path),
+    binary:encode_hex(crypto:hash(sha256, Bin), lowercase).
+
+fmt(F, A) ->
+    iolist_to_binary(io_lib:format(F, A)).

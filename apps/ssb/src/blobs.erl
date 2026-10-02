@@ -18,7 +18,8 @@
          store/1,
          store_verified/2,
          has/1,
-         size_of/1]).
+         size_of/1,
+         file_of/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -52,6 +53,14 @@ has(BlobId) ->
 
 size_of(BlobId) ->
     gen_server:call(?MODULE, {size_of, BlobId}).
+
+%% Where BlobId lives on disk, or `error` for a malformed id.  Pure — no
+%% call through the server — so a bulk reader (feed_export) can copy blob
+%% files without dragging every byte through this process's mailbox.
+file_of(BlobId) ->
+    try blob_path(utils:decode_id(BlobId))
+    catch _:_ -> error
+    end.
 
 %%%===================================================================
 %%% gen_server callbacks
