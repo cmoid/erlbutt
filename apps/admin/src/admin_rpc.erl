@@ -336,6 +336,13 @@ non_owner_is_refused() ->
      end || {Name, _, _} <- manifest()],
     ok.
 
+%% Bad arguments answer an error frame rather than crashing into the
+%% plugin's catch-all "internal error".
+export_rejects_bad_args_test() ->
+    [?assertMatch({error, _}, handle_rpc([~"admin", ~"export"], Args, #{}))
+     || Args <- [[], [~""], [42], [~"relative/dir"], [~"/abs", ~"notalist"],
+                 [~"/abs", [], extra]]].
+
 %% With the services down these must answer, not crash a connection.
 degrades_without_services_test() ->
     case whereis(peer_dialer) of

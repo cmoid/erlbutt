@@ -381,3 +381,151 @@ file_sha256(Path) ->
 
 fmt(F, A) ->
     iolist_to_binary(io_lib:format(F, A)).
+
+%%%===================================================================
+%%% Tests
+%%%===================================================================
+-ifdef(TEST).
+
+export_test_() ->
+    {foreach, fun setup/0, fun teardown/1,
+     [fun exports_own_feed_test/1,
+      fun includes_archived_history_test/1,
+      fun copies_referenced_blobs_test/1,
+      fun refuses_existing_dir_test/1,
+      fun refuses_unheld_and_floored_test/1,
+      fun preview_escapes_test/1]}.
+
+setup() ->
+    Home = filename:join("/tmp", "export_" ++
+                             integer_to_list(erlang:system_time(microsecond))),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    application:set_env(ssb, ssb_home, Home),
+    {ok, _} = config:start_link("no-such-cfg"),
+    {ok, _} = keys:start_link(),
+    {ok, _} = ssb_store:start_link(),
+    {ok, _} = mess_auth:start_link(),
+    {ok, _} = blobs:start_link(),
+    {ok, _} = feed_floor:start_link(),
+    FeedId = keys:pub_key_disp(),
+    {ok, Pid} = ssb_feed:start_link(FeedId),
+    {Pid, FeedId, Home}.
+
+teardown({Pid, _, Home}) ->
+    catch gen_server:stop(Pid),
+    [catch gen_server:stop(Name)
+     || Name <- [feed_floor, blobs, mess_auth, ssb_store, keys, config]],
+    os:cmd("rm -rf " ++ Home),
+    application:unset_env(ssb, ssb_home),
+    ok.
+
+post(Pid, Text) ->
+    ok = ssb_feed:post_content(Pid, {[{~"type", ~"post"}, {~"text", Text}]}),
+    #message{id = Id} = ssb_feed:fetch_last_msg(Pid),
+    Id.
+
+out(Home) -> filename:join(Home, "bundle").
+
+read_lines(Dir, #{file := File}) ->
+    {ok, Gz} = file:read_file(filename:join(Dir, File)),
+    [L || L <- binary:split(zlib:gunzip(Gz), ~"\n", [global]), L =/= ~""].
+
+%% The bundle holds the chain verbatim: every line decodes, with its
+%% signature, back to the message that was posted — and the manifest
+%% says so.
+exports_own_feed_test({Pid, FeedId, Home}) ->
+    fun() ->
+        K1 = post(Pid, ~"one"),
+        K2 = post(Pid, ~"two"),
+        {ok, M} = export(out(Home), #{}),
+        #{feeds := [Info], refused := []} = M,
+        ?assertMatch(#{id := FeedId, from := 1, to := 2, latest := K2}, Info),
+        Lines = read_lines(out(Home), Info),
+        ?assertEqual([K1, K2],
+                     [Id || #message{id = Id, validated = true}
+                                <- [message:decode(L, true) || L <- Lines]]),
+        %% the manifest on disk is the one returned, and the file hash holds
+        {ok, Json} = file:read_file(filename:join(out(Home), "manifest.json")),
+        #{~"format" := ~"erlbutt-export", ~"version" := 1,
+          ~"feeds" := [#{~"sha256" := Sha}]} = json:decode(Json),
+        {ok, Gz} = file:read_file(filename:join(out(Home), maps:get(file, Info))),
+        ?assertEqual(Sha, binary:encode_hex(crypto:hash(sha256, Gz), lowercase)),
+        ?assert(filelib:is_regular(filename:join(out(Home), "index.html"))),
+        ?assertNot(filelib:is_dir(out(Home) ++ ".partial"))
+    end.
+
+%% Archived segments are part of the feed.  An export that read only the
+%% live log would start at the archive genesis and be refused — or worse,
+%% look complete.
+includes_archived_history_test({Pid, _FeedId, Home}) ->
+    fun() ->
+        K1 = post(Pid, ~"before"),
+        {ok, _} = ssb_feed:archive(Pid),
+        _  = post(Pid, ~"after"),
+        #message{sequence = Last} = ssb_feed:fetch_last_msg(Pid),
+        {ok, #{feeds := [Info]}} = export(out(Home), #{}),
+        ?assertMatch(#{from := 1, to := Last}, Info),
+        [First | _] = Lines = read_lines(out(Home), Info),
+        ?assertEqual(Last, length(Lines)),
+        ?assertMatch(#message{id = K1}, message:decode(First, false))
+    end.
+
+copies_referenced_blobs_test({Pid, _FeedId, Home}) ->
+    fun() ->
+        Data   = crypto:strong_rand_bytes(256),
+        Held   = blobs:store(Data),
+        Absent = <<"&", (base64:encode(crypto:strong_rand_bytes(32)))/binary,
+                   ".sha256">>,
+        ok = ssb_feed:post_content(
+               Pid, {[{~"type", ~"post"}, {~"text", ~"see attached"},
+                      {~"mentions", [{[{~"link", Held}]}, {[{~"link", Absent}]}]}]}),
+        {ok, M} = export(out(Home), #{}),
+        #{blobs := [#{id := Held, file := File, size := 256}],
+          missingBlobs := [Absent]} = M,
+        {ok, Copy} = file:read_file(filename:join(out(Home), File)),
+        ?assertEqual(Data, Copy),
+        ?assertEqual(64, byte_size(filename:basename(File)))
+    end.
+
+%% Never write into (or over) something that is already there.
+refuses_existing_dir_test({Pid, _FeedId, Home}) ->
+    fun() ->
+        _ = post(Pid, ~"x"),
+        ok = filelib:ensure_dir(filename:join(out(Home), "x")),
+        ?assertMatch({error, {exists, _}}, export(out(Home), #{}))
+    end.
+
+%% A feed we do not hold is refused, and refused feeds ride along in the
+%% manifest without spoiling the ones that did export.  With nothing
+%% exportable at all, there is no bundle.
+refuses_unheld_and_floored_test({Pid, FeedId, Home}) ->
+    fun() ->
+        _ = post(Pid, ~"x"),
+        Other = <<"@", (base64:encode(crypto:strong_rand_bytes(32)))/binary,
+                  ".ed25519">>,
+        {ok, M} = export(out(Home), #{feeds => [FeedId, Other]}),
+        ?assertMatch(#{feeds := [#{id := FeedId}],
+                       refused := [#{id := Other}]}, M),
+        Out2 = out(Home) ++ "2",
+        ?assertMatch({error, {nothing_exported, [_]}},
+                     export(Out2, #{feeds => [Other]})),
+        ?assertNot(filelib:is_file(Out2)),
+        ?assertNot(filelib:is_file(Out2 ++ ".partial")),
+        %% a chain that does not start at 1 is a floored suffix
+        W = #walk{feed = FeedId, fd = undefined},
+        Msg = message:new_msg(null, 5, {[{~"type", ~"post"}]},
+                              {FeedId, keys:priv_key()}),
+        ?assertThrow({refused, {starts_at, 5}},
+                     line(message:encode(Msg), W))
+    end.
+
+preview_escapes_test({Pid, _FeedId, Home}) ->
+    fun() ->
+        _ = post(Pid, ~"<script>alert(1)</script>"),
+        {ok, _} = export(out(Home), #{}),
+        {ok, Html} = file:read_file(filename:join(out(Home), "index.html")),
+        ?assertEqual(nomatch, binary:match(Html, ~"<script>")),
+        ?assertNotEqual(nomatch, binary:match(Html, ~"&lt;script&gt;"))
+    end.
+
+-endif.
