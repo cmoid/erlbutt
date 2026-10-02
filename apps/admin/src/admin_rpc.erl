@@ -363,6 +363,10 @@ non_owner_is_refused() ->
 
 %% Bad arguments answer an error frame rather than crashing into the
 %% plugin's catch-all "internal error".
+import_rejects_bad_args_test() ->
+    [?assertMatch({error, _}, handle_rpc([~"admin", ~"import"], Args, #{}))
+     || Args <- [[], [~""], [42], [~"relative/dir"], [~"/abs", extra]]].
+
 export_rejects_bad_args_test() ->
     [?assertMatch({error, _}, handle_rpc([~"admin", ~"export"], Args, #{}))
      || Args <- [[], [~""], [42], [~"relative/dir"], [~"/abs", ~"notalist"],

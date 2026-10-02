@@ -343,3 +343,274 @@ blob_outcome(Dir, Id) ->
         end
     catch _:_ -> bad
     end.
+
+%%%===================================================================
+%%% Tests
+%%%===================================================================
+-ifdef(TEST).
+
+%% Two homes in one VM: export from A's store, then switch the node's
+%% ssb_home to B and import there.  The services are restarted between,
+%% which is what a separate node would look like.
+import_test_() ->
+    {foreach, fun setup/0, fun teardown/1,
+     [fun round_trip_test/1,
+      fun resumes_from_what_is_held_test/1,
+      fun stale_bundle_is_up_to_date_test/1,
+      fun detects_fork_test/1,
+      fun tampered_line_stops_import_test/1,
+      fun wrong_key_is_refused_test/1,
+      fun sha256_mismatch_refused_test/1,
+      fun manifest_paths_are_ignored_test/1,
+      fun bad_blob_is_reported_test/1,
+      fun rejects_non_bundles_test/1]}.
+
+-define(SERVICES, [ssb_feed_sup, feed_floor, blobs, mess_auth, ssb_store,
+                   keys, config]).
+
+setup() ->
+    Base = filename:join("/tmp", "import_" ++
+                             integer_to_list(erlang:system_time(microsecond))),
+    start_home(filename:join(Base, "a")),
+    Base.
+
+teardown(Base) ->
+    stop_services(),
+    os:cmd("rm -rf " ++ Base),
+    application:unset_env(ssb, ssb_home),
+    ok.
+
+start_home(Home) ->
+    stop_services(),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    application:set_env(ssb, ssb_home, Home),
+    {ok, _} = config:start_link("no-such-cfg"),
+    {ok, _} = keys:start_link(),
+    {ok, _} = ssb_store:start_link(),
+    {ok, _} = mess_auth:start_link(),
+    {ok, _} = blobs:start_link(),
+    {ok, _} = feed_floor:start_link(),
+    {ok, _} = ssb_feed_sup:start_link(),
+    ok.
+
+stop_services() ->
+    [case whereis(N) of
+         undefined -> ok;
+         P         -> unlink(P), catch gen_server:stop(P)
+     end || N <- ?SERVICES],
+    ok.
+
+home(Base, Name) -> filename:join(Base, Name).
+bundle(Base)     -> filename:join(Base, "bundle").
+
+%% A's own feed with N posts; returns its id and the posted ids.
+author(N) ->
+    FeedId = keys:pub_key_disp(),
+    Pid = utils:find_or_create_feed_pid(FeedId),
+    Ids = [begin
+               ok = ssb_feed:post_content(
+                      Pid, {[{~"type", ~"post"},
+                             {~"text", integer_to_binary(I)}]}),
+               #message{id = Id} = ssb_feed:fetch_last_msg(Pid),
+               Id
+           end || I <- lists:seq(1, N)],
+    {FeedId, Ids}.
+
+export_to(Base) ->
+    {ok, _} = feed_export:export(bundle(Base), #{}).
+
+held(FeedId) ->
+    ssb_feed:current_seq(utils:find_or_create_feed_pid(FeedId)).
+
+one_feed(Base) ->
+    {ok, #{feeds := [F]}} = import(bundle(Base)),
+    F.
+
+round_trip_test(Base) ->
+    fun() ->
+        Data = crypto:strong_rand_bytes(300),
+        {FeedId, _} = author(2),
+        BlobId = blobs:store(Data),
+        ok = ssb_feed:post_content(
+               utils:find_or_create_feed_pid(FeedId),
+               {[{~"type", ~"post"}, {~"text", ~"scan"},
+                 {~"mentions", [{[{~"link", BlobId}]}]}]}),
+        export_to(Base),
+        start_home(home(Base, "b")),
+        ?assertNotEqual(FeedId, keys:pub_key_disp()),   %% a different node
+        ?assertEqual(0, held(FeedId)),
+        {ok, #{feeds := [F], blobs := B} = Report} = import(bundle(Base)),
+        ?assertMatch(#{id := FeedId, status := ~"imported", added := 3}, F),
+        %% what admin.import answers with
+        ?assertMatch(#{~"feeds" := [#{~"status" := ~"imported"}]},
+                     json:decode(report_json(Report))),
+        ?assertMatch(#{stored := 1, bad := [], missing := []}, B),
+        ?assertEqual(3, held(FeedId)),
+        ?assertEqual({ok, Data}, blobs:fetch(BlobId)),
+        %% and a second import is a no-op
+        {ok, #{feeds := [F2], blobs := B2}} = import(bundle(Base)),
+        ?assertMatch(#{status := ~"up_to_date", added := 0}, F2),
+        ?assertMatch(#{present := 1}, B2)
+    end.
+
+%% We hold a prefix of the feed: only what is beyond it is stored.
+resumes_from_what_is_held_test(Base) ->
+    fun() ->
+        {FeedId, _} = author(5),
+        export_to(Base),
+        start_home(home(Base, "b")),
+        Lines = lines(Base, FeedId),
+        Pid = utils:find_or_create_feed_pid(FeedId),
+        [stored = ssb_feed:store_msg_checked(Pid, to_msg(L))
+         || L <- lists:sublist(Lines, 2)],
+        ?assertMatch(#{status := ~"imported", held := 2, added := 3},
+                     one_feed(Base)),
+        ?assertEqual(5, held(FeedId))
+    end.
+
+%% A bundle older than what we hold adds nothing — and is still checked
+%% against our copy at its last sequence.
+stale_bundle_is_up_to_date_test(Base) ->
+    fun() ->
+        _ = author(2),
+        export_to(Base),
+        _ = author(1),                          %% A moves on to 3
+        ?assertMatch(#{status := ~"up_to_date", held := 3, added := 0},
+                     one_feed(Base))
+    end.
+
+%% Same author, same sequence numbers, different messages: the author
+%% forked their feed (or the bundle's history was rewritten).  Neither
+%% copy is stored over the other.
+detects_fork_test(Base) ->
+    fun() ->
+        {FeedId, _} = author(2),
+        export_to(Base),
+        Secret = ?b2l(config:ssb_repo_loc()) ++ "secret",
+        %% B gets A's identity but writes a different history
+        start_home(home(Base, "b")),
+        BSecret = ?b2l(config:ssb_repo_loc()) ++ "secret",
+        stop_services(),
+        {ok, _} = file:copy(Secret, BSecret),
+        start_home(home(Base, "b")),
+        ?assertEqual(FeedId, keys:pub_key_disp()),
+        _ = author(3),
+        #{status := ~"refused", added := 0, reason := Why} = one_feed(Base),
+        ?assertMatch({_, _}, binary:match(Why, ~"FORK")),
+        ?assertEqual(3, held(FeedId))
+    end.
+
+%% A line whose content was edited no longer verifies.  Everything before
+%% it is stored; nothing from it on.
+tampered_line_stops_import_test(Base) ->
+    fun() ->
+        {FeedId, _} = author(3),
+        export_to(Base),
+        [L1, L2, L3] = lines(Base, FeedId),
+        Bad = binary:replace(L2, ~"\"text\":\"2\"", ~"\"text\":\"X\""),
+        ?assertNotEqual(L2, Bad),
+        rewrite(Base, FeedId, [L1, Bad, L3]),
+        start_home(home(Base, "b")),
+        #{status := ~"stopped", added := 1, reason := Why} = one_feed(Base),
+        ?assertMatch({_, _}, binary:match(Why, ~"signature")),
+        ?assertEqual(1, held(FeedId))
+    end.
+
+%% A genuine value under a claimed key that is not its hash.
+wrong_key_is_refused_test(Base) ->
+    fun() ->
+        {FeedId, [K1 | _]} = author(1),
+        export_to(Base),
+        [L1] = lines(Base, FeedId),
+        Fake = <<"%", (base64:encode(crypto:strong_rand_bytes(32)))/binary,
+                 ".sha256">>,
+        rewrite(Base, FeedId, [binary:replace(L1, K1, Fake)]),
+        start_home(home(Base, "b")),
+        #{status := ~"refused", reason := Why} = one_feed(Base),
+        ?assertMatch({_, _}, binary:match(Why, ~"key")),
+        ?assertEqual(0, held(FeedId))
+    end.
+
+%% The manifest's file hash catches damage before any line is read.
+sha256_mismatch_refused_test(Base) ->
+    fun() ->
+        {FeedId, _} = author(2),
+        export_to(Base),
+        [L1, _] = lines(Base, FeedId),
+        Path = filename:join(bundle(Base), feed_export:feed_file(FeedId)),
+        ok = file:write_file(Path, zlib:gzip([L1, $\n])),   %% truncated
+        start_home(home(Base, "b")),
+        #{status := ~"refused", reason := Why} = one_feed(Base),
+        ?assertMatch({_, _}, binary:match(Why, ~"sha256")),
+        ?assertEqual(0, held(FeedId))
+    end.
+
+%% A manifest `file` pointing elsewhere changes nothing: the path comes
+%% from the id.
+manifest_paths_are_ignored_test(Base) ->
+    fun() ->
+        {FeedId, _} = author(1),
+        export_to(Base),
+        edit_manifest(Base, fun(#{~"feeds" := [F]} = M) ->
+                                    M#{~"feeds" := [F#{~"file" :=
+                                                           ~"../../etc/passwd"}]}
+                            end),
+        start_home(home(Base, "b")),
+        ?assertMatch(#{status := ~"imported", added := 1}, one_feed(Base)),
+        ?assertEqual(1, held(FeedId))
+    end.
+
+bad_blob_is_reported_test(Base) ->
+    fun() ->
+        {FeedId, _} = author(1),
+        BlobId = blobs:store(crypto:strong_rand_bytes(64)),
+        ok = ssb_feed:post_content(
+               utils:find_or_create_feed_pid(FeedId),
+               {[{~"type", ~"post"}, {~"mentions", [{[{~"link", BlobId}]}]}]}),
+        export_to(Base),
+        ok = file:write_file(filename:join(bundle(Base),
+                                           feed_export:blob_file(BlobId)),
+                             ~"not the blob"),
+        start_home(home(Base, "b")),
+        {ok, #{blobs := B}} = import(bundle(Base)),
+        ?assertMatch(#{stored := 0, bad := [BlobId]}, B),
+        ?assertNot(blobs:has(BlobId))
+    end.
+
+rejects_non_bundles_test(Base) ->
+    fun() ->
+        ?assertEqual({error, not_a_bundle}, import(Base)),
+        ok = file:write_file(filename:join(Base, "manifest.json"), ~"{nope"),
+        ?assertEqual({error, bad_manifest}, import(Base)),
+        ok = file:write_file(filename:join(Base, "manifest.json"),
+                             ~"{\"format\":\"erlbutt-export\",\"version\":9}"),
+        ?assertEqual({error, {unsupported_version, 9}}, import(Base))
+    end.
+
+lines(Base, FeedId) ->
+    Path = filename:join(bundle(Base), feed_export:feed_file(FeedId)),
+    {ok, Gz} = file:read_file(Path),
+    [L || L <- binary:split(zlib:gunzip(Gz), ~"\n", [global]), L =/= ~""].
+
+%% Replace a feed file AND its manifest hash, so a test reaches the line
+%% checks rather than stopping at the sha256.
+rewrite(Base, FeedId, Lines) ->
+    Path = filename:join(bundle(Base), feed_export:feed_file(FeedId)),
+    Gz = zlib:gzip([[L, $\n] || L <- Lines]),
+    ok = file:write_file(Path, Gz),
+    Sha = binary:encode_hex(crypto:hash(sha256, Gz), lowercase),
+    edit_manifest(Base, fun(#{~"feeds" := [F]} = M) ->
+                                M#{~"feeds" := [F#{~"sha256" := Sha}]}
+                        end).
+
+edit_manifest(Base, Fun) ->
+    Path = filename:join(bundle(Base), "manifest.json"),
+    {ok, Bin} = file:read_file(Path),
+    ok = file:write_file(Path, json:encode(Fun(json:decode(Bin)))).
+
+to_msg(Line) ->
+    {Env} = utils:nat_decode(Line),
+    {Value} = ?pgv(~"value", Env),
+    message:from_value(Value, true).
+
+-endif.

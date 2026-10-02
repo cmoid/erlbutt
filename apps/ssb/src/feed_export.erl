@@ -535,6 +535,21 @@ refuses_unheld_and_floored_test({Pid, FeedId, Home}) ->
                      line(message:encode(Msg), W))
     end.
 
+%% Bundle paths come from ids alone, and anything that is not a
+%% well-formed id raises rather than naming some other path.
+bundle_paths_test() ->
+    Key = crypto:strong_rand_bytes(32),
+    Hex = ?b2l(binary:encode_hex(Key, lowercase)),
+    ?assertEqual("feeds/" ++ Hex ++ ".jsonl.gz",
+                 feed_file(<<"@", (base64:encode(Key))/binary, ".ed25519">>)),
+    ?assertEqual("blobs/" ++ Hex,
+                 blob_file(<<"&", (base64:encode(Key))/binary, ".sha256">>)),
+    [?assertError(_, F(Bad))
+     || F <- [fun feed_file/1, fun blob_file/1],
+        Bad <- [~"@../../x.ed25519", ~"&../secret", ~"@.ed25519",
+                <<"@", (base64:encode(Key))/binary, ".sha256">>,
+                <<"&", (base64:encode(<<1,2,3>>))/binary, ".sha256">>]].
+
 preview_escapes_test({Pid, _FeedId, Home}) ->
     fun() ->
         _ = post(Pid, ~"<script>alert(1)</script>"),
