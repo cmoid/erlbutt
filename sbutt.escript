@@ -15,6 +15,7 @@
 %%   glimpse         Publish, read or promote a feed glimpse
 %%   health          Node, view and derived-store health report
 %%   census encoding Count stored messages that cannot be encoded for a client
+%%   export          Write feeds + their blobs out as a portable bundle
 %%
 %% The escript connects to the local erlbutt node on port 8008 using the
 %% shared ~/.ssberl/secret key (same approach as sbot in Node.js: two processes,
@@ -31,6 +32,8 @@
 main(["health"])          -> run(fun cmd_health/1);
 main(["census", "encoding" | Args]) ->
     run_local(fun() -> cmd_census_encoding(Args) end);
+main(["export", Dir | Feeds]) ->
+    run_local(fun() -> cmd_export(Dir, Feeds) end);
 main(["whoami"])          -> run(fun cmd_whoami/1);
 main(["id"])              -> run(fun cmd_whoami/1);
 main(["ping"])            -> run(fun cmd_ping/1);
@@ -268,6 +271,37 @@ cmd_health(Peer) ->
 %% the json module changes under us.  `decode failures` is the one that
 %% can move, and it means damaged storage — a torn or corrupted frame —
 %% which is a different problem reported differently.
+%% Export runs against the store's files, not through the node: the logs
+%% are append-only and blob files are immutable, so reading them beside
+%% a running node is safe, and a big export never blocks a connection.
+%% keys is needed for our own feed id and to find the blobs our private
+%% messages reference.
+cmd_export(Dir, Feeds) ->
+    {ok, _} = keys:start_link(),
+    Opts = case Feeds of
+               [] -> #{};
+               _  -> #{feeds => [list_to_binary(F) || F <- Feeds]}
+           end,
+    case feed_export:export(Dir, Opts) of
+        {ok, #{feeds := Done, blobs := Blobs, missingBlobs := Missing,
+               refused := Refused}} ->
+            io:format("~nExported to ~s~n", [filename:absname(Dir)]),
+            [io:format("  ~s  messages 1..~s~n", [Id, num(To)])
+             || #{id := Id, to := To} <- Done],
+            io:format("  ~s blob(s) included", [num(length(Blobs))]),
+            case Missing of
+                [] -> io:format("~n");
+                _  -> io:format(", ~s referenced but not held here~n",
+                                [num(length(Missing))])
+            end,
+            [io:format("  NOT exported ~s: ~s~n", [Id, Why])
+             || #{id := Id, reason := Why} <- Refused],
+            ok;
+        {error, Why} ->
+            io:format("Export failed: ~s~n", [feed_export:describe_error(Why)]),
+            erlang:halt(1)
+    end.
+
 cmd_census_encoding(Args) ->
     Limit = arg_int(Args, "--limit", -1),
     Feeds = feed_store:feed_dirs(),
@@ -739,4 +773,7 @@ usage() ->
     io:format("  health                        Node/view/store health report~n"),
     io:format("  census encoding [--limit N]   Count stored messages that cannot~n"),
     io:format("                                be encoded for a client (reads the~n"),
-    io:format("                                logs directly; no node needed)~n").
+    io:format("                                logs directly; no node needed)~n"),
+    io:format("  export DIR [FEEDID ...]       Write feeds (default: your own) and~n"),
+    io:format("                                their blobs to a new directory DIR~n"),
+    io:format("                                (reads the store directly)~n").

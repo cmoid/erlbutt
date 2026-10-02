@@ -29,7 +29,8 @@ manifest() ->
      {[~"admin", ~"views", ~"rebuild"],  async, owner},
      {[~"admin", ~"peers", ~"known"],     async, owner},
      {[~"admin", ~"peers", ~"connected"], async, owner},
-     {[~"admin", ~"store", ~"tables"],    async, owner}].
+     {[~"admin", ~"store", ~"tables"],    async, owner},
+     {[~"admin", ~"export"],              async, owner}].
 
 %%%===================================================================
 %%% status
@@ -124,6 +125,40 @@ handle_rpc([~"admin", ~"peers", ~"connected"], _Args, _Caller) ->
     Rows = try peer_registry:all() catch _:_ -> [] end,
     {reply, [{[{~"id", peer_id(PubKey)}]} || {PubKey, _Pid} <- Rows,
                                              is_binary(PubKey)]};
+
+%%%===================================================================
+%%% export
+%%%===================================================================
+
+%% Write a portable bundle of feeds and their blobs (feed_export) into a
+%% directory ON THE NODE'S DISK — the caller fetches it from there.
+%% Args: [Dir] for our own feed, or [Dir, [FeedId, ...]].  Answers with
+%% the bundle's manifest.
+%%
+%% This blocks the calling connection for the length of the export.  It
+%% is a few seconds for one feed of ordinary size; for a big multi-feed
+%% bundle use `sbutt export`, which reads the store without going
+%% through the node at all.
+handle_rpc([~"admin", ~"export"], [Dir], Caller) ->
+    handle_rpc([~"admin", ~"export"], [Dir, own], Caller);
+handle_rpc([~"admin", ~"export"], [Dir, Feeds], _Caller)
+  when is_binary(Dir), Dir =/= ~"", (Feeds =:= own orelse is_list(Feeds)) ->
+    Opts = case Feeds of
+               own -> #{};
+               _   -> #{feeds => Feeds}
+           end,
+    case filename:pathtype(Dir) of
+        absolute ->
+            case feed_export:export(binary_to_list(Dir), Opts) of
+                {ok, Manifest} -> {reply, {json, feed_export:manifest_json(Manifest)}};
+                {error, Why}   -> {error, feed_export:describe_error(Why)}
+            end;
+        _ ->
+            %% relative to what?  The node's cwd is the release dir.
+            {error, ~"export needs an absolute directory"}
+    end;
+handle_rpc([~"admin", ~"export"], _Args, _Caller) ->
+    {error, ~"export takes a directory, and optionally a list of feed ids"};
 
 %%%===================================================================
 %%% store
