@@ -30,7 +30,8 @@ manifest() ->
      {[~"admin", ~"peers", ~"known"],     async, owner},
      {[~"admin", ~"peers", ~"connected"], async, owner},
      {[~"admin", ~"store", ~"tables"],    async, owner},
-     {[~"admin", ~"export"],              async, owner}].
+     {[~"admin", ~"export"],              async, owner},
+     {[~"admin", ~"import"],              async, owner}].
 
 %%%===================================================================
 %%% status
@@ -159,6 +160,30 @@ handle_rpc([~"admin", ~"export"], [Dir, Feeds], _Caller)
     end;
 handle_rpc([~"admin", ~"export"], _Args, _Caller) ->
     {error, ~"export takes a directory, and optionally a list of feed ids"};
+
+%% Read a bundle written by admin.export / sbutt export (feed_import):
+%% verify every message and blob, store what is new.  Dir is on the
+%% node's disk.  Answers with a per-feed report — a refused or stopped
+%% feed is a normal answer, not an error; only an unreadable bundle is.
+%%
+%% Unlike export this cannot run outside the node: new messages go in
+%% through the feed processes, like replicated ones.  It blocks the
+%% calling connection for its length.
+handle_rpc([~"admin", ~"import"], [Dir], _Caller)
+  when is_binary(Dir), Dir =/= ~"" ->
+    case filename:pathtype(Dir) of
+        absolute ->
+            case feed_import:import(binary_to_list(Dir)) of
+                {ok, Report} -> {reply, {json, feed_import:report_json(Report)}};
+                {error, Why} -> {error, iolist_to_binary(
+                                          io_lib:format("import failed: ~p",
+                                                        [Why]))}
+            end;
+        _ ->
+            {error, ~"import needs an absolute directory"}
+    end;
+handle_rpc([~"admin", ~"import"], _Args, _Caller) ->
+    {error, ~"import takes a bundle directory"};
 
 %%%===================================================================
 %%% store

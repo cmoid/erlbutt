@@ -16,6 +16,7 @@
 %%   health          Node, view and derived-store health report
 %%   census encoding Count stored messages that cannot be encoded for a client
 %%   export          Write feeds + their blobs out as a portable bundle
+%%   import          Verify and load a bundle into the running node
 %%
 %% The escript connects to the local erlbutt node on port 8008 using the
 %% shared ~/.ssberl/secret key (same approach as sbot in Node.js: two processes,
@@ -34,6 +35,8 @@ main(["census", "encoding" | Args]) ->
     run_local(fun() -> cmd_census_encoding(Args) end);
 main(["export", Dir | Feeds]) ->
     run_local(fun() -> cmd_export(Dir, Feeds) end);
+main(["import", Dir]) ->
+    run(fun(P) -> cmd_import(P, Dir) end);
 main(["whoami"])          -> run(fun cmd_whoami/1);
 main(["id"])              -> run(fun cmd_whoami/1);
 main(["ping"])            -> run(fun cmd_ping/1);
@@ -300,6 +303,50 @@ cmd_export(Dir, Feeds) ->
         {error, Why} ->
             io:format("Export failed: ~s~n", [feed_export:describe_error(Why)]),
             erlang:halt(1)
+    end.
+
+%% Import goes through the node (new messages are stored by the feed
+%% processes, like replicated ones), so the bundle path must be one the
+%% node can read — absolutized here, since the node's cwd is not ours.
+%% No timeout: a large bundle legitimately takes a while.
+cmd_import(Peer, Dir) ->
+    Abs = list_to_binary(filename:absname(Dir)),
+    case catch ssb_peer:rpc_call(Peer, [<<"admin">>, <<"import">>],
+                                 <<"async">>, [Abs], infinity) of
+        {ok, Body} ->
+            case catch json:decode(Body) of
+                #{<<"feeds">> := Feeds, <<"blobs">> := Blobs} ->
+                    report_import(Abs, Feeds, Blobs);
+                _ ->
+                    io:format("Import failed: ~s~n", [Body]),
+                    erlang:halt(1)
+            end;
+        Other ->
+            io:format("Import failed: ~p~n", [Other]),
+            erlang:halt(1)
+    end.
+
+report_import(Dir, Feeds, Blobs) ->
+    io:format("~nImported from ~s~n", [Dir]),
+    [io:format("  ~s  ~s: +~s (held ~s)~s~n",
+               [Id, Status, num(maps:get(<<"added">>, F, 0)),
+                num(maps:get(<<"held">>, F, 0)),
+                case maps:get(<<"reason">>, F, null) of
+                    null -> "";
+                    Why  -> ["  ", Why]
+                end])
+     || #{<<"id">> := Id, <<"status">> := Status} = F <- Feeds],
+    #{<<"stored">> := Stored, <<"present">> := Present,
+      <<"missing">> := Missing, <<"bad">> := Bad} = Blobs,
+    io:format("  blobs: ~s stored, ~s already held, ~s missing, ~s BAD~n",
+              [num(Stored), num(Present), num(length(Missing)),
+               num(length(Bad))]),
+    [io:format("  BAD blob (does not hash to its id): ~s~n", [B]) || B <- Bad],
+    Failed = [F || #{<<"status">> := S} = F <- Feeds,
+                   S =:= <<"refused">> orelse S =:= <<"stopped">>],
+    case Failed =:= [] andalso Bad =:= [] of
+        true  -> ok;
+        false -> erlang:halt(2)
     end.
 
 cmd_census_encoding(Args) ->
@@ -776,4 +823,6 @@ usage() ->
     io:format("                                logs directly; no node needed)~n"),
     io:format("  export DIR [FEEDID ...]       Write feeds (default: your own) and~n"),
     io:format("                                their blobs to a new directory DIR~n"),
-    io:format("                                (reads the store directly)~n").
+    io:format("                                (reads the store directly)~n"),
+    io:format("  import DIR                    Verify a bundle and load what is new~n"),
+    io:format("                                into the running node~n").

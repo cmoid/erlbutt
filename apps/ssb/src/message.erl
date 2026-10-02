@@ -11,6 +11,7 @@
 %% API
 -export([decode/2,
          decode_value/2,
+         from_value/2,
          encode/1,
          encode_value/1,
          encode_value_decrypted/2,
@@ -93,6 +94,14 @@ value_decrypted(#message{swapped = Swapped} = Msg, ContentObj) ->
 %% the same form used when the message was originally signed and stored.
 decode_value(ValueJson, CheckValid) ->
     {ValueProps} = utils:nat_decode(ValueJson),
+    from_value(ValueProps, CheckValid).
+
+%% decode_value/2 for a value that is already decoded — the `value` of a
+%% {"key","value","timestamp"} record from outside our store (an import
+%% bundle).  The id is DERIVED here, never taken from the record's `key`:
+%% decode/2 trusts the stored envelope because we wrote it, and an
+%% imported one has earned no such trust.
+from_value(ValueProps, CheckValid) ->
     IsSwapped = is_swapped(ValueProps),
     IsValid   = validate(CheckValid, ValueProps),
     %% Re-encode in canonical (pretty-printed) form before hashing.

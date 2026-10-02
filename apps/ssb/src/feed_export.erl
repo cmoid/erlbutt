@@ -60,7 +60,9 @@
 
 -export([export/2,
          manifest_json/1,
-         describe_error/1]).
+         describe_error/1,
+         feed_file/1,
+         blob_file/1]).
 
 -define(FORMAT, ~"erlbutt-export").
 -define(VERSION, 1).
@@ -137,7 +139,7 @@ build(Tmp, FeedIds) ->
 export_feed(FeedId, Tmp) ->
     case feed_dir(FeedId) of
         {ok, Dir} ->
-            Rel  = filename:join("feeds", ?b2l(hex_of(FeedId)) ++ ".jsonl.gz"),
+            Rel  = feed_file(FeedId),
             Path = filename:join(Tmp, Rel),
             {ok, Fd} = file:open(Path, [write, binary, compressed]),
             Result = try feed_store:fold_feed(fun line/2,
@@ -221,7 +223,7 @@ copy_blobs(Refs, Tmp) ->
     lists:foldr(
       fun(Ref, {Have, Miss}) ->
               Src = blobs:file_of(Ref),
-              Rel = filename:join("blobs", ?b2l(hex_of(Ref))),
+              Rel = blob_file(Ref),
               case Src =/= error andalso filelib:is_regular(Src) of
                   true ->
                       {ok, Size} = file:copy(Src, filename:join(Tmp, Rel)),
@@ -370,10 +372,24 @@ iso8601(_) ->
 %%% Internal
 %%%===================================================================
 
+%% Where a feed or blob lives inside a bundle, relative to its root.
+%% The importer derives paths with these too, rather than believing the
+%% manifest's `file` fields — a bundle is untrusted input, and a `file`
+%% of "../../.ssberl/secret" is a path, not a feed.
+%%
+%% Both raise on anything but a well-formed id.
+feed_file(<<"@", _/binary>> = FeedId) ->
+    filename:join("feeds", ?b2l(hex_of(FeedId, ~".ed25519")) ++ ".jsonl.gz").
+
+blob_file(<<"&", _/binary>> = BlobId) ->
+    filename:join("blobs", ?b2l(hex_of(BlobId, ~".sha256"))).
+
 %% "@<b64>.ed25519" / "&<b64>.sha256" -> 64 lowercase hex chars
-hex_of(<<_Sigil, Rest/binary>>) ->
-    [B64 | _] = binary:split(Rest, ~"."),
-    binary:encode_hex(base64:decode(B64), lowercase).
+hex_of(<<_Sigil, Rest/binary>>, Suffix) ->
+    B64 = binary:part(Rest, 0, byte_size(Rest) - byte_size(Suffix)),
+    Suffix = binary:part(Rest, byte_size(Rest), -byte_size(Suffix)),
+    <<_:32/binary>> = Raw = base64:decode(B64),
+    binary:encode_hex(Raw, lowercase).
 
 file_sha256(Path) ->
     {ok, Bin} = file:read_file(Path),
