@@ -181,9 +181,9 @@ dialer_enabled() ->
     (get_config())#config.dialer.
 
 %% Whether a peer message that fails signature verification is REJECTED
-%% (true) or stored with a warning and a count (false, the default).
-%% Set {require_valid_sigs, true}. in ssb.cfg once the measured rate on
-%% your corpus is known to be zero.
+%% (true) or stored with a warning and a count (false).  Releases ship
+%% true via config/default.vars; the record default of false applies only
+%% when there is no ssb.cfg (eunit).
 require_valid_sigs() ->
     (get_config())#config.require_valid_sigs.
 

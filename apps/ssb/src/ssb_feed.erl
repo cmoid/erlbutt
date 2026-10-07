@@ -635,11 +635,12 @@ store_if_chained(Msg, LastMsg, Before, FeedId, State) ->
 %% is a bug at that call site rather than an attack, and is reported
 %% differently so it cannot hide among genuine failures.
 %%
-%% Default is to COUNT AND WARN, not reject.  Turning rejection on is a
-%% config decision ({require_valid_sigs, true}) to be taken once the rate
-%% on a real corpus is known — erlbutt re-encodes canonically to check a
-%% signature, and if that ever disagrees with what was originally signed
-%% the messages at stake are genuine ones.
+%% Releases REJECT ({require_valid_sigs, true} in config/default.vars,
+%% since Aug 2026, after the measured rate on a real corpus was zero).
+%% With no ssb.cfg (eunit) the record default is false: COUNT AND WARN.
+%% Setting it back to false is the escape hatch — erlbutt re-encodes
+%% canonically to check a signature, and if that ever disagrees with what
+%% was originally signed the messages at stake are genuine ones.
 signature_ok(#message{validated = true}, _FeedId, State) ->
     {true, State};
 signature_ok(#message{sequence = Seq, validated = V}, FeedId, State) ->
