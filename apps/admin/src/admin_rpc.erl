@@ -263,10 +263,17 @@ null_for_undefined(undefined) -> null;
 null_for_undefined(V)         -> V.
 
 %% conn.json metadata is a map of binary keys; pass it through as EJSON.
+%% Values nest — every entry carries a `duration` map — and the reply
+%% encoder takes EJSON objects only, so a nested map must be converted
+%% too or the whole reply fails to encode.
 meta_props(Meta) when is_map(Meta) ->
-    [{K, V} || K := V <- Meta, is_binary(K)];
+    [{K, ejson(V)} || K := V <- Meta, is_binary(K)];
 meta_props(_) ->
     [].
+
+ejson(M) when is_map(M)  -> {meta_props(M)};
+ejson(L) when is_list(L) -> [ejson(V) || V <- L];
+ejson(V)                 -> V.
 
 registered_view(Name) ->
     try
@@ -371,6 +378,22 @@ export_rejects_bad_args_test() ->
     [?assertMatch({error, _}, handle_rpc([~"admin", ~"export"], Args, #{}))
      || Args <- [[], [~""], [42], [~"relative/dir"], [~"/abs", ~"notalist"],
                  [~"/abs", [], extra]]].
+
+%% A real conn_db entry nests maps (`duration`); the reply must still
+%% encode.  It failed with function_clause in json:do_encode_map before.
+peers_known_reply_encodes_test() ->
+    Meta = #{~"host" => ~"ssb.example.com", ~"port" => 8008,
+             ~"duration" => #{~"mean" => 0, ~"stdev" => 0},
+             ~"pool" => [#{~"a" => 1}, 2]},
+    Props = meta_props(Meta),
+    ?assertEqual({[{~"mean", 0}, {~"stdev", 0}]},
+                 proplists:get_value(~"duration", Props)),
+    Bin = iolist_to_binary(
+            message:ssb_encoder([{[{~"address", ~"net:x"} | Props]}],
+                                fun message:ssb_encoder/3, [])),
+    [Row] = json:decode(Bin),
+    ?assertEqual(#{~"mean" => 0, ~"stdev" => 0}, maps:get(~"duration", Row)),
+    ?assertEqual([#{~"a" => 1}, 2], maps:get(~"pool", Row)).
 
 %% With the services down these must answer, not crash a connection.
 degrades_without_services_test() ->
