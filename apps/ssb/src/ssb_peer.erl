@@ -363,8 +363,12 @@ handle_info({tcp, Socket, Data},
     {Done, NewState} = unbox_and_parse(BoxData, State),
 
     case Done of
+        %% A goodbye is the normal end of a session.  {shutdown, _} keeps
+        %% the exit signal to linked processes but writes no crash report;
+        %% a bare `done` wrote one per disconnect, mailbox and all — a
+        %% queued request_blob_wants made that tens of thousands of lines.
         done ->
-            stop(done, NewState);
+            stop({shutdown, done}, NewState);
         _Else ->
             %%?LOG_DEBUG("Are we complete and need to wait? ~p ~n",[Done]),
             Transport:setopts(Socket, [{active, once}]),
@@ -379,7 +383,7 @@ handle_info({tunnel_data, RecvReqNo, Body},
     BoxData = combine(BoxLeftOver, Body),
     {Done, NewState} = unbox_and_parse(BoxData, State),
     case Done of
-        done -> stop(done, NewState);
+        done -> stop({shutdown, done}, NewState);
         _    -> {noreply, NewState}
     end;
 
