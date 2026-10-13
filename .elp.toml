@@ -1,0 +1,14 @@
+# ELP (Erlang Language Platform) project config.
+#
+# Project discovery is left to rebar3: ELP reads rebar.config and finds all
+# five umbrella apps (ssb, ssb_conv, admin, plumtree, silkpurse) plus deps.
+# The test profile is used so TEST-guarded code and test/ dirs are indexed.
+[rebar]
+profile = "test"
+
+# eqWAlizer is ELP's gradual type checker.  It is NOT the compiler: run over
+# the whole project it reports ~170 type errors (October 2026), and those are
+# the red underlines in the editor.  Turned off project-wide; a module can
+# opt back in with -typing([eqwalizer]).
+[eqwalizer]
+enable_all = false
