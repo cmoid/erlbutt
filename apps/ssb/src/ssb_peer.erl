@@ -973,7 +973,7 @@ log_handshake_failure(Dir, {identity_rejected, Reason}, Who) ->
               "the identity we dialed (~s; ~p after our auth box — the key is "
               "stale, or that host now answers as someone else)~n",
               [Dir, Who, Reason]);
-log_handshake_failure(Dir, {badmatch, <<"bad">>}, Who) ->
+log_handshake_failure(Dir, {badmatch, ~"bad"}, Who) ->
     ?SSB_INFO("~p handshake rejected: identity verification failed "
               "(~s; peer dialed a stale/wrong key, or bad handshake)~n",
               [Dir, Who]);

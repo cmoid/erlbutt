@@ -188,7 +188,7 @@ line(Data, #walk{feed = FeedId, fd = Fd, seq = Seq, last = Last} = W) ->
         orelse throw({refused, {broken_chain, MsgSeq}}),
     %% Stored records are compact JSON, so one never holds a raw newline;
     %% if one ever did, the line format would silently split it.
-    nomatch = binary:match(Data, <<"\n">>),
+    nomatch = binary:match(Data, ~"\n"),
     ok = file:write(Fd, [Data, $\n]),
     W#walk{seq  = MsgSeq,
            last = Id,
