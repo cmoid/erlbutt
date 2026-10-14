@@ -242,8 +242,8 @@ dispatch(Calls, ReqNo, Body, Socket, Nonce, SecretBoxKey) ->
     end.
 
 %% Single permission choke point for every incoming request, builtin or
-%% plugin.  Methods the registry does not know keep the old fall-through
-%% behavior (answered with true), so unknown-method handling is unchanged.
+%% plugin.  Methods the registry does not know are let through here, and
+%% answered with an error by unhandled_request/7.
 permitted(Calls, #ssb_rpc{name = Name}) when is_list(Name) ->
     {Kind, Perm} = case plugin_registry:lookup(Name) of
         {ok, {_Mod, K, P}}  -> {K, P};
@@ -752,14 +752,41 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = Name, args = Args} = ReqBody,
         {ok, {Mod, Kind, _Perm}} ->
             plugin_dispatch(Mod, Kind, Name, Args, caller_info(Calls), Calls,
                             ReqNo, Socket, Nonce, SecretBoxKey);
-        _ ->  %% unknown, or a builtin whose args didn't match its clause
-            unhandled_request(Calls, ReqNo, ReqBody, Socket, Nonce, SecretBoxKey)
+        unknown ->
+            unhandled_request(Calls, ReqNo, ReqBody, ~"method not found: ",
+                              Socket, Nonce, SecretBoxKey);
+        _ ->  %% a builtin whose args didn't match its clause
+            unhandled_request(Calls, ReqNo, ReqBody, ~"invalid arguments for ",
+                              Socket, Nonce, SecretBoxKey)
     end;
 
 proc_request(Calls, ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
-    unhandled_request(Calls, ReqNo, ReqBody, Socket, Nonce, SecretBoxKey).
+    unhandled_request(Calls, ReqNo, ReqBody, ~"method not found: ",
+                      Socket, Nonce, SecretBoxKey).
 
-unhandled_request(Calls, ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
+%% A request nothing here can answer gets an error, as ssb-server does —
+%% answering it with a normal end made "no such method" indistinguishable
+%% from "an empty result", which is how a misnamed call reads as a broken
+%% view.  The error carries the stream flag for stream requests, or a
+%% standard client never routes it and hangs.
+%%
+%% Only real requests: those carry a muxrpc type.  A peer's error/end on
+%% one of its own streams we already let go of also lands here (named
+%% "Error", no type), and is not a call — it keeps the old end frame.
+unhandled_request(Calls, ReqNo, #ssb_rpc{name = Name, type = Type} = ReqBody,
+                  Prefix, Socket, Nonce, SecretBoxKey)
+  when is_list(Name), is_binary(Type) ->
+    ?SSB_INFO("unhandled RPC: ~p~n", [ReqBody]),
+    ets:insert(Calls, {ReqNo, noop}),
+    Kind = case Type of
+               ~"source" -> source;
+               ~"duplex" -> source;
+               ~"sink"   -> sink;
+               _         -> async
+           end,
+    Reason = iolist_to_binary([Prefix, lists:join(".", [N || N <- Name, is_binary(N)])]),
+    rpc_error(ReqNo, Reason, Kind, Socket, Nonce, SecretBoxKey);
+unhandled_request(Calls, ReqNo, ReqBody, _Prefix, Socket, Nonce, SecretBoxKey) ->
     ?SSB_INFO("ROOMDBG unhandled RPC (fall thru): ~p~n", [ReqBody]),
     ets:insert(Calls, {ReqNo, noop}),
     Flags = create_flags(1, 1, 2),
