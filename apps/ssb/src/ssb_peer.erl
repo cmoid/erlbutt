@@ -23,6 +23,7 @@
          send_sink_data/3,
          send_sink_end/2,
          send_frame/3,
+         send_frames/4,
          tunnel_connect/3,
          start_tunnel_server/3,
          tunnel_client_init/2,
@@ -219,6 +220,15 @@ send_sink_end(Pid, ReqNo) ->
 %% connection's enc_nonce.  Async; ordering preserved per caller.
 send_frame(Pid, ReqNo, Body) ->
     gen_server:cast(Pid, {send_frame, ReqNo, Body}).
+
+%% Send a batch of stream data frames on ReqNo, then — if End — the
+%% stream's end frame (JSON true).  Synchronous on purpose: it is the
+%% backpressure for a source that is sent outside the request path (see
+%% rpc_processor's pump), which would otherwise queue a whole store's
+%% worth of frames in this process's mailbox.  No timeout: the caller is
+%% paced by the socket, and dies with this process if the connection does.
+send_frames(Pid, ReqNo, Bodies, End) ->
+    gen_server:call(Pid, {send_frames, ReqNo, Bodies, End}, infinity).
 
 request_ebt(Pid) ->
     gen_server:cast(Pid, {request_ebt}).
@@ -684,6 +694,28 @@ handle_call({has_blob, BlobId}, From,
     NewEncNonce = send_blob_has(Socket, EncBoxKey, EncNonce, BlobId, ReqNo),
     {noreply, State1#sbox_state{enc_nonce = NewEncNonce,
                                 pending_has = {From, Ref}}};
+
+handle_call({send_frames, ReqNo, Bodies, End}, _From,
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce} = State) ->
+    DataFlags = rpc_processor:create_flags(1, 0, 2),
+    Nonce1 = lists:foldl(
+               fun(Body, N) ->
+                       Header = rpc_processor:create_header(DataFlags, size(Body), ReqNo),
+                       send_data(combine(Header, Body), Socket, N, EncBoxKey)
+               end, EncNonce, Bodies),
+    Nonce2 = case End of
+                 false ->
+                     Nonce1;
+                 true ->
+                     TrueEnd = utils:encode_rec(true),
+                     EndHeader = rpc_processor:create_header(
+                                   rpc_processor:create_flags(1, 1, 2),
+                                   size(TrueEnd), ReqNo),
+                     send_data(combine(EndHeader, TrueEnd), Socket, Nonce1, EncBoxKey)
+             end,
+    {reply, ok, State#sbox_state{enc_nonce = Nonce2}};
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.

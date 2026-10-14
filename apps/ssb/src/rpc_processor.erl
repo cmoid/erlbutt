@@ -163,6 +163,16 @@ rpc_frame(HasSeen, ReqNo, Header, Body,
                 0 -> ok
             end,
             {Nonce, none};
+        [{ReqNo, {source_pump, Pump}}] ->
+            %% the client ended or aborted a finite source: stop sending
+            {_, IsEnd, _} = parse_flags(Header),
+            case IsEnd of
+                1 ->
+                    exit(Pump, kill),
+                    ets:insert(Calls, {ReqNo, noop});
+                0 -> ok
+            end,
+            {Nonce, none};
         [{ReqNo, {Mod, SinkPid}}] ->
             ?SSB_DEBUG("Stream continuation for req with pid: ~p ~n", [ReqNo]),
             NewNonce = Mod:handle_data(ReqNo, Body, Conn, SinkPid),
@@ -817,11 +827,19 @@ plugin_dispatch(Mod, Kind, Name, Args, Caller, Calls,
              end,
     case {Kind, Result} of
         {source, {source, Items}} ->
-            ets:insert(Calls, {ReqNo, noop}),
-            N1 = send_source_items(Items, ReqNo, Socket, Nonce, SecretBoxKey),
-            TrueEnd = encode_json(true),
-            Header = create_header(create_flags(1, 1, 2), size(TrueEnd), -ReqNo),
-            utils:send_data(utils:combine(Header, TrueEnd), Socket, N1, SecretBoxKey);
+            case owner(Calls) of
+                undefined ->
+                    %% no owning ssb_peer (e.g. unit tests): send inline
+                    ets:insert(Calls, {ReqNo, noop}),
+                    N1 = send_source_items(Items, ReqNo, Socket, Nonce, SecretBoxKey),
+                    TrueEnd = encode_json(true),
+                    Header = create_header(create_flags(1, 1, 2), size(TrueEnd), -ReqNo),
+                    utils:send_data(utils:combine(Header, TrueEnd), Socket, N1, SecretBoxKey);
+                OwnerPid ->
+                    Pump = pump(OwnerPid, ReqNo, Items, end_stream),
+                    ets:insert(Calls, {ReqNo, {source_pump, Pump}}),
+                    Nonce
+            end;
         {source, {live_source, Pairs, ViewMod, EventFun}} ->
             %% snapshot now, then keep the stream open: a view_stream
             %% pushes later matches via the connection's ordered writes
@@ -840,10 +858,13 @@ plugin_dispatch(Mod, Kind, Name, Args, Caller, Calls,
                     {ok, Stream} = view_stream:start(OwnerPid, -ReqNo,
                                                      ViewMod, EventFun),
                     ets:insert(Calls, {ReqNo, {live_source, Stream}}),
-                    N1 = send_source_items([snapshot_item(B) || {_, B} <- Pairs],
-                                           ReqNo, Socket, Nonce, SecretBoxKey),
-                    ok = view_stream:release(Stream, [Id || {Id, _} <- Pairs]),
-                    N1
+                    %% the snapshot can be a whole index (messagesByType
+                    %% live), so it goes out through the pump too; the
+                    %% stream goes live once the pump has sent it
+                    _ = pump(OwnerPid, ReqNo,
+                             [snapshot_item(B) || {_, B} <- Pairs],
+                             {release, Stream, [Id || {Id, _} <- Pairs]}),
+                    Nonce
             end;
         {_, {reply, Term}} when Kind =:= sync; Kind =:= async ->
             case safe_encode(Term) of
@@ -875,28 +896,89 @@ plugin_dispatch(Mod, Kind, Name, Args, Caller, Calls,
 %% full store).
 send_source_items(Items, ReqNo, Socket, Nonce, SecretBoxKey) ->
     lists:foldl(
-      fun(Item0, N) ->
-              case materialize(Item0) of
+      fun(Item, N) ->
+              case item_body(Item) of
                   skip ->
                       N;
-                  Item ->
-                      case safe_encode(Item) of
-                          {ok, Body} ->
-                              Header = create_header(create_flags(1, 0, 2),
-                                                     size(Body), -ReqNo),
-                              utils:send_data(utils:combine(Header, Body),
-                                              Socket, N, SecretBoxKey);
-                          {error, Why} ->
-                              %% Mid-stream there is no way to report one
-                              %% bad item, so drop it and keep the stream
-                              %% alive — losing an item beats losing the
-                              %% connection and every other item with it.
-                              ?SSB_ERROR("rpc_processor: skipping unencodable "
-                                         "stream item (~p)", [Why]),
-                              N
-                      end
+                  Body ->
+                      Header = create_header(create_flags(1, 0, 2),
+                                             size(Body), -ReqNo),
+                      utils:send_data(utils:combine(Header, Body),
+                                      Socket, N, SecretBoxKey)
               end
       end, Nonce, Items).
+
+%% The encoded frame body for one source item, or skip.
+item_body(Item0) ->
+    case materialize(Item0) of
+        skip ->
+            skip;
+        Item ->
+            case safe_encode(Item) of
+                {ok, Body} ->
+                    Body;
+                {error, Why} ->
+                    %% Mid-stream there is no way to report one bad item,
+                    %% so drop it and keep the stream alive — losing an
+                    %% item beats losing the connection and every other
+                    %% item with it.
+                    ?SSB_ERROR("rpc_processor: skipping unencodable "
+                               "stream item (~p)", [Why]),
+                    skip
+            end
+    end.
+
+%%%===================================================================
+%%% Pump: plugin sources sent outside the request path
+%%%
+%%% Every frame is encrypted with the connection's box-stream nonce, so
+%%% ssb_peer waits on process/3 for the nonce a request leaves behind.
+%%% Sending a source inline therefore holds that call open for the whole
+%%% stream, and process/3 has a 45s timeout: messagesByType("contact")
+%%% over a 624k-row store ran past it and the timeout killed the
+%%% connection.  A bigger timeout only moves the cliff, and blocks every
+%%% other request on the connection meanwhile.
+%%%
+%%% So the request returns at once and a pump process sends the items
+%%% through ssb_peer:send_frames/4 — the same ordered write path a live
+%%% stream's later frames already take, so the nonce never forks.  Batches
+%%% are synchronous calls, which paces the pump to the socket instead of
+%%% filling ssb_peer's mailbox.  The pump runs unlinked: it ends with the
+%%% stream, is killed if the client cancels (the {source_pump, Pid} call
+%%% entry), and exits on its next batch if the connection is gone.
+%%%===================================================================
+
+-define(PUMP_BATCH, 64).
+
+%% Finish is end_stream (send the end frame) or {release, Stream, SentIds}
+%% (hand the stream to its view_stream, which goes live).
+pump(OwnerPid, ReqNo, Items, Finish) ->
+    spawn(fun() ->
+                  try
+                      pump_items(OwnerPid, -ReqNo, Items, 0, [], Finish)
+                  catch
+                      exit:_ -> ok   %% connection gone mid-stream
+                  end
+          end).
+
+pump_items(Owner, ReqNo, [], _Count, Batch, end_stream) ->
+    ok = ssb_peer:send_frames(Owner, ReqNo, lists:reverse(Batch), true);
+pump_items(Owner, ReqNo, [], _Count, Batch, {release, Stream, SentIds}) ->
+    ok = ssb_peer:send_frames(Owner, ReqNo, lists:reverse(Batch), false),
+    view_stream:release(Stream, SentIds);
+pump_items(Owner, ReqNo, Items, ?PUMP_BATCH, Batch, Finish) ->
+    ok = ssb_peer:send_frames(Owner, ReqNo, lists:reverse(Batch), false),
+    %% a cancelled live stream stops its view_stream, not this pump
+    case Finish of
+        {release, Stream, _} -> is_process_alive(Stream) orelse exit(cancelled);
+        end_stream           -> ok
+    end,
+    pump_items(Owner, ReqNo, Items, 0, [], Finish);
+pump_items(Owner, ReqNo, [Item | Rest], Count, Batch, Finish) ->
+    case item_body(Item) of
+        skip -> pump_items(Owner, ReqNo, Rest, Count, Batch, Finish);
+        Body -> pump_items(Owner, ReqNo, Rest, Count + 1, [Body | Batch], Finish)
+    end.
 
 materialize(F) when is_function(F, 0) ->
     case F() of
