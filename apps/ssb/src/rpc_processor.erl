@@ -275,6 +275,7 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [Method],
     Seq   = proplists:get_value(~"seq",   ArgProps, 0),
     Limit = proplists:get_value(~"limit", ArgProps, -1),
     Keys  = proplists:get_value(~"keys",  ArgProps, true),
+    Reverse = proplists:get_value(~"reverse", ArgProps, false) =:= true,
     ets:insert(Calls, {ReqNo, noop}),
     FeedPid = utils:find_or_create_feed_pid(Id),
     case ssb_feed:servable_from(FeedPid, Seq) of
@@ -293,29 +294,36 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [Method],
             EHeader = create_header(EFlags, size(ErrMsg), -ReqNo),
             utils:send_data(utils:combine(EHeader, ErrMsg), Socket, Nonce,
                             SecretBoxKey);
+        true when Reverse ->
+            %% Newest first, as ssb-db does.  The log only reads forward,
+            %% so keep the last Limit bodies in a bounded queue as it
+            %% passes and send those backwards — memory is bounded by the
+            %% limit rather than the feed (an unlimited reverse read does
+            %% hold the whole feed, which is what it asked for).
+            {_Len, Kept} = ssb_feed:fold_servable(Id, FeedPid, Seq,
+                fun(MsgData, Acc) ->
+                    case history_body(MsgData, Seq, Keys) of
+                        skip -> Acc;
+                        Body -> keep_last(Limit, Body, Acc)
+                    end
+                end, {0, queue:new()}),
+            NewNonce = lists:foldl(
+                fun(Body, N) -> send_history_item(Body, ReqNo, Socket, N, SecretBoxKey) end,
+                Nonce, lists:reverse(queue:to_list(Kept))),
+            TrueEnd = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+            Flags  = create_flags(1, 1, 2),
+            Header = create_header(Flags, size(TrueEnd), -ReqNo),
+            utils:send_data(utils:combine(Header, TrueEnd), Socket, NewNonce, SecretBoxKey);
         true ->
             {NewNonce, _} = ssb_feed:fold_servable(Id, FeedPid, Seq,
                 fun(MsgData, {N, Count}) ->
                     case Limit >= 0 andalso Count >= Limit of
                         true -> {N, Count};
                         false ->
-                            try
-                                Msg = message:decode(MsgData, false),
-                                case Msg#message.sequence > Seq of
-                                    true ->
-                                        Body = case Keys of
-                                            true  -> message:encode(Msg);
-                                            false -> MsgData
-                                        end,
-                                        Flags  = create_flags(1, 0, 2),
-                                        Header = create_header(Flags, size(Body), -ReqNo),
-                                        N1 = utils:send_data(utils:combine(Header, Body),
-                                                             Socket, N, SecretBoxKey),
-                                        {N1, Count + 1};
-                                    false ->
-                                        {N, Count}
-                                end
-                            catch _:_ -> {N, Count}
+                            case history_body(MsgData, Seq, Keys) of
+                                skip -> {N, Count};
+                                Body -> {send_history_item(Body, ReqNo, Socket, N, SecretBoxKey),
+                                         Count + 1}
                             end
                     end
                 end, {Nonce, 0}),
@@ -906,6 +914,36 @@ snapshot_item(B)                        -> {json, B}.
 %% muxrpc client routes a stream-flagged frame to its open source and a
 %% plain one to its async callback — the wrong flag means the caller
 %% never sees the error and waits forever.  A sink is a stream too.
+%% One createHistoryStream item: the wire body for a stored message past
+%% Seq, or skip.  keys:true (the default) is the {key, value, timestamp}
+%% envelope; keys:false the bare stored value.
+history_body(MsgData, Seq, Keys) ->
+    try message:decode(MsgData, false) of
+        #message{sequence = S} = Msg when S > Seq ->
+            case Keys of
+                true  -> message:encode(Msg);
+                false -> MsgData
+            end;
+        _ ->
+            skip
+    catch _:_ -> skip
+    end.
+
+%% Append Body, dropping the oldest once more than Limit are held
+%% (Limit < 0 = no limit).  The count rides along because queue:len/1
+%% walks the queue.
+keep_last(Limit, Body, {Len, Q}) ->
+    Q1 = queue:in(Body, Q),
+    case Limit >= 0 andalso Len + 1 > Limit of
+        true when Limit =:= 0 -> {0, queue:new()};
+        true                  -> {Len, queue:drop(Q1)};
+        false                 -> {Len + 1, Q1}
+    end.
+
+send_history_item(Body, ReqNo, Socket, Nonce, SecretBoxKey) ->
+    Header = create_header(create_flags(1, 0, 2), size(Body), -ReqNo),
+    utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey).
+
 rpc_error(ReqNo, Reason, Kind, Socket, Nonce, SecretBoxKey) ->
     ErrMsg = utils:error_msg(~"Error", Reason),
     Stream = case Kind of
