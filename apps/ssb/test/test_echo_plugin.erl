@@ -11,7 +11,8 @@ manifest() ->
     [{[~"echo", ~"hello"],   async,  anyone},
      {[~"echo", ~"whoAmI"],  async,  anyone},
      {[~"echo", ~"secrets"], async,  owner},
-     {[~"echo", ~"count"],   source, anyone}].
+     {[~"echo", ~"count"],   source, anyone},
+     {[~"echo", ~"slow"],    source, anyone}].
 
 handle_rpc([~"echo", ~"hello"], Args, _Caller) ->
     {reply, Args};
@@ -24,6 +25,12 @@ handle_rpc([~"echo", ~"secrets"], _Args, _Caller) ->
 
 handle_rpc([~"echo", ~"count"], [N], _Caller) when is_integer(N), N > 0 ->
     {source, lists:seq(1, N)};
+
+%% N items, each taking Ms to produce — lazy, like messagesByType's
+%% per-message hydration — so the stream outlasts a quick request.
+handle_rpc([~"echo", ~"slow"], [N, Ms], _Caller) ->
+    {source, [fun() -> timer:sleep(Ms), integer_to_binary(I) end
+              || I <- lists:seq(1, N)]};
 
 handle_rpc([~"echo", ~"count"], _Args, _Caller) ->
     {error, ~"count takes a positive integer"}.

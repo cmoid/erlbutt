@@ -1338,4 +1338,15 @@ neg_req_no_test() ->
     Header = create_header(Flags,size(~"true"), -5),
     ?assert(req_no(Header) == -5).
 
+keep_last_test() ->
+    Keep = fun(Limit, Items) ->
+                   {Len, Q} = lists:foldl(fun(I, Acc) -> keep_last(Limit, I, Acc) end,
+                                          {0, queue:new()}, Items),
+                   {Len, queue:to_list(Q)}
+           end,
+    ?assertEqual({2, [c, d]},       Keep(2, [a, b, c, d])),
+    ?assertEqual({2, [a, b]},       Keep(5, [a, b])),
+    ?assertEqual({0, []},           Keep(0, [a, b])),
+    ?assertEqual({3, [a, b, c]},    Keep(-1, [a, b, c])).
+
 -endif.

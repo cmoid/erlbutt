@@ -18,6 +18,9 @@
          plugin_rpc_test/1,
          manifest_rpc_test/1,
          log_stream_test/1,
+         unknown_method_test/1,
+         long_source_test/1,
+         history_reverse_test/1,
          archive_serving_over_the_wire_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
@@ -35,6 +38,9 @@ all() ->
      plugin_rpc_test,
      manifest_rpc_test,
      log_stream_test,
+     unknown_method_test,
+     long_source_test,
+     history_reverse_test,
      %% last: it archives the node's own feed, which removes early history
      %% from what this node can serve for the rest of the suite
      archive_serving_over_the_wire_test].
@@ -144,6 +150,70 @@ log_stream_test(_Config) ->
     {ok, Frames} = ssb_peer:rpc_stream_call(Peer, [~"createLogStream"], []),
     ?assert(lists:any(fun(F) -> binary:match(F, Marker) =/= nomatch end,
                       Frames)),
+    gen_server:stop(Peer).
+
+%% A long plugin source is sent outside the request path: the connection
+%% keeps answering other requests while it streams, and every item still
+%% arrives in order across the pump's batches.  Inline, the stream held
+%% the connection's request call open — past 45s that timeout killed the
+%% connection (messagesByType "contact" on a full store).
+long_source_test(_Config) ->
+    ok = plugin_registry:register_plugin(test_echo_plugin),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    Self = self(),
+    N = 200,
+    spawn_link(fun() ->
+                       Self ! {slow, ssb_peer:rpc_stream_call(
+                                       Peer, [~"echo", ~"slow"], [N, 20])}
+               end),
+    timer:sleep(300),   %% well into the ~4s stream
+    T0 = erlang:monotonic_time(millisecond),
+    {ok, _} = ssb_peer:rpc_call(Peer, [~"manifest"], ~"sync"),
+    ?assert(erlang:monotonic_time(millisecond) - T0 < 1000),
+    receive
+        {slow, {ok, Frames}} ->
+            ?assertEqual(lists:seq(1, N), [utils:nat_decode(F) || F <- Frames])
+    after 20000 ->
+        ct:fail(slow_source_never_ended)
+    end,
+    ok = plugin_registry:unregister_plugin(test_echo_plugin),
+    gen_server:stop(Peer).
+
+%% An unknown method is answered with an error naming it, not an empty
+%% success: a misnamed call used to read as a view returning nothing.
+unknown_method_test(_Config) ->
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, Body} = ssb_peer:rpc_call(Peer, [~"no", ~"suchMethod"], ~"async"),
+    {Props} = utils:nat_decode(Body),
+    ?assertEqual(~"Error", proplists:get_value(~"name", Props)),
+    ?assertEqual(~"method not found: no.suchMethod",
+                 proplists:get_value(~"message", Props)),
+    %% the connection survives it
+    {ok, _} = ssb_peer:rpc_call(Peer, [~"manifest"], ~"sync"),
+    gen_server:stop(Peer).
+
+%% createHistoryStream honours reverse: with a limit, the NEWEST messages,
+%% newest first — not the oldest ones in log order.
+history_reverse_test(_Config) ->
+    FeedPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    Ms = [base64:encode(crypto:strong_rand_bytes(12)) || _ <- [1, 2, 3]],
+    [ok = ssb_feed:post_content(FeedPid, M) || M <- Ms],
+    [_, M2, M3] = Ms,
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    Id = keys:pub_key_disp(),
+    {ok, Frames} = ssb_peer:rpc_stream_call(
+                     Peer, [~"createHistoryStream"],
+                     [{[{~"id", Id}, {~"reverse", true}, {~"limit", 2}]}]),
+    Has = fun(F, M) -> binary:match(F, M) =/= nomatch end,
+    ?assertMatch([_, _], Frames),
+    [First, Second] = Frames,
+    ?assert(Has(First, M3)),
+    ?assert(Has(Second, M2)),
+
+    %% without reverse the order is unchanged: oldest first
+    {ok, Fwd} = ssb_peer:rpc_stream_call(
+                  Peer, [~"createHistoryStream"], [{[{~"id", Id}]}]),
+    ?assert(Has(lists:last(Fwd), M3)),
     gen_server:stop(Peer).
 
 %% The servability guard, over a real socket.
