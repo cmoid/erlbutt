@@ -499,19 +499,44 @@ due_test() ->
     %% Never tried.
     ?assert(due(A, #{}, Now)),
     %% A success wrote attempts = 0; it must not be held back.
-    ?assert(due(A, #{A => {0, Now}}, Now)),
+    ?assert(due(A, #{A => {0, Now, Now}}, Now)),
     %% One failure just now: held until the base wait elapses.
-    ?assertNot(due(A, #{A => {1, Now}}, Now)),
-    ?assertNot(due(A, #{A => {1, Now}}, Now + ?BACKOFF_BASE_MS - 1)),
-    ?assert(due(A, #{A => {1, Now}}, Now + ?BACKOFF_BASE_MS)),
+    ?assertNot(due(A, #{A => {1, Now, 0}}, Now)),
+    ?assertNot(due(A, #{A => {1, Now, 0}}, Now + ?BACKOFF_BASE_MS - 1)),
+    ?assert(due(A, #{A => {1, Now, 0}}, Now + ?BACKOFF_BASE_MS)),
     %% Backed off further after repeated failures.
-    ?assertNot(due(A, #{A => {3, Now}}, Now + ?BACKOFF_BASE_MS * 2)),
-    ?assert(due(A, #{A => {3, Now}}, Now + ?BACKOFF_BASE_MS * 4)).
+    ?assertNot(due(A, #{A => {3, Now, 0}}, Now + ?BACKOFF_BASE_MS * 2)),
+    ?assert(due(A, #{A => {3, Now, 0}}, Now + ?BACKOFF_BASE_MS * 4)).
 
 attempts_test() ->
     A = ~"net:example.com:8008~shs:AAAA=",
     ?assertEqual(0, attempts(A, #{})),
-    ?assertEqual(7, attempts(A, #{A => {7, 0}})).
+    ?assertEqual(7, attempts(A, #{A => {7, 0, 0}})).
+
+%% The ordering trap: conn_db order is fixed, so a working pub that sits
+%% behind hundreds of dead entries was reached last on every pass, and not
+%% at all once the cap filled.  An address that has connected before goes
+%% first whatever its place in the file, most recently connected first.
+proven_addresses_go_first_test() ->
+    Cand = fun(N) -> {~"pub.example", 8008, <<N:256>>} end,
+    Dead = [Cand(N) || N <- lists:seq(1, 50)],
+    EarlButt = Cand(100),
+    Older = Cand(101),
+    Backoff = #{addr(EarlButt) => {0, 900, 900},
+                addr(Older)    => {2, 950, 400},
+                addr(Cand(7))  => {5, 990, 0}},   %% tried, never reached
+    Ordered = order(Dead ++ [Older, EarlButt], Backoff),
+    ?assertMatch([EarlButt, Older | _], Ordered),
+    ?assertEqual(lists:sort(Dead ++ [Older, EarlButt]), lists:sort(Ordered)).
+
+%% Never-reached addresses are drawn in a fresh order each pass, so none
+%% of them is permanently at the back.  Over 200 passes of 20 the odds of
+%% the last entry never making the first half by chance are 2^-200.
+unproven_order_varies_test() ->
+    Cands = [{~"pub.example", 8008, <<N:256>>} || N <- lists:seq(1, 20)],
+    Last = lists:last(Cands),
+    Front = [lists:sublist(order(Cands, #{}), 10) || _ <- lists:seq(1, 200)],
+    ?assert(lists:any(fun(F) -> lists:member(Last, F) end, Front)).
 
 %% The address is the conn.json key, so the two entries that share
 %% pub.cmoid.org — the live pub and a stale one for a key it no longer
@@ -589,7 +614,7 @@ a_failed_dial_backs_off() ->
     ?assert(due(Addr, load_backoff(), Now)),
     record_fail(Addr, 1, Now),
     B = load_backoff(),
-    ?assertEqual({1, Now}, maps:get(Addr, B)),
+    ?assertEqual({1, Now, 0}, maps:get(Addr, B)),
     ?assertNot(due(Addr, B, Now)),
     ?assert(due(Addr, B, Now + ?BACKOFF_BASE_MS)),
     ?assertEqual([[1]], ssb_store:q("SELECT attempts FROM peer_dial_try"
