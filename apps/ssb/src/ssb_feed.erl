@@ -1137,6 +1137,7 @@ feed_test_() ->
      fun setup/0,
      fun teardown/1,
      [fun post_and_fetch_test/1,
+      fun post_to_foreign_feed_refused_test/1,
       fun sequence_increments_test/1,
       fun fetch_last_msg_test/1,
       fun store_msg_dedup_test/1,
@@ -1176,8 +1177,26 @@ feed_test_() ->
       fun restart_then_archive_naming_test/1,
       fun crash_window_recovery_test/1,
       fun frame_chain_is_walkable_test/1,
+      fun torn_tail_recovers_test/1,
+      fun zero_filled_tail_recovers_test/1,
+      fun whole_log_is_left_alone_test/1,
       fun idle_releases_log_handle_test/1,
       fun log_handles_are_capped_test/1]}.
+
+%% Only the feed of the key the node booted with can be signed.  A post
+%% to any other feed would sign with the wrong key — an invalid message
+%% stored under someone else's id — so it is refused and nothing written.
+post_to_foreign_feed_refused_test({_Pid, _FeedId, _}) ->
+    fun() ->
+        {OtherPub, _} = utils:create_key_pair(),
+        Other = utils:display_pub(OtherPub),
+        {ok, OtherPid} = ssb_feed:start_link(Other),
+        ?assertEqual(no_post, ssb_feed:post_content(OtherPid, ~"not mine")),
+        ?assertEqual({error, not_owner}, ssb_feed:archive(OtherPid)),
+        ?assertEqual(0, ssb_feed:current_seq(OtherPid)),
+        ?assertNot(filelib:is_file(feed_file(Other))),
+        ok = gen_server:stop(OtherPid)
+    end.
 
 %% Fully isolated home per test: these tests archive and restart the
 %% own feed, and a home shared across eunit runs accumulates
@@ -1301,6 +1320,68 @@ frame_chain_is_walkable_test({Pid, FeedId, _}) ->
          || N <- lists:seq(1, 5)],
         {ok, Bin} = file:read_file(feed_file(FeedId)),
         ?assertEqual({5, byte_size(Bin)}, walk_frames(Bin, 0, 0))
+    end.
+
+%% A crash (power loss, not a process kill: one frame is one write) can
+%% leave the last frame half on disk.  The feed must come back at the
+%% last whole frame and chain the next post onto it, leaving a log that
+%% still walks — not refuse to start, and not append after the debris.
+%% A message that never fully reached disk cannot have reached a peer
+%% either: store/2 writes before EBT sees it.
+torn_tail_recovers_test({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"one"),
+        ok = ssb_feed:post_content(Pid, ~"two"),
+        #message{id = TwoId} = ssb_feed:fetch_last_msg(Pid),
+        {ok, Whole} = file:read_file(feed_file(FeedId)),
+        ok = ssb_feed:post_content(Pid, ~"three, torn"),
+        ok = gen_server:stop(Pid),
+        {ok, Bin} = file:read_file(feed_file(FeedId)),
+        Torn = (byte_size(Bin) - byte_size(Whole)) div 2,
+        ok = file:write_file(feed_file(FeedId),
+                             binary:part(Bin, 0, byte_size(Whole) + Torn)),
+        {ok, Pid2} = ssb_feed:start_link(FeedId),
+        ?assertEqual(2, ssb_feed:current_seq(Pid2)),
+        ok = ssb_feed:post_content(Pid2, ~"three, again"),
+        #message{sequence = 3, previous = Prev} = ssb_feed:fetch_last_msg(Pid2),
+        ?assertEqual(TwoId, Prev),
+        {ok, After} = file:read_file(feed_file(FeedId)),
+        ?assertEqual({3, byte_size(After)}, walk_frames(After, 0, 0)),
+        ?assertEqual({ok, binary:part(Bin, byte_size(Whole), Torn)},
+                     file:read_file(?b2l(feed_file(FeedId)) ++ ".torn")),
+        ok = gen_server:stop(Pid2)
+    end.
+
+%% The other shape power loss leaves: the file was extended but the
+%% data never landed, so the tail reads as zeros — which a length check
+%% alone would take for an empty frame.
+zero_filled_tail_recovers_test({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"one"),
+        #message{id = OneId} = ssb_feed:fetch_last_msg(Pid),
+        ok = gen_server:stop(Pid),
+        {ok, _} = file:read_file(feed_file(FeedId)),
+        ok = file:write_file(feed_file(FeedId), <<0:(64*8)>>, [append]),
+        {ok, Pid2} = ssb_feed:start_link(FeedId),
+        ?assertEqual(1, ssb_feed:current_seq(Pid2)),
+        ok = ssb_feed:post_content(Pid2, ~"two"),
+        #message{sequence = 2, previous = OneId} = ssb_feed:fetch_last_msg(Pid2),
+        {ok, After} = file:read_file(feed_file(FeedId)),
+        ?assertEqual({2, byte_size(After)}, walk_frames(After, 0, 0)),
+        ok = gen_server:stop(Pid2)
+    end.
+
+%% And a log that ends cleanly is not touched.
+whole_log_is_left_alone_test({Pid, FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"one"),
+        ok = ssb_feed:post_content(Pid, ~"two"),
+        ok = gen_server:stop(Pid),
+        {ok, Before} = file:read_file(feed_file(FeedId)),
+        {ok, Pid2} = ssb_feed:start_link(FeedId),
+        ?assertEqual({ok, Before}, file:read_file(feed_file(FeedId))),
+        ?assertNot(filelib:is_file(?b2l(feed_file(FeedId)) ++ ".torn")),
+        ok = gen_server:stop(Pid2)
     end.
 
 %% Returns {RecordsSeen, FinalOffset}; crashes if a NextOffset does not

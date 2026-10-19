@@ -3,6 +3,9 @@
 %% Copyright (C) 2023 Charles Moid
 -module(keys).
 -include_lib("ssb/include/ssb.hrl").
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
 -behaviour(gen_server).
 
 -import(utils, [base_64/1,
@@ -216,3 +219,106 @@ suffix(Pub) ->
 %% hack to get Moid's key, the number one thing I seem to need in my REPL :)
 moid() ->
     ~"@Sur8RwcDh6kBjub8pLZpHNWDfuuRpYVyCHrVo+TdA/4=.ed25519".
+
+-ifdef(TEST).
+
+pair() ->
+    shs:create_long_pair().
+
+%% A secret file body as ssb-keys writes it, from raw key bytes.
+secret_body(Pub, Priv) ->
+    iolist_to_binary([prelude(), make_json({Pub, Priv}), suffix(Pub)]).
+
+valid_secret_parses_test() ->
+    {Pub, Priv} = pair(),
+    PubB64 = ?l2b(base_64(Pub)),
+    ?assertEqual({ok, {PubB64, ?l2b(base_64(Priv))}},
+                 parse_secret(make_json({Pub, Priv}))).
+
+id_is_optional_test() ->
+    {Pub, Priv} = pair(),
+    Json = json:encode(#{~"curve" => ~"ed25519",
+                         ~"public" => ?l2b(base_64(Pub) ++ ".ed25519"),
+                         ~"private" => ?l2b(base_64(Priv) ++ ".ed25519")}),
+    ?assertMatch({ok, _}, parse_secret(iolist_to_binary(Json))).
+
+%% The dangerous one: it parses, and the node would boot as Pub while
+%% signing with someone else's private key.
+mismatched_pair_refused_test() ->
+    {Pub, _} = pair(),
+    {_, Priv} = pair(),
+    ?assertEqual({error, key_mismatch}, parse_secret(make_json({Pub, Priv}))).
+
+id_disagreeing_with_public_refused_test() ->
+    {Pub, Priv} = pair(),
+    {Other, _} = pair(),
+    Json = json:encode(#{~"public" => ?l2b(base_64(Pub) ++ ".ed25519"),
+                         ~"private" => ?l2b(base_64(Priv) ++ ".ed25519"),
+                         ~"id" => display_pub(?l2b(base_64(Other)))}),
+    ?assertEqual({error, id_mismatch}, parse_secret(iolist_to_binary(Json))).
+
+malformed_secrets_refused_test() ->
+    {Pub, Priv} = pair(),
+    <<Short:32/binary, _/binary>> = Priv,
+    ?assertEqual({error, not_json}, parse_secret(~"{\"public\": ")),
+    ?assertEqual({error, not_json}, parse_secret(~"")),
+    ?assertEqual({error, missing_keys}, parse_secret(~"{\"public\": \"x\"}")),
+    ?assertEqual({error, missing_keys}, parse_secret(~"[1, 2]")),
+    ?assertEqual({error, missing_keys},
+                 parse_secret(~"{\"public\": 1, \"private\": 2}")),
+    ?assertEqual({error, bad_base64},
+                 parse_secret(~"{\"public\": \"!!\", \"private\": \"!!\"}")),
+    ?assertEqual({error, bad_key_length}, parse_secret(make_json({Pub, Short}))).
+
+%% Booting against a bad secret must fail the start, not run as a
+%% placeholder identity; a good one boots as exactly that identity.
+boot_test_() ->
+    {foreach,
+     fun() ->
+             Home = filename:join("/tmp", "keys_" ++
+                                      integer_to_list(erlang:system_time(microsecond))),
+             ok = filelib:ensure_dir(Home ++ "/"),
+             application:set_env(ssb, ssb_home, Home),
+             {ok, _} = config:start_link("no-such-cfg"),
+             ok = filelib:ensure_dir(secret_file()),
+             Home
+     end,
+     fun(Home) ->
+             catch gen_server:stop(keys),
+             catch gen_server:stop(config),
+             application:unset_env(ssb, ssb_home),
+             os:cmd("rm -rf " ++ Home)
+     end,
+     [fun(_) ->
+              fun() ->
+                      {Pub, Priv} = pair(),
+                      ok = file:write_file(secret_file(), secret_body(Pub, Priv)),
+                      {ok, _} = gen_server:start({local, keys}, keys, [], []),
+                      ?assertEqual(display_pub(?l2b(base_64(Pub))), pub_key_disp())
+              end
+      end,
+      fun(_) ->
+              fun() ->
+                      {Pub, _} = pair(),
+                      {_, Priv} = pair(),
+                      ok = file:write_file(secret_file(), secret_body(Pub, Priv)),
+                      ?assertEqual({error, {bad_secret, key_mismatch}},
+                                   gen_server:start({local, keys}, keys, [], []))
+              end
+      end,
+      fun(_) ->
+              fun() ->
+                      ok = file:write_file(secret_file(), ~"# truncated\n{\"curve\""),
+                      ?assertEqual({error, {bad_secret, not_json}},
+                                   gen_server:start({local, keys}, keys, [], []))
+              end
+      end,
+      fun(_) ->
+              fun() ->
+                      %% absent is not bad: a first boot mints one
+                      ?assertMatch({ok, _}, gen_server:start({local, keys}, keys, [], [])),
+                      ?assertMatch({ok, _}, fetch_key())
+              end
+      end]}.
+
+-endif.
