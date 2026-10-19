@@ -268,11 +268,17 @@ is_peer_error(_) -> false.
 
 %% For each feed in the peer's clock, send them any messages they are
 %% missing (i.e. messages with sequence > their last known sequence).
+%%
+%% The entry for our OWN feed is also the fork guard's evidence: the peer's
+%% sequence for it, ahead of ours, means the feed went on without this
+%% store (see own_feed).
 handle_clock(ReqNo, {PeerClock}, Socket, Nonce, Key) ->
+    Self = keys:pub_key_disp(),
     {NewNonce, Cnt} =
     lists:foldl(fun({FeedId, EncodedInt}, {NonceAcc, Fc}) ->
                         check_feed_cnt(Fc),
                         {Rep, Rec, PeerSeq} = ebt_vc:decode_clock_int(EncodedInt),
+                        FeedId =:= Self andalso own_feed:peer_note({Rep, PeerSeq}),
                         %%?SSB_DEBUG("EBT: decode vector to ~p for feed ~p ~n", [{Rep, Rec, PeerSeq},
                         %%    {FeedId, EncodedInt}]),
                         {send_feed_msgs_after(FeedId, {Rep, Rec,PeerSeq}, -ReqNo, Socket, NonceAcc, Key), Fc + 1}

@@ -348,14 +348,26 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"publish"],
              = _ReqBody, Socket, Nonce, SecretBoxKey) ->
     OurId   = keys:pub_key_disp(),
     FeedPid = utils:find_or_create_feed_pid(OurId),
-    ok = ssb_feed:post_content(FeedPid, Content),
-    Msg  = ssb_feed:fetch_last_msg(FeedPid),
-    Body = message:encode(Msg),
-    %% async reply: stream=0.  A stream/end-flagged frame is rejected by
-    %% a standard muxrpc async caller ("no stream for incoming msg").
-    Flags  = create_flags(0, 0, 2),
-    Header = create_header(Flags, size(Body), -ReqNo),
-    utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+    case ssb_feed:post_content(FeedPid, Content) of
+        ok ->
+            Msg  = ssb_feed:fetch_last_msg(FeedPid),
+            Body = message:encode(Msg),
+            %% async reply: stream=0.  A stream/end-flagged frame is rejected by
+            %% a standard muxrpc async caller ("no stream for incoming msg").
+            Flags  = create_flags(0, 0, 2),
+            Header = create_header(Flags, size(Body), -ReqNo),
+            utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+        {error, {own_feed_behind, Ours, Target}} ->
+            %% Signing now would fork the feed: see own_feed.
+            Text = iolist_to_binary(
+                     io_lib:format("this node holds your feed to sequence ~p but "
+                                   "it reaches ~p elsewhere; publishing is paused "
+                                   "until it has caught up", [Ours, Target])),
+            ErrMsg = utils:error_msg(~"Error", Text),
+            Flags  = create_flags(0, 1, 2),
+            Header = create_header(Flags, size(ErrMsg), -ReqNo),
+            utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey)
+    end;
 
 proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"get"],
                              args = [Arg]}
@@ -742,7 +754,13 @@ proc_request(Calls, ReqNo, #ssb_rpc{name = [~"invite", ~"use"],
                                       {~"contact",   FeedId},
                                       {~"following", true},
                                       {~"pub",       true}]},
-                    ok = ssb_feed:post_content(FeedPid, FollowContent)
+                    %% refused only while the fork guard holds publishing;
+                    %% the invite itself stands
+                    case ssb_feed:post_content(FeedPid, FollowContent) of
+                        ok    -> ok;
+                        Other -> ?SSB_INFO("invite.use: follow-back of ~p not "
+                                           "published: ~p~n", [FeedId, Other])
+                    end
             end,
             %% The new member/follow just changed our replication set; refresh
             %% it now so we replicate their feed immediately rather than after

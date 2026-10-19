@@ -60,6 +60,10 @@
 
 
 -record(state, {id,
+                %% is this the feed of the key the node booted with?  Fixed
+                %% for the life of the process: the key only changes across
+                %% a restart.
+                own = false,
                 last_msg = null,
                 last_seq = 0,
                 feed,
@@ -217,6 +221,7 @@ init([FeedId]) ->
     process_flag(trap_exit, true),
     Feed = init_directories(FeedId),
     State = #state{id = FeedId,
+                   own = is_own(FeedId),
                    feed = Feed,
                    msg_cache = ets:new(messages, [])},
     %% Register in the global feed registry when running under ssb_feed_sup.
@@ -266,14 +271,16 @@ handle_call(seq_bounds, _From, #state{id = Id, feed = FeedFile,
 handle_call(whoami, _From, #state{id = Id} = State) ->
     {reply, Id, State};
 
-handle_call({post, Content}, _From, #state{id = Id} = State) ->
-    %% A given peer can only post to the feed it owns
-    CanPost = Id == keys:pub_key_disp(),
-    if CanPost ->
-            NewState = post(Content, State),
-            {reply, ok, NewState};
-       true ->
-            {reply, no_post, State}
+%% A given peer can only post to the feed it owns, and only when the
+%% fork guard says this store is not behind that feed's real head.
+handle_call({post, _Content}, _From, #state{own = false} = State) ->
+    {reply, no_post, State};
+handle_call({post, Content}, _From, State) ->
+    case own_feed:may_publish() of
+        ok ->
+            {reply, ok, post(Content, State)};
+        {error, _} = Refused ->
+            {reply, Refused, State}
     end;
 
 handle_call({store, Msg}, _From, #state{last_seq = Before} = State) ->
@@ -740,6 +747,7 @@ store(#message{id = Id, sequence = Seq, author = Auth} = Msg,
     ingest_journal:append(Auth, Seq),
     social_msg:dispatch(Msg),
     view_manager:ingest(Msg),
+    State#state.own andalso own_feed:stored(Auth, Seq),
     State#state{last_msg = Id, last_seq = Seq}.
 
 write_msg(#message{} = DecMsg, State) ->
@@ -876,6 +884,10 @@ init_directories(FeedId) ->
     Feed = <<FeedDir/binary,~"/"/binary,~"log.offset"/binary>>,
     filelib:ensure_dir(Feed),
     Feed.
+
+%% Without keys (the offline converter) there is no own feed.
+is_own(FeedId) ->
+    whereis(keys) =/= undefined andalso FeedId =:= keys:pub_key_disp().
 
 %% Only feed corresponding to the owner of the peer can post.
 %% All the other feeds are only meant to be read

@@ -172,6 +172,8 @@ init_secret() ->
     JsonDoc = make_json({Pub, Priv}),
     file:write_file(SecretFileName, JsonDoc, [append]),
     file:write_file(SecretFileName, suffix(Pub), [append]),
+    %% minted here, so there is no history anywhere to be behind
+    ok = own_feed:seed_record(display_pub(?l2b(base_64(Pub)))),
     {?l2b(base_64(Pub)), ?l2b(base_64(Priv))}.
 
     make_json({Pub, Priv}) ->
