@@ -24,18 +24,23 @@
 
 -export([identity_switch_round_trip_test/1,
          sigterm_during_publish_test/1,
-         sigkill_during_publish_test/1]).
+         sigkill_during_publish_test/1,
+         lost_tail_refuses_then_recovers_test/1,
+         restored_secret_catches_up_test/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("ssb/include/ssb.hrl").
 
 -define(PORT, 18120).
+-define(PUB_PORT, 18121).
 
 all() ->
     [identity_switch_round_trip_test,
      sigterm_during_publish_test,
-     sigkill_during_publish_test].
+     sigkill_during_publish_test,
+     lost_tail_refuses_then_recovers_test,
+     restored_secret_catches_up_test].
 
 init_per_suite(Config) ->
     ssb_ct_helper:ensure_distributed(),
@@ -102,7 +107,128 @@ sigterm_during_publish_test(Config) ->
 sigkill_during_publish_test(Config) ->
     killed_during_publish(Config, "KILL").
 
+%% The fork guard, from the disk alone.  Our own log lost its last two
+%% messages (a power cut after peers had them), but the own-head record
+%% outlived them: the node boots BEHIND, refuses to publish with no peer
+%% in sight, and only publishes again once a pub that holds the feed has
+%% given the missing messages back — at seq 6, onto the real 5.
+lost_tail_refuses_then_recovers_test(Config) ->
+    Dir = ?config(dir, Config),
+    Node1 = boot(Config),
+    A = rpc:call(Node1, keys, pub_key_disp, []),
+    Log = log_file(Node1, A),
+    [ok = post(Node1, A, <<"A", (integer_to_binary(N))/binary>>) || N <- lists:seq(1, 5)],
+    #message{id = A5} = last(Node1, A),
+    Pub = start_pub(Config, Node1, A),
+    signal(Node1, "TERM"),
+
+    ok = cut_log(Log, 3),
+    Node2 = boot(Config),
+    ?assertEqual({behind, 3, 5}, own_status(Node2)),
+    ?assertEqual({error, {own_feed_behind, 3, 5}}, post(Node2, A, ~"forks at 4")),
+    ?assertEqual(3, seq(Node2, A)),
+
+    %% No EBT on this connection, so the pull alone must do it: an
+    %% explicit createHistoryStream from our tail, which is what gets
+    %% past an ssb-ebt pub's cached belief about what we hold.
+    _ = connect_to(Node2, Pub, ?PUB_PORT, no_ebt),
+    ok = rpc:call(Node2, own_feed, pull_now, []),
+    ?assert(wait_until(fun() -> own_status(Node2) =:= {confident, 5, 5} end, 80)),
+    %% the boot-time pull (no peers yet) may still be the latest for a moment
+    ?assert(wait_until(fun() ->
+                               rpc:call(Node2, own_feed, last_pull, []) =:=
+                                   #{peers => 1, stored => 2}
+                       end, 40)),
+    ok = post(Node2, A, ~"A6"),
+    #message{sequence = 6, previous = A5} = last(Node2, A),
+    ?assertEqual(6, valid_chain(Node2, A)),
+    signal(Node2, "TERM"),
+    signal(Pub, "TERM"),
+    ct:log("lost tail recovered in ~s", [Dir]).
+
+%% The patchwork case: the secret, and nothing else.  An empty store
+%% cannot know its feed has history, so it boots unconfirmed; the pub's
+%% note says the feed reaches 5, which puts it behind; it pulls its own
+%% feed back and is confident at 5 before anything new is signed.
+restored_secret_catches_up_test(Config) ->
+    Dir = ?config(dir, Config),
+    Node1 = boot(Config, filename:join(Dir, "original"), ?PORT),
+    A = rpc:call(Node1, keys, pub_key_disp, []),
+    [ok = post(Node1, A, <<"A", (integer_to_binary(N))/binary>>) || N <- lists:seq(1, 5)],
+    #message{id = A5} = last(Node1, A),
+    Secret = binary_to_list(rpc:call(Node1, config, ssb_repo_loc, [])) ++ "secret",
+    Pub = start_pub(Config, Node1, A),
+    signal(Node1, "TERM"),
+
+    Restored = filename:join([Dir, "restored", ".ssberl", "secret"]),
+    ok = filelib:ensure_dir(Restored),
+    {ok, _} = file:copy(Secret, Restored),
+    Node2 = boot(Config, filename:join(Dir, "restored"), ?PORT),
+    ?assertEqual(A, rpc:call(Node2, keys, pub_key_disp, [])),
+    ?assertEqual({unconfirmed, 0, 0}, own_status(Node2)),
+
+    connect(Node2, Pub),
+    ?assert(wait_until(fun() -> own_status(Node2) =:= {confident, 5, 5} end, 80)),
+    ok = post(Node2, A, ~"A6"),
+    #message{sequence = 6, previous = A5} = last(Node2, A),
+    ?assertEqual(6, valid_chain(Node2, A)),
+    signal(Node2, "TERM"),
+    signal(Pub, "TERM").
+
 %%% Helpers -------------------------------------------------------------
+
+%% A pub (its own identity, its own store) that follows A and has
+%% replicated all of A's feed from Node.
+start_pub(Config, Node, A) ->
+    Pub = boot(Config, filename:join(?config(dir, Config), "pub"), ?PUB_PORT),
+    PubId = rpc:call(Pub, keys, pub_key_disp, []),
+    ok = post(Pub, PubId, {[{~"type", ~"contact"}, {~"contact", A}, {~"following", true}]}),
+    ok = rpc:call(Pub, ebt, refresh_repl_set, []),
+    Want = seq(Node, A),
+    PeerPid = connect_to(Pub, Node, ?PORT),
+    ?assert(wait_until(fun() -> seq(Pub, A) =:= Want end, 80)),
+    rpc:call(Pub, gen_server, stop, [PeerPid]),
+    Pub.
+
+%% Node dials the pub and starts EBT.
+connect(Node, Pub) ->
+    _ = connect_to(Node, Pub, ?PUB_PORT),
+    ok.
+
+connect_to(From, To, Port) ->
+    PeerPid = connect_to(From, To, Port, no_ebt),
+    rpc:call(From, ssb_peer, request_ebt, [PeerPid]),
+    PeerPid.
+
+connect_to(From, To, Port, no_ebt) ->
+    Curve = base64:decode(rpc:call(To, keys, pub_key, [])),
+    {ok, PeerPid} = rpc:call(From, ssb_peer, start, ["localhost", Port, Curve]),
+    timer:sleep(300),
+    PeerPid.
+
+own_status(Node) ->
+    rpc:call(Node, own_feed, status, []).
+
+log_file(Node, FeedId) ->
+    binary_to_list(rpc:call(Node, utils, feed_dir, [FeedId])) ++ "/log.offset".
+
+%% Keep the first Keep whole frames of a log: the tail a power cut takes.
+cut_log(Log, Keep) ->
+    {ok, Bin} = file:read_file(Log),
+    file:write_file(Log, binary:part(Bin, 0, frames_end(Bin, 0, Keep))).
+
+frames_end(_Bin, Pos, 0) ->
+    Pos;
+frames_end(Bin, Pos, N) ->
+    <<_:Pos/binary, Len:32, _/binary>> = Bin,
+    frames_end(Bin, Pos + Len + 12, N - 1).
+
+wait_until(_F, 0) -> false;
+wait_until(F, N) ->
+    case F() of
+        true  -> true;
+        false -> timer:sleep(250), wait_until(F, N - 1)
+    end.
 
 killed_during_publish(Config, Signal) ->
     Node1 = boot(Config),
@@ -147,9 +273,13 @@ drain_acks(Last) ->
     end.
 
 boot(Config) ->
+    boot(Config, ?config(dir, Config), ?PORT).
+
+boot(Config, Dir, Port) ->
+    ok = filelib:ensure_dir(Dir ++ "/"),
     Name = list_to_atom("ident_" ++ integer_to_list(erlang:unique_integer([positive]))),
-    {ok, _Peer, Node} = ssb_ct_helper:start_ssb_node(Name, ?config(dir, Config),
-                                                     ?PORT, ?config(pas, Config)),
+    {ok, _Peer, Node} = ssb_ct_helper:start_ssb_node(Name, Dir, Port,
+                                                     ?config(pas, Config)),
     Node.
 
 %% Signal the node's OS process and wait until it is gone — not just
