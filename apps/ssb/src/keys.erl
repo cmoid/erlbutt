@@ -44,19 +44,25 @@ start_link() ->
 %%% gen_server callbacks
 %%%===================================================================
 
+%% A secret that is present but unusable stops the node.  It used to boot
+%% as {nokey, nokey} (or whatkey), and a mismatched public/private pair
+%% booted as the public id while signing with someone else's key: every
+%% post an invalid message on our own feed.  Clients that swap the secret
+%% between restarts (multiple identities) make that a file a program
+%% writes, not one a person never touches — so check it, and refuse.
 init([]) ->
     process_flag(trap_exit, true),
-    {PubKey, PrivKey} =
-        case fetch_key() of
-            {Pub, Priv} -> {Pub, Priv};
-            first_time ->
-                init_secret();
-            _Any ->
-                ?LOG_ERROR("Should not get this ~p ~n",[_Any]),
-                {~"whatkey",~"whatkey"}
-        end,
-    {ok, #state{pub_key = PubKey,
-                priv_key = PrivKey}}.
+    case fetch_key() of
+        {ok, {PubKey, PrivKey}} ->
+            {ok, #state{pub_key = PubKey, priv_key = PrivKey}};
+        first_time ->
+            {PubKey, PrivKey} = init_secret(),
+            {ok, #state{pub_key = PubKey, priv_key = PrivKey}};
+        {error, Reason} ->
+            ?LOG_ERROR("keys: refusing to start, unusable secret ~s: ~p",
+                       [secret_file(), Reason]),
+            {stop, {bad_secret, Reason}}
+    end.
 
 handle_call(pub_key, _From, #state{pub_key = PubKey}=State) ->
     {reply, PubKey, State};
@@ -87,24 +93,57 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+secret_file() ->
+    ?b2l(config:ssb_repo_loc()) ++ "secret".
+
 fetch_key() ->
-    SecretFileName = ?b2l(config:ssb_repo_loc()) ++ "secret",
-    case file:open(SecretFileName, [read]) of
+    case file:open(secret_file(), [read]) of
         {error, enoent} ->
             ?LOG_INFO("first time empty dir ~n"),
             first_time;
+        {error, Reason} ->
+            {error, {unreadable, Reason}};
         {ok, IoDevice} ->
-                extract_key(IoDevice)
+            try
+                parse_secret(iolist_to_binary(read_non_comment_lines(IoDevice)))
+            after
+                file:close(IoDevice)
+            end
     end.
 
-extract_key(IoDevice) ->
-    Lines = read_non_comment_lines(IoDevice),
-    case json:decode(iolist_to_binary(Lines)) of
-        KeyMap when is_map(KeyMap) ->
-            {key_only(maps:get(~"public",  KeyMap)),
-             key_only(maps:get(~"private", KeyMap))};
+%% {ok, {PubB64, PrivB64}} — base64 without the .ed25519 suffix, the form
+%% the rest of the node expects — or {error, Reason}.
+parse_secret(Json) ->
+    try json:decode(Json) of
+        #{~"public" := Pub, ~"private" := Priv} = KeyMap
+          when is_binary(Pub), is_binary(Priv) ->
+            check_pair(key_only(Pub), key_only(Priv), maps:find(~"id", KeyMap));
         _ ->
-            {~"nokey", ~"nokey"}
+            {error, missing_keys}
+    catch _:_ ->
+        {error, not_json}
+    end.
+
+%% The private key must be the one the public key belongs to: re-derive
+%% the pair from the private key's seed and compare both halves.  `id` is
+%% optional (ssb-keys always writes it) but must agree when present.
+check_pair(PubB64, PrivB64, Id) ->
+    try {base64:decode(PubB64), base64:decode(PrivB64)} of
+        {<<_:32/binary>> = Pub, <<Seed:32/binary, _:32/binary>> = Priv} ->
+            #{public := DerivedPub, secret := DerivedPriv} =
+                enacl:sign_seed_keypair(Seed),
+            DisplayId = display_pub(PubB64),
+            if DerivedPub =/= Pub orelse DerivedPriv =/= Priv ->
+                    {error, key_mismatch};
+               Id =/= error andalso Id =/= {ok, DisplayId} ->
+                    {error, id_mismatch};
+               true ->
+                    {ok, {PubB64, PrivB64}}
+            end;
+        _ ->
+            {error, bad_key_length}
+    catch _:_ ->
+        {error, bad_base64}
     end.
 
 read_non_comment_lines(IoDevice) ->
