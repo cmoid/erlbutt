@@ -49,10 +49,10 @@
 %% patchX, so erlbutt-only bookkeeping written into it would show up
 %% in every other client that reads the file.
 %%
-%% last_ok is never read by the dial decision — it exists so an operator
-%% can tell "down since Tuesday" from "has never once completed a
-%% handshake", which are the same row until you look.  It carries a
-%% DEFAULT so a later version bump can add columns to an existing table.
+%% last_ok tells "down since Tuesday" from "has never once completed a
+%% handshake", which are the same row until you look.  The backoff does not
+%% read it; the dial order does (see order/2).  It carries a DEFAULT so a
+%% later version bump can add columns to an existing table.
 -define(DDL,
         ["CREATE TABLE IF NOT EXISTS peer_dial_try("
          "  addr     TEXT PRIMARY KEY,"
@@ -169,13 +169,57 @@ cancel_timer(Ref)       -> erlang:cancel_timer(Ref), ok.
 dial_candidates() ->
     Now = erlang:system_time(millisecond),
     Backoff = load_backoff(),
-    Candidates = dedup(lan_candidates() ++ known_candidates()),
+    Candidates = dedup(lan_candidates() ++ order(known_candidates(), Backoff)),
     {Due, Held} = lists:partition(
                     fun(C) -> due(addr(C), Backoff, Now) end, Candidates),
     ?SSB_DEBUG("peer_dialer: ~p candidate(s), ~p connected~n",
                [length(Candidates), length(peer_registry:all())]),
     log_held(Held, Candidates),
-    lists:foreach(fun(C) -> maybe_dial(C, Backoff) end, Due).
+    dial_due(Due, Backoff).
+
+%% The order a pass dials in decides who gets the ?MAX_CONNS slots, so it
+%% cannot be the order conn_db happens to hold them in.  maps:to_list/1 is
+%% stable for an unchanged map, and the pass used to walk it front to back:
+%% if the first few hundred entries ever filled the cap, an address further
+%% down was skipped on every pass, forever.  EarlButt sat at #851 of 1248.
+%%
+%% Addresses that have completed a handshake before go first, most recent
+%% first — those are the ones likely to answer.  The rest, never once
+%% reached, are shuffled each pass, so no position in the file is a
+%% permanent place at the back of the queue.  LAN peers are ahead of both:
+%% heartbeat only lists what has broadcast recently.
+order(Candidates, Backoff) ->
+    {Proven, Unproven} =
+        lists:partition(fun(C) -> last_ok(addr(C), Backoff) > 0 end, Candidates),
+    [C || {_, C} <- lists:keysort(1, [{-last_ok(addr(C), Backoff), C}
+                                      || C <- Proven])]
+        ++ shuffle(Unproven).
+
+shuffle(L) ->
+    [C || {_, C} <- lists:sort([{rand:uniform(), C} || C <- L])].
+
+%% Stop at the cap rather than walk the rest of the list: once it is full
+%% every remaining candidate would only be skipped, and the next pass draws
+%% a fresh order anyway.  Re-check the flag before every candidate so
+%% disable/0 takes effect in the middle of a long pass, not just between
+%% passes.
+dial_due([], _Backoff) ->
+    ok;
+dial_due([Candidate | Rest] = Due, Backoff) ->
+    case is_enabled() of
+        false ->
+            ok;
+        true ->
+            case length(peer_registry:all()) >= ?MAX_CONNS of
+                true ->
+                    ?SSB_DEBUG("peer_dialer: at connection cap, ~p due "
+                               "candidate(s) wait for the next pass~n",
+                               [length(Due)]);
+                false ->
+                    dial(Candidate, Backoff),
+                    dial_due(Rest, Backoff)
+            end
+    end.
 
 %% What the backoff skipped is logged rather than dropped quietly.  A dial
 %% list that has silently shrunk to nothing looks exactly like one that is
@@ -243,26 +287,13 @@ dedup(Candidates) ->
         end, {[], sets:new()}, Candidates),
     lists:reverse(Uniq).
 
-%% Re-check the flag before every candidate so disable/0 takes effect in
-%% the middle of a long pass, not just between passes.
-maybe_dial(Candidate, Backoff) ->
-    case is_enabled() of
-        true  -> dial(Candidate, Backoff);
-        false -> ok
-    end.
-
 dial({Host, Port, RawKey} = Candidate, Backoff) ->
-    case length(peer_registry:all()) >= ?MAX_CONNS of
+    case peer_registry:is_connected(RawKey) of
         true ->
-            ?SSB_DEBUG("peer_dialer: at connection cap, skipping~n", []);
+            ok;
         false ->
-            case peer_registry:is_connected(RawKey) of
-                true ->
-                    ok;
-                false ->
-                    ?SSB_INFO("peer_dialer: dialing ~p:~p~n", [Host, Port]),
-                    do_dial(Candidate, Backoff)
-            end
+            ?SSB_INFO("peer_dialer: dialing ~p:~p~n", [Host, Port]),
+            do_dial(Candidate, Backoff)
     end.
 
 %% Only a real attempt moves the retry state.  Being at the connection cap
@@ -329,15 +360,22 @@ to_bin(T) when is_tuple(T)   ->
 %% no failures behind it (attempts = 0, written by a success) is due.
 due(Addr, Backoff, Now) ->
     case maps:get(Addr, Backoff, undefined) of
-        undefined        -> true;
-        {0, _}           -> true;
-        {Attempts, Last} -> Last + backoff_ms(Attempts) =< Now
+        undefined           -> true;
+        {0, _, _}           -> true;
+        {Attempts, Last, _} -> Last + backoff_ms(Attempts) =< Now
     end.
 
 attempts(Addr, Backoff) ->
     case maps:get(Addr, Backoff, undefined) of
         undefined -> 0;
-        {A, _}    -> A
+        {A, _, _} -> A
+    end.
+
+%% 0 for an address that has never completed a handshake.
+last_ok(Addr, Backoff) ->
+    case maps:get(Addr, Backoff, undefined) of
+        undefined  -> 0;
+        {_, _, Ok} -> Ok
     end.
 
 backoff_ms(Attempts) when Attempts =< 1 ->
@@ -373,9 +411,10 @@ prune_rows() ->
 %% through the store on every poll.
 load_backoff() ->
     maps:from_list(
-      [{Addr, {Attempts, LastTry}}
-       || [Addr, Attempts, LastTry]
-              <- rows("SELECT addr, attempts, last_try FROM peer_dial_try", [])]).
+      [{Addr, {Attempts, LastTry, LastOk}}
+       || [Addr, Attempts, LastTry, LastOk]
+              <- rows("SELECT addr, attempts, last_try, last_ok"
+                      " FROM peer_dial_try", [])]).
 
 %% A connection that worked clears the history, so the next failure starts
 %% from the base wait instead of inheriting a backoff earned months ago.
