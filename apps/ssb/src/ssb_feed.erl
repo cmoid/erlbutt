@@ -881,6 +881,7 @@ init_directories(FeedId) ->
 %% All the other feeds are only meant to be read
 check_owner_feed(#state{feed = Feed,
                        msg_cache = Messages} = State) ->
+    ok = repair_tail(Feed),
     Resp = feed_get_last(Feed),
     case Resp of
         no_file ->
@@ -1027,6 +1028,73 @@ fetch_archived(Key, Feed) ->
         {ok, Msg}  -> message:decode(Msg, false);
         not_found  -> not_found
     end.
+
+%% Cut a torn final frame off the live log before anything reads or
+%% appends to it.
+%%
+%% Logs are not fsynced (see log_fd/1), so a power loss can leave the last
+%% frame half written, or the file extended with zeros.  The readers stop
+%% cleanly at such a tail, but feed_get_last/1 badmatched on it — the feed
+%% process could not start, and for our own feed that is no publishing at
+%% all — and anything appended after the debris would be unreachable.
+%%
+%% The common case costs two preads: the final frame's leading and
+%% trailing lengths agree.  Only when they do not is the log walked from
+%% the front, by lengths alone (NextOffset is not trusted for this), to
+%% the last whole frame.  The cut bytes are kept beside the log.
+repair_tail(Feed) ->
+    %% `write` would create the log: a feed with none must stay without one
+    case filelib:is_regular(Feed) andalso file:open(Feed, [read, write, raw, binary]) of
+        false ->
+            ok;
+        {ok, Fd} ->
+            try
+                {ok, Size} = file:position(Fd, eof),
+                case tail_is_whole(Fd, Size) of
+                    true  -> ok;
+                    false -> cut_tail(Fd, Feed, Size, last_whole_frame(Fd, Size, 0))
+                end
+            after
+                file:close(Fd)
+            end;
+        {error, Reason} ->
+            %% e.g. read-only: nothing to repair with; let the read path report it
+            ?LOG_WARNING("feed log ~s: cannot check tail: ~p", [Feed, Reason]),
+            ok
+    end.
+
+tail_is_whole(_Fd, 0) ->
+    true;
+tail_is_whole(Fd, Size) when Size >= 12 ->
+    case file:pread(Fd, Size - 8, 4) of
+        {ok, <<Len:32>>} when Len > 0, Size - Len - 12 >= 0 ->
+            file:pread(Fd, Size - Len - 12, 4) =:= {ok, <<Len:32>>};
+        _ ->
+            false
+    end;
+tail_is_whole(_Fd, _Size) ->
+    false.
+
+%% Offset just past the last frame whose leading and trailing lengths agree.
+last_whole_frame(Fd, Size, Pos) ->
+    case file:pread(Fd, Pos, 4) of
+        {ok, <<Len:32>>} when Len > 0, Pos + Len + 12 =< Size ->
+            case file:pread(Fd, Pos + 4 + Len, 4) of
+                {ok, <<Len:32>>} -> last_whole_frame(Fd, Size, Pos + Len + 12);
+                _                -> Pos
+            end;
+        _ ->
+            Pos
+    end.
+
+cut_tail(Fd, Feed, Size, Good) ->
+    {ok, Debris} = file:pread(Fd, Good, Size - Good),
+    ok = file:write_file(?b2l(Feed) ++ ".torn", Debris, [append]),
+    {ok, Good} = file:position(Fd, Good),
+    ok = file:truncate(Fd),
+    ?LOG_WARNING("feed log ~s: cut a torn tail of ~p bytes at offset ~p",
+                 [Feed, Size - Good, Good]),
+    ok.
 
 feed_get_last(Feed) ->
     case filelib:is_file(Feed) of
