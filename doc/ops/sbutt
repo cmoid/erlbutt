@@ -25,19 +25,19 @@
 #
 #  2. It supplies the same environment systemd does.  Because vm.args.src
 #     exists, EVERY bin/ssb invocation re-expands vm.args from the current
-#     environment — so running without SSB_COOKIE silently rewrites the
-#     file with the placeholder cookie.  Harmless to the escript itself,
-#     but it leaves the node's args wrong on disk.  Sourcing the same
-#     EnvironmentFile the unit uses keeps the two from drifting.
+#     environment, so a different SSB_NODE or SSB_DIST_PORT would leave
+#     the node's args wrong on disk.  Sourcing the same EnvironmentFile
+#     the unit uses (when there is one) keeps the two from drifting.  -H
+#     makes HOME the service account's, which is where the node's
+#     .erlang.cookie lives.
 #
 #  3. It goes through `bin/ssb escript` rather than a system escript, so
 #     it uses the ERTS bundled in the release.  Nothing needs to be on
 #     PATH and it survives an OTP upgrade.  The script path is relative to
 #     the release root on purpose: relx_escript prepends $ROOTDIR.
 #
-# The env file is root:erlbutt 0640, so the service account reads it
-# itself — the cookie never passes through this script's arguments or
-# environment, where the process list would expose it.
+# The env file, if any, is root:erlbutt 0640, so the service account reads
+# it itself — nothing secret passes through this script's arguments.
 set -eu
 
 # Refresh the sudo timestamp FIRST, as its own step.  Otherwise the password
@@ -47,9 +47,9 @@ set -eu
 # here means the prompt appears before any data moves, clearly labelled.
 sudo -v -p "sbutt: sudo password for %p: " || exit 1
 
-exec sudo -u erlbutt sh -c '
+exec sudo -H -u erlbutt sh -c '
     set -a
-    . /etc/erlbutt/env
+    if [ -r /etc/erlbutt/env ]; then . /etc/erlbutt/env; fi
     set +a
     : "${SSB_HOME:=/opt/erlbutt}"
     export SSB_HOME

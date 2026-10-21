@@ -60,13 +60,16 @@ otherwise the port is random on every boot and no `ssh -L` can name it.
 Setting `min` alone is enough — with `inet_dist_listen_max` unset it
 defaults to `min`, pinning the port exactly rather than opening a range.
 
-The cookie is the other half, and it is **not** fixed by editing that file:
-`vm.args.prod` is in git, so the value there can only ever be a
-placeholder. Set `SSB_COOKIE` in `/etc/erlbutt/env` (§5) and let the
-`${SSB_COOKIE:-...}` substitution pick it up. On a box with a public IP
-that cookie is the only thing between a reachable distribution port and
-arbitrary code execution, and the whole loopback posture assumes it is
-real.
+The cookie is the other half. `vm.args.prod` sets none: the node uses
+`$HOME/.erlang.cookie` of the account it runs as, which the release's
+`bin/hooks/cookie.sh` creates (random, mode 0400) on first start. For the
+service account that is `/var/lib/erlbutt/.erlang.cookie`. If `SSB_COOKIE`
+is set in `/etc/erlbutt/env`, the hook writes that value into the file
+instead, which is how an install from before the hook keeps its cookie.
+On a box with a public IP that cookie is the only thing between a
+reachable distribution port and arbitrary code execution, and the whole
+loopback posture assumes it is real. A file also keeps it out of `ps`; a
+`-setcookie` in `vm.args` shows up in the beam process's arguments.
 
 ## 3. The box
 
@@ -200,13 +203,10 @@ Never hand-edit `/opt/erlbutt/ssb.cfg` as a permanent fix — it is a
 rendered overlay and the next deploy silently reverts it. Changes belong in
 `config/default.vars` or `config/prod.vars`, in git.
 
-**Cookie:**
-
-```
-printf 'SSB_COOKIE=%s\n' "$(head -c 32 /dev/urandom | base64)" \
-  | sudo tee /etc/erlbutt/env >/dev/null
-sudo chown root:erlbutt /etc/erlbutt/env && sudo chmod 640 /etc/erlbutt/env
-```
+**Cookie:** nothing to do. The first start creates
+`/var/lib/erlbutt/.erlang.cookie`. `/etc/erlbutt/env` is optional; the
+unit reads it if present (`EnvironmentFile=-...`). Setting `SSB_COOKIE`
+there still works, and pins the cookie to that value.
 
 **Unit file and CLI wrapper:**
 
@@ -304,10 +304,10 @@ release root, where `bin/ssb escript` looks (`relx_escript` prepends
 `$ROOTDIR`). The `/usr/local/bin/sbutt` wrapper runs it as the `erlbutt`
 account, which is required: `.ssberl/secret` is mode 600 owned by that
 user, and every command that opens a connection reads it. The wrapper also
-sources `/etc/erlbutt/env`, which matters more than it looks — because
-`vm.args.src` exists, **every** `bin/ssb` invocation re-expands `vm.args`
-from the current environment, so running without `SSB_COOKIE` rewrites the
-node's args file with the placeholder cookie.
+sources `/etc/erlbutt/env` when it exists, because `vm.args.src` means
+**every** `bin/ssb` invocation re-expands `vm.args` from the current
+environment, and a different `SSB_NODE` or `SSB_DIST_PORT` would leave the
+node's args wrong on disk.
 
 Finally, confirm the pub is reachable *as a peer*, not merely listening.
 `nc -vz <host> 8008` proves the port is open; only a real handshake proves
@@ -336,14 +336,13 @@ right there:
 sbutt-console
 ```
 
-It needs the same environment systemd gives it, which is what the wrapper
-is for. Because `vm.args.src` exists, **every** `bin/ssb` invocation
-re-expands `vm.args` from the current environment before doing anything
-else — so running `bin/ssb remote_console` by hand rewrites the file with
-the `change-me-in-production` placeholder, reads that back as the cookie,
-fails to connect, and leaves the node's args wrong on disk. The wrapper
-sources the same `EnvironmentFile` the unit does, as the `erlbutt` user, so
-the cookie never appears in a process listing.
+It needs the same identity and environment systemd gives the node, which
+is what the wrapper is for. `remote_console` reads the cookie from
+`$HOME/.erlang.cookie`, so it must run as `erlbutt` *with* that account's
+HOME (`sudo -H`) — run `bin/ssb remote_console` as yourself and it reads
+your own cookie and fails to connect. The wrapper also sources the same
+`EnvironmentFile` the unit does, when there is one, so the node name and
+dist port match.
 
 **Do not type `q().` in that shell.** It evaluates on the far side —
 `init:stop()` — and takes the pub down. Leave with `Ctrl-G` then `q`, which
@@ -365,8 +364,8 @@ node — and therefore a local epmd — the moment it comes up, and `-L 4369`
 cannot bind a port something already holds. With the tunnel up, distel's
 lookup of `ssb` reaches the *remote* epmd, gets 9100, and connects back
 through the second forward. Point maxbutt's `ssb-node` at `ssb@127.0.0.1`
-(prod naming, not `erlbutt@localhost`) and give it the cookie from
-`/etc/erlbutt/env`.
+(prod naming, not `erlbutt@localhost`) and give it the node's cookie:
+`sudo cat /var/lib/erlbutt/.erlang.cookie`.
 
 Two gotchas. Every RPC now crosses the internet rather than a LAN, so
 chattier commands feel it and `gen_server:call` timeouts tuned for

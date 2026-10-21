@@ -7,7 +7,7 @@
 #
 #   /opt/erlbutt          the unpacked release, and SSB_HOME
 #   /opt/erlbutt/.ssberl  SYMLINK -> /var/lib/erlbutt/.ssberl (the real data)
-#   /etc/erlbutt/env      SSB_COOKIE and anything else secret
+#   /etc/erlbutt/env      optional: SSB_COOKIE and anything else secret
 #
 # Install:
 #   sudo cp doc/ops/erlbutt.service /etc/systemd/system/
@@ -55,8 +55,12 @@ Environment=SSB_DIST_PORT=9100
 # closing it; this makes that belt-and-braces rather than the only line.
 Environment=ERL_EPMD_ADDRESS=127.0.0.1
 
-# SSB_COOKIE=<something long and random>, mode 0600, root:erlbutt.
-EnvironmentFile=/etc/erlbutt/env
+# Optional (the leading - means a missing file is fine).  The distribution
+# cookie is $HOME/.erlang.cookie, created on first start by the release's
+# bin/hooks/cookie.sh; if SSB_COOKIE is set here, the hook writes that
+# value instead, which is how an install that predates the hook keeps its
+# cookie.  Mode 0640, root:erlbutt.
+EnvironmentFile=-/etc/erlbutt/env
 
 ExecStart=/opt/erlbutt/bin/ssb foreground
 
