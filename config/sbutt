@@ -34,6 +34,13 @@ while [ -L "$self" ]; do
 done
 root=$(cd "$(dirname "$self")/.." && pwd -P)
 
+# Service installation is shell work (accounts, launchd, systemd), so it is
+# its own script; `sbutt install-service ...` is only a way in.
+if [ "${1:-}" = install-service ]; then
+    shift
+    exec "$root/bin/install-service" "$@"
+fi
+
 # Bundled ERTS in a packaged release; a dev release (include_erts=false)
 # uses whatever escript is on PATH, as the node itself does.
 escript=

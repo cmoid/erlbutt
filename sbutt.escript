@@ -35,6 +35,7 @@
 -define(STREAM_IDLE_MS, 30000).
 
 main(["init"])            -> cmd_init();
+main(["init", "--check"]) -> cmd_init_check();
 main(["init", "--from", Src]) -> cmd_init_from(Src);
 main(["health"])          -> run(fun cmd_health/1);
 main(["census", "encoding" | Args]) ->
@@ -190,25 +191,77 @@ release_root() ->
 %% The dev tree (_build/default/lib/*/ebin) exists only in a checkout; a
 %% deployed node has the release layout (<home>/lib/<app>-<vsn>/ebin) and
 %% no _build at all, which is why this used to crash on the box with
-%% `undef` before it could report anything useful.  Both are globbed, so
-%% neither has to exist.  esqlite is picked up by the glob too — its NIF
-%% is loaded on demand, so a missing one only matters if a command
-%% touches the store.
+%% `undef` before it could report anything useful.  Neither has to exist.
+%% esqlite's NIF is loaded on demand, so a missing one only matters if a
+%% command touches the store.
+%%
+%% In a release, the CURRENT release's app versions go to the FRONT of the
+%% path.  lib/ accumulates every version ever unpacked there — a tarball
+%% extracted over an install, a _build/<profile>/rel rebuilt again and
+%% again — and neither default picks the right one: a VM booted on the
+%% bundled ERTS has already put the highest version of every app first
+%% (wrong after rolling back by extracting an older tarball over a newer
+%% one), and a glob with add_path appends in sort order, so the oldest
+%% wins.  The current release is named in releases/start_erl.data, and
+%% its .rel lists the exact versions the node boots with.
 add_code_paths(SSBHome) ->
-    Paths = filelib:wildcard("./_build/default/lib/*/ebin")
-        ++ filelib:wildcard(filename:join(SSBHome, "lib/*/ebin"))
-        ++ filelib:wildcard(filename:join(SSBHome, "lib/*/priv")),
-    [code:add_path(P) || P <- Paths],
+    [code:add_path(P) || P <- filelib:wildcard("./_build/default/lib/*/ebin")],
+    add_release_paths(SSBHome),
     case code:ensure_loaded(ssb_peer) of
         {module, _} ->
             ok;
         _ ->
             io:format("Cannot find the erlbutt beams.~n"
                       "Looked in ./_build/default/lib and ~s/lib.~n"
-                      "Run it as <release>/bin/ssb escript sbutt.escript, "
+                      "Run it as <release>/bin/sbutt, "
                       "or set SSB_HOME to the release directory.~n",
                       [SSBHome]),
             erlang:halt(1)
+    end.
+
+add_release_paths(Root) ->
+    case release_apps(Root) of
+        {ok, Apps} ->
+            [begin
+                 code:add_patha(filename:join(Dir, "ebin")),
+                 code:add_pathz(filename:join(Dir, "priv"))
+             end || {App, AV} <- Apps,
+                    Dir <- [filename:join([Root, "lib", AV])],
+                    filelib:is_dir(filename:join(Dir, "ebin")),
+                    not owned_by_runtime(App, Root)];
+        error ->
+            %% Not a relx release (or a damaged one): the old glob, which
+            %% is right whenever lib/ holds one version of each app.
+            [code:add_path(P)
+             || P <- filelib:wildcard(filename:join(Root, "lib/*/ebin"))
+                    ++ filelib:wildcard(filename:join(Root, "lib/*/priv"))]
+    end.
+
+%% An OTP app the running VM already provides from a DIFFERENT root — a
+%% system Erlang running a release built without ERTS.  Its kernel and
+%% stdlib are the ones this VM must use; the release's copies may be
+%% another OTP version.
+owned_by_runtime(App, Root) ->
+    case code:lib_dir(App) of
+        {error, bad_name} -> false;
+        LibDir ->
+            RuntimeLib = filename:join(code:root_dir(), "lib"),
+            filename:dirname(LibDir) =:= RuntimeLib
+                andalso filename:absname(Root) =/= filename:absname(code:root_dir())
+    end.
+
+%% {ok, [{ssb, "ssb-0.1.0"}, ...]} for the release the node runs.
+release_apps(Root) ->
+    Rels = filename:join(Root, "releases"),
+    try
+        {ok, Data} = file:read_file(filename:join(Rels, "start_erl.data")),
+        [_ErtsVsn, RelVsn] = string:lexemes(string:trim(Data), " "),
+        [RelFile] = filelib:wildcard(filename:join([Rels, binary_to_list(RelVsn), "*.rel"])),
+        {ok, [{release, _, _, Apps}]} = file:consult(RelFile),
+        {ok, [{element(1, A),
+               atom_to_list(element(1, A)) ++ "-" ++ element(2, A)} || A <- Apps]}
+    catch _:_ ->
+        error
     end.
 
 connect() ->
@@ -699,6 +752,16 @@ cmd_init() ->
             end
     end.
 
+%% sbutt init --check — exit 0 when the data directory holds a usable
+%% identity, 1 otherwise.  Silent; for scripts (bin/install-service).
+cmd_init_check() ->
+    init_paths(),
+    Secret = binary_to_list(config:ssb_repo_loc()) ++ "secret",
+    case filelib:is_regular(Secret) andalso keys:check_secret(Secret) of
+        {ok, _} -> erlang:halt(0);
+        _       -> erlang:halt(1)
+    end.
+
 %% sbutt init --from DIR — adopt an existing erlbutt data directory.
 %%
 %% DIR is a .ssberl, or a directory holding one (an old SSB_HOME).  The
@@ -1024,6 +1087,10 @@ usage() ->
     io:format("Commands:~n"),
     io:format("  init                          Create this node's identity~n"),
     io:format("  init --from DIR               Adopt an existing .ssberl (copied)~n"),
+    io:format("  init --check                  Exit 0 if there is an identity~n"),
+    io:format("  install-service --user|--system [...]~n"),
+    io:format("                                Run this release as a service~n"),
+    io:format("                                (bin/install-service --help)~n"),
     io:format("  whoami                        Show local SSB identity~n"),
     io:format("  id                            Alias for whoami~n"),
     io:format("  ping                          Ping local erlbutt node~n"),

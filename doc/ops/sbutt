@@ -9,7 +9,8 @@
 #   sbutt health
 #   sbutt get %somekey=.sha256
 #
-# Install once:
+# Installed by `sudo bin/install-service --system`, which also sets
+# ERLBUTT_PREFIX below to its --prefix.  By hand:
 #   sudo install -m 0755 doc/ops/sbutt /usr/local/bin/sbutt
 #
 # The CLI itself needs no installing — the release ships it as bin/sbutt
@@ -48,11 +49,15 @@ set -eu
 # here means the prompt appears before any data moves, clearly labelled.
 sudo -v -p "sbutt: sudo password for %p: " || exit 1
 
+# Where the release is — only that.  Not SSB_HOME: that would also say
+# where the DATA is ($SSB_HOME/.ssberl), and on an install made by
+# bin/install-service the data is the service account's ~/.ssberl, which
+# the release finds by itself from HOME (sudo -H).
+ERLBUTT_PREFIX=/opt/erlbutt
+
 exec sudo -H -u erlbutt sh -c '
     set -a
     if [ -r /etc/erlbutt/env ]; then . /etc/erlbutt/env; fi
     set +a
-    : "${SSB_HOME:=/opt/erlbutt}"
-    export SSB_HOME
-    exec "$SSB_HOME/bin/sbutt" "$@"
-' sbutt "$@"
+    exec "$0/bin/sbutt" "$@"
+' "$ERLBUTT_PREFIX" "$@"

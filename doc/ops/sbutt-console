@@ -7,7 +7,7 @@
 #
 #   sbutt-console
 #
-# Install:
+# Installed by `sudo bin/install-service --system`.  By hand:
 #   sudo install -m 0755 doc/ops/sbutt-console /usr/local/bin/sbutt-console
 #
 # Companion to `sbutt`, and it exists for the same reason: `bin/ssb` needs
@@ -35,6 +35,9 @@ sudo -v -p "sbutt-console: sudo password for %p: " || exit 1
 # local shell job; Ctrl-C twice aborts the hidden remsh node, not the pub.
 printf 'sbutt-console: leave with Ctrl-G then q. Do NOT type q(). — it stops the node.\n' >&2
 
+# Where the release is (see sbutt for why this is not SSB_HOME).
+ERLBUTT_PREFIX=/opt/erlbutt
+
 exec sudo -H -u erlbutt sh -c '
     set -a
     if [ -r /etc/erlbutt/env ]; then . /etc/erlbutt/env; fi
@@ -42,9 +45,8 @@ exec sudo -H -u erlbutt sh -c '
     # Defaults mirror the systemd unit and vm.args.prod.  Anything defined
     # in /etc/erlbutt/env wins, so moving those settings out of the unit
     # and into the env file makes this agree automatically.
-    : "${SSB_HOME:=/opt/erlbutt}"
     : "${SSB_NODE:=ssb@127.0.0.1}"
     : "${SSB_DIST_PORT:=9100}"
-    export SSB_HOME SSB_NODE SSB_DIST_PORT
-    exec "$SSB_HOME/bin/ssb" remote_console "$@"
-' sbutt-console "$@"
+    export SSB_NODE SSB_DIST_PORT
+    exec "$0/bin/ssb" remote_console "$@"
+' "$ERLBUTT_PREFIX" "$@"

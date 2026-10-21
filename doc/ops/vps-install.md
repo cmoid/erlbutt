@@ -11,6 +11,25 @@ key unrecoverable.
 
 Read §1 before touching anything. The rest is mechanical.
 
+> **Short version (Oct 2026).** On the box, with Erlang 28 and libsodium
+> installed (§4), and port 8008 open in the firewall:
+>
+> ```
+> git clone https://github.com/cmoid/erlbutt && cd erlbutt && make prodpkg
+> mkdir ~/rel && tar -xzf dist/erlbutt-prod-*.tar.gz -C ~/rel
+> sudo ~/rel/bin/install-service --system --init              # a new pub
+> sudo ~/rel/bin/install-service --system --from ~/ssberl-staging   # or bring one
+> sbutt whoami
+> ```
+>
+> That does §4's accounts and directories, §5's install, unit and
+> wrappers, and §6's adoption (with the checks `sbutt init --from` makes),
+> and starts the node. Upgrading is the same command run from the new
+> release: it stops the node, swaps the release (keeping the old one as
+> `/opt/erlbutt.prev`), and starts it again. Add `--dry-run` to see every
+> step first. The sections below are what it does and why, and remain the
+> reference.
+
 ---
 
 ## 1. Two rules

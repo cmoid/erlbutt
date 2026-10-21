@@ -1,0 +1,522 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Copyright (C) 2026 Charles Moid
+#
+# bin/install-service — run this release as a service.  Also reachable as
+# `sbutt install-service ...`.
+#
+#   install-service --user   [options]   personal node, runs as you
+#                                        (macOS launchd agent, or a Linux
+#                                        systemd --user unit)
+#   install-service --system [options]   a pub on Linux: service account,
+#                                        /opt/erlbutt, systemd unit, the
+#                                        sbutt / sbutt-console wrappers
+#   install-service --uninstall --user|--system [--name N]
+#
+# Options:
+#   --init        create the identity first if there is none (sbutt init)
+#   --from DIR    adopt an existing .ssberl first (sbutt init --from DIR)
+#   --env K=V     extra environment for the node (repeatable), e.g.
+#                 --env SSB_PORT=8009 --env SSB_DATA=/srv/ssb
+#   --name N      service name (default erlbutt) — two nodes, two names
+#   --prefix DIR  --system only: where the release lives (/opt/erlbutt)
+#   --dry-run     print what would be done, change nothing
+#
+# Without --init or --from, a node with no identity is NOT installed: you
+# are told how to give it one.  Installed means started at every boot or
+# login, and the node mints a fresh identity on its first start — which is
+# wrong when you meant to bring an existing one (doc/ops/vps-install.md
+# §6).  So an identity comes first, on purpose, every time.
+#
+# Re-running it is how you upgrade: run the NEW release's install-service.
+# --user repoints the service at the new release and restarts it.
+# --system stops the unit, copies the new release into the prefix (the
+# previous one is kept as <prefix>.prev for rollback), and starts it again.
+# Data is never touched by either: it lives outside the release.
+set -eu
+
+self=$0
+while [ -L "$self" ]; do
+    link=$(readlink "$self")
+    case $link in /*) self=$link ;; *) self=$(dirname "$self")/$link ;; esac
+done
+ROOT=$(cd "$(dirname "$self")/.." && pwd -P)
+
+MODE=
+UNINSTALL=false
+DRY=false
+INIT=
+FROM=
+NAME=erlbutt
+PREFIX=/opt/erlbutt
+ENVS=
+
+usage() {
+    sed -n '9,30p' "$self" | sed 's/^# \{0,1\}//'
+    exit "${1:-2}"
+}
+
+die() { echo "install-service: $*" >&2; exit 1; }
+say() { echo "==> $*"; }
+
+# Every change goes through run, so --dry-run shows exactly what a real
+# run would do.
+run() {
+    if $DRY; then
+        echo "    $*"
+    else
+        "$@"
+    fi
+}
+
+# write FILE MODE — contents on stdin.  Through a temp file and a rename so
+# an interrupted run never leaves a half-written unit behind.
+write() {
+    if $DRY; then
+        echo "    write $1 (mode $2):"
+        sed 's/^/      | /'
+    else
+        mkdir -p "$(dirname "$1")"
+        cat > "$1.tmp"
+        chmod "$2" "$1.tmp"
+        mv "$1.tmp" "$1"
+    fi
+}
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        --user)      MODE=user ;;
+        --system)    MODE=system ;;
+        --uninstall) UNINSTALL=true ;;
+        --dry-run)   DRY=true ;;
+        --init)      INIT=init ;;
+        --from)      [ $# -ge 2 ] || usage; FROM=$2; shift ;;
+        --name)      [ $# -ge 2 ] || usage; NAME=$2; shift ;;
+        --prefix)    [ $# -ge 2 ] || usage; PREFIX=$2; shift ;;
+        --env)       [ $# -ge 2 ] || usage
+                     case $2 in *=*) ;; *) die "--env wants KEY=VALUE, got $2" ;; esac
+                     ENVS="$ENVS
+$2"; shift ;;
+        -h|--help)   usage 0 ;;
+        *)           echo "install-service: unknown option $1" >&2; usage ;;
+    esac
+    shift
+done
+
+[ -n "$MODE" ] || usage
+[ -z "$INIT" ] || [ -z "$FROM" ] || die "--init and --from are alternatives"
+case $NAME in *[!A-Za-z0-9._-]*|"") die "bad --name: $NAME" ;; esac
+
+OS=$(uname -s)
+# For reviewing the other platform's output on this one: --dry-run only.
+if [ -n "${INSTALL_SERVICE_OS:-}" ]; then
+    $DRY || die "INSTALL_SERVICE_OS is only honoured with --dry-run"
+    OS=$INSTALL_SERVICE_OS
+fi
+[ -x "$ROOT/bin/ssb" ] || die "$ROOT does not look like an erlbutt release"
+
+# The data directory the node will use, as the node itself would decide:
+# ask sbutt, run in the same environment the service will have.  Printed
+# by `init`; here we only need to know whether an identity exists.
+has_identity() {
+    # $1 = command prefix to run sbutt as the service account ("" = as us)
+    # shellcheck disable=SC2046
+    $1 env $(env_args) "$BIN/sbutt" init --check >/dev/null 2>&1
+}
+
+env_args() {
+    printf '%s\n' "$ENVS" | sed '/^$/d'
+}
+
+# Checked once this service's own previous instance is stopped, so an
+# upgrade does not warn about the port it is itself about to release.
+warn_port() {
+    if ! $DRY && port_in_use; then
+        echo "install-service: warning: something already listens on the SSB" \
+             "port.  If that is another erlbutt, this one will fail to bind" \
+             "(set --env SSB_PORT=...)." >&2
+    fi
+}
+
+port_in_use() {
+    p=$(env_args | sed -n 's/^SSB_PORT=//p' | tail -1)
+    p=${p:-8008}
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1
+    elif command -v ss >/dev/null 2>&1; then
+        ss -ltn "sport = :$p" 2>/dev/null | grep -q LISTEN
+    else
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# --user
+# ---------------------------------------------------------------------------
+
+user_identity() {
+    if [ -n "$FROM" ]; then
+        say "adopting the identity in $FROM"
+        run env $(env_args) "$ROOT/bin/sbutt" init --from "$FROM"
+    elif [ -n "$INIT" ]; then
+        run env $(env_args) "$ROOT/bin/sbutt" init
+    fi
+}
+
+launchd_plist() {
+    cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Written by $ROOT/bin/install-service.  Re-run it rather than editing. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$ROOT/bin/ssb</string>
+    <string>foreground</string>
+  </array>
+  <key>WorkingDirectory</key><string>$ROOT</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SSB_LOG_LEVEL</key><string>info</string>
+EOF
+    env_args | while IFS= read -r kv; do
+        printf '    <key>%s</key><string>%s</string>\n' \
+            "$(xml "${kv%%=*}")" "$(xml "${kv#*=}")"
+    done
+    cat <<EOF
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <!-- Restart when it exits.  A node that REFUSES to start (data locked
+       by another node, a lost secret) exits non-zero too, and is retried
+       every ThrottleInterval seconds: the reason is in the log. -->
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <!-- The node has real work on the way down (SQLite checkpoints, the
+       mess_auth flush); launchd's default is 20s before SIGKILL. -->
+  <key>ExitTimeOut</key><integer>90</integer>
+  <key>StandardOutPath</key><string>$LOGFILE</string>
+  <key>StandardErrorPath</key><string>$LOGFILE</string>
+</dict>
+</plist>
+EOF
+}
+
+# bootout returns before the job has exited — the node is still flushing
+# its stores — and bootstrapping the same label meanwhile fails.  Wait
+# for it, as long as ExitTimeOut lets it take.
+wait_gone() {
+    i=0
+    while launchctl print "$1" >/dev/null 2>&1; do
+        i=$((i + 1))
+        [ $i -le 100 ] || die "$1 did not stop within 100s"
+        sleep 1
+    done
+}
+
+xml() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+systemd_user_unit() {
+    cat <<EOF
+# Written by $ROOT/bin/install-service.  Re-run it rather than editing.
+[Unit]
+Description=erlbutt SSB node ($NAME)
+After=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=$ROOT
+Environment=SSB_LOG_LEVEL=info
+EOF
+    env_args | while IFS= read -r kv; do
+        printf 'Environment="%s"\n' "$kv"
+    done
+    cat <<EOF
+ExecStart=$ROOT/bin/ssb foreground
+ExecStop=$ROOT/bin/ssb stop
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=30
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
+no_identity() {
+    # $1 = how to run sbutt, for the message
+    echo "install-service: no identity for this node yet, so nothing was" >&2
+    echo "installed (it would start at boot or login and mint a new one)." >&2
+    echo "Re-run with --init to create one, or --from DIR to adopt one," >&2
+    echo "or first:  $1 init   /   $1 init --from DIR" >&2
+    exit 1
+}
+
+install_user() {
+    BIN=$ROOT/bin
+    [ "$(id -u)" -ne 0 ] || die "--user is for your own account; run it without sudo"
+    user_identity
+    $DRY || has_identity "" || no_identity "$ROOT/bin/sbutt"
+
+    case $OS in
+        Darwin)
+            LABEL="org.erlbutt.$NAME"
+            PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+            LOGFILE="$HOME/Library/Logs/$NAME.log"
+            DOMAIN="gui/$(id -u)"
+            say "launchd agent $LABEL -> $PLIST"
+            launchd_plist | write "$PLIST" 644
+            # bootout first: bootstrap refuses a label that is loaded, and
+            # this is also how an upgrade picks up the new release path.
+            if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+                run launchctl bootout "$DOMAIN/$LABEL" || true
+                $DRY || wait_gone "$DOMAIN/$LABEL"
+            fi
+            warn_port
+            run launchctl bootstrap "$DOMAIN" "$PLIST"
+            logs="tail -f $LOGFILE  (and $ROOT/log/info.log)"
+            stop="launchctl bootout $DOMAIN/$LABEL"
+            ;;
+        Linux)
+            $DRY || command -v systemctl >/dev/null 2>&1 || die "no systemctl; --user needs systemd"
+            UNIT="$HOME/.config/systemd/user/$NAME.service"
+            say "systemd user unit -> $UNIT"
+            systemd_user_unit | write "$UNIT" 644
+            run systemctl --user daemon-reload
+            run systemctl --user enable "$NAME"
+            run systemctl --user stop "$NAME" 2>/dev/null || true
+            warn_port
+            run systemctl --user start "$NAME"
+            logs="journalctl --user -u $NAME -f  (and $ROOT/log/info.log)"
+            stop="systemctl --user stop $NAME"
+            echo "    note: a user unit stops when you log out unless you run" \
+                 "'loginctl enable-linger $(id -un)'"
+            ;;
+        *)
+            die "unsupported OS $OS"
+            ;;
+    esac
+
+    finish_user
+}
+
+finish_user() {
+    echo
+    say "started.  Check it with:  $ROOT/bin/sbutt whoami"
+    echo "    logs:  $logs"
+    echo "    stop:  $stop"
+    echo "    CLI on PATH:  ln -s $ROOT/bin/sbutt ~/.local/bin/sbutt  (or any dir on PATH)"
+}
+
+uninstall_user() {
+    case $OS in
+        Darwin)
+            LABEL="org.erlbutt.$NAME"
+            PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+            if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+                run launchctl bootout "gui/$(id -u)/$LABEL"
+                $DRY || wait_gone "gui/$(id -u)/$LABEL"
+            fi
+            [ ! -f "$PLIST" ] || run rm -f "$PLIST"
+            ;;
+        Linux)
+            UNIT="$HOME/.config/systemd/user/$NAME.service"
+            run systemctl --user disable --now "$NAME" || true
+            [ ! -f "$UNIT" ] || run rm -f "$UNIT"
+            run systemctl --user daemon-reload
+            ;;
+    esac
+    say "service removed.  The release and the data are untouched."
+}
+
+# ---------------------------------------------------------------------------
+# --system (Linux pub)
+# ---------------------------------------------------------------------------
+
+SVC_USER=erlbutt
+SVC_HOME=/var/lib/erlbutt
+ETC=/etc/erlbutt
+
+system_unit() {
+    cat <<EOF
+# Written by bin/install-service.  Re-run it rather than editing; see
+# doc/ops/erlbutt.service in the source tree for what each line is for.
+[Unit]
+Description=erlbutt SSB node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=$SVC_USER
+Group=$SVC_USER
+WorkingDirectory=$PREFIX
+# The data is \$HOME/.ssberl = $SVC_HOME/.ssberl (prod default; see
+# apps/ssb/src/ssb_paths.erl).  The cookie is \$HOME/.erlang.cookie.
+Environment=HOME=$SVC_HOME
+Environment=SSB_LOG_LEVEL=info
+Environment=SSB_NODE=ssb@127.0.0.1
+Environment=SSB_DIST_PORT=9100
+Environment=ERL_EPMD_ADDRESS=127.0.0.1
+EOF
+    env_args | while IFS= read -r kv; do
+        printf 'Environment="%s"\n' "$kv"
+    done
+    cat <<EOF
+EnvironmentFile=-$ETC/env
+ExecStart=$PREFIX/bin/ssb foreground
+ExecStop=$PREFIX/bin/ssb stop
+TimeoutStopSec=90
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=$SVC_HOME $PREFIX
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# The release, copied into the prefix.  New copy first, then swap, so a
+# failed copy leaves the running release alone; the old one is kept as
+# <prefix>.prev, which is the rollback (swap it back and restart).
+install_release() {
+    if [ "$ROOT" = "$(cd "$PREFIX" 2>/dev/null && pwd -P)" ]; then
+        say "release already at $PREFIX"
+        return
+    fi
+    if [ -d "$PREFIX/.ssberl" ] && [ ! -L "$PREFIX/.ssberl" ]; then
+        die "$PREFIX/.ssberl is a real directory: the data is inside the" \
+            "release.  Move it to $SVC_HOME/.ssberl first (stop the node," \
+            "then mv), or this upgrade would carry it into .prev."
+    fi
+    say "installing release $ROOT -> $PREFIX"
+    run rm -rf "$PREFIX.new"
+    run cp -Rp "$ROOT" "$PREFIX.new"
+    # The old layout's symlink to the data is carried over, so a unit that
+    # still sets SSB_HOME=$PREFIX keeps finding it.
+    if [ -L "$PREFIX/.ssberl" ]; then
+        run cp -P "$PREFIX/.ssberl" "$PREFIX.new/.ssberl"
+    fi
+    run chown -R "$SVC_USER:$SVC_USER" "$PREFIX.new"
+    if [ -d "$PREFIX" ]; then
+        run rm -rf "$PREFIX.prev"
+        run mv "$PREFIX" "$PREFIX.prev"
+    fi
+    run mv "$PREFIX.new" "$PREFIX"
+}
+
+# sbutt as the service account, with its HOME — where the data and the
+# cookie are.  The node is not running yet, so nothing else holds them.
+as_svc() {
+    if $DRY; then
+        echo "    sudo -H -u $SVC_USER env $(env_args | tr '\n' ' ')$PREFIX/bin/sbutt $*"
+    else
+        # shellcheck disable=SC2046
+        sudo -H -u "$SVC_USER" env $(env_args) "$PREFIX/bin/sbutt" "$@"
+    fi
+}
+
+system_identity() {
+    if [ -n "$FROM" ]; then
+        # Run as root: the source is usually in an admin's 0700 home,
+        # which the service account cannot read.  Then hand it over.
+        say "adopting the identity in $FROM"
+        run env HOME="$SVC_HOME" $(env_args) "$PREFIX/bin/sbutt" init --from "$FROM"
+        run chown -R "$SVC_USER:$SVC_USER" "$SVC_HOME"
+    elif [ -n "$INIT" ]; then
+        as_svc init
+    fi
+}
+
+install_system() {
+    BIN=$PREFIX/bin
+    if ! $DRY; then
+        [ "$OS" = Linux ] || die "--system is for a Linux pub; on $OS use --user"
+        [ "$(id -u)" -eq 0 ] || die "--system needs root: sudo $ROOT/bin/install-service --system ..."
+        command -v systemctl >/dev/null 2>&1 || die "no systemctl"
+    fi
+    UNIT=/etc/systemd/system/$NAME.service
+
+    if id "$SVC_USER" >/dev/null 2>&1; then
+        say "service account $SVC_USER exists"
+    else
+        nologin=$(command -v nologin || echo /usr/sbin/nologin)
+        say "creating service account $SVC_USER"
+        run useradd --system --home-dir "$SVC_HOME" --create-home \
+                    --shell "$nologin" "$SVC_USER"
+    fi
+    run install -d -o "$SVC_USER" -g "$SVC_USER" -m 750 "$SVC_HOME"
+    run install -d -o root -g "$SVC_USER" -m 750 "$ETC"
+
+    # Stop before swapping the release out from under it.
+    if ! $DRY && systemctl is-active --quiet "$NAME" 2>/dev/null; then
+        was_running=yes
+    else
+        was_running=no
+    fi
+    [ "$was_running" = no ] || run systemctl stop "$NAME"
+
+    install_release
+
+    system_identity
+    if ! $DRY && ! has_identity "sudo -H -u $SVC_USER"; then
+        [ "$was_running" = no ] || run systemctl start "$NAME"
+        no_identity "sudo -H -u $SVC_USER $PREFIX/bin/sbutt"
+    fi
+
+    if [ -f "$UNIT" ] && ! $DRY; then
+        if ! system_unit | cmp -s - "$UNIT"; then
+            say "replacing $UNIT (old one saved as $UNIT.bak)"
+            run cp -p "$UNIT" "$UNIT.bak"
+        fi
+    fi
+    say "systemd unit -> $UNIT"
+    system_unit | write "$UNIT" 644
+
+    say "wrappers -> /usr/local/bin/sbutt, /usr/local/bin/sbutt-console"
+    for w in sbutt sbutt-console; do
+        sed "s|^ERLBUTT_PREFIX=.*|ERLBUTT_PREFIX=$PREFIX|" "$ROOT/share/ops/$w" \
+            | write "/usr/local/bin/$w" 755
+    done
+
+    run systemctl daemon-reload
+    run systemctl enable "$NAME"
+    run systemctl start "$NAME"
+
+    echo
+    say "started.  Check it:  sbutt whoami   (and: sbutt health)"
+    echo "    logs:     journalctl -u $NAME -f   and   $PREFIX/log/info.log"
+    echo "    console:  sbutt-console   (leave with Ctrl-G q, never q().)"
+    echo "    firewall: open 8008/tcp only — never 4369 or 9100"
+    [ ! -d "$PREFIX.prev" ] || echo "    rollback: systemctl stop $NAME; mv $PREFIX $PREFIX.bad; mv $PREFIX.prev $PREFIX; systemctl start $NAME"
+}
+
+uninstall_system() {
+    BIN=$PREFIX/bin
+    if ! $DRY; then
+        [ "$(id -u)" -eq 0 ] || die "--system needs root"
+    fi
+    run systemctl disable --now "$NAME" || true
+    run rm -f "/etc/systemd/system/$NAME.service" /usr/local/bin/sbutt /usr/local/bin/sbutt-console
+    run systemctl daemon-reload
+    say "service removed.  Left in place: $PREFIX (release), $SVC_HOME (data" \
+        "and identity), $ETC, and the $SVC_USER account."
+}
+
+case $MODE in
+    user)   if $UNINSTALL; then uninstall_user;   else install_user;   fi ;;
+    system) if $UNINSTALL; then uninstall_system; else install_system; fi ;;
+esac
