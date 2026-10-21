@@ -299,15 +299,14 @@ failure, so it works as a post-deploy gate. `sbutt census encoding` reads
 the logs directly without connecting, so it is safe against a live node
 when you want an independent count of what is actually stored.
 
-`sbutt.escript` needs no installing — a relx overlay ships it at the
-release root, where `bin/ssb escript` looks (`relx_escript` prepends
-`$ROOTDIR`). The `/usr/local/bin/sbutt` wrapper runs it as the `erlbutt`
-account, which is required: `.ssberl/secret` is mode 600 owned by that
-user, and every command that opens a connection reads it. The wrapper also
-sources `/etc/erlbutt/env` when it exists, because `vm.args.src` means
-**every** `bin/ssb` invocation re-expands `vm.args` from the current
-environment, and a different `SSB_NODE` or `SSB_DIST_PORT` would leave the
-node's args wrong on disk.
+The CLI needs no installing — the release ships it as `bin/sbutt`, a
+launcher for a prebuilt `sbutt.escript` that runs on the bundled ERTS (no
+system Erlang, no compiler). The `/usr/local/bin/sbutt` wrapper runs it as
+the `erlbutt` account, which is required: `.ssberl/secret` is mode 600
+owned by that user, and every command that opens a connection reads it.
+The wrapper also sources `/etc/erlbutt/env` when it exists, so the CLI sees
+the same `SSB_PORT` / `SSB_DATA` as the node. (On a personal machine, where
+the node runs as you, skip the wrapper and symlink `bin/sbutt` onto PATH.)
 
 Finally, confirm the pub is reachable *as a peer*, not merely listening.
 `nc -vz <host> 8008` proves the port is open; only a real handshake proves

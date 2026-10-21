@@ -1,0 +1,50 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Copyright (C) 2026 Charles Moid
+#
+# bin/sbutt — the erlbutt CLI, run from the release it belongs to.
+#
+#   sbutt whoami
+#   sbutt health
+#
+# Put it on your PATH with a symlink, e.g.
+#
+#   ln -s /opt/erlbutt/bin/sbutt ~/.local/bin/sbutt
+#
+# and it still finds its release: symlinks are followed back to the real
+# file before the root is worked out.  The CLI therefore always comes from
+# the same release as the node, and uses the node's own data (located the
+# way the node locates it — apps/ssb/src/ssb_paths.erl).
+#
+# It runs the release's bundled escript directly rather than going through
+# `bin/ssb escript`.  That needs no compiler (sbutt.escript is prebuilt),
+# and it skips the relx start script, which re-expands vm.args from the
+# caller's environment on every call and can print its own notices onto
+# stdout, in the middle of output piped to jq.
+set -eu
+
+self=$0
+while [ -L "$self" ]; do
+    link=$(readlink "$self")
+    case $link in
+        /*) self=$link ;;
+        *)  self=$(dirname "$self")/$link ;;
+    esac
+done
+root=$(cd "$(dirname "$self")/.." && pwd -P)
+
+# Bundled ERTS in a packaged release; a dev release (include_erts=false)
+# uses whatever escript is on PATH, as the node itself does.
+escript=
+for e in "$root"/erts-*/bin/escript; do
+    [ -x "$e" ] && escript=$e && break
+done
+if [ -z "$escript" ]; then
+    escript=$(command -v escript) || {
+        echo "sbutt: no bundled ERTS in $root and no escript on PATH" >&2
+        exit 1
+    }
+fi
+
+exec "$escript" "$root/sbutt.escript" "$@"

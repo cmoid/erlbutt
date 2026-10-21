@@ -18,12 +18,15 @@
 %%   export          Write feeds + their blobs out as a portable bundle
 %%   import          Verify and load a bundle into the running node
 %%
-%% The escript connects to the local erlbutt node on port 8008 using the
+%% The escript connects to the local erlbutt node on port 8008 (or SSB_PORT) using the
 %% node's own secret key, found the same way the node finds it (ssb_paths) (same approach as sbot in Node.js: two processes,
 %% one SHS connection, same identity on both sides).
 
 -define(INFO(Fmt, Args), io:format(Fmt, Args)).
--define(PORT, 8008).
+%% The node's listen port, overridable with SSB_PORT exactly as the node's
+%% own is (config/sys.config.src), so a CLI and node started in the same
+%% environment agree — a second node on 8009 is reachable as itself.
+-define(DEFAULT_PORT, "8008").
 
 %% Idle timeout while draining a source stream: how long to wait for the
 %% NEXT frame, not for the whole stream.  A long history keeps arriving, so
@@ -178,9 +181,15 @@ add_code_paths(SSBHome) ->
 connect() ->
     %% Both sides share the same key — we're connecting to ourselves locally.
     RemotePk = base64:decode(keys:pub_key()),
-    case ssb_peer:start("localhost", ?PORT, RemotePk) of
+    case ssb_peer:start("localhost", port(), RemotePk) of
         {ok, Peer} -> {ok, Peer};
         Err        -> {error, Err}
+    end.
+
+port() ->
+    case os:getenv("SSB_PORT") of
+        P when is_list(P), P =/= "" -> list_to_integer(P);
+        _ -> list_to_integer(?DEFAULT_PORT)
     end.
 
 %%% Commands ---------------------------------------------------------------

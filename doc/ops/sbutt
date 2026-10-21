@@ -12,9 +12,11 @@
 # Install once:
 #   sudo install -m 0755 doc/ops/sbutt /usr/local/bin/sbutt
 #
-# sbutt.escript itself needs no installing — a relx overlay ships it at the
-# release root, so extracting the tarball puts it where `bin/ssb escript`
-# looks and the CLI is always the same vintage as the node.
+# The CLI itself needs no installing — the release ships it as bin/sbutt
+# (plus a prebuilt sbutt.escript at its root), so the CLI is always the
+# same vintage as the node.  On a personal machine, symlink bin/sbutt onto
+# PATH and you are done; this wrapper is for a pub, where the node runs as
+# a separate service account.
 #
 # Three things this exists to get right, all of them easy to forget:
 #
@@ -31,10 +33,9 @@
 #     makes HOME the service account's, which is where the node's
 #     .erlang.cookie lives.
 #
-#  3. It goes through `bin/ssb escript` rather than a system escript, so
-#     it uses the ERTS bundled in the release.  Nothing needs to be on
-#     PATH and it survives an OTP upgrade.  The script path is relative to
-#     the release root on purpose: relx_escript prepends $ROOTDIR.
+#  3. It runs the release's bin/sbutt, which uses the ERTS bundled in the
+#     release.  Nothing needs to be on PATH and it survives an OTP upgrade.
+#     It does not go through bin/ssb, so it no longer re-expands vm.args.
 #
 # The env file, if any, is root:erlbutt 0640, so the service account reads
 # it itself — nothing secret passes through this script's arguments.
@@ -53,5 +54,5 @@ exec sudo -H -u erlbutt sh -c '
     set +a
     : "${SSB_HOME:=/opt/erlbutt}"
     export SSB_HOME
-    exec "$SSB_HOME/bin/ssb" escript sbutt.escript "$@"
+    exec "$SSB_HOME/bin/sbutt" "$@"
 ' sbutt "$@"

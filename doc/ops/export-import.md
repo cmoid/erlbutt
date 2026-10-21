@@ -47,7 +47,7 @@ sbutt export DIR                  # your own feed
 sbutt export DIR @a... @b...      # these feeds instead
 ```
 
-On a release install, run it as `bin/ssb escript sbutt.escript export ...`.
+On a release install, run it as `bin/sbutt export ...`.
 `DIR` must not exist yet. The bundle is built in `DIR.partial` and renamed
 into place at the end, so `DIR` only ever appears complete.
 
@@ -148,7 +148,7 @@ handlers in-process, so the directory is likewise on the node's machine.
 
 ```sh
 # on the VPS
-cd /opt/erlbutt && bin/ssb escript sbutt.escript export /tmp/moid-export
+sbutt export /tmp/moid-export        # the /usr/local/bin wrapper: runs as erlbutt
 tar czf /tmp/moid-export.tgz -C /tmp moid-export
 
 # on the laptop
