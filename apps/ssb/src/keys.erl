@@ -13,6 +13,8 @@
 
 %% API
 -export([start_link/0,
+         check_secret/1,
+         prior_identity/1,
          pub_key/0,
          pub_key_disp/0,
          priv_key/0,
@@ -59,8 +61,8 @@ init([]) ->
         {ok, {PubKey, PrivKey}} ->
             {ok, #state{pub_key = PubKey, priv_key = PrivKey}};
         first_time ->
-            {PubKey, PrivKey} = init_secret(),
-            {ok, #state{pub_key = PubKey, priv_key = PrivKey}};
+            first_time(prior_identity(?b2l(config:ssb_repo_loc())),
+                       application:get_env(ssb, mint_identity, true));
         {error, Reason} ->
             ?LOG_ERROR("keys: refusing to start, unusable secret ~s: ~p",
                        [secret_file(), Reason]),
@@ -92,6 +94,57 @@ terminate(_Reason, _State) ->
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
+
+%% No secret.  Mint one only when nothing says this directory was ever
+%% someone's.  A data directory with feeds or an own_feed record but no
+%% secret is a lost or misplaced key — a broken symlink, a partial copy,
+%% a restore that missed one file — and minting there is the worst thing
+%% the node can do: it boots fine, under a new id, with the old one's
+%% follows and history around it and nothing pointing at the mistake.
+first_time(none, true) ->
+    {PubKey, PrivKey} = init_secret(),
+    {ok, #state{pub_key = PubKey, priv_key = PrivKey}};
+first_time(none, false) ->
+    %% a client (sbutt) pointed at a directory with no identity in it
+    {stop, no_identity};
+first_time({previous, Evidence}, _) ->
+    ?LOG_ERROR("keys: REFUSING TO START: ~s has no secret, but was "
+               "already in use (~0p).  Minting a new identity here would "
+               "orphan the old one.  Restore the secret, or point the node "
+               "at a fresh data directory (SSB_DATA).",
+               [config:ssb_repo_loc(), Evidence]),
+    {stop, {secret_missing, Evidence}}.
+
+%% none | {previous, Evidence}: what in RepoDir shows an identity lived
+%% here.  Both signals only ever appear after a key existed — feed logs
+%% need replication or publishing, and own_heads is written at the moment
+%% of minting — so a first boot that crashed before minting (store.db and
+%% data_version already written) is still a first boot.
+prior_identity(RepoDir) ->
+    Ids = case file:consult(filename:join(RepoDir, "own_heads")) of
+              {ok, [Rec]} when is_map(Rec) -> maps:keys(Rec);
+              _ -> []
+          end,
+    Feeds = length(filelib:wildcard(filename:join([RepoDir, "feeds", "*", "*"]))),
+    case {Ids, Feeds} of
+        {[], 0} -> none;
+        _       -> {previous, #{identities => Ids, feeds => Feeds}}
+    end.
+
+%% {ok, DisplayId} | {error, Reason} — validate a secret file without
+%% loading it into a running server.  For `sbutt init --from`.
+check_secret(File) ->
+    case file:open(File, [read]) of
+        {error, Reason} ->
+            {error, {unreadable, Reason}};
+        {ok, IoDevice} ->
+            try parse_secret(iolist_to_binary(read_non_comment_lines(IoDevice))) of
+                {ok, {Pub, _}} -> {ok, display_pub(Pub)};
+                Err            -> Err
+            after
+                file:close(IoDevice)
+            end
+    end.
 
 %%%===================================================================
 %%% Internal functions
@@ -168,6 +221,11 @@ read_non_comment_lines(IoDevice) ->
 init_secret() ->
     {Pub, Priv} = shs:create_long_pair(),
     SecretFileName = check_secret_file(),
+    %% 0600 before a byte of key material goes in: the default umask
+    %% leaves it world-readable, and the docs' "mode 600" was only ever
+    %% true where someone had run chmod by hand.
+    ok = file:write_file(SecretFileName, <<>>),
+    ok = file:change_mode(SecretFileName, 8#600),
     file:write_file(SecretFileName, prelude(), [append]),
     JsonDoc = make_json({Pub, Priv}),
     file:write_file(SecretFileName, JsonDoc, [append]),
@@ -319,7 +377,61 @@ boot_test_() ->
               fun() ->
                       %% absent is not bad: a first boot mints one
                       ?assertMatch({ok, _}, gen_server:start({local, keys}, keys, [], [])),
-                      ?assertMatch({ok, _}, fetch_key())
+                      ?assertMatch({ok, _}, fetch_key()),
+                      {ok, Info} = file:read_file_info(secret_file()),
+                      ?assertEqual(8#600, element(8, Info) band 8#777)
+              end
+      end,
+      fun(_) ->
+              fun() ->
+                      %% a first boot that crashed after the store was
+                      %% created but before minting is still a first boot
+                      Repo = ?b2l(config:ssb_repo_loc()),
+                      ok = file:write_file(Repo ++ "store.db", ~""),
+                      ok = file:write_file(Repo ++ "data_version", ~"1\n"),
+                      ?assertMatch({ok, _}, gen_server:start({local, keys}, keys, [], []))
+              end
+      end,
+      fun(_) ->
+              fun() ->
+                      %% feed logs but no secret: a lost key, not a new node
+                      Log = ?b2l(config:ssb_repo_loc()) ++ "feeds/AB/CDEF/log.offset",
+                      ok = filelib:ensure_dir(Log),
+                      ok = file:write_file(Log, ~""),
+                      ?assertMatch({error, {secret_missing, #{feeds := 1}}},
+                                   gen_server:start({local, keys}, keys, [], [])),
+                      ?assertNot(filelib:is_file(secret_file()))
+              end
+      end,
+      fun(_) ->
+              fun() ->
+                      %% the own_feed record names who lived here
+                      ok = own_feed:seed_record(~"@old.ed25519"),
+                      ?assertMatch({error, {secret_missing,
+                                            #{identities := [~"@old.ed25519"]}}},
+                                   gen_server:start({local, keys}, keys, [], []))
+              end
+      end,
+      fun(_) ->
+              fun() ->
+                      %% a client may not mint at all
+                      application:set_env(ssb, mint_identity, false),
+                      try
+                          ?assertEqual({error, no_identity},
+                                       gen_server:start({local, keys}, keys, [], []))
+                      after
+                          application:unset_env(ssb, mint_identity)
+                      end
+              end
+      end,
+      fun(_) ->
+              fun() ->
+                      {Pub, Priv} = pair(),
+                      ok = file:write_file(secret_file(), secret_body(Pub, Priv)),
+                      ?assertEqual({ok, display_pub(?l2b(base_64(Pub)))},
+                                   check_secret(secret_file())),
+                      ?assertMatch({error, {unreadable, enoent}},
+                                   check_secret(secret_file() ++ ".nope"))
               end
       end]}.
 

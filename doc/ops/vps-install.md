@@ -162,6 +162,17 @@ consequence when it does go missing is the worst one available: the node
 boots, finds no `secret`, and mints a new identity. §7's `whoami` is what
 catches that.
 
+Since Oct 2026 the node refuses to mint in a directory that shows an
+identity lived there: feed logs, or the `own_heads` record written at
+minting. A missing or misplaced `secret` next to real data is reported
+and the node stops. A directory that is genuinely *empty* (the symlink
+target gone) still looks like a first boot, so `whoami` remains the
+check. `sbutt init` before the first start makes the identity, and the
+data directory it lives in, something you see rather than infer. The node
+also takes `<data>/LOCK` at start, so a second node on the same data
+(a hand-started console next to the systemd unit) refuses to start
+instead of forking the feed.
+
 ## 5. Build and install
 
 Build on the box. It takes about a minute and sidesteps every
@@ -222,8 +233,18 @@ booting with an empty `.ssberl` generates a fresh one.
 
 ## 6. Starting with an existing identity
 
-Skip this for a brand new pub; `systemctl start` will mint an identity and
-you are done.
+Skip this for a brand new pub: `sudo -H -u erlbutt /opt/erlbutt/bin/sbutt
+init` creates the identity and prints it (or let the first `systemctl
+start` do it).
+
+When the old data directory is readable on this machine, `sbutt init
+--from DIR` does the adoption in one checked step. It refuses a source in
+use by a running node, a source from a newer erlbutt, a JS `~/.ssb`
+(that's a conversion, see `ssb-conversion.md`), and a destination that
+already holds data or an identity. It copies with `cp -Rp`, sets the
+secret to 0600, and verifies the copy's secret before reporting the id.
+Run as `erlbutt`, the copy ends up owned by `erlbutt`, so step 3's
+`chown` isn't needed. The procedure below is the cross-host version.
 
 To carry an existing pub across, copy `.ssberl` from the old host. Ordering
 matters: copying live state out from under a running node gives you a torn

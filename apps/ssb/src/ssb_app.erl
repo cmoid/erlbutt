@@ -25,9 +25,30 @@ start(_StartType, _StartArgs) ->
     %% against data written by a newer build.  Not binding the port is part
     %% of not running — a half-started node that answers peers while
     %% declining to read its own floors is worse than one that stopped.
-    case data_version:check() of
-        ok               -> start_node(LogLevel);
-        {error, _} = Err -> Err
+    %%
+    %% And before even that: one node per data directory (store_lock).
+    Dir = ssb_paths:repo_dir(),
+    case store_lock:acquire(Dir) of
+        ok ->
+            case data_version:check() of
+                ok ->
+                    case start_node(LogLevel) of
+                        {ok, _} = Ok -> Ok;
+                        Err          -> _ = store_lock:release(Dir), Err
+                    end;
+                {error, _} = Err ->
+                    _ = store_lock:release(Dir),
+                    Err
+            end;
+        {error, {locked, Holder}} = Err ->
+            ?SSB_ERROR("REFUSING TO START: ~s is in use by another erlbutt "
+                       "node (~p).  Two nodes on one store fork the "
+                       "identity.  Stop that one first; if it is truly "
+                       "gone, delete ~sLOCK.", [Dir, Holder, Dir]),
+            Err;
+        {error, Reason} = Err ->
+            ?SSB_ERROR("REFUSING TO START: cannot lock ~s: ~p", [Dir, Reason]),
+            Err
     end.
 
 start_node(_LogLevel) ->
@@ -43,6 +64,7 @@ start_node(_LogLevel) ->
     ssb_sup:start_link().
 
 stop(_State) ->
+    _ = store_lock:release(ssb_paths:repo_dir()),
     ok.
 
 -ifdef(TEST).

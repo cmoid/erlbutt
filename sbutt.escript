@@ -8,6 +8,7 @@
 %%   sbot <command> [args...]
 %%
 %% Commands:
+%%   init            Create this node's identity, or adopt one (--from DIR)
 %%   whoami          Show the local node's SSB identity
 %%   id              Alias for whoami
 %%   ping            Ping the local node
@@ -33,6 +34,8 @@
 %% a total timeout would abort a perfectly healthy fetch.
 -define(STREAM_IDLE_MS, 30000).
 
+main(["init"])            -> cmd_init();
+main(["init", "--from", Src]) -> cmd_init_from(Src);
 main(["health"])          -> run(fun cmd_health/1);
 main(["census", "encoding" | Args]) ->
     run_local(fun() -> cmd_census_encoding(Args) end);
@@ -109,7 +112,7 @@ run_local(CmdFun) ->
 
 setup() ->
     init_paths(),
-    {ok, _} = keys:start_link(),
+    start_keys(),
     {ok, _} = network_id_cache:start_link(),
     %% ssb_peer is a full bidirectional peer, so the node we call answers
     %% back — in particular with blob `createWants`, which the connection
@@ -124,6 +127,36 @@ setup() ->
     %% ssb_store that guess turned into a boot crash on every invocation,
     %% because a client has no business opening the node's database.
     {ok, _} = blobs:start_link().
+
+%% Load the node's identity, never create one.  A client minting a secret
+%% wherever it happened to look is how a typo in SSB_DATA used to become a
+%% second identity; creating one is `sbutt init`, on purpose.
+start_keys() ->
+    application:set_env(ssb, mint_identity, false),
+    Old = process_flag(trap_exit, true),
+    %% A refused start is reported below, in words; the gen_server's crash
+    %% report for it would only bury that.
+    #{level := Level} = logger:get_primary_config(),
+    logger:set_primary_config(level, none),
+    Started = keys:start_link(),
+    logger:set_primary_config(level, Level),
+    case Started of
+        {ok, _} ->
+            process_flag(trap_exit, Old),
+            ok;
+        {error, no_identity} ->
+            io:format(standard_error,
+                      "No identity in ~s.~n"
+                      "Create one with `sbutt init` (or adopt an existing "
+                      "one with `sbutt init --from DIR`), or set SSB_DATA if "
+                      "the node keeps its data elsewhere.~n",
+                      [config:ssb_repo_loc()]),
+            erlang:halt(1);
+        {error, Reason} ->
+            io:format(standard_error, "Cannot load the identity in ~s: ~p~n",
+                      [config:ssb_repo_loc(), Reason]),
+            erlang:halt(1)
+    end.
 
 %% Find the release, then let ssb_paths find the data exactly as the node
 %% does — so the CLI uses the node's keys without being told where they
@@ -630,6 +663,169 @@ fmt_uptime(Ms) when is_integer(Ms) ->
 fmt_uptime(_) ->
     "?".
 
+%% sbutt init — create the identity for this node's data directory.
+%%
+%% The node would mint one on first start anyway; doing it here first means
+%% the id is known (and can be backed up) before anything runs, and that
+%% the directory the node will use is the one you meant.  Refuses wherever
+%% the node itself would refuse: a directory that held an identity before
+%% and has lost its secret is a lost key, not a new node.
+cmd_init() ->
+    init_paths(),
+    Repo = binary_to_list(config:ssb_repo_loc()),
+    Secret = Repo ++ "secret",
+    case filelib:is_regular(Secret) of
+        true ->
+            case keys:check_secret(Secret) of
+                {ok, Id} ->
+                    io:format("Already initialised: ~s~n  data: ~s~n", [Id, Repo]);
+                {error, Reason} ->
+                    die("~s exists but is unusable (~p); not touching it.~n",
+                        [Secret, Reason])
+            end;
+        false ->
+            case keys:prior_identity(Repo) of
+                {previous, Evidence} ->
+                    die("~s has no secret but was already in use (~0p).~n"
+                        "Restore its secret rather than creating a new "
+                        "identity over it, or set SSB_DATA to a fresh "
+                        "directory.~n", [Repo, Evidence]);
+                none ->
+                    {ok, _} = keys:start_link(),
+                    io:format("Created ~s~n  data: ~s~n"
+                              "Back up ~s now: it IS the identity, and "
+                              "nothing can recover it.~n",
+                              [keys:pub_key_disp(), Repo, Secret])
+            end
+    end.
+
+%% sbutt init --from DIR — adopt an existing erlbutt data directory.
+%%
+%% DIR is a .ssberl, or a directory holding one (an old SSB_HOME).  The
+%% copy is checked before and after: the source must have a usable secret,
+%% must not be in use by a node, and must not be from a newer erlbutt; the
+%% destination must not already be anyone's.  It copies rather than moves,
+%% so the source is a rollback until you delete it — but it holds the same
+%% identity, so it must never run again alongside this one.
+cmd_init_from(Src0) ->
+    init_paths(),
+    Dest = binary_to_list(config:ssb_repo_loc()),
+    Src = adopt_source(Src0),
+    same_dir(Src, Dest) andalso
+        die("~s is already this node's data directory.~n", [Src]),
+    Id = case keys:check_secret(filename:join(Src, "secret")) of
+             {ok, I} -> I;
+             {error, R} -> die("The secret in ~s is unusable: ~p~n", [Src, R])
+         end,
+    case store_lock:holder(Src) of
+        {live, Holder} ->
+            die("~s is in use by a running node (~0p).~n"
+                "Stop it first.  If it is truly gone (e.g. it crashed on "
+                "another machine), delete ~s/LOCK.~n", [Src, Holder, Src]);
+        _ ->
+            ok
+    end,
+    case read_data_version(Src) of
+        V when is_integer(V) ->
+            V > data_version:current() andalso
+                die("~s was written by a newer erlbutt (data version ~p; "
+                    "this one understands ~p).  Upgrade first.~n",
+                    [Src, V, data_version:current()]);
+        _ ->
+            ok
+    end,
+    case filelib:is_regular(filename:join(Dest, "secret")) of
+        true ->
+            {ok, Existing} = keys:check_secret(filename:join(Dest, "secret")),
+            die("~s already holds the identity ~s.~n"
+                "Move it aside first if you mean to replace it.~n",
+                [Dest, Existing]);
+        false ->
+            ok
+    end,
+    has_files(Dest) andalso
+        die("~s is not empty.  Move it aside, or set SSB_DATA to an "
+            "empty directory.~n", [Dest]),
+    io:format("Copying ~s~n     to ~s ...~n", [Src, Dest]),
+    copy_tree(Src, Dest),
+    _ = file:delete(filename:join(Dest, "LOCK")),
+    ok = file:change_mode(filename:join(Dest, "secret"), 8#600),
+    case keys:check_secret(filename:join(Dest, "secret")) of
+        {ok, Id} ->
+            io:format("Adopted ~s~n  data: ~s~n"
+                      "~s still holds the same identity.  Keep it only as a "
+                      "cold backup: never run a node on it again while this "
+                      "one exists.~n", [Id, Dest, Src]);
+        Other ->
+            die("Copy finished but the secret in ~s does not verify (~p).~n",
+                [Dest, Other])
+    end.
+
+%% The .ssberl itself, or a directory with one in it.  A JS ssb directory
+%% has a secret too, but its data is a flume log, which is a conversion.
+adopt_source(Dir0) ->
+    Dir = filename:absname(Dir0),
+    Nested = filename:join(Dir, ".ssberl"),
+    Src = case {filelib:is_regular(filename:join(Dir, "secret")),
+                filelib:is_regular(filename:join(Nested, "secret"))} of
+              {true, _}      -> Dir;
+              {false, true}  -> Nested;
+              {false, false} -> die("No secret in ~s (or ~s).~n", [Dir, Nested])
+          end,
+    filelib:is_dir(filename:join(Src, "flume")) andalso
+        die("~s looks like a JS ssb directory (it has flume/), not an "
+            "erlbutt one.  See doc/ops/ssb-conversion.md.~n", [Src]),
+    Src.
+
+same_dir(A, B) ->
+    real(A) =:= real(B).
+
+real(Dir) ->
+    {ok, Cwd} = file:get_cwd(),
+    try ok = file:set_cwd(Dir), {ok, R} = file:get_cwd(), R
+    catch _:_ -> filename:absname(Dir)
+    after file:set_cwd(Cwd)
+    end.
+
+read_data_version(Dir) ->
+    case file:read_file(filename:join(Dir, "data_version")) of
+        {ok, B} -> try binary_to_integer(string:trim(B)) catch _:_ -> bad end;
+        _       -> none
+    end.
+
+%% Any regular file at all.  The empty feeds/ and blobs/ directories that
+%% config creates on start do not make a directory "in use".
+has_files(Dir) ->
+    try
+        filelib:fold_files(Dir, ".*", true,
+                           fun(_, _) -> throw(found) end, false)
+    catch throw:found -> true
+    end.
+
+%% cp, not a copy loop: the data can be tens of gigabytes, and cp keeps
+%% modes and times (-p) and copies symlinks as links.  "Src/." copies the
+%% contents into Dest, which BSD and GNU cp both understand.
+copy_tree(Src, Dest) ->
+    ok = filelib:ensure_dir(filename:join(Dest, "x")),
+    Cp = os:find_executable("cp"),
+    Port = open_port({spawn_executable, Cp},
+                     [exit_status, stderr_to_stdout,
+                      {args, ["-Rp", filename:join(Src, "."), Dest]}]),
+    case collect(Port, []) of
+        {0, _} -> ok;
+        {N, Out} -> die("cp failed (~p): ~s~n", [N, Out])
+    end.
+
+collect(Port, Acc) ->
+    receive
+        {Port, {data, D}}        -> collect(Port, [Acc, D]);
+        {Port, {exit_status, N}} -> {N, lists:flatten(Acc)}
+    end.
+
+die(Fmt, Args) ->
+    io:format(standard_error, Fmt, Args),
+    erlang:halt(1).
+
 cmd_whoami(Peer) ->
     case ssb_peer:rpc_call(Peer, [<<"whoami">>], <<"async">>) of
         {ok, Body} ->
@@ -826,6 +1022,8 @@ parse_kv([], Acc)                          -> Acc.
 usage() ->
     io:format("Usage: sbot <command> [args...]~n~n"),
     io:format("Commands:~n"),
+    io:format("  init                          Create this node's identity~n"),
+    io:format("  init --from DIR               Adopt an existing .ssberl (copied)~n"),
     io:format("  whoami                        Show local SSB identity~n"),
     io:format("  id                            Alias for whoami~n"),
     io:format("  ping                          Ping local erlbutt node~n"),
