@@ -140,6 +140,18 @@ release directory and the data sits inside the thing you replace on
 upgrade. So `SSB_HOME` is the release root, `.ssberl` under it is a symlink
 out to `/var/lib/erlbutt`, and node and CLI agree on one value.
 
+> **Since Oct 2026 this is no longer necessary, only still supported.**
+> The node and `sbutt.escript` now find the release from where they are
+> installed, and the data directory is resolved separately
+> (`apps/ssb/src/ssb_paths.erl`). In order: `SSB_DATA`, then a legacy
+> `SSB_HOME` (meaning `$SSB_HOME/.ssberl`, as before), then an existing
+> `<release>/.ssberl`, then the `prod` default `~/.ssberl`. Since the unit
+> sets `HOME=/var/lib/erlbutt`, a new install can drop both
+> `SSB_HOME` and the symlink, and the data lands in
+> `/var/lib/erlbutt/.ssberl` anyway. Settings you want to keep across
+> upgrades go in `<data>/ssb.cfg`, which is layered over the release's
+> `ssb.cfg` (everything except `data_dir`).
+
 Extracting a release tarball over `/opt/erlbutt` does **not** disturb the
 symlink — the tarball contains no `.ssberl` path. It is lost only if a
 deploy removes the directory first (`rm -rf /opt/erlbutt`). But the

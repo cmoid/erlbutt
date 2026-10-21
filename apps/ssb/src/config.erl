@@ -239,8 +239,10 @@ set_archive_length(undefined) ->
 set_archive_length(Len) when is_integer(Len), Len > 0 ->
     gen_server:call(?MODULE, {set_archive_length, Len}, infinity).
 
+%% The release's own ssb.cfg, found from the release root rather than the
+%% working directory (see ssb_paths).
 start_link() ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, ["ssb.cfg"], []).
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [ssb_paths:release_cfg()], []).
 
 start_link(Config) ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [Config], []).
@@ -252,24 +254,63 @@ start_link(Config) ->
 init([Config]) ->
     process_flag(trap_exit, true),
     ets:new(?TABLE, [named_table, protected, set, {read_concurrency, true}]),
-    SSBHome = application:get_env(ssb, ssb_home, "."),
+    RepoLoc = ssb_paths:repo_dir(Config),
     %% Room settings default from application env; a cfg-file entry overrides.
-    Base = #config{ssb_home = SSBHome,
+    Base = #config{ssb_home = ssb_paths:release_root(),
+                   repo_loc = RepoLoc,
+                   feed_loc = <<RepoLoc/binary, "feeds/">>,
+                   blob_loc = <<RepoLoc/binary, "blobs/">>,
                    net_id = default_net_id(),
                    room = application:get_env(ssb, room, false),
                    room_name = application:get_env(ssb, room_name, <<"erlbutt room">>),
                    room_privacy = application:get_env(ssb, room_privacy, open),
                    replication_hops = application:get_env(ssb, replication_hops,
                                                           ?DEFAULT_REPLICATION_HOPS)},
-    Cfg = case filelib:is_file(Config) of
-              true ->
-                  load_and_parse(Config, Base#config{repo_loc = default_repo(SSBHome)});
-              false ->
-                  Base#config{repo_loc = default_repo(SSBHome),
-                              feed_loc = default_feed_store(SSBHome),
-                              blob_loc = default_blob_store(SSBHome)}
-          end,
-    {ok, publish(load_overrides(Cfg))}.
+    %% Defaults, then the release's ssb.cfg, then the user's, then the
+    %% runtime overrides — each layer wins over the one before.
+    Cfg = load_overrides(load_user_cfg(Config, load_if_present(Config, Base))),
+    ok = filelib:ensure_dir(Cfg#config.feed_loc),
+    ok = filelib:ensure_dir(Cfg#config.blob_loc),
+    {ok, publish(Cfg)}.
+
+load_if_present(File, Cfg) ->
+    case filelib:is_file(File) of
+        true  -> load_and_parse(File, Cfg);
+        false -> Cfg
+    end.
+
+%% <data>/ssb.cfg: the operator's settings.
+%%
+%% The release's ssb.cfg is a relx template rendered into the release
+%% directory, so hand-edits to it are lost on the next upgrade.  This one
+%% lives with the data, where a redeploy cannot reach it.  Same terms as
+%% the release file, except data_dir — the location of this file cannot be
+%% decided by its own contents.
+%%
+%% Unlike overrides.cfg, a broken one stops the node.  It is written by a
+%% person on purpose and may hold the network id; starting on the release
+%% defaults instead would quietly put the node on a different network.
+load_user_cfg(ReleaseCfg, #config{repo_loc = RepoLoc} = Cfg) ->
+    File = filename:join(?b2l(RepoLoc), "ssb.cfg"),
+    case filelib:is_file(File) andalso not same_file(File, ReleaseCfg) of
+        false ->
+            Cfg;
+        true ->
+            case file:consult(File) of
+                {ok, Terms} ->
+                    [?SSB_ERROR("config: data_dir in ~s is ignored; set it "
+                                "with SSB_DATA instead", [File])
+                     || {data_dir, _} <- Terms],
+                    parse_terms(Terms, Cfg);
+                {error, Reason} ->
+                    ?SSB_ERROR("config: cannot read ~s: ~s",
+                               [File, file:format_error(Reason)]),
+                    exit({bad_config, File, Reason})
+            end
+    end.
+
+same_file(A, B) ->
+    filename:absname(A) =:= filename:absname(B).
 
 %% Settings changed at runtime, layered on top of ssb.cfg.
 %%
@@ -384,9 +425,16 @@ get_config() ->
 
 load_and_parse(CfgFile, #config{} = Cfg) ->
     {ok, CfgTerms} = file:consult(CfgFile),
+    parse_terms(CfgTerms, Cfg).
+
+parse_terms(CfgTerms, #config{} = Cfg) ->
     lists:foldl(fun(CfgTerm, CfgIn) ->
                         parse(CfgTerm, CfgIn)
                 end, Cfg, CfgTerms).
+
+%% Consumed by ssb_paths before any of this runs; nothing to do here.
+parse({data_dir, _}, Cfg) ->
+    Cfg;
 
 parse({feed_store_location, Loc}, #config{repo_loc = RepLoc} = Cfg) ->
     Store = ?l2b(?b2l(RepLoc) ++ Loc),
@@ -444,19 +492,6 @@ parse(Any, Cfg) ->
     %% rather than silently drop it, so the setting being ignored is visible.
     ?SSB_ERROR("config: ignoring unrecognised term ~p", [Any]),
     Cfg.
-
-default_repo(SSBHome) ->
-    ?l2b(SSBHome ++ "/.ssberl/").
-
-default_feed_store(SSBHome) ->
-    DataStore = ?l2b(SSBHome ++ "/.ssberl/feeds/"),
-    filelib:ensure_dir(DataStore),
-    DataStore.
-
-default_blob_store(SSBHome) ->
-    DataStore = ?l2b(SSBHome ++ "/.ssberl/blobs/"),
-    filelib:ensure_dir(DataStore),
-    DataStore.
 
 default_net_id() ->
     ?DEFAULT_NETWORK_ID.

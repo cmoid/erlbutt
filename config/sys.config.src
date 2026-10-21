@@ -31,7 +31,11 @@
                     compress_on_rotate => true}}}
     ]}]},
  {ssb, [{ssb_log_level, ${SSB_LOG_LEVEL:-error}},
-        {ssb_home, "${SSB_HOME:-.}"},
+        %% No ssb_home here any more.  The data directory is resolved by
+        %% ssb_paths from SSB_DATA, legacy SSB_HOME, or the data_dir
+        %% default in the release's ssb.cfg — read straight from the OS
+        %% environment, so that app env stays free for tests to set
+        %% without a shell variable overriding them.
         %% The SSB listen port.  Overridable so that two nodes can run on
         %% one machine, which is the only way to exercise anything that
         %% needs a peer — replication, archive boundaries, adopting a

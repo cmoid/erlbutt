@@ -60,8 +60,7 @@ current() ->
     ?DATA_VERSION.
 
 file_path() ->
-    Home = application:get_env(ssb, ssb_home, "."),
-    filename:join([Home, ".ssberl", "data_version"]).
+    filename:join(ssb_paths:repo_dir(), "data_version").
 
 %% The version recorded on disk: an integer, or `none` when there is no
 %% marker (a fresh node, or one that predates this check).
@@ -110,7 +109,7 @@ check() ->
                "floors and re-store sequences into your own feed, neither "
                "of which can be undone.~n"
                "Either run the newer build, or restore ~s from backup.",
-               [Found, Cur, application:get_env(ssb, ssb_home, ".")]),
+               [Found, Cur, ssb_paths:repo_dir()]),
             {error, {data_too_new, Found, Cur}}
     end.
 

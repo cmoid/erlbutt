@@ -19,7 +19,7 @@
 %%   import          Verify and load a bundle into the running node
 %%
 %% The escript connects to the local erlbutt node on port 8008 using the
-%% shared ~/.ssberl/secret key (same approach as sbot in Node.js: two processes,
+%% node's own secret key, found the same way the node finds it (ssb_paths) (same approach as sbot in Node.js: two processes,
 %% one SHS connection, same identity on both sides).
 
 -define(INFO(Fmt, Args), io:format(Fmt, Args)).
@@ -101,22 +101,11 @@ run(CmdFun) ->
 %% process ran it for the duration.  No connection, no keys, no blobs;
 %% config is the only thing needed, to find the feed store.
 run_local(CmdFun) ->
-    logger:set_primary_config(level, error),
-    SSBHome = os:getenv("SSB_HOME", "./_build/default/rel/ssb"),
-    add_code_paths(SSBHome),
-    application:set_env(ssb, ssb_home, SSBHome),
-    {ok, _} = config:start_link(SSBHome ++ "/ssb.cfg"),
+    init_paths(),
     CmdFun().
 
 setup() ->
-    logger:set_primary_config(level, error),
-    %% Default to the dev release dir so the escript shares keys/data with
-    %% the running node. Override by setting SSB_HOME in the environment.
-    SSBHome = os:getenv("SSB_HOME", "./_build/default/rel/ssb"),
-    add_code_paths(SSBHome),
-    application:set_env(ssb, ssb_home, SSBHome),
-    CfgFile = SSBHome ++ "/ssb.cfg",
-    {ok, _} = config:start_link(CfgFile),
+    init_paths(),
     {ok, _} = keys:start_link(),
     {ok, _} = network_id_cache:start_link(),
     %% ssb_peer is a full bidirectional peer, so the node we call answers
@@ -132,6 +121,33 @@ setup() ->
     %% ssb_store that guess turned into a boot crash on every invocation,
     %% because a client has no business opening the node's database.
     {ok, _} = blobs:start_link().
+
+%% Find the release, then let ssb_paths find the data exactly as the node
+%% does — so the CLI uses the node's keys without being told where they
+%% are.
+init_paths() ->
+    logger:set_primary_config(level, error),
+    Root = release_root(),
+    add_code_paths(Root),
+    application:set_env(ssb, release_root, Root),
+    {ok, _} = config:start_link(ssb_paths:release_cfg()).
+
+%% SSB_HOME if set: the legacy setting, which names the release and (inside
+%% ssb_paths) still decides the data directory.  Otherwise the directory
+%% this script sits in, when that is a release — `bin/ssb escript` runs it
+%% from the release root — and otherwise the dev release of a checkout.
+release_root() ->
+    case os:getenv("SSB_HOME") of
+        Home when is_list(Home), Home =/= "" ->
+            Home;
+        _ ->
+            Here = filename:dirname(filename:absname(escript:script_name())),
+            case filelib:is_regular(filename:join(Here, "ssb.cfg"))
+                andalso filelib:is_dir(filename:join(Here, "lib")) of
+                true  -> Here;
+                false -> "./_build/default/rel/ssb"
+            end
+    end.
 
 %% Find the beams in either layout.
 %%
@@ -153,7 +169,8 @@ add_code_paths(SSBHome) ->
         _ ->
             io:format("Cannot find the erlbutt beams.~n"
                       "Looked in ./_build/default/lib and ~s/lib.~n"
-                      "Set SSB_HOME to the node's release directory.~n",
+                      "Run it as <release>/bin/ssb escript sbutt.escript, "
+                      "or set SSB_HOME to the release directory.~n",
                       [SSBHome]),
             erlang:halt(1)
     end.
