@@ -3,9 +3,9 @@
 # Copyright (C) 2026 Charles Moid
 #
 # systemd unit for an erlbutt node running from the prod package.
-# See doc/ops/vps-migration.md for the layout this assumes:
+# See doc/ops/vps-install.md for the layout this assumes:
 #
-#   /opt/erlbutt          the unpacked release, and SSB_HOME
+#   /opt/erlbutt          the unpacked release, and SSB_HOME (legacy)
 #   /opt/erlbutt/.ssberl  SYMLINK -> /var/lib/erlbutt/.ssberl (the real data)
 #   /etc/erlbutt/env      optional: SSB_COOKIE and anything else secret
 #
@@ -29,14 +29,12 @@ Group=erlbutt
 # write to a relative log/ too, so info.log/error.log/debug.log land here.
 WorkingDirectory=/opt/erlbutt
 
-# SSB_HOME decides where the DATA lives: config.erl derives
-# $SSB_HOME/.ssberl/{feeds,blobs,secret,...} from it.  It points AT the
-# release directory rather than at /var/lib, because sbutt.escript resolves
-# three different things from this one variable — the release's beams
-# ($SSB_HOME/lib/*/ebin), ssb.cfg, and .ssberl — so a node and a CLI that
-# disagree about it cannot both work.  The data still lives outside the
-# release: /opt/erlbutt/.ssberl is a symlink to /var/lib/erlbutt/.ssberl.
-# Re-create that symlink after every upgrade.
+# SSB_HOME is legacy (see apps/ssb/src/ssb_paths.erl): it means the data
+# is $SSB_HOME/.ssberl, here the /opt/erlbutt/.ssberl symlink to
+# /var/lib/erlbutt/.ssberl.  Extracting a tarball over /opt/erlbutt leaves
+# that symlink alone (the tarball has no .ssberl); only `rm -rf
+# /opt/erlbutt` loses it.  A new install can drop this line and the
+# symlink: with HOME below, the prod default ~/.ssberl is the same place.
 Environment=SSB_HOME=/opt/erlbutt
 Environment=HOME=/var/lib/erlbutt
 # info, not notice: nearly all of erlbutt's logging goes through ?SSB_INFO
