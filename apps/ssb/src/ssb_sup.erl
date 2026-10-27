@@ -61,4 +61,6 @@ init([]) ->
             ?CHILD(room_attendants, worker),
             ?CHILD(tunnel_endpoint, worker),
             ?CHILD(blob_fetcher, worker),
-            ?CHILD(peer_dialer, worker)]}}.
+            ?CHILD(peer_dialer, worker),
+            %% Last: plugins depend on every service above.
+            ?CHILD(plugin_loader, worker)]}}.

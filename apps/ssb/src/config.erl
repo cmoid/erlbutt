@@ -28,6 +28,7 @@
          require_valid_sigs/0,
          set_require_valid_sigs/1,
          blob_scan_enabled/0,
+         plugins/0,
          is_room/0,
          room_name/0,
          room_privacy/0]).
@@ -63,7 +64,9 @@
                  require_valid_sigs = false,
                  room = false,
                  room_name = <<"erlbutt room">>,
-                 room_privacy = open}).
+                 room_privacy = open,
+                 %% all | [atom()]: which plugin apps plugin_loader starts
+                 plugins = all}).
 
 %%%===================================================================
 %%% API
@@ -176,6 +179,12 @@ glimpses() ->
     (get_config())#config.glimpses.
 
 %% Whether peer_dialer should dial automatically at startup.
+%% Which plugins plugin_loader starts at boot: `all` (the default) is
+%% every plugin installed under <release>/plugins or <data>/plugins; a list
+%% names exactly the ones to start, so {plugins, []}. turns them all off.
+plugins() ->
+    (get_config())#config.plugins.
+
 %% Set {peer_dialer, false}. in ssb.cfg to start with dialing off.
 dialer_enabled() ->
     (get_config())#config.dialer.
@@ -474,6 +483,16 @@ parse({peer_dialer, Bool}, Cfg) when is_boolean(Bool) ->
 
 parse({blob_scan, Bool}, Cfg) when is_boolean(Bool) ->
     Cfg#config{blob_scan = Bool};
+
+parse({plugins, all}, Cfg) ->
+    Cfg#config{plugins = all};
+parse({plugins, Apps} = Term, Cfg) when is_list(Apps) ->
+    case lists:all(fun is_atom/1, Apps) of
+        true  -> Cfg#config{plugins = Apps};
+        false -> ?SSB_ERROR("config: ignoring ~p: plugins are app names "
+                            "(atoms), or all", [Term]),
+                 Cfg
+    end;
 
 parse({room, Bool}, Cfg) when is_boolean(Bool) ->
     Cfg#config{room = Bool};

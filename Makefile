@@ -25,6 +25,12 @@ GH_REPO  ?= cmoid/erlbutt
 ## anything written into _build/<profile>/rel/ beforehand.  No-op off macOS.
 VENDOR   := ./scripts/vendor-macos-dylibs.sh
 
+## Plugin source trees to build into the release's plugins/ (see
+## scripts/stage-plugins.sh).  ssb_git when it is checked out beside this
+## tree; PLUGINS= for a package with none.
+PLUGINS ?= $(wildcard ../ssb_git)
+export PLUGINS
+
 compile:
 	$(REBAR) compile
 
