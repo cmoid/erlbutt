@@ -8,6 +8,26 @@
 -define(b2l(List), binary_to_list(List)).
 -define(pgv(K,V), proplists:get_value(K, V)).
 
+%% The plugin API version: what a plugin compiled against this header may
+%% assume of the node it is loaded into.  A plugin compiles the #message{}
+%% layout below into its own beams, so a plugin built against one layout
+%% and run against another fails at runtime, far from the cause, with a
+%% badrecord or a bad match.
+%%
+%% Every module that includes this header carries the version it was
+%% compiled with, as the attribute below — nobody has to remember to
+%% declare it — and plugin_registry and view_manager refuse to register a
+%% module whose version differs from the node's (ssb_plugin:check_module/1).
+%%
+%% Bump it when #message{} changes, or when a function a plugin is
+%% expected to call (ssb_plugin, ssb_view, ssb_store, the registries)
+%% changes incompatibly.  ssb_plugin's tests pin the record layout to this
+%% number, so changing the record without bumping it fails `make test`.
+%% The other records here are connection internals, not plugin API, and
+%% change freely.
+-define(SSB_PLUGIN_API, 1).
+-ssb_plugin_api(?SSB_PLUGIN_API).
+
 -define(SSB_DEBUG(Format, Args), ?LOG_DEBUG("~p " ++ Format, [self() | Args])).
 -define(SSB_ERROR(Format, Args), ?LOG_ERROR("~p " ++ Format, [self() | Args])).
 -define(SSB_INFO(Format, Args), ?LOG_INFO("~p " ++ Format, [self() | Args])).

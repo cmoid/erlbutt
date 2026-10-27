@@ -181,13 +181,20 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
+%% The API check comes first: a plugin built against another record
+%% layout must not get as far as having its manifest called.
 do_register(Mod) ->
-    Manifest = Mod:manifest(),
-    case validate(Mod, Manifest) of
+    case ssb_plugin:check_module(Mod) of
         ok ->
-            [ets:insert(?TABLE, {Name, Mod, Kind, Perm})
-             || {Name, Kind, Perm} <- Manifest],
-            ok;
+            Manifest = Mod:manifest(),
+            case validate(Mod, Manifest) of
+                ok ->
+                    [ets:insert(?TABLE, {Name, Mod, Kind, Perm})
+                     || {Name, Kind, Perm} <- Manifest],
+                    ok;
+                {error, _} = Err ->
+                    Err
+            end;
         {error, _} = Err ->
             Err
     end.
@@ -285,8 +292,17 @@ registry_test_() ->
               ?_test(room_perm_matrix()),
               ?_test(manifest_filtering()),
               ?_test(register_and_dispatch()),
-              ?_test(method_conflict())]
+              ?_test(method_conflict()),
+              ?_test(stale_plugin_refused())]
      end}.
+
+%% Built against a plugin API this node does not implement: refused, and
+%% none of its methods appear.
+stale_plugin_refused() ->
+    ?assertMatch({error, {plugin_api_mismatch, #{module := test_stale_plugin,
+                                                 built  := 0}}},
+                 register_plugin(test_stale_plugin)),
+    ?assertEqual(unknown, lookup([~"stale", ~"hello"])).
 
 builtin_lookup() ->
     ?assertEqual({builtin, sync, anyone},  lookup([?whoami])),

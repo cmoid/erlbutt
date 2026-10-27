@@ -260,21 +260,14 @@ handle_call({register_view, Mod}, _From, #vm_state{views = Views} = State) ->
         true ->
             {reply, ok, State};
         false ->
-            Class   = ssb_view:class(Mod),
-            StoredV = stored_version(Mod),
-            CodeV   = Mod:view_version(),
-            State1 =
-                case StoredV =:= CodeV andalso Mod:view_load() =:= ok of
-                    true ->
-                        start_catch_up(Mod, State);
-                    false ->
-                        ?SSB_INFO("view_manager: rebuilding ~p ~p "
-                                  "(stored ~p, code ~p)",
-                                  [Class, Mod, StoredV, CodeV]),
-                        reset_view(Mod),
-                        start_catch_up(Mod, State)
-                end,
-            {reply, ok, State1#vm_state{views = insert_view(Mod, Class, Views)}}
+            %% Before anything is read or reset: a view built against
+            %% another #message{} layout must not be handed a message.
+            case ssb_plugin:check_module(Mod) of
+                ok ->
+                    register_new_view(Mod, State);
+                {error, _} = Err ->
+                    {reply, Err, State}
+            end
     end;
 
 handle_call({rebuild, Mod}, _From, #vm_state{views = Views} = State) ->
@@ -342,6 +335,30 @@ handle_call(resume_ingest, _From, #vm_state{views = Views} = State) ->
 handle_call(save, _From, #vm_state{views = Views, catching = Catching} = State) ->
     save_all(Views, Catching),
     {reply, ok, State}.
+
+%%%===================================================================
+%%% Registration
+%%%===================================================================
+
+%% A view not yet registered, and already through the plugin API check:
+%% caught up from its checkpoints when its stored state is current,
+%% otherwise reset and refolded.
+register_new_view(Mod, #vm_state{views = Views} = State) ->
+    Class   = ssb_view:class(Mod),
+    StoredV = stored_version(Mod),
+    CodeV   = Mod:view_version(),
+    State1 =
+        case StoredV =:= CodeV andalso Mod:view_load() =:= ok of
+            true ->
+                start_catch_up(Mod, State);
+            false ->
+                ?SSB_INFO("view_manager: rebuilding ~p ~p "
+                          "(stored ~p, code ~p)",
+                          [Class, Mod, StoredV, CodeV]),
+                reset_view(Mod),
+                start_catch_up(Mod, State)
+        end,
+    {reply, ok, State1#vm_state{views = insert_view(Mod, Class, Views)}}.
 
 %%%===================================================================
 %%% Chunked catch-up
@@ -822,8 +839,17 @@ vm_test_() ->
               ?_test(a_turn_is_bounded_by_time()),
               ?_test(imports_the_legacy_snapshot()),
               ?_test(pause_drops_ingest_and_resume_folds_it_in()),
-              ?_test(a_pause_survives_a_manager_restart())]
+              ?_test(a_pause_survives_a_manager_restart()),
+              ?_test(a_stale_view_is_refused())]
      end}.
+
+%% Built against a plugin API this node does not implement: refused
+%% before it is reset, loaded or handed a single message.
+a_stale_view_is_refused() ->
+    ?assertMatch({error, {plugin_api_mismatch, #{module := test_stale_plugin,
+                                                 built  := 0}}},
+                 register_view(test_stale_plugin)),
+    ?assertNot(lists:member(test_stale_plugin, views())).
 
 %% Fully isolated home: these tests archive the own feed and rebuild
 %% from disk, and a home shared across eunit runs accumulates
