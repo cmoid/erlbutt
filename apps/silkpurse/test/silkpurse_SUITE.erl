@@ -39,6 +39,8 @@
          private_thread_reply_test/1,
          public_feed_roots_test/1,
          public_feed_latest_test/1,
+         public_feed_latest_sends_the_reply_test/1,
+         participating_latest_skips_own_replies_test/1,
          profile_roots_test/1,
          mentions_feed_test/1,
          manifest_includes_silkpurse_test/1]).
@@ -78,6 +80,8 @@ all() ->
      private_thread_reply_test,
      public_feed_roots_test,
      public_feed_latest_test,
+     public_feed_latest_sends_the_reply_test,
+     participating_latest_skips_own_replies_test,
      profile_roots_test,
      mentions_feed_test,
      manifest_includes_silkpurse_test].
@@ -684,6 +688,81 @@ public_feed_latest_test(_Config) ->
     #message{id = RootId} = ssb_feed:fetch_last_msg(OwnPid),
     ?assert(wait_for_root(RootId, 12)),
     gen_server:stop(Peer).
+
+%% A reply in the owner's own thread arrives on publicFeed.latest as the
+%% REPLY — its own key, its content.root, and the thread's root message
+%% attached — not as the thread.  When the stream sent the thread instead,
+%% the renderer saw a message by the owner with no content.root and
+%% prepended it as a new post: the thread appeared twice, reply missing.
+public_feed_latest_sends_the_reply_test(_Config) ->
+    OwnPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    Marker = base64:encode(crypto:strong_rand_bytes(9)),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", Marker}]}),
+    #message{id = RootId} = ssb_feed:fetch_last_msg(OwnPid),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, _Ref} = ssb_peer:open_source(Peer, [~"patchwork", ~"publicFeed", ~"latest"],
+                                      [{[]}], self()),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", Marker},
+                                         {~"root", RootId}]}),
+    #message{id = ReplyId} = ssb_feed:fetch_last_msg(OwnPid),
+    {ok, Item} = wait_for_key(ReplyId, 12),
+    {Value} = proplists:get_value(~"value", Item),
+    {Content} = proplists:get_value(~"content", Value),
+    ?assertEqual(RootId, proplists:get_value(~"root", Content)),
+    ?assertEqual(ReplyId, proplists:get_value(~"rootId", Item)),
+    {Root} = proplists:get_value(~"root", Item),
+    ?assertEqual(RootId, proplists:get_value(~"key", Root)),
+    %% a message, not a roots item
+    ?assertEqual(undefined, proplists:get_value(~"latestReplies", Item)),
+    gen_server:stop(Peer).
+
+%% participatingFeed.latest is what OTHERS add to threads you are in, as
+%% in patchwork: the owner's own reply is not sent, the owner's new thread
+%% is.
+participating_latest_skips_own_replies_test(_Config) ->
+    OwnPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    Marker = base64:encode(crypto:strong_rand_bytes(9)),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", Marker}]}),
+    #message{id = RootId} = ssb_feed:fetch_last_msg(OwnPid),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, _Ref} = ssb_peer:open_source(Peer, [~"patchwork", ~"participatingFeed",
+                                             ~"latest"], [{[]}], self()),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", Marker},
+                                         {~"root", RootId}]}),
+    #message{id = ReplyId} = ssb_feed:fetch_last_msg(OwnPid),
+    ok = ssb_feed:post_content(OwnPid, {[{~"type", ~"post"}, {~"text", Marker}]}),
+    #message{id = NewRootId} = ssb_feed:fetch_last_msg(OwnPid),
+    %% the new thread arrives; the reply, published before it, never did —
+    %% neither as itself nor (the old behaviour) as its thread re-sent
+    {ok, _} = wait_for_key(NewRootId, 12),
+    Seen = flush_keys(),
+    ?assertNot(lists:member(ReplyId, Seen)),
+    ?assertNot(lists:member(RootId, Seen)),
+    gen_server:stop(Peer).
+
+%% {ok, ItemProps} for the first frame whose key is Key, skipping others.
+wait_for_key(_Key, 0) -> timeout;
+wait_for_key(Key, N) ->
+    receive
+        {stream_data, _, Frame} ->
+            {Props} = utils:nat_decode(Frame),
+            case proplists:get_value(~"key", Props) of
+                Key -> {ok, Props};
+                Other ->
+                    self() ! {seen_key, Other},
+                    wait_for_key(Key, N - 1)
+            end
+    after 3000 -> timeout
+    end.
+
+flush_keys() ->
+    receive
+        {seen_key, K} -> [K | flush_keys()];
+        {stream_data, _, Frame} ->
+            {Props} = utils:nat_decode(Frame),
+            [proplists:get_value(~"key", Props) | flush_keys()]
+    after 0 -> []
+    end.
 
 wait_for_root(_RootId, 0) -> false;
 wait_for_root(RootId, N) ->
