@@ -90,6 +90,48 @@ substrate itself.
   client." That lets a Python or JS process extend an erlbutt node without
   writing Erlang. Cheap to add once the registry exists.
 
+## Plugins built outside the tree: the API version (October 2026)
+
+"A plugin = an OTP app" turned out to hide a binary contract. What a view
+is actually handed is a `#message{}`, and a record is a tuple whose layout
+is compiled into every module that pattern-matches on it. silkpurse can
+never disagree with the node about that layout because they are built
+together. A plugin in its own repository — ssb_git is the first — is not,
+and a plugin built against one layout and loaded into a node with another
+does not fail to load: it loads, registers, and then dies on the first
+message with a `badrecord` or a bad match, in the view manager's process,
+far from the cause.
+
+So the node now has a **plugin API version**, `?SSB_PLUGIN_API` in
+`ssb.hrl`, and refuses a plugin built against any other:
+
+- **Every module that includes `ssb.hrl` is stamped** with the version it
+  was compiled against, as a `-ssb_plugin_api(N)` attribute the header
+  itself declares. Nobody has to remember to declare it, and the stamp
+  records what the beam was *built* against rather than what its author
+  believes.
+- **`plugin_registry` and `view_manager` check before anything else** —
+  before a manifest is read or a view is reset — and return
+  `{error, {plugin_api_mismatch, #{module, built, node}}}`. Both sit
+  behind `ssb_view:ensure_registered/1`, which already treats a refusal as
+  final and logs it loudly.
+- **`ssb_plugin:check_app/1` checks a whole application** from its
+  `.app` module list, reading beams that are not loaded yet (the normal
+  state in an embedded-mode release). A plugin's `start/2` calls it, and
+  so will a plugin loader, so that a mismatch is one error at start
+  instead of a running app with methods missing.
+- **A module that never included `ssb.hrl` has no stamp and is accepted.**
+  It has no record layout compiled in, which is the thing the version
+  exists to protect.
+
+The version covers `#message{}` and the functions a plugin is expected to
+call (`ssb_plugin`, `ssb_view`, `ssb_store`, the two registries). The
+other records in `ssb.hrl` are connection internals and are not plugin
+API; if they were, the version would move every time `#sbox_state{}`
+grew a field. `ssb_plugin`'s tests pin `#message{}`'s field list to each
+version, so changing the record without bumping the version fails
+`make test` rather than every external plugin.
+
 ## Suggested sequencing
 
 1. **Registry + manifest + connection classes.** Small, and immediately
