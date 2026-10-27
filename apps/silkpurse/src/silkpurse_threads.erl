@@ -45,8 +45,10 @@
 %% both arrival orders.  Before that it stayed null-author forever, which
 %% roots/2 reads as "root not replicated yet" and hides.
 %%
-%% Deferred: the live publicFeed.latest stream, and patchwork's channel /
-%% subscription filterResult policy.
+%% The live *.latest streams send each new message, not a roots item — see
+%% latest/1 for why the difference reaches the screen.
+%%
+%% Deferred: patchwork's channel / subscription filterResult policy.
 -module(silkpurse_threads).
 
 -ifdef(TEST).
@@ -156,14 +158,14 @@ view_entry(#message{id = Id, author = Author, timestamp = Ts,
     case classify(Type, Root) of
         root ->
             set_root(Id, Author, Ts, Sort, Props),  %% the root's own id keys the thread
-            {events, [{thread, Id}]};
+            {events, [{thread, Id, Id}]};
         {reply, RootId} ->
             add_reply(RootId, Author, Id, Sort, Props),
             %% This message may itself be something else forked off, in
             %% which case a thread row keyed by OUR id is waiting for an
             %% author that set_root/4 will never supply.
             complete_root(Id, Author, Ts, Props),
-            {events, [{thread, RootId}]};
+            {events, [{thread, RootId, Id}]};
         ignore ->
             ok
     end;
@@ -230,20 +232,62 @@ roots(Feed, Args) ->
                 (Item = item(RootId, Total)) =/= undefined],
     {source, Items ++ resume_marker(Found, Limit)}.
 
-%% Live prepend: a root item each time a thread in scope gains activity.
+%% The live tail: each new message in a thread in Feed's scope, as the
+%% message itself — {key, value, timestamp} plus `rootId` and, for a
+%% reply, the thread's `root` message — which is patchwork's shape
+%% (createFeedStream piped through LookupRoots).  Not a roots item.
+%%
+%% The renderer's rollup depends on that.  It counts an arriving item as
+%% "new" only when someone else wrote it, and slots an item of the owner's
+%% own under its thread by reading content.root.  Sending the thread's
+%% summary instead (as this did from July to October 2026) made the item's
+%% author the ROOT's author: a reply in someone else's thread was counted
+%% as a new thread, and a reply in one's own thread was not counted and,
+%% having no content.root, was prepended as a duplicate of the thread.
+%%
+%% As in patchwork, participatingFeed leaves out the owner's own replies —
+%% the feed is for what others add to threads you are in — and every feed
+%% drops messages by feeds the owner blocks, as well as threads whose root
+%% author is blocked (in_scope/2).
 latest(Feed) ->
+    Me = keys:pub_key_disp(),
     EventFun =
-        fun({thread, RootId}) ->
-                case in_scope(Feed, RootId) of
-                    {true, Total, _Last} ->
-                        case item(RootId, Total) of
-                            undefined -> skip;
-                            Item      -> {send, encode_json(Item)}
-                        end;
-                    false -> skip
-                end
+        fun({thread, RootId, MsgId}) -> latest_item(Feed, Me, RootId, MsgId);
+           (_)                       -> skip
         end,
     {live_source, [], ?MODULE, EventFun}.
+
+latest_item(Feed, Me, RootId, MsgId) ->
+    IsReply = RootId =/= MsgId,
+    case in_scope(Feed, RootId) of
+        {true, _Total, _Last} ->
+            case decoded(MsgId) of
+                {Props} = Msg ->
+                    Author = msg_author(Msg),
+                    Skip = (Feed =:= ~"participatingFeed"
+                            andalso IsReply andalso Author =:= Me)
+                        orelse lists:member(Author, ssb_social_graph:blocks(Me)),
+                    case Skip of
+                        true ->
+                            skip;
+                        false ->
+                            Root = [{~"root", R} || IsReply,
+                                                    (R = decoded(RootId)) =/= undefined],
+                            {send, MsgId,
+                             encode_json({Props ++ [{~"rootId", MsgId} | Root]})}
+                    end;
+                undefined ->
+                    skip
+            end;
+        false ->
+            skip
+    end.
+
+msg_author({Props}) ->
+    case ?pgv(~"value", Props) of
+        {VP} -> ?pgv(~"author", VP);
+        _    -> undefined
+    end.
 
 %% Does one root pass this feed's scope right now?  The same predicate as
 %% roots/2, asked of a single row — expressed as SQL rather than a

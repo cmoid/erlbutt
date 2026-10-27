@@ -91,10 +91,10 @@ view_entry(#message{id = Id, author = Author, timestamp = Ts, content = Box})
             case classify(?pgv(~"type", Props), ?pgv(~"root", Props)) of
                 root ->
                     set_root(Id, Author, Ts),
-                    {events, [{priv, Id}]};
+                    {events, [{priv, Id, Id}]};
                 {reply, RootId} ->
                     add_reply(RootId, Author, Id, Ts),
-                    {events, [{priv, RootId}]};
+                    {events, [{priv, RootId, Id}]};
                 ignore ->
                     ok
             end;
@@ -130,17 +130,25 @@ handle_rpc([~"patchwork", ~"privateFeed", ~"roots"], Args, _Caller) ->
                 (Item = item(RootId, Total)) =/= undefined],
     {source, Items ++ resume_marker(Found, Limit)};
 
+%% The live tail: each new private message we can read, decrypted, plus
+%% `rootId` and, for a reply, the thread's decrypted `root` — patchwork's
+%% shape, not a roots item (silkpurse_threads:latest/1 has why that
+%% matters to the renderer).  Unlike participatingFeed, patchwork keeps
+%% the owner's own replies here, so they appear in the open thread.
 handle_rpc([~"patchwork", ~"privateFeed", ~"latest"], _Args, _Caller) ->
     EventFun =
-        fun({priv, RootId}) ->
-                case summary(RootId) of
-                    {Total, _Last} ->
-                        case item(RootId, Total) of
-                            undefined -> skip;
-                            Item      -> {send, encode_json(Item)}
-                        end;
-                    undefined -> skip
-                end
+        fun({priv, RootId, MsgId}) ->
+                case summary(RootId) =/= undefined andalso decrypted(MsgId) of
+                    {Props} ->
+                        Root = [{~"root", R} || RootId =/= MsgId,
+                                                (R = decrypted(RootId)) =/= undefined],
+                        {send, MsgId,
+                         encode_json({Props ++ [{~"rootId", MsgId} | Root]})};
+                    _ ->
+                        skip
+                end;
+           (_) ->
+                skip
         end,
     {live_source, [], ?MODULE, EventFun}.
 
