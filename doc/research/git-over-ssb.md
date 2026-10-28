@@ -216,7 +216,9 @@ and 22 of the earliest store each object as its own blob under
 ```
 
 `title` is optional, and most of the network's issues have none; a reader
-uses the first line of `text`. A pull request asks for `head_repo`'s
+uses the first line of `text`. ssb_git writes both: the title in `title`,
+and again as the first line of `text`, because clients that render an
+issue (silkpurse among them) show only its text. A pull request asks for `head_repo`'s
 `head_branch` to be merged into `repo`'s `branch`.
 
 ### `issue-edit`: a change of state
