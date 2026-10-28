@@ -30,6 +30,11 @@ out=$top/_build/plugins
 
 rm -rf "$out"
 mkdir -p "$out"
+# relx's overlay copies into an existing release directory without
+# clearing it, so a plugin from an earlier build would survive one built
+# without it, and go into the tarball.  Clear every profile's copy; the
+# overlay recreates it from $out.
+rm -rf "$top"/_build/*/rel/ssb/plugins
 cat > "$out/README" <<'EOF'
 Plugins shipped with this erlbutt package: OTP applications started at
 boot by plugin_loader, after the node itself.
