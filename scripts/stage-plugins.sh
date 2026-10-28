@@ -18,7 +18,8 @@
 # the declared dep) with this tree's rebar3, so its beams match the node
 # they ship with.  Then _build/plugins/<app>/ gets its ebin, its priv if
 # any, and its bin/ if any (ssb_git's git-ssb launcher), which the overlay
-# copies to <release>/plugins/.  plugin_loader starts them at boot.
+# copies to <release>/plugins/, with its elisp/ if it has one (ssb_git's
+# Emacs front end).  plugin_loader starts them at boot.
 #
 # _build/plugins always exists, with a README, so the overlay never has a
 # missing source to fail on.
@@ -56,4 +57,8 @@ for src in ${PLUGINS:-}; do
     cp -R "$lib/ebin" "$out/$app/ebin"
     [ -d "$lib/priv" ] && cp -R "$lib/priv" "$out/$app/priv"
     [ -d "$src/bin" ]  && cp -R "$src/bin"  "$out/$app/bin"
+    if [ -d "$src/elisp" ]; then
+        mkdir -p "$out/$app/elisp"
+        cp "$src"/elisp/*.el "$out/$app/elisp/"
+    fi
 done
