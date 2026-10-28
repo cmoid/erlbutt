@@ -18,7 +18,8 @@
          encode_decrypted/2,
          ssb_encoder/3,
          is_null_ref/1,
-         new_msg/4]).
+         new_msg/4,
+         value_length/1]).
 
 
 %% Every spelling of "no reference" that reaches us: `null` from JSON,
@@ -288,6 +289,14 @@ canonical_sign_props(#message{previous  = Prev,  author    = Auth,
      {~"timestamp", TS},
      {~"hash",      Hash},
      {~"content",   Content}].
+
+%% The length the network's size limit is measured in: ssb-validate's
+%% JSON.stringify(value, null, 2).length, in UTF-16 code units — which is
+%% exactly the byte count of the latin1 form the id is hashed over.
+value_length(#message{signature = Sig} = Msg) ->
+    Props = canonical_sign_props(Msg) ++ [{~"signature", Sig}],
+    byte_size(ssb_hash_bytes(ssb_encoder({Props}, fun ssb_encoder/3,
+                                         [pretty, use_nil]))).
 
 compute_id(CanonJson) ->
     ?l2b("%" ++

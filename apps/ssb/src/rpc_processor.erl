@@ -366,6 +366,16 @@ proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"publish"],
             ErrMsg = utils:error_msg(~"Error", Text),
             Flags  = create_flags(0, 1, 2),
             Header = create_header(Flags, size(ErrMsg), -ReqNo),
+            utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey);
+        {error, {too_large, Len}} ->
+            %% ssb-validate's wording, which git-ssb's publish retry
+            %% matches on ("must not be large") to shrink and try again.
+            Text = iolist_to_binary(
+                     io_lib:format("encoded message must not be larger than ~p "
+                                   "bytes (this one is ~p)", [?MAX_MSG_LENGTH, Len])),
+            ErrMsg = utils:error_msg(~"Error", Text),
+            Flags  = create_flags(0, 1, 2),
+            Header = create_header(Flags, size(ErrMsg), -ReqNo),
             utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey)
     end;
 

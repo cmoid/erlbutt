@@ -278,7 +278,10 @@ handle_call({post, _Content}, _From, #state{own = false} = State) ->
 handle_call({post, Content}, _From, State) ->
     case own_feed:may_publish() of
         ok ->
-            {reply, ok, post(Content, State)};
+            case post(Content, State) of
+                {ok, NewState}      -> {reply, ok, NewState};
+                {error, _} = Refused -> {reply, Refused, State}
+            end;
         {error, _} = Refused ->
             {reply, Refused, State}
     end;
@@ -367,14 +370,23 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
+%% A message over the limit is refused before it is stored.  Every other
+%% implementation (ssb-validate) rejects it, and with it every later
+%% message in the feed, so signing one would silently stop the feed
+%% replicating anywhere but here.
 post(Content, #state{id = FeedId, last_msg = Prev,
                      last_seq = Seq} = State) ->
     #message{id = Id} = Msg =
         message:new_msg(Prev, Seq + 1, Content,
                         {FeedId, keys:priv_key()}),
-    State1 = store(Msg, State),
-    State2 = State1#state{last_msg = Id, last_seq = Seq + 1},
-    maybe_archive(State2).
+    case message:value_length(Msg) of
+        Len when Len > ?MAX_MSG_LENGTH ->
+            {error, {too_large, Len}};
+        _ ->
+            State1 = store(Msg, State),
+            State2 = State1#state{last_msg = Id, last_seq = Seq + 1},
+            {ok, maybe_archive(State2)}
+    end.
 
 maybe_archive(#state{last_seq = Seq} = State) ->
     case archive_length() of
@@ -1193,7 +1205,8 @@ feed_test_() ->
       fun zero_filled_tail_recovers_test/1,
       fun whole_log_is_left_alone_test/1,
       fun idle_releases_log_handle_test/1,
-      fun log_handles_are_capped_test/1]}.
+      fun log_handles_are_capped_test/1,
+      fun oversized_post_refused_test/1]}.
 
 %% Only the feed of the key the node booted with can be signed.  A post
 %% to any other feed would sign with the wrong key — an invalid message
@@ -1309,6 +1322,37 @@ idle_releases_log_handle_test({Pid, FeedId, _}) ->
         %% both records are on disk and the chain still walks
         {ok, Bin} = file:read_file(feed_file(FeedId)),
         ?assertEqual({2, byte_size(Bin)}, walk_frames(Bin, 0, 0))
+    end.
+
+%% A message the rest of the network would reject is never signed into
+%% the feed: the post is refused, and the next one takes the sequence it
+%% would have had.  The boundary is checked from both sides by measuring
+%% a message and growing its content to land exactly on the limit.
+oversized_post_refused_test({Pid, _FeedId, _}) ->
+    fun() ->
+        ok = ssb_feed:post_content(Pid, ~"first"),
+        #message{} = Probe = ssb_feed:fetch_last_msg(Pid),
+        %% content ~"first" (5 chars); grow it by the remaining room, which
+        %% the next message (seq 2, a longer previous) shares to within a
+        %% few characters — so step down until it fits, then one over
+        Room = ?MAX_MSG_LENGTH - message:value_length(Probe),
+        Fits = fit(Pid, 5 + Room),
+        ?assertMatch({error, {too_large, L}} when L > ?MAX_MSG_LENGTH,
+                     ssb_feed:post_content(Pid, binary:copy(~"x", Fits + 1))),
+        ?assertMatch(#message{sequence = 1}, ssb_feed:fetch_last_msg(Pid)),
+        ok = ssb_feed:post_content(Pid, binary:copy(~"x", Fits)),
+        #message{sequence = 2} = Last = ssb_feed:fetch_last_msg(Pid),
+        ?assertEqual(?MAX_MSG_LENGTH, message:value_length(Last))
+    end.
+
+%% The longest run of x's that would fit as the next message, found by
+%% measuring unsigned candidates rather than posting them.
+fit(Pid, N) ->
+    #state{id = Id, last_msg = Prev, last_seq = Seq} = sys:get_state(Pid),
+    M = message:new_msg(Prev, Seq + 1, binary:copy(~"x", N), {Id, keys:priv_key()}),
+    case message:value_length(M) > ?MAX_MSG_LENGTH of
+        true  -> fit(Pid, N - 1);
+        false -> N
     end.
 
 %% The feed's current log handle, via a sys call so the assertions read

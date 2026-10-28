@@ -87,6 +87,9 @@
 %% (and the limit ssb-blob-files enforces client-side), so a file the
 %% client would refuse to send is also one we refuse to buffer.
 -define(BLOB_MAX_SIZE, 5242880).
+%% A message's signed value, as JSON.stringify(value, null, 2), may be at
+%% most this many UTF-16 code units long (ssb-validate).  message:value_length/1.
+-define(MAX_MSG_LENGTH, 8192).
 
 %% Largest glimpse payload this node will fetch on a peer's say-so.
 %%
