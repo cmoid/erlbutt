@@ -151,6 +151,16 @@ The message id **is** the repo, and its URL is `ssb://%<id>`. `name` and
 `upstream` are optional. A fork inherits its upstream's refs under any
 name it does not set itself.
 
+A repo is named, or renamed, by an ordinary `about` message:
+
+```json
+{ "type": "about", "about": "%<repo>.sha256", "name": "ssb_git" }
+```
+
+Older `git ssb create` put the name only here, so it matters: 370 repos
+on the network have one, 217 of them repos whose `git-repo` message has
+no name.
+
 ### `git-update`: a push
 
 ```json
@@ -443,6 +453,13 @@ and shown, marked as not counted. On one node in October 2026, 278 of the
 306 state changes naming a known issue counted; the other 28 were third
 parties'.
 
+A repo's name follows the same rule with one authority, its author: the
+latest `about` name in the author's feed, by sequence rather than
+timestamp, else the `git-repo` message's. Of 389 names given to repos,
+331 were their authors'. The other 58 are kept and shown as someone
+else's, standing in for a name only for a repo its author never named;
+31 repos have no other.
+
 A push closes what it fixes, as in git-ssb: a commit it adds to the repo's
 `HEAD` branch whose message says `close`, `closes`, `closed`, `closing`,
 `fix`, `fixes`, `fixed` or `fixing`, optionally `issue`, then an issue's
@@ -569,9 +586,6 @@ against millions of messages.
 
 - **Maintainers**, as described under [State and authority](#state-and-authority).
 - **Deliberate pack retention** on pubs and rooms.
-- **Repo names from `about` messages.** git-ssb renamed repos with
-  `{type: about, about: <repo>, name}`, and 370 repos on the network have
-  one; ssb_git shows only the `git-repo` message's name.
 - **From a commit to its push.** A command that takes a commit id, from
   any log, and opens the `git-update` that introduced it, so a push is a
   message one can discuss.
