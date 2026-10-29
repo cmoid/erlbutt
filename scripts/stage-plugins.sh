@@ -19,7 +19,8 @@
 # they ship with.  Then _build/plugins/<app>/ gets its ebin, its priv if
 # any, and its bin/ if any (ssb_git's git-ssb launcher), which the overlay
 # copies to <release>/plugins/, with its elisp/ if it has one (ssb_git's
-# Emacs front end).  plugin_loader starts them at boot.
+# Emacs front end), and its doc/*.texi built into info/.  plugin_loader
+# starts them at boot.
 #
 # _build/plugins always exists, with a README, so the overlay never has a
 # missing source to fail on.
@@ -66,4 +67,18 @@ for src in ${PLUGINS:-}; do
         mkdir -p "$out/$app/elisp"
         cp "$src"/elisp/*.el "$out/$app/elisp/"
     fi
+    # A texinfo manual becomes info/<name>.info plus the dir file C-h i
+    # reads (ssb-git.el adds info/ to Info's path).  Without makeinfo the
+    # package is built without it, and says so.
+    for texi in "$src"/doc/*.texi; do
+        [ -f "$texi" ] || continue
+        if command -v makeinfo >/dev/null && command -v install-info >/dev/null; then
+            info=$out/$app/info/$(basename "$texi" .texi).info
+            mkdir -p "$out/$app/info"
+            makeinfo -o "$info" "$texi"
+            install-info --info-dir="$out/$app/info" "$info"
+        else
+            echo "stage-plugins: no makeinfo; $app ships without $(basename "$texi" .texi).info" >&2
+        fi
+    done
 done
