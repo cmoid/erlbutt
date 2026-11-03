@@ -12,7 +12,8 @@ manifest() ->
      {[~"echo", ~"whoAmI"],  async,  anyone},
      {[~"echo", ~"secrets"], async,  owner},
      {[~"echo", ~"count"],   source, anyone},
-     {[~"echo", ~"slow"],    source, anyone}].
+     {[~"echo", ~"slow"],    source, anyone},
+     {[~"echo", ~"crash"],   async,  anyone}].
 
 handle_rpc([~"echo", ~"hello"], Args, _Caller) ->
     {reply, Args};
@@ -33,4 +34,7 @@ handle_rpc([~"echo", ~"slow"], [N, Ms], _Caller) ->
               || I <- lists:seq(1, N)]};
 
 handle_rpc([~"echo", ~"count"], _Args, _Caller) ->
-    {error, ~"count takes a positive integer"}.
+    {error, ~"count takes a positive integer"};
+
+handle_rpc([~"echo", ~"crash"], _Args, _Caller) ->
+    erlang:error(boom).

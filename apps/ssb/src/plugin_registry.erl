@@ -10,6 +10,11 @@
 %% registered plugins' manifests and the builtin (hardcoded) methods,
 %% filtered by the caller's permission class.  It serves the `manifest`
 %% muxrpc method itself — the first plugin.
+%%
+%% call/3 is the in-node entry point to the same plugin methods, for
+%% code that already runs on (or holds the cookie for) this node —
+%% maxbutt, a UI reaching the node over distribution — so it does not
+%% have to reach into a plugin's handle_rpc/3 itself.
 -module(plugin_registry).
 
 -ifdef(TEST).
@@ -27,7 +32,8 @@
          unregister_plugin/1,
          lookup/1,
          manifest/1,
-         allowed/2]).
+         allowed/2,
+         call/3]).
 
 %% ssb_plugin callbacks
 -export([manifest/0, handle_rpc/3]).
@@ -133,6 +139,81 @@ allowed(peer, _Perm)         -> false.
 room_allowed(_Class, false, _Privacy) -> true;
 room_allowed(_Class, true, open)      -> true;
 room_allowed(Class, true, _MembersOnly) -> allowed(Class, member).
+
+%% Call a plugin method in-process, answering what a muxrpc client of
+%% the same class would get, minus the connection:
+%%   {ok, Term}       sync/async: the reply as decoded EJSON
+%%   {ok, [Term]}     source: every item, decoded; a live_source answers
+%%                    its snapshot only (there is no stream to keep open)
+%%   {error, Reason}  the handler's binary reason, ~"internal error" for
+%%                    a crash or a malformed result, or one of
+%%                    unknown_method | builtin | not_allowed
+%% Builtins live inside rpc_processor's connection machinery and have
+%% no entry point here, hence `builtin`.  Caller is the same map the
+%% wire hands handle_rpc/3; feed_id defaults to undefined.  Runs in the
+%% calling process, so the caller owns the timeout.
+call(Name, Args, #{class := Class} = Caller0)
+  when is_list(Name), (Class =:= owner orelse Class =:= member
+                       orelse Class =:= peer) ->
+    Caller = maps:merge(#{feed_id => undefined}, Caller0),
+    case lookup(Name) of
+        {ok, {Mod, Kind, Perm}} ->
+            case allowed(Class, Perm) of
+                true  -> call_plugin(Mod, Kind, Name, Args, Caller);
+                false -> {error, not_allowed}
+            end;
+        {builtin, _Kind, _Perm} ->
+            {error, builtin};
+        unknown ->
+            {error, unknown_method}
+    end.
+
+%% The same result handling as rpc_processor:plugin_dispatch/10, with
+%% decoding where the wire would encode.
+call_plugin(Mod, Kind, Name, Args, Caller) ->
+    Result = try Mod:handle_rpc(Name, Args, Caller)
+             catch C:R:Stack ->
+                     ?SSB_ERROR("plugin ~p crashed on ~p: ~p:~p ~p",
+                                [Mod, Name, C, R, Stack]),
+                     {error, ~"internal error"}
+             end,
+    case {Kind, Result} of
+        {source, {source, Items}} ->
+            {ok, call_items(Items)};
+        {source, {live_source, Pairs, _ViewMod, _EventFun}} ->
+            {ok, call_items([B || {_Id, B} <- Pairs])};
+        {_, {reply, Term}} when Kind =:= sync; Kind =:= async ->
+            case call_item(Term) of
+                {ok, Value} -> {ok, Value};
+                skip        -> {error, ~"reply not decodable"}
+            end;
+        {_, {error, Reason}} when is_binary(Reason) ->
+            {error, Reason};
+        {_, Other} ->
+            ?SSB_ERROR("plugin ~p returned ~p for ~p method ~p",
+                       [Mod, Other, Kind, Name]),
+            {error, ~"internal error"}
+    end.
+
+%% An item the wire would drop (a lazy one answering undefined, or bytes
+%% that do not decode) is dropped here too.
+call_items(Items) ->
+    [V || Item <- Items, {ok, V} <- [call_item(Item)]].
+
+call_item(F) when is_function(F, 0) ->
+    case F() of
+        undefined -> skip;
+        Bin       -> call_item({json, Bin})
+    end;
+call_item({json, Bin}) when is_binary(Bin) ->
+    try {ok, utils:nat_decode(Bin)}
+    catch C:R ->
+            ?SSB_ERROR("plugin_registry: skipping undecodable item (~p:~p)",
+                       [C, R]),
+            skip
+    end;
+call_item(Term) ->
+    {ok, Term}.
 
 %%%===================================================================
 %%% ssb_plugin callbacks (the registry serves `manifest` itself)
@@ -293,6 +374,7 @@ registry_test_() ->
               ?_test(manifest_filtering()),
               ?_test(register_and_dispatch()),
               ?_test(method_conflict()),
+              ?_test(in_node_call()),
               ?_test(stale_plugin_refused())]
      end}.
 
@@ -380,5 +462,32 @@ register_and_dispatch() ->
 method_conflict() ->
     %% a plugin may not take a method someone else owns
     {error, {method_taken, _, _}} = do_register(test_clash_plugin).
+
+%% call/3 answers what a muxrpc client of the same class would get.
+in_node_call() ->
+    ok = register_plugin(test_echo_plugin),
+    Owner = #{class => owner},
+    Peer  = #{class => peer, feed_id => ~"@peer.ed25519"},
+    ?assertEqual({ok, [~"hi"]}, call([~"echo", ~"hello"], [~"hi"], Peer)),
+    %% feed_id defaults to undefined when the caller names none
+    ?assertEqual({ok, {[{~"feed", undefined}, {~"class", ~"owner"}]}},
+                 call([~"echo", ~"whoAmI"], [], Owner)),
+    %% the permission lattice gates here as it does on the wire
+    ?assertEqual({error, not_allowed}, call([~"echo", ~"secrets"], [], Peer)),
+    ?assertEqual({ok, ~"the owner's secrets"},
+                 call([~"echo", ~"secrets"], [], Owner)),
+    %% source: the whole stream as a list; lazy items are decoded
+    ?assertEqual({ok, [1, 2, 3]}, call([~"echo", ~"count"], [3], Peer)),
+    ?assertEqual({ok, [1, 2]}, call([~"echo", ~"slow"], [2, 0], Peer)),
+    %% the handler's own error, a crash, and the structural refusals
+    ?assertEqual({error, ~"count takes a positive integer"},
+                 call([~"echo", ~"count"], [0], Peer)),
+    ?assertEqual({error, ~"internal error"}, call([~"echo", ~"crash"], [], Peer)),
+    ?assertEqual({error, builtin}, call([?whoami], [], Owner)),
+    ?assertEqual({error, unknown_method}, call([~"noSuch", ~"method"], [], Owner)),
+    %% the registry's own method goes through the same path
+    {ok, {Props}} = call([~"manifest"], [], Owner),
+    ?assertEqual(~"async", proplists:get_value(~"publish", Props)),
+    ok = unregister_plugin(test_echo_plugin).
 
 -endif.
