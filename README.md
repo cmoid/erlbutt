@@ -41,13 +41,13 @@ make rel
 ```
 To run:
 ```
-./_build/default/rel/ssb/bin/ssb-0.0.1 console
+./_build/default/rel/ssb/bin/ssb console
 
 ```
 An environment variable can be used to control logging, .eg.:
 
 ```
-SSB_LOG_LEVEL=debug _build/default/rel/ssb/bin/ssb-0.0.1 console
+SSB_LOG_LEVEL=debug _build/default/rel/ssb/bin/ssb console
 ```
 
 See [ssb conversion][4] for details on converting an existing `SSB` store to erlbutt.
