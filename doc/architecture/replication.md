@@ -110,5 +110,5 @@ Further reading
 
 - [research/papers/ebt.pdf](../research/papers/ebt.pdf) — the epidemic
   broadcast trees paper.
-- [Scuttlebutt protocol guide](https://ssbc.github.io/scuttlebutt-protocol-guide/)
+- [Scuttlebutt protocol guide](https://cmoid.github.io/scuttlebutt-protocol-guide/)
   — EBT and blobs on the wire.

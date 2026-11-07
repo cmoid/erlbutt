@@ -62,7 +62,8 @@ dialed back. The dialer keeps at most ten connections, and a peer that
 fails is retried on an exponential backoff from five minutes up to six
 hours.
 
-The dialer can be switched off — `{peer_dialer, false}` in `ssb.cfg`, or
+The dialer is on in released builds and off in development builds. It
+can be switched off — `{peer_dialer, false}` in `ssb.cfg`, or
 `admin.dialer.disable` at runtime, which persists in `overrides.cfg`. A
 node with the dialer off still accepts inbound connections but never
 opens any, which on a personal node looks like a silent outage.
@@ -109,10 +110,42 @@ parts.
   muxrpc, EBT and blob machinery, over a tunnel handle instead of a
   socket. Full replication works through a room.
 
+Clients over Erlang distribution
+--------------------------------
+
+Everything above is how SSB peers and ordinary clients talk to the node.
+An Erlang client can skip all of it. [maxbutt](https://github.com/cmoid/maxbutt),
+the Emacs client, connects to the node as an Erlang node (through
+Distel), not as an SSB peer. There is no secret handshake, box stream or
+muxrpc. Its own modules are loaded into the erlbutt node, and it calls
+them, and the node's functions, directly.
+
+- **Trust comes from the distribution cookie, not from a key.** Anyone
+  holding the cookie can run arbitrary code on the node, which is far
+  more than an owner client can do. That is why the production
+  `vm.args` binds distribution to loopback and pins its port
+  (`SSB_DIST_PORT`, default 9100). To reach a remote node, tunnel that
+  port over SSH (`ssh -L 9100:localhost:9100 …`); never open it on a
+  firewall.
+- **Plugin methods are reached with `plugin_registry:call/3`**, which
+  applies the same permission check a muxrpc caller of the given class
+  would get (see [plugins](plugins.md#calling-methods-from-inside-the-node)).
+  maxbutt's admin commands go through it as `owner`.
+- **Its code has to be on the node.** The `devpkg` release takes an
+  extra code path from `SSB_EXTRA_PA`, for maxbutt's `ebin`. The release
+  boots in embedded mode, which never loads modules on demand, so after
+  each node start the maxbutt modules must be loaded by hand
+  (`code:load_file/1`).
+
+The same route is open to any Erlang or Elixir program. HighWire uses it
+too, through `erpc`, but only for an engine it started itself. When it
+attaches to a node that is already running, it is an ordinary muxrpc
+client.
+
 Further reading
 ---------------
 
-- [Scuttlebutt protocol guide](https://ssbc.github.io/scuttlebutt-protocol-guide/)
+- [Scuttlebutt protocol guide](https://cmoid.github.io/scuttlebutt-protocol-guide/)
   — the handshake, box stream and muxrpc on the wire.
 - [research/papers/shs.pdf](../research/papers/shs.pdf) — the secret
   handshake paper.

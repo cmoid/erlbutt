@@ -229,12 +229,16 @@ actually landed:
 grep -E 'network_id|require_valid_sigs|peer_dialer' /opt/erlbutt/ssb.cfg
 ```
 
-`peer_dialer` off is right for a pub that mostly accepts inbound
-connections; turn it on later if you want it dialling out from `conn_db`.
+Releases ship `peer_dialer` on. For a pub that mostly accepts inbound
+connections, off is often right: put `{peer_dialer, false}.` in the data
+directory's `ssb.cfg` (`/var/lib/erlbutt/.ssberl/ssb.cfg`), which an
+upgrade never touches, or run `admin.dialer.disable`, which persists in
+`overrides.cfg`.
 
 Never hand-edit `/opt/erlbutt/ssb.cfg` as a permanent fix — it is a
-rendered overlay and the next deploy silently reverts it. Changes belong in
-`config/default.vars` or `config/prod.vars`, in git.
+rendered overlay and the next deploy silently reverts it. Settings for
+this pub belong in `/var/lib/erlbutt/.ssberl/ssb.cfg`; defaults for every
+release belong in `config/default.vars` or `config/prod.vars`, in git.
 
 **Cookie:** nothing to do. The first start creates
 `/var/lib/erlbutt/.erlang.cookie`. `/etc/erlbutt/env` is optional; the

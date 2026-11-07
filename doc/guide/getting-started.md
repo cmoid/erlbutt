@@ -24,6 +24,11 @@ connects to it:
   Patchwork tradition.
 - [HighWire](https://github.com/mwmiller/highwire) — a browser-based
   client.
+- [maxbutt](https://github.com/cmoid/maxbutt) — an Emacs client. It works
+  differently from the others: rather than connecting the way a peer
+  would, it joins the running node as an Erlang node, so it suits people
+  who run their own node and are at home in Emacs. Its own README covers
+  setting it up.
 - `sbutt`, the command line tool that comes with erlbutt.
 
 You can run erlbutt on your own computer, or on a server that is always
@@ -123,17 +128,6 @@ cover the rest, including pointing it at a node on another machine.
 4. Meet the network
 -------------------
 
-First, let the node dial out. Releases ship with the dialer off, so
-until you turn it on the node only talks to peers that connect to it.
-Create `~/.ssberl/ssb.cfg` containing
-
-```erlang
-{peer_dialer, true}.
-```
-
-and restart the node (`install-service --user` again, or stop and start
-it by hand). `sbutt health` shows the dialer's state.
-
 A new node knows nobody, so it has nothing to replicate. You need
 someone to follow and someone to follow you back. The usual way in is a
 **pub invite**: ask someone who runs a pub for an invite code and redeem
@@ -141,8 +135,9 @@ it in a client that supports invites (HighWire does). The pub follows you, you f
 starts from there. Follow people you meet, and their feeds — and the
 feeds they follow — start arriving.
 
-With the dialer on, peers on the same local network find each other
-automatically.
+The node dials out by itself — to peers it learns about from the feeds
+it replicates, and to peers on the same local network, which find each
+other automatically. `sbutt health` shows the dialer's state.
 
 Day to day
 ----------

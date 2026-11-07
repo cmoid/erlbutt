@@ -8,6 +8,14 @@ feed before deciding to replicate it. The last two are erlbutt's own
 extensions; both are designed so that peers that know nothing about
 them are unaffected.
 
+These extensions are **not part of the core SSB protocol**. They are
+proposals, implemented in erlbutt first. Their wire formats — the
+`archive` and `glimpse` message types and the `archives.boundaries` and
+`glimpses.offers` methods — are specified, for other implementations, in
+the [Extensions section](https://cmoid.github.io/scuttlebutt-protocol-guide/#extensions)
+of the protocol guide this project maintains, under *Partial feeds* and
+*Feed glimpses*. This page is about erlbutt's implementation.
+
 Publishing safely: the fork guard
 ---------------------------------
 

@@ -10,8 +10,29 @@ it, and the biggest difference is persistence.
 
 It is deliberately not called a server. Peer-to-peer systems should not
 have servers and clients: every node is a peer, acting as both, so the
-distinction is moot. A UI such as silkpurse or HighWire is a client only
-in the narrow sense that it holds the node's own key and drives it.
+distinction is moot. A UI is a client only in the narrow sense that it
+drives the node. Silkpurse and HighWire do it over muxrpc, holding the
+node's own key. maxbutt, the Emacs client, does it over Erlang
+distribution, running inside the node (see
+[networking](networking.md#clients-over-erlang-distribution)).
+
+Protocol extensions
+-------------------
+
+erlbutt implements the protocol as other implementations do, and adds two
+extensions of its own: **partial feeds** (archive boundaries) and **feed
+glimpses**. Both are additive and optional. A peer that knows nothing
+about them is still a correct Scuttlebutt implementation and
+interoperates with erlbutt unchanged. They are **not part of the core
+protocol**: they are proposals, implemented here first.
+
+The wire-level descriptions are in the
+[Extensions section][ext] of the protocol guide erlbutt maintains (a
+fork of the ssbc guide), so another implementation can be compatible
+with them; that section is marked as proposed extensions, separate
+from the core protocol the rest of the guide describes. How erlbutt implements them is in
+[feeds, archives and glimpses](feeds-archives-glimpses.md), and the
+reasoning behind them is in `doc/research`.
 
 This page is the map. The pages beside it go into each part:
 
@@ -153,5 +174,6 @@ newer build.
 
 ----
 [4]: https://github.com/ssbc/ssb-server
-[7]: https://ssbc.github.io/scuttlebutt-protocol-guide/
-[8]: https://ssbc.github.io/scuttlebutt-protocol-guide/#message-format
+[7]: https://cmoid.github.io/scuttlebutt-protocol-guide/
+[8]: https://cmoid.github.io/scuttlebutt-protocol-guide/#message-format
+[ext]: https://cmoid.github.io/scuttlebutt-protocol-guide/#extensions

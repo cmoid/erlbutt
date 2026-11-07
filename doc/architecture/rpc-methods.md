@@ -34,8 +34,8 @@ Implemented in `rpc_processor` itself and always present.
 | `blobs.want` | async | owner | fetch a blob from the network |
 | `blobs.add` | sink | owner | store a blob (stream the bytes, end with `true`) |
 | `blobs.push` | async | owner | offer a blob to peers |
-| `archives.boundaries` | source | anyone | every archive boundary this node knows |
-| `glimpses.offers` | source | anyone | every glimpse this node holds |
+| `archives.boundaries` | source | anyone | every archive boundary this node knows (extension†) |
+| `glimpses.offers` | source | anyone | every glimpse this node holds (extension†) |
 | `invite.create` | async | owner | mint a pub invite |
 | `invite.use` | async | anyone | redeem an invite |
 | `tunnel.isRoom` | sync | anyone | whether this node is a room |
@@ -43,6 +43,11 @@ Implemented in `rpc_processor` itself and always present.
 | `tunnel.endpoints` | source | room | attendants (legacy rooms form) |
 | `room.metadata` | async | anyone | room name and privacy mode |
 | `room.attendants` | source | room | who is connected, then join/leave events |
+
+† A protocol extension, not part of core SSB: see the
+[Extensions section](https://cmoid.github.io/scuttlebutt-protocol-guide/#extensions)
+of the protocol guide. Peers that do not implement these answer them as
+unknown methods, and erlbutt treats that as "nothing to offer".
 
 Admin (`apps/admin`)
 --------------------

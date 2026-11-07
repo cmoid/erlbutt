@@ -41,7 +41,7 @@ Settings
 | `network_id` | the main SSB network (prod builds) | Which SSB network to join. Peers on a different network id cannot connect at all. |
 | `extra_network_ids` | `[]` | More network ids to accept, as a list of base64 strings. |
 | `replication_hops` | `2` | How far out the follow graph to replicate: 1 is the feeds you follow, 2 adds the feeds they follow. Each hop can multiply the data stored many times over. |
-| `peer_dialer` | `false` in the release `ssb.cfg` | Whether the node dials out to known peers by itself. A node that never dials only gets what others bring it. Changed at runtime with `admin.dialer.enable` / `disable`, which persists. |
+| `peer_dialer` | `true` (releases); `false` (development builds) | Whether the node dials out to known peers by itself. A node that never dials only gets what others bring it. Changed at runtime with `admin.dialer.enable` / `disable`, which persists. |
 | `require_valid_sigs` | `true` | Reject messages whose signature does not verify. Leave it on. |
 | `blob_scan` | `false` | At startup, scan every stored message for blobs and fetch any that are missing. A full pass over the store. |
 | `archive_length` | unset | Archive your own feed automatically every N messages. Leave it unset on a pub. See [archives](../architecture/feeds-archives-glimpses.md#archive-boundaries). |
@@ -54,12 +54,14 @@ Settings
 | `room_name` | `<<"erlbutt room">>` | The room's name, as an Erlang binary. |
 | `room_privacy` | `open` | `open`, `community` or `restricted`; the last two admit only members, who join with a room invite. |
 
-**The dialer is off in the shipped `ssb.cfg`.** A fresh node accepts
-connections but never opens any, so it sits silent until you turn the
-dialer on — add `{peer_dialer, true}.` to `~/.ssberl/ssb.cfg` and
-restart. Because `overrides.cfg` is read last, a dialer once turned off
-with `admin.dialer.disable` stays off whatever `ssb.cfg` says, until
-`admin.dialer.enable`.
+**The dialer.** Releases ship with it on; development builds (`make
+rel`, `devpkg`) ship with it off, so a test node makes only the
+connections you make for it. To run a released node inbound-only — a
+pub that waits for others, or a converted feed you have not verified
+yet — add `{peer_dialer, false}.` to `~/.ssberl/ssb.cfg`. Because
+`overrides.cfg` is read last, the runtime switch wins over both:
+a dialer turned off with `admin.dialer.disable` stays off whatever
+`ssb.cfg` says, until `admin.dialer.enable`, and the other way round.
 
 Environment variables
 ---------------------

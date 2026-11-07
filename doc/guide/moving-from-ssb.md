@@ -38,9 +38,10 @@ The dev package is the other artifact on a release, and it is not this: it
 carries the development network id, so a node built or downloaded that way
 will talk to nobody on the real network no matter how it is configured.
 
-`default.vars` also sets `{peer_dialer, false}`, which is what makes the
-sequence below safe: a freshly installed node holds your identity but
-talks to nobody until you say so.
+A prod release dials out by default. For a conversion that is the wrong
+default, so step 2 turns the dialer off before the node first starts: a
+freshly installed node then holds your identity but talks to nobody until
+you say so, which is what makes the sequence below safe.
 
 ## 1. Install a prod release
 
@@ -108,7 +109,12 @@ cd ~/erlbutt-ssb && SSB_HOME=. ./sbutt.escript health
 mkdir -p ~/erlbutt-ssb/.ssberl
 cp /path/to/backup/secret ~/erlbutt-ssb/.ssberl/secret
 chmod 600 ~/erlbutt-ssb/.ssberl/secret
+echo '{peer_dialer, false}.' > ~/erlbutt-ssb/.ssberl/ssb.cfg
 ```
+
+The `ssb.cfg` line keeps the node off the network until step 6. Do not
+skip it: a prod release otherwise starts dialing peers as soon as it
+boots, before you have checked the conversion.
 
 `SSB_HOME` is the *parent*: data lands in `$SSB_HOME/.ssberl/`. Getting
 this wrong nests a `.ssberl` inside a `.ssberl` and the node starts as a
@@ -190,6 +196,10 @@ Only once the above looks right:
 ```erlang
 peer_dialer:enable().
 ```
+
+That persists in `overrides.cfg`, which wins over `ssb.cfg`, so the node
+stays dialing across restarts. Delete the `{peer_dialer, false}.` line
+from `ssb.cfg` as well, so the two files do not disagree.
 
 Then retire the old store, so it cannot become a second writer:
 

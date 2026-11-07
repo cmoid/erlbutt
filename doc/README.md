@@ -52,6 +52,14 @@ For programmers: how it works, and how to change it.
   [testing glimpses](development/testing-glimpses.md) — two-node
   procedures for watching those features work.
 
+**Protocol** — the wire.
+
+- [Scuttlebutt protocol guide](https://cmoid.github.io/scuttlebutt-protocol-guide/)
+  — the protocol erlbutt implements, maintained by this project. Its
+  [Extensions section](https://cmoid.github.io/scuttlebutt-protocol-guide/#extensions)
+  specifies erlbutt's two additions, partial feeds and feed glimpses.
+  These are proposals, not yet part of the core protocol.
+
 **Research** — why it is built this way.
 
 - [Design notes](research/README.md) — persistence, plugins, archive
