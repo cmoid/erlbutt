@@ -837,7 +837,7 @@ adopt_source(Dir0) ->
           end,
     filelib:is_dir(filename:join(Src, "flume")) andalso
         die("~s looks like a JS ssb directory (it has flume/), not an "
-            "erlbutt one.  See doc/ops/ssb-conversion.md.~n", [Src]),
+            "erlbutt one.  See doc/guide/moving-from-ssb.md.~n", [Src]),
     Src.
 
 same_dir(A, B) ->

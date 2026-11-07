@@ -15,7 +15,7 @@
 %% patchwork conventions.  So no field is privileged here; every key in
 %% the message is stored, and callers ask for the ones they know about.
 %% An application with entirely different self-description gets the same
-%% machinery for free.  See doc/persistence.md §5.
+%% machinery for free.  See doc/research/persistence.md §5.
 %%
 %% Last-write-wins is resolved on sequence number, not on the message's
 %% self-asserted timestamp (which is untrustworthy — see §5 on causal

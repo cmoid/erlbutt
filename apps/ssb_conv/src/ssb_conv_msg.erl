@@ -3,7 +3,7 @@
 %% Copyright (C) 2026 Charles Moid
 %%
 %% Message-type predicates for SSB *application conventions* — the half
-%% of social_msg that replication does not need (doc/persistence.md §5).
+%% of social_msg that replication does not need (doc/research/persistence.md §5).
 %%
 %% `contact` and `about` stayed in apps/ssb because ebt cannot build a
 %% replication set without them.  `root`/`branch` are different: only

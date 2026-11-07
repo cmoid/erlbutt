@@ -2,7 +2,7 @@
 %%
 %% Copyright (C) 2026 Charles Moid
 %%
-%% The embedded store for derived state (doc/persistence.md §4, §6).
+%% The embedded store for derived state (doc/research/persistence.md §4, §6).
 %%
 %% Everything a view derives from the log lives here instead of in ETS
 %% plus a 60-second ets:tab2file snapshot.  That swap buys three things:

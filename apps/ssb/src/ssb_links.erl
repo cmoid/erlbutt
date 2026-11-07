@@ -10,7 +10,7 @@
 %% edges as a *conversation* is a convention (see tangle in ssb_conv);
 %% reading them as a graph is what makes them foundational.
 %%
-%% WHY THIS BELONGS TO THE PROTOCOL LAYER (doc/persistence.md §5)
+%% WHY THIS BELONGS TO THE PROTOCOL LAYER (doc/research/persistence.md §5)
 %%
 %% A cross-feed reference is a cryptographically enforced happens-before:
 %% if message M in feed A carries the id of message N in feed B, then A

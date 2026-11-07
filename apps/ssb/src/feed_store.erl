@@ -146,7 +146,7 @@ cursor_close(eof)                    -> ok.
 %% *uncompressed* frame stream, so a hit extracts with one gunzip and a
 %% binary:part — no fold.  Borrowed from bitcask, where hint files let
 %% the keydir be rebuilt at startup without reading values
-%% (doc/persistence.md §6).
+%% (doc/research/persistence.md §6).
 %%
 %% Written when do_archive/1 freezes a segment, and built on demand for
 %% segments archived before this existed, so an upgrading node heals

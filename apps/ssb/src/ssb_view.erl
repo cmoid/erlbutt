@@ -9,7 +9,7 @@
 %% lifecycle: it tracks a per-feed sequence checkpoint for every view,
 %% replays missed messages at registration, rebuilds from scratch when a
 %% view's version bumps, and fans out each newly stored message.  See
-%% doc/plugin-architecture.md.
+%% doc/research/plugin-architecture.md.
 %%
 %% Every callback here is called from the view_manager process, never
 %% from the view's own process — so a view backed by a gen_server must
@@ -50,7 +50,7 @@
 -callback view_save() -> ok.
 -callback view_entry(#message{}) -> ok | {events, [term()]}.
 
-%% Which layer the view belongs to (doc/persistence.md §5):
+%% Which layer the view belongs to (doc/research/persistence.md §5):
 %%
 %%   core — protocol infrastructure owned by the ssb app, always on, and
 %%          part of what an application may assume exists.  Registered

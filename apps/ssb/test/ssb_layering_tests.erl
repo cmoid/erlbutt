@@ -2,7 +2,7 @@
 %%
 %% Copyright (C) 2026 Charles Moid
 %%
-%% Guards the layering rule of doc/persistence.md §5:
+%% Guards the layering rule of doc/research/persistence.md §5:
 %%
 %%   apps/ssb_conv depends on apps/ssb.  Nothing in apps/ssb may call
 %%   into apps/ssb_conv.

@@ -16,7 +16,7 @@ Running on two nodes; not yet on the public pub. The modules are
 [`feed_pins`](../../apps/ssb/src/feed_pins.erl) and
 [`silkpurse_glimpses`](../../apps/silkpurse/src/silkpurse_glimpses.erl);
 the two-node procedure is [glimpse
-testing](../ops/glimpse-testing.md).
+testing](../development/testing-glimpses.md).
 
 ---
 

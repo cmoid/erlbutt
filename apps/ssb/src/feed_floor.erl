@@ -15,7 +15,7 @@
 %% journal — replay the journal, get the same view.  A floor is the
 %% opposite: it is a record of a LOCAL DECISION about what we declined to
 %% fetch, and nothing in any feed's contents implies it.  Rebuilding views
-%% from scratch must not disturb it (doc/persistence.md's truth-vs-
+%% from scratch must not disturb it (doc/research/persistence.md's truth-vs-
 %% derivation seam: this is local truth, not derivation).
 %%
 %% WHAT A FLOOR COSTS.  Adopting one means accepting the author's claim

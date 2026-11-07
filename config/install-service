@@ -26,7 +26,7 @@
 # Without --init or --from, a node with no identity is NOT installed: you
 # are told how to give it one.  Installed means started at every boot or
 # login, and the node mints a fresh identity on its first start — which is
-# wrong when you meant to bring an existing one (doc/ops/vps-install.md
+# wrong when you meant to bring an existing one (doc/guide/running-a-pub.md
 # §6).  So an identity comes first, on purpose, every time.
 #
 # Re-running it is how you upgrade: run the NEW release's install-service.
@@ -345,7 +345,7 @@ ETC=/etc/erlbutt
 system_unit() {
     cat <<EOF
 # Written by bin/install-service.  Re-run it rather than editing; see
-# doc/ops/erlbutt.service in the source tree for what each line is for.
+# config/pub/erlbutt.service in the source tree for what each line is for.
 [Unit]
 Description=erlbutt SSB node
 After=network-online.target

@@ -1508,7 +1508,7 @@ store_msg_checked_chain_test({Pid, FeedId, _}) ->
 
 %% Storing about and contact messages no longer writes the per-feed
 %% `profile` and `contacts` side-logs.  They duplicated message bodies for
-%% a lazy loader that no longer exists (doc/persistence.md §3); the feed
+%% a lazy loader that no longer exists (doc/research/persistence.md §3); the feed
 %% directory should now hold only log.offset and references.
 no_profile_or_contacts_files_test({Pid, FeedId, _}) ->
     fun() ->

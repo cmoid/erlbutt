@@ -3,7 +3,7 @@
 %% Copyright (C) 2026 Charles Moid
 %%
 %% The convention layer: what sits between the SSB foundation and the
-%% applications built on it (doc/persistence.md §5).
+%% applications built on it (doc/research/persistence.md §5).
 %%
 %% `apps/ssb` knows the protocol — feeds, sequences, replication, and the
 %% message types replication itself depends on (contact, about).  It does

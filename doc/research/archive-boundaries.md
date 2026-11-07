@@ -313,4 +313,4 @@ local. The implementation works either way.
 [archive_verify.erl](https://github.com/cmoid/erlbutt/blob/main/apps/ssb/src/archive_verify.erl),
 [boundary_discovery.erl](https://github.com/cmoid/erlbutt/blob/main/apps/ssb/src/boundary_discovery.erl).
 Test procedure:
-[doc/ops/archive-testing.md](https://github.com/cmoid/erlbutt/blob/main/doc/ops/archive-testing.md).*
+[doc/development/testing-archives.md](https://github.com/cmoid/erlbutt/blob/main/doc/development/testing-archives.md).*

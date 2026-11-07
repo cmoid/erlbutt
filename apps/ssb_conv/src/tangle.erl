@@ -8,7 +8,7 @@
 %%
 %% This lives in ssb_conv, not in the foundation, because it is one
 %% interpretation of the reference graph rather than the graph itself
-%% (doc/persistence.md §5).  `root`/`branch` are SSB application
+%% (doc/research/persistence.md §5).  `root`/`branch` are SSB application
 %% conventions; replication never needs them.
 %%
 %% The edges it walks come from the ssb_links core view.  A reply to M
@@ -17,7 +17,7 @@
 %% ssb_links queries and reads no message bodies at all.  It used to come
 %% from a per-feed `references` file that ssb_feed wrote on every store —
 %% a tangle-shaped index maintained by the foundation, which is precisely
-%% the layering ssb_links exists to undo (doc/persistence.md §5).
+%% the layering ssb_links exists to undo (doc/research/persistence.md §5).
 -module(tangle).
 
 -ifdef(TEST).

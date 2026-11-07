@@ -5,7 +5,7 @@
 %% Message-type predicates, and the dispatch of a stored message to the
 %% handlers that care about its type.
 %%
-%% This module straddles the foundation/convention line (doc/persistence.md
+%% This module straddles the foundation/convention line (doc/research/persistence.md
 %% §5), and the split runs *through* it rather than around it:
 %%
 %%   FOUNDATION — stays here.  `contact` and `about` are de-facto

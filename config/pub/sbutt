@@ -11,7 +11,7 @@
 #
 # Installed by `sudo bin/install-service --system`, which also sets
 # ERLBUTT_PREFIX below to its --prefix.  By hand:
-#   sudo install -m 0755 doc/ops/sbutt /usr/local/bin/sbutt
+#   sudo install -m 0755 config/pub/sbutt /usr/local/bin/sbutt
 #
 # The CLI itself needs no installing — the release ships it as bin/sbutt
 # (plus a prebuilt sbutt.escript at its root), so the CLI is always the

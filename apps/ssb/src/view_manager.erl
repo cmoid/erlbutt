@@ -15,7 +15,7 @@
 %% folded independently; per-author order is all a view may rely on,
 %% which is sufficient for SSB content semantics (only my messages
 %% assert my follows/abouts).  Views needing arrival order across
-%% feeds will use the future ingest journal (doc/plugin-architecture.md).
+%% feeds will use the future ingest journal (doc/research/plugin-architecture.md).
 %%
 %% Events: a view's view_entry/1 may return {events, [Event]}; each is
 %% published as {view_event, ViewMod, Event} to processes that joined
@@ -95,7 +95,7 @@
 %% Registered views as [{Mod, core | app}], in delivery order: every core
 %% view before every app view, each group in registration order.  Core
 %% views are protocol infrastructure an app view may fold against, so they
-%% must see a message first (doc/persistence.md §5).
+%% must see a message first (doc/research/persistence.md §5).
 -record(vm_state, {views = [],
                    %% Bulk-load mode: ingest is dropped on the floor and
                    %% the store is folded in afterwards.  See
@@ -367,7 +367,7 @@ register_new_view(Mod, #vm_state{views = Views} = State) ->
 %% catch_up used to run inside the register_view call, which meant the
 %% manager was blocked for the whole fold — and because ssb_feed:store/2
 %% calls ingest/1 synchronously, replication stalled with it.  Measured
-%% at ~28 s for a 2.5M-message store (doc/persistence.md §8), with every
+%% at ~28 s for a 2.5M-message store (doc/research/persistence.md §8), with every
 %% other view's registration queued behind it.
 %%
 %% Now registration returns immediately and the fold runs in the
@@ -1007,7 +1007,7 @@ core_views_ordered_first() ->
 %% register_view/1 must not block on the fold: the manager keeps
 %% answering while catch-up runs, which is the whole point of chunking it
 %% (a 2.5M-message store folded for ~28 s inside the call, stalling
-%% replication with it — doc/persistence.md §8).
+%% replication with it — doc/research/persistence.md §8).
 catch_up_is_asynchronous() ->
     ok = test_counter_view:ensure_table(),
     ok = vm_ensure_manager(),

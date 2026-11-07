@@ -9,7 +9,7 @@
 %% This used to keep its OWN index — an ssb_view over a bag of
 %% {Target, MsgId}, snapshotted under <repo>/views/.  That index was an
 %% edge set, which is exactly what the ssb_links core view now holds for
-%% the whole node (doc/persistence.md §5), so this module keeps no state
+%% the whole node (doc/research/persistence.md §5), so this module keeps no state
 %% at all: it is a stateless ssb_plugin that queries ssb_links and
 %% renders the answers in the shape the JS client expects.
 %%

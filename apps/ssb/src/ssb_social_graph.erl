@@ -6,12 +6,12 @@
 %%
 %% This is protocol infrastructure, not a social feature — `ebt` asks it
 %% who to replicate and who to refuse, so a node carrying no social
-%% application at all still needs it (doc/persistence.md §5).  It was
+%% application at all still needs it (doc/research/persistence.md §5).  It was
 %% called `friends` until July 2026, a patchwork-ism sitting in the
 %% foundation; the display-name cache it also carried moved out to
 %% ssb_feed_meta, where arbitrary self-asserted fields live.
 %%
-%% The graphs live in ssb_store (doc/persistence.md §6) as one table of
+%% The graphs live in ssb_store (doc/research/persistence.md §6) as one table of
 %% edges, and this is the first view ported off ETS-plus-tab2file.  It
 %% was chosen as the pilot for having the fewest readers and the
 %% clearest shape; two things came out better than a straight swap:

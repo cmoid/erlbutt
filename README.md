@@ -1,62 +1,114 @@
 erlbutt
-======
+=======
 
-An implementation of the [`SSB`][1] protocol.
+A [Scuttlebutt][1] peer, written in Erlang/OTP.
 
-## [Project notes][2]
+Scuttlebutt (SSB) is a peer-to-peer social network with no servers and no
+accounts. Each person's posts go into their own signed, append-only log —
+a *feed* — kept on their own machine, and friends' machines keep copies of
+each other's feeds, passing updates along whenever they connect.
 
-## Installing a release
+erlbutt is the part that does the work: it holds your identity and your
+copies of everyone's feeds, connects to other peers and replicates. It has
+no user interface of its own; you read and post through a client that
+connects to it, such as [Silkpurse][6] or [HighWire][7], or with the
+`sbutt` command line tool. The same node can run on your laptop or, with
+a public address, as a pub or room that others connect through.
 
-Download (or `make prodpkg`) an `erlbutt-prod-*.tar.gz` for your platform
-and unpack it anywhere. It carries its own Erlang runtime, so nothing else
-needs installing. Then:
+What it implements:
 
-```
-tar -xzf erlbutt-prod-*.tar.gz -C ~/erlbutt
-~/erlbutt/bin/install-service --user --init        # macOS (launchd) or Linux (systemd --user)
-ln -s ~/erlbutt/bin/sbutt ~/.local/bin/sbutt       # the CLI, on PATH
+- the SSB protocol core: secret handshake, box stream, muxrpc, signed
+  feeds, EBT replication, blobs, private messages;
+- pubs and invites, and SSB rooms (connection relays, without the HTTP
+  parts);
+- the client surface a Patchwork-style UI expects;
+- erlbutt's own extensions, designed to be invisible to peers that do not
+  know them: **archive boundaries** (a feed can retire old history, and a
+  newcomer can start partway down) and **feed glimpses** (a feed can
+  describe itself to people just beyond its follow graph);
+- **plugins**: extra RPC methods and indexes, loaded at boot — for
+  example [ssb_git][8], git over SSB;
+- feed **export and import** as portable, verifiable bundles.
+
+Under the hood it stores each feed as its own log file and keeps every
+index in an embedded SQLite database that can be rebuilt from the logs at
+any time. The [architecture overview][2] explains why.
+
+Install a release
+-----------------
+
+Download an `erlbutt-prod-…` tarball for your platform from the
+[releases page][9]. It carries its own Erlang runtime, so nothing else is
+needed:
+
+```sh
+mkdir -p ~/erlbutt && tar -xzf erlbutt-prod-*.tar.gz -C ~/erlbutt
+~/erlbutt/bin/install-service --user --init     # macOS (launchd) or Linux (systemd --user)
+ln -s ~/erlbutt/bin/sbutt ~/.local/bin/sbutt    # the CLI, on your PATH
 sbutt whoami
 ```
 
-`--init` creates a new identity. To bring one you already have, use
-`--from ~/old/.ssberl` instead. The data lives in `~/.ssberl`, outside
-the release, so upgrading is: unpack the new release and run its
-`install-service` again. Settings that should survive upgrades go in
-`~/.ssberl/ssb.cfg`. The distribution cookie is `~/.erlang.cookie`.
+`--init` creates a new identity in `~/.ssberl`; `--from DIR` brings an
+existing erlbutt data directory instead. Upgrading is unpacking the new
+release and running its `install-service` again — your data is never
+touched.
 
-For a pub on a Linux server: `sudo bin/install-service --system --init`
-(or `--from DIR`). That creates the `erlbutt` service account, installs
-the release into `/opt/erlbutt`, the systemd unit, and the `sbutt` /
-`sbutt-console` wrappers. See [the VPS guide][5] for the background.
+Releases ship with outgoing dialing off. To let your node connect to
+peers by itself, put `{peer_dialer, true}.` in `~/.ssberl/ssb.cfg` and
+restart it.
 
-## Building
+[Getting started][3] walks through all of this, including connecting a
+client and joining the network. Coming from a JavaScript client? See
+[Moving from SSB][4]. Running a pub? See [Running a pub][5].
 
-```
-make test
+Build from source
+-----------------
 
-make ct
+Needs Erlang/OTP 28, a C compiler, libsodium and git. rebar3 is included.
 
-make rel
-
-```
-To run:
-```
-./_build/default/rel/ssb/bin/ssb console
-
-```
-An environment variable can be used to control logging, .eg.:
-
-```
-SSB_LOG_LEVEL=debug _build/default/rel/ssb/bin/ssb console
+```sh
+make rel                                      # build a development release
+_build/default/rel/ssb/bin/ssb console        # run it, with a shell
+make test                                     # unit tests
+make ct                                       # multi-node Common Test suites
 ```
 
-See [ssb conversion][4] for details on converting an existing `SSB` store to erlbutt.
+A development build joins a test network and keeps its identity inside
+the release directory, so it can never post as you on the real network.
+`make prodpkg` builds a production package. See
+[Building and testing][10] and [Releasing][11].
 
-There is also a [dev-diary][3] that are posts made on `SSB`, so many of the linked items in those entries are not visible in github.
+Documentation
+-------------
+
+- [Getting started][3] and [configuration][12] — for running a node
+- [Architecture overview][2] — for understanding the code
+- [Writing plugins][13]
+- [Everything else][14] — the full documentation index
+
+There is also a [dev diary][15], posted to SSB as it was written, so
+links to SSB messages in it resolve only from an SSB client.
+
+License
+-------
+
+GPL-2.0-only; see [LICENSES/COPYING](LICENSES/COPYING). Test data is MIT
+licensed (`testdata.zip.license`). Contributors are listed in
+[BUTTS](BUTTS).
 
 ----
-[1]: https://ssbc.github.io/scuttlebutt-protocol-guide/
-[2]: https://github.com/cmoid/erlbutt/blob/main/doc/project.md
-[3]: https://github.com/cmoid/erlbutt/tree/main/doc/dev-diary
-[4]: https://github.com/cmoid/erlbutt/blob/main/doc/ops/ssb-conversion.md
-[5]: https://github.com/cmoid/erlbutt/blob/main/doc/ops/vps-install.md
+[1]: https://scuttlebutt.nz
+[2]: doc/architecture/overview.md
+[3]: doc/guide/getting-started.md
+[4]: doc/guide/moving-from-ssb.md
+[5]: doc/guide/running-a-pub.md
+[6]: https://github.com/cmoid/silkpurse
+[7]: https://github.com/mwmiller/highwire
+[8]: https://github.com/cmoid/ssb_git
+[9]: https://github.com/cmoid/erlbutt/releases
+[10]: doc/development/building-and-testing.md
+[11]: doc/development/releasing.md
+[12]: doc/guide/configuration.md
+[13]: doc/architecture/plugins.md
+[14]: doc/README.md
+[15]: doc/dev-diary/

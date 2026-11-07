@@ -55,12 +55,12 @@ into place at the end, so `DIR` only ever appears complete.
 node. The logs are append-only and blobs are immutable, so it is safe to
 run beside a live node, and a large export never blocks it. Set
 `SSB_HOME` if you are not in the release directory (see
-[ssb-conversion.md](ssb-conversion.md)).
+[Moving from SSB](moving-from-ssb.md)).
 
 **What is exported.** A feed is exported only if this node holds it
 **from sequence 1, as one unbroken chain**. Archived segments are part
 of the feed and are included. A feed held from a validation floor (a
-suffix, see [archive-testing.md](archive-testing.md)) is refused and
+suffix, see [testing archives](../development/testing-archives.md)) is refused and
 listed under `refused`, and so is a feed this node does not hold. The
 other feeds still export.
 

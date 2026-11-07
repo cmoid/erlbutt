@@ -3,7 +3,7 @@
 %% Test fixture: the same minimal ssb_view as test_counter_view, but
 %% declaring view_class() -> core.  Used to exercise view_manager's
 %% core-before-app ordering without registering a real core view into a
-%% test fixture (doc/persistence.md §5).
+%% test fixture (doc/research/persistence.md §5).
 -module(test_core_view).
 -behaviour(ssb_view).
 

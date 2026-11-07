@@ -1,8 +1,11 @@
 # Installing erlbutt as a pub on a VPS
 
-*Operational note, August 2026. Companion files in this directory:
-`erlbutt.service` (systemd unit), `sbutt` (CLI wrapper) and
-`sbutt-console` (Erlang shell wrapper).*
+*Operational note, August 2026. Companion files in `config/pub/` in the
+source tree: `erlbutt.service` (systemd unit), `sbutt` (CLI wrapper) and
+`sbutt-console` (Erlang shell wrapper). A release carries the two
+wrappers in `share/ops/`, and `install-service --system` writes an
+equivalent unit and installs both wrappers for you; the manual steps
+below are the long way round.*
 
 A pub's address is `net:<host>:8008~shs:<pubkey>`, and peers resolve the
 hostname at dial time. **The identity is the key, not the IP** — which is
@@ -63,7 +66,7 @@ belong with `secret`, not with the views.
 
 Your own feed is the sharp edge in `feeds/`. Everything else can be
 re-replicated from peers; your own log cannot, because no peer will send it
-back to you if you are its only author. See `resync-runbook.md` before
+back to you if you are its only author. See [Rebuilding a node](rebuilding-a-node.md) before
 deleting anything under `.ssberl`.
 
 ## 2. Pin the distribution port
@@ -241,10 +244,10 @@ there still works, and pins the cookie to that value.
 **Unit file and CLI wrapper:**
 
 ```
-sudo cp doc/ops/erlbutt.service /etc/systemd/system/
+sudo cp config/pub/erlbutt.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable erlbutt
-sudo install -m 0755 doc/ops/sbutt         /usr/local/bin/sbutt
-sudo install -m 0755 doc/ops/sbutt-console /usr/local/bin/sbutt-console
+sudo install -m 0755 config/pub/sbutt         /usr/local/bin/sbutt
+sudo install -m 0755 config/pub/sbutt-console /usr/local/bin/sbutt-console
 ```
 
 Do **not** start it yet if you are bringing an existing identity (§6) —
@@ -259,7 +262,7 @@ start` do it).
 When the old data directory is readable on this machine, `sbutt init
 --from DIR` does the adoption in one checked step. It refuses a source in
 use by a running node, a source from a newer erlbutt, a JS `~/.ssb`
-(that's a conversion, see `ssb-conversion.md`), and a destination that
+(that's a conversion, see [Moving from SSB](moving-from-ssb.md)), and a destination that
 already holds data or an identity. It copies with `cp -Rp`, sets the
 secret to 0600, and verifies the copy's secret before reporting the id.
 Run as `erlbutt`, the copy ends up owned by `erlbutt`, so step 3's
@@ -492,7 +495,7 @@ folded **nothing** — a tail read that skipped every feed — so it is not
 evidence that work happened. A real fold is orders of magnitude longer.
 
 Wiping anything else under `.ssberl` is a different and more dangerous
-operation, because of the own-feed problem in §1. `resync-runbook.md`
+operation, because of the own-feed problem in §1. [Rebuilding a node](rebuilding-a-node.md)
 covers it, including the trap that peers will not re-send what you lost:
 ssb-ebt folds clocks with `max()` and never rewinds, so a peer that
 remembers you at sequence N will not go back, no matter what you advertise.

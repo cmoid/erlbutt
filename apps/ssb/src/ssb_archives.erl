@@ -21,7 +21,7 @@
 %%
 %% WHY THIS IS A VIEW AND feed_floor IS NOT.  Both concern archives; they
 %% sit on opposite sides of the truth-vs-derivation seam
-%% (doc/persistence.md).  This view is a deterministic fold over the
+%% (doc/research/persistence.md).  This view is a deterministic fold over the
 %% ingest journal — what AUTHORS said — so replaying the journal
 %% reproduces it exactly and a rebuild is free.  A floor is a record of
 %% what WE decided not to fetch, is implied by nothing in any feed, and

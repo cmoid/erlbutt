@@ -45,7 +45,7 @@ init([]) ->
             %% After the feeds: its boot check reads our own feed's seq.
             ?CHILD(own_feed, worker),
             ?CHILD(view_manager, worker),
-            %% core views (doc/persistence.md §5): the ssb app owns these
+            %% core views (doc/research/persistence.md §5): the ssb app owns these
             %% and starts them itself, before any application's views
             ?CHILD(ssb_social_graph, worker),
             ?CHILD(ssb_feed_meta, worker),

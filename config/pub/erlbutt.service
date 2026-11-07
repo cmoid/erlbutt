@@ -3,14 +3,14 @@
 # Copyright (C) 2026 Charles Moid
 #
 # systemd unit for an erlbutt node running from the prod package.
-# See doc/ops/vps-install.md for the layout this assumes:
+# See doc/guide/running-a-pub.md for the layout this assumes:
 #
 #   /opt/erlbutt          the unpacked release, and SSB_HOME (legacy)
 #   /opt/erlbutt/.ssberl  SYMLINK -> /var/lib/erlbutt/.ssberl (the real data)
 #   /etc/erlbutt/env      optional: SSB_COOKIE and anything else secret
 #
 # Install:
-#   sudo cp doc/ops/erlbutt.service /etc/systemd/system/
+#   sudo cp config/pub/erlbutt.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now erlbutt
 
 [Unit]

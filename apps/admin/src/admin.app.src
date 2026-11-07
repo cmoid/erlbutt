@@ -3,7 +3,7 @@
 %% Copyright (C) 2026 Charles Moid
 %%
 %% The control plane: an owner-only muxrpc namespace for operating a
-%% running node (doc/persistence.md §5).
+%% running node (doc/research/persistence.md §5).
 %%
 %% Before this app, administering erlbutt meant either a remsh session
 %% calling internal modules by hand, or a client like maxbutt reaching

@@ -8,7 +8,7 @@
 #   sbutt-console
 #
 # Installed by `sudo bin/install-service --system`.  By hand:
-#   sudo install -m 0755 doc/ops/sbutt-console /usr/local/bin/sbutt-console
+#   sudo install -m 0755 config/pub/sbutt-console /usr/local/bin/sbutt-console
 #
 # Companion to `sbutt`, and it exists for the same reason: `bin/ssb` needs
 # the environment systemd gives it, and getting that wrong is worse here
