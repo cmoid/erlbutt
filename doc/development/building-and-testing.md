@@ -60,7 +60,7 @@ make ct      # Common Test: suites that start real nodes and connect them
 ```
 
 **eunit** tests live at the bottom of the module they test, inside
-`-ifdef(TEST)`. `make test` unpacks `testdata.zip` (sample feeds, blobs
+`-ifdef(TEST)`. `make test` unpacks `test/testdata.zip` (sample feeds, blobs
 and vector clocks) into `testdata/` first and removes it afterwards.
 Run `make test` after every change.
 

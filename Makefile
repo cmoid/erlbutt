@@ -44,7 +44,7 @@ distclean: clean
 ## and -n would skip it on every run after, so the suite stays red until you
 ## delete testdata/ by hand.  -n and -o together are contradictory; -n wins.
 test: compile
-	unzip -o testdata.zip
+	unzip -o test/testdata.zip
 	$(REBAR) eunit
 	rm -Rf testdata
 

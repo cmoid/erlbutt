@@ -13,8 +13,10 @@
 %% DRY RUN by default: it only reports what it would change.  Add --apply to
 %% actually rewrite the file (it backs the original up first).
 %%
-%%   ./truncate_feed.escript <path/to/feeds/<feed>/log.offset> <keep-seq>
-%%   ./truncate_feed.escript <path/to/.../log.offset> <keep-seq> --apply
+%% Run from the erlbutt root (the -pa above is relative to it):
+%%
+%%   scripts/truncate_feed.escript <path/to/feeds/<feed>/log.offset> <keep-seq>
+%%   scripts/truncate_feed.escript <path/to/.../log.offset> <keep-seq> --apply
 %%
 %% NOTE: this only edits log.offset.  erlbutt's side indexes (mess_auth.ets,
 %% ingest.journal, views/, references) may still reference the dropped

@@ -94,7 +94,7 @@ License
 -------
 
 GPL-2.0-only; see [LICENSES/COPYING](LICENSES/COPYING). Test data is MIT
-licensed (`testdata.zip.license`). Contributors are listed in
+licensed (`test/testdata.zip.license`). Contributors are listed in
 [BUTTS](BUTTS).
 
 ----
