@@ -1,0 +1,296 @@
+%% SPDX-License-Identifier: GPL-2.0-only
+%%
+%% Copyright (C) 2026 Charles Moid
+%%
+%% Loopback peer communication tests.
+%%
+-module(erlbutt_peer_SUITE).
+
+-export([all/0,
+         init_per_suite/1,
+         end_per_suite/1,
+         init_per_testcase/2,
+         end_per_testcase/2]).
+
+-export([handshake_test/1,
+         post_and_fetch_test/1,
+         ebt_path_test/1,
+         plugin_rpc_test/1,
+         manifest_rpc_test/1,
+         log_stream_test/1,
+         unknown_method_test/1,
+         long_source_test/1,
+         history_reverse_test/1,
+         archive_serving_over_the_wire_test/1]).
+
+-include_lib("common_test/include/ct.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("ssb/include/ssb.hrl").
+
+-define(TEST_PORT, 18008).
+
+%%% CT callbacks --------------------------------------------------------
+
+all() ->
+    [handshake_test,
+     post_and_fetch_test,
+     ebt_path_test,
+     plugin_rpc_test,
+     manifest_rpc_test,
+     log_stream_test,
+     unknown_method_test,
+     long_source_test,
+     history_reverse_test,
+     %% last: it archives the node's own feed, which removes early history
+     %% from what this node can serve for the rest of the suite
+     archive_serving_over_the_wire_test].
+
+init_per_suite(Config) ->
+    DataDir = ?config(priv_dir, Config),
+    write_test_cfg(DataDir),
+    %% Stop ssb if another suite already started it on a different port,
+    %% then restart with our isolated config and an ephemeral test port.
+    application:stop(ssb),
+    application:set_env(ssb, ssb_home, DataDir),
+    application:set_env(ssb, port,     ?TEST_PORT),
+    application:ensure_all_started(ssb),
+    Config.
+
+end_per_suite(Config) ->
+    application:stop(ssb),
+    Config.
+
+init_per_testcase(_Case, Config) -> Config.
+end_per_testcase(_Case, Config)  -> Config.
+
+%%% Tests ---------------------------------------------------------------
+
+%% Full SHS client+server handshake over loopback.
+%% ssb_peer:start_link/2 only returns {ok, Pid} after the handshake
+%% completes on the client side, so a live process means it succeeded.
+handshake_test(_Config) ->
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    ?assert(is_process_alive(Peer)),
+    gen_server:stop(Peer).
+
+%% Post a message to our own feed and read it back.
+%% Exercises ssb_feed write + fetch without a network round-trip.
+post_and_fetch_test(_Config) ->
+    FeedPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    ok = ssb_feed:post_content(FeedPid, ~"hello from CT"),
+    #message{} = ssb_feed:fetch_last_msg(FeedPid).
+
+%% Connect to ourselves and verify the EBT code path runs without
+%% crashing.  ebt:initial_vector/0 is called during the handshake;
+%% we check that it includes our feed with a sequence >= 1 (the
+%% message posted in post_and_fetch_test).
+%%
+%% Note: this test depends on post_and_fetch_test having run first.
+%% For true cross-peer replication verification, use multi-node tests.
+ebt_path_test(_Config) ->
+    {[{OurId, EncodedSeq}]} = ebt:initial_vector(),
+    ?assert(OurId == keys:pub_key_disp()),
+    {true, true, Seq} = ebt_vc:decode_clock_int(EncodedSeq),
+    ?assert(Seq >= 1),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    ?assert(is_process_alive(Peer)),
+    gen_server:stop(Peer).
+
+%% Register a plugin and call its methods over a real loopback
+%% connection.  The loopback client authenticates with the node's own
+%% keypair, so its permission class is owner.
+plugin_rpc_test(_Config) ->
+    ok = plugin_registry:register_plugin(test_echo_plugin),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+
+    %% async method: args come back verbatim
+    {ok, Body} = ssb_peer:rpc_call(Peer, [~"echo", ~"hello"], ~"async",
+                                   [~"hi there"]),
+    ?assertEqual([~"hi there"], utils:nat_decode(Body)),
+
+    %% the plugin sees the authenticated caller identity and class
+    {ok, Body2} = ssb_peer:rpc_call(Peer, [~"echo", ~"whoAmI"], ~"async"),
+    {Props} = utils:nat_decode(Body2),
+    ?assertEqual(keys:pub_key_disp(), proplists:get_value(~"feed", Props)),
+    ?assertEqual(~"owner", proplists:get_value(~"class", Props)),
+
+    %% owner-only method is callable by the owner
+    {ok, Body3} = ssb_peer:rpc_call(Peer, [~"echo", ~"secrets"], ~"async"),
+    ?assertEqual(~"the owner's secrets", utils:nat_decode(Body3)),
+
+    %% source method: one frame per item, then a clean end-of-stream
+    {ok, Frames} = ssb_peer:rpc_stream_call(Peer, [~"echo", ~"count"], [3]),
+    ?assertEqual([1, 2, 3], [utils:nat_decode(F) || F <- Frames]),
+
+    ok = plugin_registry:unregister_plugin(test_echo_plugin),
+    gen_server:stop(Peer).
+
+%% The manifest method serves the node's RPC surface (builtins included),
+%% filtered by the caller's class.
+manifest_rpc_test(_Config) ->
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, Body} = ssb_peer:rpc_call(Peer, [~"manifest"], ~"sync"),
+    {Props} = utils:nat_decode(Body),
+    ?assertEqual(~"source", proplists:get_value(~"createHistoryStream", Props)),
+    ?assertEqual(~"sync",   proplists:get_value(~"manifest", Props)),
+    {Blobs} = proplists:get_value(~"blobs", Props),
+    ?assertEqual(~"async", proplists:get_value(~"has", Blobs)),
+    %% the loopback caller is the owner, so owner-only methods are visible
+    ?assertEqual(~"async", proplists:get_value(~"publish", Props)),
+    gen_server:stop(Peer).
+
+%% createLogStream serves arrival order from the ingest journal, with
+%% bodies resolved from the per-feed store.  The loopback caller is the
+%% owner, so the (owner-gated) method is callable.
+log_stream_test(_Config) ->
+    FeedPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    Marker = base64:encode(crypto:strong_rand_bytes(12)),
+    ok = ssb_feed:post_content(FeedPid, Marker),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, Frames} = ssb_peer:rpc_stream_call(Peer, [~"createLogStream"], []),
+    ?assert(lists:any(fun(F) -> binary:match(F, Marker) =/= nomatch end,
+                      Frames)),
+    gen_server:stop(Peer).
+
+%% A long plugin source is sent outside the request path: the connection
+%% keeps answering other requests while it streams, and every item still
+%% arrives in order across the pump's batches.  Inline, the stream held
+%% the connection's request call open — past 45s that timeout killed the
+%% connection (messagesByType "contact" on a full store).
+long_source_test(_Config) ->
+    ok = plugin_registry:register_plugin(test_echo_plugin),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    Self = self(),
+    N = 200,
+    spawn_link(fun() ->
+                       Self ! {slow, ssb_peer:rpc_stream_call(
+                                       Peer, [~"echo", ~"slow"], [N, 20])}
+               end),
+    timer:sleep(300),   %% well into the ~4s stream
+    T0 = erlang:monotonic_time(millisecond),
+    {ok, _} = ssb_peer:rpc_call(Peer, [~"manifest"], ~"sync"),
+    ?assert(erlang:monotonic_time(millisecond) - T0 < 1000),
+    receive
+        {slow, {ok, Frames}} ->
+            ?assertEqual(lists:seq(1, N), [utils:nat_decode(F) || F <- Frames])
+    after 20000 ->
+        ct:fail(slow_source_never_ended)
+    end,
+    ok = plugin_registry:unregister_plugin(test_echo_plugin),
+    gen_server:stop(Peer).
+
+%% An unknown method is answered with an error naming it, not an empty
+%% success: a misnamed call used to read as a view returning nothing.
+unknown_method_test(_Config) ->
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    {ok, Body} = ssb_peer:rpc_call(Peer, [~"no", ~"suchMethod"], ~"async"),
+    {Props} = utils:nat_decode(Body),
+    ?assertEqual(~"Error", proplists:get_value(~"name", Props)),
+    ?assertEqual(~"method not found: no.suchMethod",
+                 proplists:get_value(~"message", Props)),
+    %% the connection survives it
+    {ok, _} = ssb_peer:rpc_call(Peer, [~"manifest"], ~"sync"),
+    gen_server:stop(Peer).
+
+%% createHistoryStream honours reverse: with a limit, the NEWEST messages,
+%% newest first — not the oldest ones in log order.
+history_reverse_test(_Config) ->
+    FeedPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    Ms = [base64:encode(crypto:strong_rand_bytes(12)) || _ <- [1, 2, 3]],
+    [ok = ssb_feed:post_content(FeedPid, M) || M <- Ms],
+    [_, M2, M3] = Ms,
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    Id = keys:pub_key_disp(),
+    {ok, Frames} = ssb_peer:rpc_stream_call(
+                     Peer, [~"createHistoryStream"],
+                     [{[{~"id", Id}, {~"reverse", true}, {~"limit", 2}]}]),
+    Has = fun(F, M) -> binary:match(F, M) =/= nomatch end,
+    ?assertMatch([_, _], Frames),
+    [First, Second] = Frames,
+    ?assert(Has(First, M3)),
+    ?assert(Has(Second, M2)),
+
+    %% without reverse the order is unchanged: oldest first
+    {ok, Fwd} = ssb_peer:rpc_stream_call(
+                  Peer, [~"createHistoryStream"], [{[{~"id", Id}]}]),
+    ?assert(Has(lists:last(Fwd), M3)),
+    gen_server:stop(Peer).
+
+%% The servability guard, over a real socket.
+%%
+%% eunit pins the RULE (ssb_feed:servable_from/2); this pins the WIRING,
+%% which is the part inspection cannot show.  A rule the send path forgets
+%% to consult is a passing test and a broken feature.
+%%
+%% After archiving, the live log starts at the archive genesis, whose
+%% `previous` names a message we no longer serve.  A caller asking from the
+%% beginning therefore cannot chain anything we would send, so it must get
+%% nothing rather than orphans — a strict client rejects those, a lenient
+%% one stores and relays them.
+archive_serving_over_the_wire_test(_Config) ->
+    FeedPid = utils:find_or_create_feed_pid(keys:pub_key_disp()),
+    Early = base64:encode(crypto:strong_rand_bytes(12)),
+    ok = ssb_feed:post_content(FeedPid, Early),
+    {ok, _} = ssb_feed:archive(FeedPid),
+    Late = base64:encode(crypto:strong_rand_bytes(12)),
+    ok = ssb_feed:post_content(FeedPid, Late),
+
+    Id = keys:pub_key_disp(),
+    {ok, Peer} = ssb_peer:start_link("localhost", server_pk()),
+    From0 = fun() ->
+                {ok, F} = ssb_peer:rpc_stream_call(
+                            Peer, [~"createHistoryStream"],
+                            [{[{~"id", Id}, {~"seq", 0}]}]),
+                F
+            end,
+    Holds = fun(Frames, M) ->
+                lists:any(fun(F) -> binary:match(F, M) =/= nomatch end, Frames)
+            end,
+
+    %% Serving ON (the default): the segment is decompressed and the
+    %% pre-boundary message is served, so a client that knows nothing about
+    %% boundaries sees an ordinary, complete feed.  This is the whole point
+    %% of archive serving, asserted over a real socket rather than inferred.
+    Served = From0(),
+    ?assert(Holds(Served, Early)),
+    ?assert(Holds(Served, Late)),
+
+    %% Serving OFF: the node declines to carry its own history and the
+    %% guard refuses rather than sending messages the caller cannot chain.
+    ok = config:set_archive_serving(false),
+    try
+        Refused = From0(),
+        ?assertEqual([], Refused),
+
+        %% but a peer already holding the genesis's predecessor is still
+        %% served, so the refusal is precise rather than a blanket no
+        Lowest = ssb_feed:lowest_seq(FeedPid),
+        {ok, Tail} = ssb_peer:rpc_stream_call(
+                       Peer, [~"createHistoryStream"],
+                       [{[{~"id", Id}, {~"seq", Lowest - 1}]}]),
+        ?assert(Holds(Tail, Late))
+    after
+        ok = config:set_archive_serving(true)
+    end,
+    gen_server:stop(Peer).
+
+%%% Helpers -------------------------------------------------------------
+
+server_pk() ->
+    base64:decode(keys:pub_key()).
+
+%% Write a minimal ssb.cfg using absolute paths inside CT's priv_dir
+%% so feeds and blobs are fully isolated from ~/.ssberl.
+write_test_cfg(DataDir) ->
+    CfgFile = filename:join(DataDir, "ssb.cfg"),
+    FeedDir = filename:join(DataDir, "feeds/"),
+    BlobDir = filename:join(DataDir, "blobs/"),
+    ok = filelib:ensure_dir(FeedDir),
+    ok = filelib:ensure_dir(BlobDir),
+    Terms = io_lib:format(
+        "{feed_store_location, \"~s\"}.~n"
+        "{blob_store_location, \"~s\"}.~n"
+        "{network_id, \"1KHLiKZvAvjbY1ziZEHMXawbCEIM6qwjCDm3VYnaR/s=\"}.~n",
+        [FeedDir, BlobDir]),
+    ok = file:write_file(CfgFile, Terms),
+    CfgFile.

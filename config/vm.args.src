@@ -1,0 +1,33 @@
+## Local development node (used by `make rel`).  syntax_tools and tools are
+## bundled in the release now, so no system -pa is needed for distel.
+##
+## Node name/cookie are overridable at boot (this is a `.src` file, so relx
+## substitutes ${...} from the environment).  To reach this node from another
+## machine over Erlang distribution (e.g. maxbutt across the LAN), start it
+## with its routable address:
+##
+##   SSB_NODE=erlbutt@192.168.4.26 bin/ssb console
+##
+## The connecting node (maxbutt) must use the SAME cookie and a long node name.
+-name ${SSB_NODE:-erlbutt@localhost}
+-setcookie ${SSB_COOKIE:-erlbutt}
+-pa ${HOME}/code/erlbutt/_build/default/lib/ssb/ebin
+-pa ${HOME}/code/erlbutt/_build/test/extras/test
+-pa ${HOME}/code/maxbutt/ebin
+
+## Cross-machine distribution (maxbutt over an ssh tunnel or LAN): the dist
+## listener port is random by default, so a remote node can reach epmd (4369)
+## but not this node.  Pinned by default so a fresh release never silently
+## breaks the tunnel again; override with SSB_DIST_PORT, and forward/open
+## both 4369 and this port (e.g. ssh -L 4369:localhost:4369 -L 9100:localhost:9100).
+-kernel inet_dist_listen_min ${SSB_DIST_PORT:-9100}
+
+## ...and a small range above it, because `bin/ssb remote_console` starts a
+## SECOND node that reads this same file.  Setting min alone pins the port
+## exactly (max defaults to min), so the remsh node tried to bind the port
+## the running node already held and died with eaddrinuse — reported as a
+## bare "Could not connect".  The node still takes SSB_DIST_PORT itself,
+## being the first free port in the range, so tunnels and firewall rules
+## are unaffected.  vm.args.prod keeps the exact pin on purpose: a box with
+## a public IP should not open a range.
+-kernel inet_dist_listen_max ${SSB_DIST_PORT_MAX:-9110}

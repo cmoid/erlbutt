@@ -1,0 +1,1191 @@
+%% SPDX-License-Identifier: GPL-2.0-only
+%%
+%% Copyright (C) 2023 Charles Moid
+-module(ssb_peer).
+
+-behaviour(gen_server).
+-behaviour(ranch_protocol).
+
+-include_lib("ssb/include/ssb.hrl").
+
+-export([start_link/2,
+         start_link/3,
+         start/2,
+         start/3,
+         send/2,
+         rpc_call/3,
+         rpc_call/4,
+         rpc_call/5,
+         rpc_stream_call/3,
+         open_source/4,
+         open_duplex/4,
+         open_sink/4,
+         send_sink_data/3,
+         send_sink_end/2,
+         send_frame/3,
+         send_frames/4,
+         tunnel_connect/3,
+         start_tunnel_server/3,
+         tunnel_client_init/2,
+         tunnel_server_init/3,
+         request_ebt/1,
+         replicating/1,
+         request_blob_wants/3,
+         fetch_blob/2,
+         has_blob/2,
+         drain_haves/1]).
+
+%% gen_server exports
+-export([init/1, handle_call/3, handle_cast/2,
+         handle_info/2, terminate/2,
+         code_change/3]).
+
+-compile({no_auto_import,[size/1]}).
+-import(utils, [concat/1,
+                combine/2,
+                send_data/4,
+                size/1]).
+
+-define(EBT_ENTROPY_MS,        ?DEFAULT_EBT_ENTROPY_MS).
+
+%% connect to another peer on the default port (ssb app env or 8008).
+start_link(Ip, PubKey) ->
+    Port = application:get_env(ssb, port, 8008),
+    start_link(Ip, Port, PubKey).
+
+%% connect to another peer on an explicit port.
+%% Idempotent: if already connected (or if an inbound connection wins the
+%% registration race), returns {ok, ExistingPid} rather than crashing.
+%% init/1 returns `ignore` (not {stop,...}) so the child exits with normal
+%% and sends no propagating EXIT signal to the caller.
+start_link(Ip, Port, PubKey) when is_integer(Port) ->
+    case peer_registry:find(PubKey) of
+        {ok, Pid} ->
+            {ok, Pid};
+        miss ->
+            case gen_server:start_link(?MODULE, [Ip, Port, PubKey], []) of
+                ignore ->
+                    %% Lost the registration race to an inbound connection.
+                    case peer_registry:find(PubKey) of
+                        {ok, Pid} -> {ok, Pid};
+                        miss      -> {error, already_connected}
+                    end;
+                Other ->
+                    Other
+            end
+    end;
+
+%% ranch 2.x protocol callback — accept a connection from another peer.
+%% Note: it no longer passes the socket in.
+start_link(Ref, Transport, Opts) ->
+    gen_server:start_link(?MODULE, {ranch, Ref, Transport, Opts}, []).
+
+%% Unlinked variants — use when the caller is a temporary process (e.g. rpc:call).
+start(Ip, PubKey) ->
+    gen_server:start(?MODULE, [Ip, PubKey], []).
+
+start(Ip, Port, PubKey) when is_integer(Port) ->
+    gen_server:start(?MODULE, [Ip, Port, PubKey], []).
+
+%% send data to another peer, asynchronously
+send(Pid, Data) ->
+    gen_server:cast(Pid, {send, Data}).
+
+%%%===================================================================
+%%% Tunnel mode — run a full peer over a room tunnel instead of a socket.
+%%% The inner Secret Handshake runs over the tunnel; afterwards the same
+%%% rpc/EBT/blob machinery operates with a {tunnel, OwnerPid, ReqNo} handle in
+%%% place of a gen_tcp socket (utils:send_data dispatches on it).
+%%%===================================================================
+
+%% Client: dial RemotePk through the room peer RoomPid and run a full peer over
+%% the resulting tunnel.  Returns {ok, PeerPid}.
+tunnel_connect(RoomPid, RemotePk, Args) ->
+    Pid = proc_lib:spawn(?MODULE, tunnel_client_init, [RoomPid, RemotePk]),
+    %% Register Pid as the stream sink before any relayed frame can arrive.
+    {ok, ReqNo} = open_duplex(RoomPid, [?tunnel, ?connect], Args, Pid),
+    Pid ! {go, ReqNo},
+    {ok, Pid}.
+
+%% Server: accept an incoming tunnel (spawned by tunnel_endpoint).  OwnerPid is
+%% the room-facing peer; the room sends us frames on +RecvReqNo and we reply on
+%% SendReqNo (= -RecvReqNo).
+start_tunnel_server(OwnerPid, RecvReqNo, SendReqNo) ->
+    proc_lib:spawn(?MODULE, tunnel_server_init, [OwnerPid, RecvReqNo, SendReqNo]).
+
+tunnel_client_init(RoomPid, RemotePk) ->
+    process_flag(trap_exit, true),
+    SendReqNo = receive {go, R} -> R after 10000 -> error(tunnel_no_reqno) end,
+    RecvReqNo = -SendReqNo,
+    Send = fun(D) -> send_frame(RoomPid, SendReqNo, D), ok end,
+    Recv = fun(_N) -> recv_tunnel(RecvReqNo) end,
+    {ok, {DecKey, DecNonce, EncKey, EncNonce}} =
+        shs:client_shake_hands_tunnel(Send, Recv, RemotePk),
+    enter_tunnel_loop(RoomPid, SendReqNo, RecvReqNo, RemotePk,
+                      DecKey, DecNonce, EncKey, EncNonce).
+
+tunnel_server_init(OwnerPid, RecvReqNo, SendReqNo) ->
+    process_flag(trap_exit, true),
+    Send = fun(D) -> send_frame(OwnerPid, SendReqNo, D), ok end,
+    Recv = fun(_N) -> recv_tunnel(RecvReqNo) end,
+    {ok, Hello} = recv_tunnel(RecvReqNo),
+    {ok, {DecKey, DecNonce, EncKey, EncNonce, ClLongPk, _NetId}} =
+        shs:server_shake_hands_tunnel(Hello, Send, Recv, config:network_ids()),
+    enter_tunnel_loop(OwnerPid, SendReqNo, RecvReqNo, ClLongPk,
+                      DecKey, DecNonce, EncKey, EncNonce).
+
+%% Build post-handshake state and hand off to the gen_server loop.  From here
+%% the peer is indistinguishable from a socket peer except that its "socket" is
+%% a tunnel handle and inbound frames arrive as {tunnel_data, RecvReqNo, Body}.
+enter_tunnel_loop(OwnerPid, SendReqNo, RecvReqNo, RemotePk,
+                  DecKey, DecNonce, EncKey, EncNonce) ->
+    {ok, RpcProc} = rpc_processor:start_link(),
+    ok = rpc_processor:set_remote_pk(RpcProc, RemotePk),
+    ok = rpc_processor:set_owner(RpcProc, self()),
+    State = #sbox_state{socket = {tunnel, OwnerPid, SendReqNo},
+                        transport = tunnel,
+                        dec_sbox_key = DecKey,
+                        enc_sbox_key = EncKey,
+                        dec_nonce = DecNonce,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc,
+                        remote_pk = RemotePk,
+                        shook_hands = 1,
+                        recv_req = RecvReqNo,
+                        req_counter = 0},
+    gen_server:enter_loop(?MODULE, [], State).
+
+recv_tunnel(ReqNo) ->
+    receive
+        {tunnel_data, ReqNo, Body} -> {ok, Body}
+    after 10000 ->
+        {error, timeout}
+    end.
+
+%% Send an RPC request and block until the response arrives (or timeout).
+%% Method is a list of binaries, e.g. [<<"whoami">>].
+%% Type is <<"async">>, <<"source">>, or <<"sync">>.
+rpc_call(Pid, Method, Type) ->
+    gen_server:call(Pid, {rpc_call, Method, Type, []}, 10000).
+
+rpc_call(Pid, Method, Type, Args) ->
+    rpc_call(Pid, Method, Type, Args, 10000).
+
+%% Some calls are legitimately slow and the caller knows which.
+%%
+%% `admin.store.tables` counts every row of every table, and SQLite has no
+%% cheaper way to answer that: on a converted store it is 3.1M link rows
+%% and 2.3M type rows, each a full scan. Ten seconds is right for asking a
+%% node a question; it is not right for asking it to count a corpus, and
+%% the difference belongs at the call site rather than in a global bound.
+rpc_call(Pid, Method, Type, Args, Timeout) ->
+    gen_server:call(Pid, {rpc_call, Method, Type, Args}, Timeout).
+
+%% Send a source RPC request and collect all response bodies until end-of-stream.
+%% Returns {ok, [Body]} in arrival order.
+rpc_stream_call(Pid, Method, Args) ->
+    gen_server:call(Pid, {rpc_stream_call, Method, Args}, 30000).
+
+%% Open a source stream without collecting: each response frame is delivered
+%% to NotifyPid as {stream_data, Ref, Body}, end-of-stream as {stream_done, Ref}.
+%% Returns {ok, Ref} immediately.  Suited to long-lived streams (e.g.
+%% room.attendants) that never terminate.
+open_source(Pid, Method, Args, NotifyPid) ->
+    gen_server:call(Pid, {open_source, Method, Args, NotifyPid}).
+
+%% Open a duplex stream: send the request and route every response frame
+%% (negative ReqNo) to SinkPid via the tunnel_relay sink as
+%% {tunnel_data, -ReqNo, Body}.  Returns {ok, ReqNo} so the caller can push
+%% further frames with send_frame/3 on the same (positive) ReqNo.
+open_duplex(Pid, Method, Args, SinkPid) ->
+    gen_server:call(Pid, {open_duplex, Method, Args, SinkPid}).
+
+%% Open a sink stream (e.g. blobs.add): send the request, then push the
+%% payload with send_sink_data/3 and close it with send_sink_end/2.  The
+%% peer's terminating frame — JSON `true`, or an error — is delivered to
+%% NotifyPid as {rpc_reply, Ref, Body}.  Returns {ok, ReqNo, Ref}.
+open_sink(Pid, Method, Args, NotifyPid) ->
+    gen_server:call(Pid, {open_sink, Method, Args, NotifyPid}).
+
+%% One chunk of a sink's payload: a BINARY frame (type 0), which is how a
+%% muxrpc client streams bytes — unlike send_frame/3's JSON frames.
+send_sink_data(Pid, ReqNo, Body) ->
+    gen_server:cast(Pid, {send_sink_data, ReqNo, Body}).
+
+%% Close a sink cleanly: end frame carrying JSON `true`.
+send_sink_end(Pid, ReqNo) ->
+    gen_server:cast(Pid, {send_sink_end, ReqNo}).
+
+%% Send a single stream data frame (stream flag, no end) on ReqNo, using this
+%% connection's enc_nonce.  Async; ordering preserved per caller.
+send_frame(Pid, ReqNo, Body) ->
+    gen_server:cast(Pid, {send_frame, ReqNo, Body}).
+
+%% Send a batch of stream data frames on ReqNo, then — if End — the
+%% stream's end frame (JSON true).  Synchronous on purpose: it is the
+%% backpressure for a source that is sent outside the request path (see
+%% rpc_processor's pump), which would otherwise queue a whole store's
+%% worth of frames in this process's mailbox.  No timeout: the caller is
+%% paced by the socket, and dies with this process if the connection does.
+send_frames(Pid, ReqNo, Bodies, End) ->
+    gen_server:call(Pid, {send_frames, ReqNo, Bodies, End}, infinity).
+
+request_ebt(Pid) ->
+    gen_server:cast(Pid, {request_ebt}).
+
+%% Is an EBT stream open on this connection?
+%%
+%% A connection can be entirely healthy — handshake done, RPC answering,
+%% archive boundaries served — and still replicate nothing, because
+%% opening the socket and asking for replication are separate steps and
+%% only peer_dialer does both.  Nothing distinguished the two states from
+%% outside, so this exposes the one bit that does.
+%%
+%% Short timeout and never raises: a peer can be blocked inside a fold for
+%% seconds while it does EBT's socket writes, and a diagnostic must not be
+%% the thing that stalls or crashes its caller.  `unknown` for a peer that
+%% could not answer in time — it is busy replicating, which is its own
+%% answer.
+replicating(Pid) ->
+    try gen_server:call(Pid, ebt_active, 1000)
+    catch _:_ -> unknown
+    end.
+
+
+init([Ip, PubKey]) ->
+    Port = application:get_env(ssb, port, 8008),
+    init([Ip, Port, PubKey]);
+
+init([Ip, Port, PubKey]) ->
+    process_flag(trap_exit, true),
+    %% Self-connections (used in tests) bypass the registry — both sides
+    %% must coexist or closing one kills the other via tcp_closed.
+    case (not is_self_pk(PubKey)) andalso peer_registry:is_connected(PubKey) of
+        true ->
+            ignore;
+        false ->
+            try
+                {ok, State} = outbound_connect(Ip, Port, PubKey),
+                RegResult = case is_self_pk(PubKey) of
+                    true  -> ok;
+                    false -> peer_registry:register(PubKey, self())
+                end,
+                case RegResult of
+                    ok ->
+                        blob_fetcher:peer_connected(self()),
+                        {ok, State};
+                    {duplicate, _} ->
+                        %% Inbound connection won the race — clean up our socket
+                        %% and rpc_proc before returning ignore, so the inbound
+                        %% peer does not receive a spurious tcp_closed.
+                        gen_tcp:close(State#sbox_state.socket),
+                        gen_server:stop(State#sbox_state.rpc_proc),
+                        ignore
+                end
+            catch
+                error:Reason ->
+                    log_handshake_failure(outbound, Reason,
+                                          io_lib:format("to ~p:~p dialing key ~p",
+                                                        [Ip, Port, PubKey])),
+                    {stop, normal}
+            end
+    end;
+
+%% a 0 timeout on this init is need because the ranch handshake is blocking
+%% we'll make that call and get the socket in the timeout handler.
+init({ranch, Ref, Transport, _Opts}) ->
+    {ok, #sbox_state{ref = Ref,
+                     transport = Transport}, 0}.
+
+handle_info({tcp, Socket, Data},
+            #sbox_state{socket=Socket,
+                   transport=Transport,
+                   shook_hands = 0} = State) ->
+    try
+        {ok, {DecBoxKey, DecNonce, EncBoxKey, EncNonce, ClientPk, WinNetId}}
+            = shs:server_shake_hands(Data, Socket, Transport),
+        network_id_cache:record(ClientPk, WinNetId),
+        RegResult = case is_self_pk(ClientPk) of
+            true  -> ok;
+            false -> peer_registry:register(ClientPk, self())
+        end,
+        case RegResult of
+            {duplicate, _} ->
+                ?SSB_INFO("ssb_peer: duplicate inbound from known peer, dropping~n", []),
+                {stop, normal, State};
+            ok ->
+                {ok, RpcProc} = rpc_processor:start_link(),
+                ok = rpc_processor:set_remote_pk(RpcProc, ClientPk),
+                ok = rpc_processor:set_owner(RpcProc, self()),
+                %% If we are a room, register this inbound peer's presence.
+                %% room_attendants monitors us, so disconnect/crash emits `left`.
+                case config:is_room() of
+                    true  -> room_attendants:join(feed_id(ClientPk), self());
+                    false -> ok
+                end,
+                Transport:setopts(Socket, [{active, once}]),
+                %% Skip createWants for invite connections — the peer expects invite.use
+                %% as the first message, not a createWants stream frame.
+                IsInvite = invite_store:is_invite(ClientPk),
+                {N1, WantsReqNo} = case IsInvite of
+                    true ->
+                        {EncNonce, undefined};
+                    false ->
+                        Req = 1,
+                        Nonce1 = open_wants_stream(Socket, EncBoxKey, EncNonce, Req),
+                        ok = rpc_processor:register_stream(RpcProc, -Req,
+                                                           {blob_wants, {blob_fetcher, self()}}),
+                        blob_fetcher:peer_connected(self()),
+                        {Nonce1, Req}
+                end,
+                {noreply, State#sbox_state{dec_sbox_key = DecBoxKey,
+                                           enc_sbox_key = EncBoxKey,
+                                           dec_nonce = DecNonce,
+                                           enc_nonce = N1,
+                                           rpc_proc = RpcProc,
+                                           shook_hands = 1,
+                                           remote_pk = ClientPk,
+                                           our_wants_req = WantsReqNo,
+                                           req_counter = case WantsReqNo of
+                                                             undefined -> 0;
+                                                             _         -> WantsReqNo
+                                                         end}}
+        end
+    catch
+        error:Reason ->
+            log_handshake_failure(inbound, Reason,
+                                  ["from ", peer_endpoint(Transport, Socket)]),
+            %% A rejected handshake is routine; stop with a shutdown reason so
+            %% it doesn't emit a crash report / ranch error.
+            {stop, {shutdown, handshake_failed}, State}
+    end;
+
+%% This function is called after the handshake is complete
+%% and we can begin to process secret box messages
+handle_info({tcp, Socket, Data},
+            #sbox_state{socket=Socket,
+                   transport=Transport,
+                   box_rem_bytes = BoxLeftOver} = State) ->
+
+    % combine new data with left overs from previous packets
+    BoxData = combine(BoxLeftOver, Data),
+
+    {Done, NewState} = unbox_and_parse(BoxData, State),
+
+    case Done of
+        %% A goodbye is the normal end of a session.  {shutdown, _} keeps
+        %% the exit signal to linked processes but writes no crash report;
+        %% a bare `done` wrote one per disconnect, mailbox and all — a
+        %% queued request_blob_wants made that tens of thousands of lines.
+        done ->
+            stop({shutdown, done}, NewState);
+        _Else ->
+            %%?LOG_DEBUG("Are we complete and need to wait? ~p ~n",[Done]),
+            Transport:setopts(Socket, [{active, once}]),
+            {noreply, NewState}
+    end;
+
+%% Tunnel mode: an inner frame arrived as one whole box-stream message.
+%% Unbox and dispatch exactly as the socket path; no active-mode to re-arm.
+handle_info({tunnel_data, RecvReqNo, Body},
+            #sbox_state{recv_req = RecvReqNo,
+                        box_rem_bytes = BoxLeftOver} = State) ->
+    BoxData = combine(BoxLeftOver, Body),
+    {Done, NewState} = unbox_and_parse(BoxData, State),
+    case Done of
+        done -> stop({shutdown, done}, NewState);
+        _    -> {noreply, NewState}
+    end;
+
+handle_info({tcp_closed, _Socket}, State) ->
+    network_error(normal, State);
+
+handle_info({tcp_error, _, Reason}, State) ->
+    network_error(Reason, State);
+
+handle_info(timeout, #sbox_state{ref = Ref,
+                                 transport = Transport} = State) ->
+    %% this timeout happens immediately on the init call
+    %% so that the ranch handshake can be called, which
+    %% returns the socket. This handshake replaces the previous accept_ack
+    %% call that was blocking in the ranch 1.x protocol.
+    {ok, Socket} = ranch:handshake(Ref),
+    ok = Transport:setopts(Socket, [{active, once}]),
+    {noreply, State#sbox_state{socket = Socket}};
+
+handle_info({'EXIT', Pid, Reason}, #sbox_state{rpc_proc = RpcProc} = State) ->
+    case Pid of
+        RpcProc ->
+            ?SSB_ERROR("ssb_peer: rpc_processor exited ~p~n", [Reason]),
+            {stop, Reason, State};
+        _ ->
+            {noreply, State}
+    end;
+
+handle_info({rpc_reply, Ref, Body},
+            #sbox_state{pending_rpc = Pending} = State) ->
+    case maps:take(Ref, Pending) of
+        {From, Rest} ->
+            gen_server:reply(From, {ok, Body}),
+            {noreply, State#sbox_state{pending_rpc = Rest}};
+        error ->
+            {noreply, State}
+    end;
+
+handle_info({stream_data, Ref, Body},
+            #sbox_state{pending_rpc = Pending} = State) ->
+    case Pending of
+       #{Ref := {collecting, From, Acc}} ->
+           {noreply, State#sbox_state{
+                pending_rpc = Pending#{Ref := {collecting, From, [Body | Acc]}}}};
+       #{} ->
+           {noreply, State}
+   end;
+
+handle_info({stream_done, Ref},
+            #sbox_state{pending_rpc = Pending} = State) ->
+    case maps:take(Ref, Pending) of
+        {{collecting, From, Acc}, Rest} ->
+            gen_server:reply(From, {ok, lists:reverse(Acc)}),
+            {noreply, State#sbox_state{pending_rpc = Rest}};
+        _ ->
+            {noreply, State}
+    end;
+
+handle_info({blob_collected, Ref, Data},
+            #sbox_state{pending_fetch = PendingFetch} = State) ->
+    %% pending_fetch is keyed by Ref so concurrent fetch_blob calls (e.g. the
+    %% startup blob scan firing many at once) each get their own reply.
+    case maps:take(Ref, PendingFetch) of
+        {From, Rest} ->
+            gen_server:reply(From, {ok, Data}),
+            {noreply, State#sbox_state{pending_fetch = Rest}};
+        error ->
+            {noreply, State}
+    end;
+
+handle_info({has_collected, Ref, Result},
+            #sbox_state{pending_has = {From, Ref}} = State) ->
+    gen_server:reply(From, {ok, Result}),
+    {noreply, State#sbox_state{pending_has = undefined}};
+
+%% The anti-entropy clock doubles as the liveness probe for this connection.
+%%
+%% There used to be a separate check that closed the connection after 120s
+%% with nothing RECEIVED.  That measured how chatty a peer is, not whether
+%% it is there: a peer we are fully in sync with has nothing to say and
+%% correctly answers an unchanged clock with silence, so it was evicted
+%% every couple of minutes and immediately redialled.  On a node whose
+%% replication set is small (all of it in sync, most of the time) that was
+%% every peer, permanently — and each redial cost a full walk of the peer's
+%% clock, which for a pub is tens of thousands of entries.
+%%
+%% Whether the write reaches the socket is the honest signal, so that is
+%% what we act on.  A peer that is gone fails the send (or the socket
+%% reports tcp_closed/tcp_error first, handled above); a peer that is
+%% merely quiet is left alone.
+handle_info(ebt_anti_entropy, #sbox_state{ebt_active = true,
+                                           ebt_out_req = OutReq,
+                                           socket = Socket,
+                                           enc_sbox_key = Key,
+                                           enc_nonce = Nonce} = State) ->
+    Clock = utils:encode_rec(ebt:full_clock()),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(Clock), OutReq),
+    case utils:send_data_checked(combine(Header, Clock), Socket, Nonce, Key) of
+        {ok, NewNonce} ->
+            ?SSB_DEBUG("EBT: sent anti-entropy clock~n", []),
+            {noreply, State#sbox_state{enc_nonce = NewNonce,
+                                       ebt_entropy_ref = schedule_ebt_entropy()}};
+        {{error, Reason}, NewNonce} ->
+            ?SSB_INFO("EBT: anti-entropy send failed (~p), closing~n", [Reason]),
+            {stop, {shutdown, {ebt_send_failed, Reason}},
+             State#sbox_state{enc_nonce = NewNonce}}
+    end;
+
+handle_info(ebt_anti_entropy, State) ->
+    {noreply, State};
+
+%% A peer joined/left the room; push presence updates on whichever stream(s)
+%% this peer opened: room.attendants (2.0, {type,id} deltas) and/or
+%% tunnel.endpoints (1.0, the full id array).  Sends use our own enc_nonce,
+%% chained across both so the box-stream nonce stays ordered.
+handle_info({room_event, Kind, FeedId},
+            #sbox_state{attendants_req = AReq,
+                        endpoints_req = EReq,
+                        remote_pk = RemotePk,
+                        socket = Socket,
+                        enc_sbox_key = Key,
+                        enc_nonce = Nonce} = State)
+  when AReq =/= undefined orelse EReq =/= undefined ->
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    %% room.attendants (2.0): the {type,id} delta on -AReq.  An event about the
+    %% subscriber itself is suppressed; a client doesn't list itself.
+    Self = feed_id(RemotePk),
+    Nonce1 = case AReq =/= undefined andalso FeedId =/= Self of
+        false -> Nonce;
+        true ->
+            ABody = utils:encode_rec({[{~"type", atom_to_binary(Kind, utf8)},
+                                       {~"id", FeedId}]}),
+            ?SSB_INFO("ROOMDBG push room_event ~p id=~p on attendants_req=~p~n",
+                      [Kind, FeedId, AReq]),
+            AHeader = rpc_processor:create_header(Flags, size(ABody), -AReq),
+            send_data(combine(AHeader, ABody), Socket, Nonce, Key)
+    end,
+    %% tunnel.endpoints (1.0): re-emit the full attendant id array (minus the
+    %% subscriber) on -EReq.
+    Nonce2 = case EReq of
+        undefined -> Nonce1;
+        _ ->
+            Ids = [Id || Id <- room_attendants:list(), Id =/= Self],
+            EBody = utils:encode_rec(Ids),
+            ?SSB_INFO("ROOMDBG push endpoints ~p ids on endpoints_req=~p~n",
+                      [length(Ids), EReq]),
+            EHeader = rpc_processor:create_header(Flags, size(EBody), -EReq),
+            send_data(combine(EHeader, EBody), Socket, Nonce1, Key)
+    end,
+    {noreply, State#sbox_state{enc_nonce = Nonce2}};
+
+handle_info({room_event, _Kind, _FeedId}, State) ->
+    {noreply, State};
+
+handle_info(Info, State) ->
+    ?SSB_INFO("Stopped presumably for normal reason: ~p ~n",[Info]),
+    {stop, normal, State}.
+
+%% Send blobs.createWants, then a want message for each BlobId.
+%% Haves arrive asynchronously as {have, BlobId, Size} messages to NotifyPid.
+request_blob_wants(Pid, BlobIds, NotifyPid) ->
+    gen_server:cast(Pid, {request_blob_wants, BlobIds, NotifyPid}).
+
+%% Fetch a blob from the remote peer via blobs.get.  Streaming a large
+%% blob can outlast the default 5s call timeout.
+fetch_blob(Pid, BlobId) ->
+    gen_server:call(Pid, {fetch_blob, BlobId}, 30000).
+
+%% Check whether the remote peer holds a blob. Returns {ok, true} or {ok, false}.
+has_blob(Pid, BlobId) ->
+    gen_server:call(Pid, {has_blob, BlobId}).
+
+%% Drain {have, BlobId, Size} messages from the mailbox until Timeout ms of
+%% silence. Returns [{BlobId, Size}] in arrival order.
+drain_haves(Timeout) ->
+    drain_haves(Timeout, []).
+drain_haves(Timeout, Acc) ->
+    receive
+        {have, BlobId, Size} -> drain_haves(Timeout, [{BlobId, Size} | Acc])
+    after Timeout ->
+        lists:reverse(Acc)
+    end.
+
+handle_call(ebt_active, _From, #sbox_state{ebt_active = Active} = State) ->
+    {reply, Active, State};
+
+handle_call({rpc_call, Method, Type, Args}, From,
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc,
+                        pending_rpc = Pending} = State) ->
+    {ReqNo, State1} = next_req(State),
+    Ref = make_ref(),
+    ok = rpc_processor:register_stream(RpcProc, -ReqNo, {reply_to, self(), Ref}),
+    ReqBody = utils:encode_rec({[{~"name", Method},
+                                  {~"args", Args},
+                                  {~"type", Type}]}),
+    Flags = rpc_processor:create_flags(0, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(ReqBody), ReqNo),
+    NewNonce = utils:send_data(utils:combine(Header, ReqBody), Socket, EncNonce, EncBoxKey),
+    {noreply, State1#sbox_state{enc_nonce   = NewNonce,
+                                pending_rpc = Pending#{Ref => From}}};
+
+handle_call({rpc_stream_call, Method, Args}, From,
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc,
+                        pending_rpc = Pending} = State) ->
+    {ReqNo, State1} = next_req(State),
+    Ref = make_ref(),
+    ok = rpc_processor:register_stream(RpcProc, -ReqNo, {stream_to, self(), Ref}),
+    ReqBody = utils:encode_rec({[{~"name", Method},
+                                  {~"args", Args},
+                                  {~"type", ~"source"}]}),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(ReqBody), ReqNo),
+    NewNonce = utils:send_data(utils:combine(Header, ReqBody), Socket, EncNonce, EncBoxKey),
+    {noreply, State1#sbox_state{enc_nonce   = NewNonce,
+                                pending_rpc = Pending#{Ref => {collecting, From, []}}}};
+
+handle_call({open_source, Method, Args, NotifyPid}, _From,
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc} = State) ->
+    {ReqNo, State1} = next_req(State),
+    Ref = make_ref(),
+    ok = rpc_processor:register_stream(RpcProc, -ReqNo, {stream_to, NotifyPid, Ref}),
+    ReqBody = utils:encode_rec({[{~"name", Method},
+                                  {~"args", Args},
+                                  {~"type", ~"source"}]}),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(ReqBody), ReqNo),
+    NewNonce = utils:send_data(utils:combine(Header, ReqBody), Socket, EncNonce, EncBoxKey),
+    {reply, {ok, Ref}, State1#sbox_state{enc_nonce = NewNonce}};
+
+handle_call({open_sink, Method, Args, NotifyPid}, _From,
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc} = State) ->
+    {ReqNo, State1} = next_req(State),
+    Ref = make_ref(),
+    %% the sink's single terminating frame comes back on -ReqNo
+    ok = rpc_processor:register_stream(RpcProc, -ReqNo, {reply_to, NotifyPid, Ref}),
+    ReqBody = utils:encode_rec({[{~"name", Method},
+                                  {~"args", Args},
+                                  {~"type", ~"sink"}]}),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(ReqBody), ReqNo),
+    NewNonce = utils:send_data(utils:combine(Header, ReqBody), Socket, EncNonce, EncBoxKey),
+    {reply, {ok, ReqNo, Ref}, State1#sbox_state{enc_nonce = NewNonce}};
+
+handle_call({open_duplex, Method, Args, SinkPid}, _From,
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc} = State) ->
+    {ReqNo, State1} = next_req(State),
+    ok = rpc_processor:register_stream(RpcProc, -ReqNo, {tunnel_relay, SinkPid}),
+    ReqBody = utils:encode_rec({[{~"name", Method},
+                                  {~"args", Args},
+                                  {~"type", ~"duplex"}]}),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(ReqBody), ReqNo),
+    NewNonce = utils:send_data(utils:combine(Header, ReqBody), Socket, EncNonce, EncBoxKey),
+    {reply, {ok, ReqNo}, State1#sbox_state{enc_nonce = NewNonce}};
+
+handle_call({fetch_blob, BlobId}, From,
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc,
+                        pending_fetch = PendingFetch} = State) ->
+    {ReqNo, State1} = next_req(State),
+    Ref = make_ref(),
+    SelfPid = self(),
+    SinkPid = spawn(fun() -> blob_collect(SelfPid, Ref, <<>>) end),
+    ok = rpc_processor:register_stream(RpcProc, -ReqNo, {blob_get_client, SinkPid}),
+    NewEncNonce = send_blob_get(Socket, EncBoxKey, EncNonce, BlobId, ReqNo),
+    {noreply, State1#sbox_state{enc_nonce = NewEncNonce,
+                                pending_fetch = PendingFetch#{Ref => From}}};
+
+
+handle_call({has_blob, BlobId}, From,
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc} = State) ->
+    {ReqNo, State1} = next_req(State),
+    Ref = make_ref(),
+    SelfPid = self(),
+    SinkPid = spawn(fun() -> blob_has_collect(SelfPid, Ref) end),
+    ok = rpc_processor:register_stream(RpcProc, -ReqNo, {blob_has_client, SinkPid}),
+    NewEncNonce = send_blob_has(Socket, EncBoxKey, EncNonce, BlobId, ReqNo),
+    {noreply, State1#sbox_state{enc_nonce = NewEncNonce,
+                                pending_has = {From, Ref}}};
+
+handle_call({send_frames, ReqNo, Bodies, End}, _From,
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce} = State) ->
+    DataFlags = rpc_processor:create_flags(1, 0, 2),
+    Nonce1 = lists:foldl(
+               fun(Body, N) ->
+                       Header = rpc_processor:create_header(DataFlags, size(Body), ReqNo),
+                       send_data(combine(Header, Body), Socket, N, EncBoxKey)
+               end, EncNonce, Bodies),
+    Nonce2 = case End of
+                 false ->
+                     Nonce1;
+                 true ->
+                     TrueEnd = utils:encode_rec(true),
+                     EndHeader = rpc_processor:create_header(
+                                   rpc_processor:create_flags(1, 1, 2),
+                                   size(TrueEnd), ReqNo),
+                     send_data(combine(EndHeader, TrueEnd), Socket, Nonce1, EncBoxKey)
+             end,
+    {reply, ok, State#sbox_state{enc_nonce = Nonce2}};
+
+handle_call(_Request, _From, State) ->
+    {reply, ok, State}.
+
+handle_cast({send, Data}, #sbox_state{socket = Socket,
+                                      transport = Transport,
+                                      enc_sbox_key = EncBoxKey,
+                                      dec_nonce = _ServerNonce,
+                                      enc_nonce = EncNonce} = State) ->
+    NewEncNonce = send_data(Data, Socket, EncNonce, EncBoxKey),
+    Transport:setopts(Socket, [{active, once}]),
+    {noreply, State#sbox_state{enc_nonce = NewEncNonce}};
+
+handle_cast({request_blob_wants, BlobIds, NotifyPid},
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce,
+                        rpc_proc = RpcProc,
+                        our_wants_req = OurWantsReq,
+                        remote_wants_req = RemoteWantsReq} = State) ->
+    %% Register on both channels so haves reach us regardless of peer style.
+    %% On invite connections we never opened our own createWants stream, so
+    %% our_wants_req is undefined; only register/send on the channel(s) we have.
+    case OurWantsReq of
+        undefined -> ok;
+        _         -> ok = rpc_processor:register_stream(RpcProc, -OurWantsReq, {blob_wants, NotifyPid})
+    end,
+    case RemoteWantsReq of
+        undefined -> ok;
+        _         -> ok = rpc_processor:register_stream(RpcProc, RemoteWantsReq, {blob_wants, NotifyPid})
+    end,
+    %% Duplex-style peers (PW, TF) expect our wants on their response channel (-remote_wants_req).
+    %% Peers that haven't opened createWants get wants on our own source stream.
+    SendReqNo = case {RemoteWantsReq, OurWantsReq} of
+        {undefined, _} -> OurWantsReq;
+        {_, _}         -> -RemoteWantsReq
+    end,
+    case SendReqNo of
+        undefined ->
+            %% No wants channel available on this connection; nothing to send.
+            {noreply, State};
+        _ ->
+            NewEncNonce = send_want_body(Socket, EncBoxKey, EncNonce, BlobIds, SendReqNo),
+            {noreply, State#sbox_state{enc_nonce = NewEncNonce}}
+    end;
+
+handle_cast({send_frame, ReqNo, Body},
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce} = State) ->
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(Body), ReqNo),
+    NewNonce = send_data(combine(Header, Body), Socket, EncNonce, EncBoxKey),
+    {noreply, State#sbox_state{enc_nonce = NewNonce}};
+
+handle_cast({send_sink_data, ReqNo, Body},
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce} = State) ->
+    %% type 0 = binary body (the bytes are not JSON)
+    Flags = rpc_processor:create_flags(1, 0, 0),
+    Header = rpc_processor:create_header(Flags, size(Body), ReqNo),
+    NewNonce = send_data(combine(Header, Body), Socket, EncNonce, EncBoxKey),
+    {noreply, State#sbox_state{enc_nonce = NewNonce}};
+
+handle_cast({send_sink_end, ReqNo},
+            #sbox_state{socket = Socket,
+                        enc_sbox_key = EncBoxKey,
+                        enc_nonce = EncNonce} = State) ->
+    Body = utils:encode_rec(true),
+    Flags = rpc_processor:create_flags(1, 1, 2),
+    Header = rpc_processor:create_header(Flags, size(Body), ReqNo),
+    NewNonce = send_data(combine(Header, Body), Socket, EncNonce, EncBoxKey),
+    {noreply, State#sbox_state{enc_nonce = NewNonce}};
+
+handle_cast({request_ebt}, #sbox_state{ebt_active = true} = State) ->
+    {noreply, State};
+
+handle_cast({request_ebt}, #sbox_state{socket = Socket,
+                                       enc_sbox_key = EncBoxKey,
+                                       enc_nonce = EncNonce,
+                                       rpc_proc = RpcProc,
+                                       remote_pk = PubKey} = State) ->
+    {ReqNo, State1} = next_req(State),
+    ok = rpc_processor:register_stream(RpcProc, -ReqNo, ebt),
+    NewEncNonce = initiate_ebt(Socket, EncBoxKey, EncNonce, PubKey, ReqNo),
+    {noreply, State1#sbox_state{enc_nonce = NewEncNonce,
+                                ebt_active = true,
+                                ebt_out_req = ReqNo,
+                                ebt_entropy_ref = schedule_ebt_entropy()}};
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+%% Tunnel peers never registered in peer_registry (they are not direct
+%% connections); unregistering here could evict a real connection to the same
+%% peer, so only tear down our own resources.
+terminate(_Reason, #sbox_state{transport = tunnel,
+                               rpc_proc = RpcProc,
+                               ebt_entropy_ref = EntropyRef}) ->
+    cancel_ebt_timer(EntropyRef),
+    stop_rpc_proc(RpcProc),
+    ok;
+terminate(_Reason, #sbox_state{rpc_proc = RpcProc,
+                               remote_pk = RemotePk,
+                               ebt_entropy_ref = EntropyRef}) when is_pid(RpcProc) ->
+    cancel_ebt_timer(EntropyRef),
+    peer_registry:unregister(RemotePk),
+    stop_rpc_proc(RpcProc),
+    ok;
+terminate(_Reason, #sbox_state{remote_pk = RemotePk}) ->
+    peer_registry:unregister(RemotePk),
+    ok;
+terminate(_Reason, _State) ->
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+%%%===================================================================
+%%% Internal functions
+%%%===================================================================
+
+%% The per-connection rpc_processor is often already down by the time we
+%% terminate (it crashing is frequently what tore the connection down).  Guard
+%% the stop: a bare gen_server:stop/1 on a dead pid exits with noproc, which
+%% would crash terminate/2 itself and OVERWRITE the real termination reason
+%% (masking the actual cause in the logs).
+stop_rpc_proc(RpcProc) when is_pid(RpcProc) ->
+    catch gen_server:stop(RpcProc),
+    ok;
+stop_rpc_proc(_) ->
+    ok.
+
+cancel_ebt_timer(undefined) -> ok;
+cancel_ebt_timer(Ref)       -> erlang:cancel_timer(Ref), ok.
+
+schedule_ebt_entropy() ->
+    erlang:send_after(?EBT_ENTROPY_MS, self(), ebt_anti_entropy).
+
+next_req(#sbox_state{req_counter = N} = State) ->
+    {N + 1, State#sbox_state{req_counter = N + 1}}.
+
+unbox_and_parse(BoxData, #sbox_state{dec_sbox_key = DecBoxKey,
+                                dec_nonce = DecNonce,
+                                rpc_rem_bytes = RpcLeftOver} = State) ->
+    {Status, Msg, NewDecNonce, NewBoxLeftOver} =
+        boxstream:unbox(DecBoxKey, DecNonce,
+                        BoxData),
+
+    NewState = State#sbox_state{dec_nonce = NewDecNonce,
+                                box_rem_bytes = NewBoxLeftOver},
+
+    case Status of
+        partial ->
+            {partial, NewState};
+        complete ->
+            Done = Msg == ?BOX_END,
+            case Done of
+                true ->
+                    ?SSB_DEBUG("Box end received ~p ~n",[Msg]),
+                    {done, NewState};
+                false ->
+                    %% now parse rpc
+                    NewState2 = rpc_parse(combine(RpcLeftOver, Msg), NewState),
+                    case size(NewBoxLeftOver) > 34 of
+                        true ->
+                            unbox_and_parse(NewBoxLeftOver, NewState2);
+                        false ->
+                            {complete, NewState2}
+                    end
+            end
+    end.
+
+rpc_parse(Data, #sbox_state{socket = Socket,
+                            enc_nonce = EncNonce,
+                            enc_sbox_key = EncBoxKey,
+                            rpc_proc = RpcProc,
+                            our_wants_req = OurWantsReq,
+                            remote_wants_req = RemoteWantsReq,
+                            response = Response} = State) ->
+
+    Parsed = rpc_parse:parse(Data),
+    {Status, NewRpcLeftOver, NewEncNonce, NewResponse} =
+        case Parsed of
+            {partial, nil, Rest} ->
+                {partial, Rest, EncNonce, Response};
+            {complete, ?RPC_END, <<>>} ->
+                ?SSB_DEBUG("The rpc call has ended ~n",[]),
+                {complete, <<>>, EncNonce, Response};
+            {complete, {Header, Body}, Rest} ->
+                {ProcEncNonce, Resp} =
+                    rpc_processor:process(RpcProc,
+                                          {Header, Body},
+                                          #ssb_conn{
+                                             socket = Socket,
+                                             nonce = EncNonce,
+                                             secret_box = EncBoxKey,
+                                             our_wants_req = OurWantsReq,
+                                             remote_wants_req = RemoteWantsReq}),
+                ?SSB_DEBUG("The rpc call returned ~p ~n",[Resp]),
+                {complete, Rest, ProcEncNonce, Resp}
+        end,
+
+    NewState0 = State#sbox_state{enc_nonce = NewEncNonce,
+                                 rpc_rem_bytes = NewRpcLeftOver,
+                                 response = NewResponse},
+    NewState = case NewResponse of
+        {wants_stream, ReqNo} ->
+            %% Re-register the remote's createWants stream with a tagged sink
+            %% so haves arriving on it reach blob_fetcher with our pid.
+            ok = rpc_processor:register_stream(RpcProc, ReqNo,
+                                               {blob_wants, {blob_fetcher, self()}}),
+            NewState0#sbox_state{remote_wants_req = ReqNo};
+        {ebt_stream, ReqNo} ->
+            case NewState0#sbox_state.ebt_active of
+                true ->
+                    %% EBT is already running on this connection (we initiated
+                    %% via the dialer, or a prior ebt.replicate).  The peer's
+                    %% request is answered in proc_request, but do NOT start a
+                    %% second stream/entropy timer — that produced duplicate
+                    %% anti-entropy clocks and repeated message sends.
+                    NewState0;
+                false ->
+                    NewState0#sbox_state{ebt_active = true,
+                                         ebt_out_req = -ReqNo,
+                                         ebt_entropy_ref = schedule_ebt_entropy()}
+            end;
+        {attendants_stream, ReqNo} ->
+            %% Peer opened room.attendants; subscribe so future join/leave
+            %% events are pushed on -ReqNo from our handle_info.
+            room_attendants:subscribe(self()),
+            NewState0#sbox_state{attendants_req = ReqNo};
+        {endpoints_stream, ReqNo} ->
+            %% Peer opened tunnel.endpoints (rooms 1.0); subscribe so each
+            %% join/leave re-emits the full id array on -ReqNo.
+            room_attendants:subscribe(self()),
+            NewState0#sbox_state{endpoints_req = ReqNo};
+        _ ->
+            NewState0
+    end,
+    case {size(NewRpcLeftOver) >= 9, Status} of
+        {true, complete} ->
+            rpc_parse(NewRpcLeftOver, NewState#sbox_state{rpc_rem_bytes = <<>>});
+        _ ->
+            NewState
+    end.
+
+network_error(Reason, State) ->
+    ?SSB_ERROR("Network error ~p ~n",[Reason]),
+    stop({shutdown, conn_closed}, State).
+
+%% Failed handshakes are routine — port scanners, peers on a different network,
+%% or a peer dialing a stale/wrong key for this node. Log one concise line
+%% rather than letting the raw exit produce a full crash report.
+%%   - no_matching_network_id : hello matched none of our network ids
+%%   - {identity_rejected, R} : outbound only — the peer took our network id and
+%%                              then refused the key we dialed for it
+%%   - {badmatch, <<"bad">>}  : right network id, but the identity/signature box
+%%                              failed to verify (shs:open_box returns <<"bad">>)
+%%
+%% "unknown network id" used to be reported for EVERY outbound handshake
+%% failure: try_net_ids caught all exceptions, tried the next network id, and
+%% raised no_matching_network_id once the list ran out — so with a single id
+%% configured, which is the normal case, one failure of any kind produced that
+%% message.  The commonest real cause was a stale key in conn.json, which the
+%% message actively pointed away from.  The two directions no longer share a
+%% clause, because the same atom does not mean the same thing in each.
+%%
+%% Who is an iodata fragment identifying the remote end. For inbound failures the
+%% key the peer dialed for us is unrecoverable — SHS folds it into a DH secret and
+%% never sends it on the wire — so the peer's IP:port is the only handle we have
+%% on who keeps dialing a stale key. For outbound we log the key we dialed.
+%% Inbound we have the peer's hello in hand and checked it against every id
+%% we have, so the name is exact.
+log_handshake_failure(inbound, no_matching_network_id, Who) ->
+    ?SSB_INFO("inbound handshake rejected: unknown network id (~s)~n", [Who]);
+%% Outbound we only know the peer hung up on our hello and never said why.
+%% That is a network mismatch or a port not speaking SHS, and the message
+%% says so rather than picking one.
+log_handshake_failure(outbound, no_matching_network_id, Who) ->
+    ?SSB_INFO("outbound handshake failed: no configured network id was "
+              "accepted (~s; peer is on another network, or is not an SSB "
+              "peer)~n", [Who]);
+log_handshake_failure(Dir, {identity_rejected, Reason}, Who) ->
+    ?SSB_INFO("~p handshake rejected: peer took our network id then refused "
+              "the identity we dialed (~s; ~p after our auth box — the key is "
+              "stale, or that host now answers as someone else)~n",
+              [Dir, Who, Reason]);
+log_handshake_failure(Dir, {badmatch, ~"bad"}, Who) ->
+    ?SSB_INFO("~p handshake rejected: identity verification failed "
+              "(~s; peer dialed a stale/wrong key, or bad handshake)~n",
+              [Dir, Who]);
+log_handshake_failure(Dir, Reason, Who) ->
+    ?SSB_INFO("~p handshake failed: ~p (~s)~n", [Dir, Reason, Who]).
+
+%% Best-effort "ip:port" for a peer socket; never throws (the socket may already
+%% be closed by the time we log a rejected handshake).
+peer_endpoint(Transport, Socket) ->
+    try Transport:peername(Socket) of
+        {ok, {Addr, Port}} -> [inet:ntoa(Addr), $:, integer_to_list(Port)];
+        _                  -> "unknown peer"
+    catch
+        _:_ -> "unknown peer"
+    end.
+
+stop(Reason, State) ->
+    {stop, Reason, State}.
+
+%% Hosts from conn_db pub entries arrive as binaries (decoded JSON);
+%% gen_tcp:connect only accepts inet tuples, charlists, or atoms.
+connect(Host, Port) when is_binary(Host) ->
+    connect(binary_to_list(Host), Port);
+connect(Host, Port) ->
+    {ok, Socket} =
+        gen_tcp:connect(Host, Port,
+                        [binary,
+                         {reuseaddr, true},
+                         {active, false},
+                         {packet, raw}
+                        ],
+                        5000),
+    Socket.
+
+initiate_ebt(Socket, EncBoxKey, EncNonce, RemotePubKey, ReqNo) ->
+    EbtReq = utils:encode_rec({[{~"name", [~"ebt", ~"replicate"]},
+                                 {~"args", [{[{~"version", 3},
+                                              {~"format", ~"classic"}]}]},
+                                 {~"type", ~"duplex"}]}),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header1 = rpc_processor:create_header(Flags, size(EbtReq), ReqNo),
+    N1 = send_data(combine(Header1, EbtReq), Socket, EncNonce, EncBoxKey),
+    Clock = build_initial_clock(RemotePubKey),
+    Header2 = rpc_processor:create_header(Flags, size(Clock), ReqNo),
+    ?SSB_DEBUG("Send initial vector ~p ~n", [Clock]),
+    send_data(combine(Header2, Clock), Socket, N1, EncBoxKey).
+
+blob_collect(Peer, Ref, Acc) ->
+    receive
+        {chunk, Data} -> blob_collect(Peer, Ref, <<Acc/binary, Data/binary>>);
+        done          -> Peer ! {blob_collected, Ref, Acc}
+    end.
+
+
+
+blob_has_collect(Peer, Ref) ->
+    receive
+        {has_result, Result} -> Peer ! {has_collected, Ref, Result}
+    after 5000 ->
+        Peer ! {has_collected, Ref, false}
+    end.
+
+send_blob_has(Socket, Key, Nonce, BlobId, ReqNo) ->
+    HasRpc = utils:encode_rec({[{~"name", [?blobs, ?blobshas]},
+                                 {~"args", [BlobId]},
+                                 {~"type", ~"async"}]}),
+    Flags = rpc_processor:create_flags(0, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(HasRpc), ReqNo),
+    ?SSB_DEBUG("asking blob has ~p ~n", [ReqNo]),
+    send_data(combine(Header, HasRpc), Socket, Nonce, Key).
+
+send_blob_get(Socket, Key, Nonce, BlobId, ReqNo) ->
+    GetRpc = utils:encode_rec({[{~"name", [?blobs, ?blobsget]},
+                                 {~"args", [BlobId]},
+                                 {~"type", ~"source"}]}),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(GetRpc), ReqNo),
+    send_data(combine(Header, GetRpc), Socket, Nonce, Key).
+
+%% Open our createWants source stream.  Call once per connection.
+open_wants_stream(Socket, Key, Nonce, ReqNo) ->
+    WantsRpc = utils:encode_rec({[{~"name", [?blobs, ?createwants]},
+                                   {~"args", []},
+                                   {~"type", ~"source"}]}),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(WantsRpc), ReqNo),
+    send_data(combine(Header, WantsRpc), Socket, Nonce, Key).
+
+%% Send only the want body on an existing duplex stream at ReqNo.
+send_want_body(Socket, Key, Nonce, BlobIds, ReqNo) ->
+    WantBody = utils:encode_rec({[{Id, -1} || Id <- BlobIds]}),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(WantBody), ReqNo),
+    send_data(combine(Header, WantBody), Socket, Nonce, Key).
+
+outbound_connect(Ip, Port, PubKey) ->
+    NetIds = ordered_net_ids(PubKey),
+    try_net_ids(Ip, Port, PubKey, NetIds, 0).
+
+ordered_net_ids(PubKey) ->
+    All = config:network_ids(),
+    case network_id_cache:lookup(PubKey) of
+        {ok, Cached} -> [Cached | lists:delete(Cached, All)];
+        miss          -> All
+    end.
+
+%% Only reasons that a different network id could plausibly fix are worth
+%% another pass round this loop.  Everything else fails now, carrying the
+%% reason it actually failed for: retrying a wrong key against each of our
+%% network ids costs a connect and a backoff sleep apiece and then reports
+%% the one cause we had already ruled out.
+try_net_ids(_Ip, _Port, _PubKey, [], _Attempt) ->
+    error(no_matching_network_id);
+try_net_ids(Ip, Port, PubKey, [NetId | Rest], Attempt) ->
+    case Attempt > 0 of
+        true  -> timer:sleep(backoff(Attempt));
+        false -> ok
+    end,
+    Socket = connect(Ip, Port),
+    try shs:client_shake_hands(Socket, PubKey, NetId) of
+        {ok, {Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce}} ->
+            network_id_cache:record(PubKey, NetId),
+            {ok, build_outbound_state(Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce, PubKey)}
+    catch
+        %% Our network id was accepted and the identity refused — the other
+        %% ids cannot change that answer.
+        error:{auth_rejected, Reason} ->
+            gen_tcp:close(Socket),
+            error({identity_rejected, Reason});
+        %% Hung up on our hello, or answered under a different id: the next
+        %% network id is worth a try.
+        _:_ ->
+            gen_tcp:close(Socket),
+            try_net_ids(Ip, Port, PubKey, Rest, Attempt + 1)
+    end.
+
+backoff(N) ->
+    min(1000 * (1 bsl (N - 1)), 30000).
+
+build_outbound_state(Socket, DecBoxKey, DecNonce, EncBoxKey, EncNonce, PubKey) ->
+    ranch_tcp:setopts(Socket, [{active, false}]),
+    {ok, RpcProc} = rpc_processor:start_link(),
+    ok = rpc_processor:set_owner(RpcProc, self()),
+    ranch_tcp:setopts(Socket, [{active, once}]),
+    WantsReqNo = 1,
+    N1 = open_wants_stream(Socket, EncBoxKey, EncNonce, WantsReqNo),
+    ok = rpc_processor:register_stream(RpcProc, -WantsReqNo,
+                                       {blob_wants, {blob_fetcher, self()}}),
+    #sbox_state{socket = Socket,
+                transport = ranch_tcp,
+                dec_sbox_key = DecBoxKey,
+                enc_sbox_key = EncBoxKey,
+                dec_nonce = DecNonce,
+                enc_nonce = N1,
+                rpc_proc = RpcProc,
+                remote_pk = PubKey,
+                shook_hands = 1,
+                our_wants_req = WantsReqNo,
+                req_counter = WantsReqNo}.
+
+%% Build our initial vector clock from all locally known feeds, ensuring the
+%% remote peer's feed is included (at seq 0 if we have no messages from them yet).
+build_initial_clock(RemotePubKey) ->
+    RemoteFeedId = <<"@", (base64:encode(RemotePubKey))/binary, ".ed25519">>,
+    {FullClock} = ebt:full_clock(),
+    %% Only advertise wanting the remote peer's feed if it is within our
+    %% replication set — otherwise we'd ask for a feed we'd then refuse to store.
+    AddRemote = ebt:replicate_feed(RemoteFeedId)
+                andalso not lists:keymember(RemoteFeedId, 1, FullClock),
+    ClockWithRemote = case AddRemote of
+        true  -> [{RemoteFeedId, ebt_vc:encode_clock_int(true, true, 0)} | FullClock];
+        false -> FullClock
+    end,
+    utils:encode_rec({ClockWithRemote}).
+
+is_self_pk(PubKey) ->
+    try PubKey =:= base64:decode(keys:pub_key())
+    catch _:_ -> false
+    end.
+
+%% Canonical feed id for a raw ed25519 public key.
+feed_id(PubKey) ->
+    <<"@", (base64:encode(PubKey))/binary, ".ed25519">>.

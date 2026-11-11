@@ -1,0 +1,190 @@
+%% SPDX-License-Identifier: GPL-2.0-only
+%%
+%% Copyright (C) 2023 Charles Moid
+
+-include_lib("kernel/include/logger.hrl").
+
+-define(l2b(List), list_to_binary(List)).
+-define(b2l(List), binary_to_list(List)).
+-define(pgv(K,V), proplists:get_value(K, V)).
+
+%% The plugin API version: what a plugin compiled against this header may
+%% assume of the node it is loaded into.  A plugin compiles the #message{}
+%% layout below into its own beams, so a plugin built against one layout
+%% and run against another fails at runtime, far from the cause, with a
+%% badrecord or a bad match.
+%%
+%% Every module that includes this header carries the version it was
+%% compiled with, as the attribute below — nobody has to remember to
+%% declare it — and plugin_registry and view_manager refuse to register a
+%% module whose version differs from the node's (ssb_plugin:check_module/1).
+%%
+%% Bump it when #message{} changes, or when a function a plugin is
+%% expected to call (ssb_plugin, ssb_view, ssb_store, the registries)
+%% changes incompatibly.  ssb_plugin's tests pin the record layout to this
+%% number, so changing the record without bumping it fails `make test`.
+%% The other records here are connection internals, not plugin API, and
+%% change freely.
+-define(SSB_PLUGIN_API, 1).
+-ssb_plugin_api(?SSB_PLUGIN_API).
+
+-define(SSB_DEBUG(Format, Args), ?LOG_DEBUG("~p " ++ Format, [self() | Args])).
+-define(SSB_ERROR(Format, Args), ?LOG_ERROR("~p " ++ Format, [self() | Args])).
+-define(SSB_INFO(Format, Args), ?LOG_INFO("~p " ++ Format, [self() | Args])).
+
+-define(KEEP_ALIVE_GRACE, 1500).
+
+%% Shown in place of message text for private content we cannot decrypt.
+-define(ENCRYPTED_PLACEHOLDER, <<"[encrypted]">>).
+
+%% This network id is almost the same
+-define(DEFAULT_NETWORK_ID, base64:decode("1KHLiKZvAvjbY1ziZEHMXawbCEIM6qwjCDm3VYnaR/s=")).
+%% Auto-archive is OFF by default; see config:archive_length/0 for why.
+-define(DEFAULT_ARCHIVE_LENGTH, undefined).
+-define(DEFAULT_REPLICATION_HOPS, 2).
+-define(DEFAULT_CACHE_CAPACITY, 1000).
+-define(DEFAULT_EBT_ENTROPY_MS,        30_000).  %% anti-entropy clock interval
+%%
+%% as this one that is for the current main SSB network
+%% 1KHLiKZvAvjbY1ziZEHMXawbCEIM6qwjCDm3VYRan/s=
+%% diff is in the last three digits
+%%
+%% Eventually this network id will be configurable
+
+%% Helper macro for declaring children of supervisor
+-define(CHILD(I, Type), {I, {I, start_link, []}, permanent, 5000, Type, [I]}).
+
+-define(SHS_NONCE, <<0:24/integer-unit:8>>).
+-define(BOX_END, <<0:18/integer-unit:8>>).
+-define(RPC_END, <<0:9/integer-unit:8>>).
+
+
+-define(createhistorystream, <<"createHistoryStream">>).
+-define(whoami, <<"whoami">>).
+-define(ping, <<"ping">>).
+-define(gossip, <<"gossip">>).
+-define(blobs, <<"blobs">>).
+-define(ebt, <<"ebt">>).
+-define(tunnel, <<"tunnel">>).
+-define(archives, <<"archives">>).
+-define(boundaries, <<"boundaries">>).
+-define(glimpses, <<"glimpses">>).
+-define(offers, <<"offers">>).
+-define(isRoom, <<"isRoom">>).
+-define(room, <<"room">>).
+-define(metadata, <<"metadata">>).
+-define(attendants, <<"attendants">>).
+-define(endpoints, <<"endpoints">>).
+-define(connect, <<"connect">>).
+-define(createwants, <<"createWants">>).
+-define(blobsget, <<"get">>).
+-define(blobshas, <<"has">>).
+-define(blobswant, <<"want">>).
+-define(blobsadd, <<"add">>).
+-define(blobspush, <<"push">>).
+
+%% Largest blob we accept over blobs.add.  Matches ssb-blobs' default
+%% (and the limit ssb-blob-files enforces client-side), so a file the
+%% client would refuse to send is also one we refuse to buffer.
+-define(BLOB_MAX_SIZE, 5242880).
+%% A message's signed value, as JSON.stringify(value, null, 2), may be at
+%% most this many UTF-16 code units long (ssb-validate).  message:value_length/1.
+-define(MAX_MSG_LENGTH, 8192).
+
+%% Largest glimpse payload this node will fetch on a peer's say-so.
+%%
+%% The design doc bounds a glimpse "by convention rather than by rule",
+%% and this is what that convention looks like from the receiving end: a
+%% self-description is a page about a person, and an author who needs
+%% more than this to introduce themselves is asking us to replicate their
+%% feed, which is the thing a glimpse exists to avoid.  Nothing stops
+%% them publishing a larger one; we simply decline to fetch it, and the
+%% feed stays as invisible at our boundary as it was before.
+-define(GLIMPSE_MAX_SIZE, 262144).
+
+-record(ssb_conn,
+        { socket,
+          nonce,
+          secret_box,
+          our_wants_req,
+          remote_wants_req
+        }).
+
+-record(ssb_rpc,
+        { name,
+          args,
+          type
+        }).
+
+%% sinks: ReqNo => {Chunks, Size} for an open blobs.add sink.  The
+%% chunks live on the rpc_processor's heap, not in the calls table:
+%% re-inserting the growing accumulator into ETS on every 64 KB frame
+%% would copy the whole blob each time (quadratic).
+-record(rpc_state,
+        { calls,
+          sinks = #{} }).
+
+-record(message,
+        { id,
+          previous,
+          author,
+          sequence,
+          timestamp,
+          hash,
+          content,
+          signature,
+          received,
+          validated,
+          %% the field order counts when signing messages. In some legacy messages,
+          %% sequence occurs before author. The swapped boolean tracks this, for
+          %% validation purposes.
+          swapped
+        }).
+
+-record(sbox_state, {ref,
+                socket,
+                transport,
+                dec_sbox_key,
+                enc_sbox_key,
+                dec_nonce,
+                enc_nonce,
+                shook_hands = 0,
+                box_rem_bytes = <<>>,
+                rpc_rem_bytes = <<>>,
+                rpc_proc,
+                %% When peer connect to a remote node
+                %% We know the remote pub key when we connect
+                remote_pk,
+                response,
+                %% Monotonically increasing counter for outbound RPC request numbers.
+                req_counter = 0,
+                %% Deferred reply for an in-flight fetch_blob call: {From, Ref}
+                pending_fetch = #{},
+                %% Deferred reply for an in-flight has_blob call: {From, Ref}
+                pending_has = undefined,
+                %% In-flight sync RPC calls: #{Ref => From}
+                pending_rpc = #{},
+                %% ReqNo of our own outbound createWants source stream
+                our_wants_req = undefined,
+                %% ReqNo of the remote peer's createWants source stream (if seen)
+                remote_wants_req = undefined,
+                %% Set to true once an EBT duplex stream is active on this
+                %% connection (either we initiated or the peer did) so that
+                %% request_ebt/1 does not open a duplicate stream.
+                ebt_active = false,
+                %% The req number to use when sending clock updates to the peer.
+                %% Positive when we initiated EBT (client), negative when the peer did (server).
+                ebt_out_req = undefined,
+                %% Timer ref for the periodic anti-entropy clock re-exchange.
+                ebt_entropy_ref = undefined,
+                %% Positive ReqNo of a peer's room.attendants source stream
+                %% (when this node is a room).  Presence updates are pushed on
+                %% -attendants_req.  undefined when no such stream is open.
+                attendants_req = undefined,
+                %% Positive ReqNo of a peer's tunnel.endpoints source stream
+                %% (rooms 1.0 analogue of room.attendants).  The full id array
+                %% is re-emitted on -endpoints_req on every join/leave.
+                endpoints_req = undefined,
+                %% Tunnel mode only: the ReqNo on which inner frames arrive as
+                %% {tunnel_data, recv_req, Body}.  undefined for socket peers.
+                recv_req = undefined}).

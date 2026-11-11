@@ -1,0 +1,63 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Copyright (C) 2026 Charles Moid
+#
+# sbutt — run the erlbutt CLI against the node on this host.
+#
+#   sbutt whoami
+#   sbutt health
+#   sbutt get %somekey=.sha256
+#
+# Installed by `sudo bin/install-service --system`, which also sets
+# ERLBUTT_PREFIX below to its --prefix.  By hand:
+#   sudo install -m 0755 config/pub/sbutt /usr/local/bin/sbutt
+#
+# The CLI itself needs no installing — the release ships it as bin/sbutt
+# (plus a prebuilt sbutt.escript at its root), so the CLI is always the
+# same vintage as the node.  On a personal machine, symlink bin/sbutt onto
+# PATH and you are done; this wrapper is for a pub, where the node runs as
+# a separate service account.
+#
+# Three things this exists to get right, all of them easy to forget:
+#
+#  1. It runs as the SERVICE account.  .ssberl/secret is mode 600 owned by
+#     erlbutt, and keys:start_link/0 reads it, so every command that opens
+#     a connection fails as anyone else.  (`census encoding` is the lone
+#     exception — it folds the logs directly and needs no keys.)
+#
+#  2. It supplies the same environment systemd does.  Because vm.args.src
+#     exists, EVERY bin/ssb invocation re-expands vm.args from the current
+#     environment, so a different SSB_NODE or SSB_DIST_PORT would leave
+#     the node's args wrong on disk.  Sourcing the same EnvironmentFile
+#     the unit uses (when there is one) keeps the two from drifting.  -H
+#     makes HOME the service account's, which is where the node's
+#     .erlang.cookie lives.
+#
+#  3. It runs the release's bin/sbutt, which uses the ERTS bundled in the
+#     release.  Nothing needs to be on PATH and it survives an OTP upgrade.
+#     It does not go through bin/ssb, so it no longer re-expands vm.args.
+#
+# The env file, if any, is root:erlbutt 0640, so the service account reads
+# it itself — nothing secret passes through this script's arguments.
+set -eu
+
+# Refresh the sudo timestamp FIRST, as its own step.  Otherwise the password
+# prompt lands in the middle of a pipeline — `sbutt hist ... | jq .` starts
+# jq immediately, which blocks reading an empty pipe while sudo waits on the
+# tty, and the whole thing reads as a hang rather than a prompt.  Doing it
+# here means the prompt appears before any data moves, clearly labelled.
+sudo -v -p "sbutt: sudo password for %p: " || exit 1
+
+# Where the release is — only that.  Not SSB_HOME: that would also say
+# where the DATA is ($SSB_HOME/.ssberl), and on an install made by
+# bin/install-service the data is the service account's ~/.ssberl, which
+# the release finds by itself from HOME (sudo -H).
+ERLBUTT_PREFIX=/opt/erlbutt
+
+exec sudo -H -u erlbutt sh -c '
+    set -a
+    if [ -r /etc/erlbutt/env ]; then . /etc/erlbutt/env; fi
+    set +a
+    exec "$0/bin/sbutt" "$@"
+' "$ERLBUTT_PREFIX" "$@"

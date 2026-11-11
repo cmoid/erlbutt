@@ -1,0 +1,777 @@
+%% SPDX-License-Identifier: GPL-2.0-only
+%%
+%% Copyright (C) 2026 Charles Moid
+%%
+%% Two-node peer replication tests.
+%%
+%% Two isolated BEAM nodes (node_a, node_b) are started via the OTP
+%% `peer` module, each running its own ssb application with a separate
+%% key pair, data directory, and TCP port.  node_b connects to node_a
+%% over loopback and exercises the full SHS → boxstream → EBT path,
+%% allowing true cross-peer replication to be verified.
+-module(erlbutt_two_node_SUITE).
+
+-export([all/0,
+         init_per_suite/1,
+         end_per_suite/1,
+         init_per_testcase/2,
+         end_per_testcase/2]).
+
+-export([two_node_handshake_test/1,
+         two_node_ebt_replication_test/1,
+         two_node_ebt_no_duplicate_stream_test/1,
+         two_node_ebt_no_double_entropy_test/1,
+         two_node_ebt_multiple_feeds_test/1,
+         two_node_ebt_post_connect_replication_test/1,
+         two_node_blob_wants_test/1,
+         two_node_multiple_blob_wants_test/1,
+         two_node_blob_fetch_test/1,
+         two_node_auto_blob_fetch_test/1,
+         two_node_rpc_permissions_test/1,
+         two_node_repl_set_event_test/1,
+         two_node_archive_boundaries_test/1,
+         two_node_adopts_floor_test/1,
+         two_node_glimpse_offers_test/1,
+         two_node_stages_and_promotes_a_glimpse_test/1]).
+
+-include_lib("common_test/include/ct.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("ssb/include/ssb.hrl").
+
+-define(PORT_A, 18108).
+-define(PORT_B, 18109).
+-define(EBT_SETTLE_MS, 500).
+
+%%% CT callbacks --------------------------------------------------------
+
+all() ->
+    [two_node_handshake_test,
+     two_node_ebt_replication_test,
+     two_node_ebt_no_duplicate_stream_test,
+     two_node_ebt_no_double_entropy_test,
+     two_node_ebt_multiple_feeds_test,
+     two_node_ebt_post_connect_replication_test,
+     two_node_blob_wants_test,
+     two_node_multiple_blob_wants_test,
+     two_node_blob_fetch_test,
+     two_node_auto_blob_fetch_test,
+     two_node_rpc_permissions_test,
+     two_node_repl_set_event_test,
+     two_node_archive_boundaries_test,
+     two_node_adopts_floor_test,
+     two_node_glimpse_offers_test,
+     two_node_stages_and_promotes_a_glimpse_test].
+
+init_per_suite(Config) ->
+    %% peer:start/1 requires the calling node to be distributed.
+    ssb_ct_helper:ensure_distributed(),
+
+    DataDir = ?config(priv_dir, Config),
+    DirA    = filename:join(DataDir, "node_a"),
+    DirB    = filename:join(DataDir, "node_b"),
+    ok = filelib:ensure_dir(DirA ++ "/"),
+    ok = filelib:ensure_dir(DirB ++ "/"),
+
+    PAs = ssb_ct_helper:pa_args(),
+    {ok, PeerA, NodeA} = ssb_ct_helper:start_ssb_node(node_a, DirA, ?PORT_A, PAs),
+    {ok, PeerB, NodeB} = ssb_ct_helper:start_ssb_node(node_b, DirB, ?PORT_B, PAs),
+
+    [{node_a, NodeA}, {peer_a, PeerA},
+     {node_b, NodeB}, {peer_b, PeerB},
+     {dir_a,  DirA},  {dir_b, DirB}
+     | Config].
+
+end_per_suite(Config) ->
+    peer:stop(?config(peer_a, Config)),
+    peer:stop(?config(peer_b, Config)),
+    Config.
+
+init_per_testcase(_Case, Config) -> Config.
+end_per_testcase(_Case, Config)  -> Config.
+
+%%% Tests ---------------------------------------------------------------
+
+%% node_b initiates SHS with node_a.  The peer process on node_b
+%% stays alive only if the full handshake succeeded.
+two_node_handshake_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                              ["localhost", ?PORT_A, ACurvePk]),
+    ?assert(rpc:call(NodeB, erlang, is_process_alive, [PeerPid])),
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Post a message on node_a, have node_b connect and run EBT,
+%% then verify the message appears in node_b's storage for node_a's feed.
+two_node_ebt_replication_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    %% Post a message on A
+    AId     = rpc:call(NodeA, keys, pub_key_disp, []),
+    AFeedPid = rpc:call(NodeA, utils, find_or_create_feed_pid, [AId]),
+    ok = rpc:call(NodeA, ssb_feed, post_content,
+                  [AFeedPid, ~"hello from node_a"]),
+    #message{sequence = Seq} =
+        rpc:call(NodeA, ssb_feed, fetch_last_msg, [AFeedPid]),
+    ?assert(Seq >= 1),
+
+    %% B connects to A — EBT runs automatically after the handshake
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                              ["localhost", ?PORT_A, ACurvePk]),
+    timer:sleep(300),
+    ok = follow_feed(NodeB, AId),
+    rpc:call(NodeB, ssb_peer, request_ebt, [PeerPid]),
+    timer:sleep(300),
+    ?assert(rpc:call(NodeB, erlang, is_process_alive, [PeerPid])),
+
+    %% Give EBT time to stream the message to B
+    timer:sleep(?EBT_SETTLE_MS),
+
+    %% Verify B has A's feed and the message is stored there
+    BFeedPid = rpc:call(NodeB, utils, find_or_create_feed_pid, [AId]),
+    #message{sequence = RepSeq} =
+        rpc:call(NodeB, ssb_feed, fetch_last_msg, [BFeedPid]),
+    ?assert(RepSeq == Seq),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Calling request_ebt/1 twice on the same peer must not open a second
+%% EBT duplex stream.  After the first call ebt_active is true; the second
+%% call is a no-op.  The connection must remain alive throughout.
+two_node_ebt_no_duplicate_stream_test(Config) ->
+    NodeB    = ?config(node_b, Config),
+    NodeA    = ?config(node_a, Config),
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                              ["localhost", ?PORT_A, ACurvePk]),
+
+    rpc:call(NodeB, ssb_peer, request_ebt, [PeerPid]),
+    timer:sleep(100),
+
+    %% ebt_active should now be set.
+    State1 = rpc:call(NodeB, sys, get_state, [PeerPid]),
+    ?assert(State1#sbox_state.ebt_active),
+
+    %% Second request_ebt is a no-op — connection must still be alive.
+    rpc:call(NodeB, ssb_peer, request_ebt, [PeerPid]),
+    timer:sleep(100),
+    ?assert(rpc:call(NodeB, erlang, is_process_alive, [PeerPid])),
+
+    State2 = rpc:call(NodeB, sys, get_state, [PeerPid]),
+    ?assert(State2#sbox_state.ebt_active),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Regression: when EBT is already active on a connection, a second
+%% ebt.replicate from the peer must NOT schedule a second entropy timer.
+%% (Field bug: peer_dialer's request_ebt + the peer's ebt.replicate produced
+%% two anti-entropy timers, so the peer re-sent every message twice.)
+two_node_ebt_no_double_entropy_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+    AId   = rpc:call(NodeA, keys, pub_key_disp, []),
+    ok = follow_feed(NodeB, AId),
+    ACurvePk = rpc:call(NodeA, base64, decode, [rpc:call(NodeA, keys, pub_key, [])]),
+    {ok, PB} = rpc:call(NodeB, ssb_peer, start, ["localhost", ?PORT_A, ACurvePk]),
+    timer:sleep(300),
+
+    %% A's inbound peer serving B.
+    BPubRaw = rpc:call(NodeB, base64, decode, [rpc:call(NodeB, keys, pub_key, [])]),
+    {ok, PA} = rpc:call(NodeA, peer_registry, find, [BPubRaw]),
+
+    %% A initiates EBT first (as peer_dialer would on a heartbeat).
+    rpc:call(NodeA, ssb_peer, request_ebt, [PA]),
+    timer:sleep(200),
+    S1 = rpc:call(NodeA, sys, get_state, [PA]),
+    ?assert(S1#sbox_state.ebt_active),
+    E1 = S1#sbox_state.ebt_entropy_ref,
+
+    %% Force B to re-initiate so A receives a second ebt.replicate while
+    %% already active (B's own request_ebt is otherwise guarded).
+    rpc:call(NodeB, sys, replace_state,
+             [PB, fun(S) -> S#sbox_state{ebt_active = false} end]),
+    rpc:call(NodeB, ssb_peer, request_ebt, [PB]),
+    timer:sleep(300),
+
+    %% The guard kept a single entropy timer — same ref, still active.
+    S2 = rpc:call(NodeA, sys, get_state, [PA]),
+    ?assert(S2#sbox_state.ebt_active),
+    ?assertEqual(E1, S2#sbox_state.ebt_entropy_ref),
+
+    rpc:call(NodeB, gen_server, stop, [PB]).
+
+%% Post messages from two distinct feeds on node_a, have node_b connect and
+%% run EBT, then verify node_b replicates both feeds.  This exercises the
+%% full-clock path: node_b's initial clock must include all known feeds so
+%% node_a knows what to push.
+two_node_ebt_multiple_feeds_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    %% Post to A's own feed.
+    AId      = rpc:call(NodeA, keys, pub_key_disp, []),
+    AFeedPid = rpc:call(NodeA, utils, find_or_create_feed_pid, [AId]),
+    ok = rpc:call(NodeA, ssb_feed, post_content,
+                  [AFeedPid, {[{~"type", ~"post"}, {~"text", ~"feed-a msg"}]}]),
+
+    %% A second feed that A follows, so it is within A's replication horizon
+    %% and appears in A's clock.
+    {PubX, _} = rpc:call(NodeA, utils, create_key_pair, []),
+    FeedX     = rpc:call(NodeA, utils, display_pub, [PubX]),
+    ok = follow_feed(NodeA, FeedX),
+    _ = rpc:call(NodeA, utils, find_or_create_feed_pid, [FeedX]),
+
+    %% A's last sequence now includes the contact message posted above.
+    #message{sequence = SeqA} =
+        rpc:call(NodeA, ssb_feed, fetch_last_msg, [AFeedPid]),
+
+    %% B follows A and runs EBT.
+    ok = follow_feed(NodeB, AId),
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                              ["localhost", ?PORT_A, ACurvePk]),
+    timer:sleep(300),
+    rpc:call(NodeB, ssb_peer, request_ebt, [PeerPid]),
+    timer:sleep(?EBT_SETTLE_MS),
+
+    %% B must have A's own feed at the correct sequence.
+    BFeedPidA = rpc:call(NodeB, utils, find_or_create_feed_pid, [AId]),
+    #message{sequence = RepSeqA} =
+        rpc:call(NodeB, ssb_feed, fetch_last_msg, [BFeedPidA]),
+    ?assert(RepSeqA =:= SeqA),
+
+    %% B must know about feed X (registered in A's clock even at seq 0).
+    _ = rpc:call(NodeA, utils, find_or_create_feed_pid, [FeedX]),
+    {Clock} = rpc:call(NodeA, ebt, full_clock, []),
+    ?assert(lists:keymember(FeedX, 1, Clock)),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Post a message on node_a AFTER the initial EBT clock exchange, then
+%% trigger anti-entropy manually and verify node_b receives the new message.
+two_node_ebt_post_connect_replication_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    %% B follows A so A's feed is within B's replication horizon.
+    AId = rpc:call(NodeA, keys, pub_key_disp, []),
+    ok = follow_feed(NodeB, AId),
+
+    %% B connects to A and runs EBT (initial sync).
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                              ["localhost", ?PORT_A, ACurvePk]),
+    timer:sleep(300),
+    rpc:call(NodeB, ssb_peer, request_ebt, [PeerPid]),
+    timer:sleep(?EBT_SETTLE_MS),
+
+    %% Post a new message on A after the initial exchange.
+    AId      = rpc:call(NodeA, keys, pub_key_disp, []),
+    AFeedPid = rpc:call(NodeA, utils, find_or_create_feed_pid, [AId]),
+    ok = rpc:call(NodeA, ssb_feed, post_content,
+                  [AFeedPid, {[{~"type", ~"post"}, {~"text", ~"post-connect msg"}]}]),
+    #message{sequence = NewSeq} =
+        rpc:call(NodeA, ssb_feed, fetch_last_msg, [AFeedPid]),
+
+    %% Trigger anti-entropy on B's peer immediately rather than waiting 30s.
+    PeerPid ! ebt_anti_entropy,
+    timer:sleep(?EBT_SETTLE_MS),
+
+    %% B must have the new message.
+    BFeedPid = rpc:call(NodeB, utils, find_or_create_feed_pid, [AId]),
+    #message{sequence = RepSeq} =
+        rpc:call(NodeB, ssb_feed, fetch_last_msg, [BFeedPid]),
+    ?assert(RepSeq =:= NewSeq),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Store a blob on node_a, connect from node_b, send a want, and verify
+%% that node_b receives the have response with the correct blob size.
+two_node_blob_wants_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    %% Store a blob on A
+    BlobData = ~"erlbutt two-node blob wants test payload",
+    BlobId   = rpc:call(NodeA, blobs, store, [BlobData]),
+    ExpectedSize = byte_size(BlobData),
+    ?assert(rpc:call(NodeA, blobs, has, [BlobId]) =:= true),
+
+    %% B connects to A
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                              ["localhost", ?PORT_A, ACurvePk]),
+
+    %% B sends want to A; haves arrive asynchronously to the test process.
+    Self = self(),
+    rpc:call(NodeB, ssb_peer, request_blob_wants, [PeerPid, [BlobId], Self]),
+    receive
+        {have, BlobId, Size} ->
+            ?assert(Size =:= ExpectedSize)
+    after 5000 ->
+        ct:fail(no_have_received)
+    end,
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Store a blob on node_a, connect from node_b, send a want, and verify
+%% that node_b receives the have response with the correct blob size.
+two_node_multiple_blob_wants_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    %% Store blobs on A
+    BlobData = ~"erlbutt two-node blob wants test payload",
+    BlobId   = rpc:call(NodeA, blobs, store, [BlobData]),
+    ExpectedSize = byte_size(BlobData),
+    ?assert(rpc:call(NodeA, blobs, has, [BlobId]) =:= true),
+
+    BlobData2 = ~"erlbutt two-node blob wants test payload which is diff",
+    BlobId2 = rpc:call(NodeA, blobs, store, [BlobData2]),
+    ExpectedSize2 = byte_size(BlobData2),
+    ?assert(rpc:call(NodeA, blobs, has, [BlobId2]) =:= true),
+
+    %% B connects to A
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                              ["localhost", ?PORT_A, ACurvePk]),
+
+    %% B sends want to A; haves arrive asynchronously to the test process.
+    Self = self(),
+    rpc:call(NodeB, ssb_peer, request_blob_wants, [PeerPid, [BlobId, BlobId2], Self]),
+
+    Haves = rpc:call(NodeB, ssb_peer, drain_haves, [1000]),
+    ?assert(lists:all(fun({_Id, Sz}) ->
+        Sz =:= ExpectedSize orelse Sz =:= ExpectedSize2
+    end, Haves)),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Connect from node_b to node_a, request a blob via blobs.get, and verify
+%% that node_b receives the complete blob data.  The payload is deliberately
+%% larger than both the 4096-byte box-stream packet limit and the 65536-byte
+%% muxrpc frame size so the transfer spans many boxes and frames — this is the
+%% case that overflowed the 2-byte box-stream length field to 0.
+two_node_blob_fetch_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    %% Store a large (multi-box, multi-frame) blob on A
+    BlobData = crypto:strong_rand_bytes(200000),
+    BlobId   = rpc:call(NodeA, blobs, store, [BlobData]),
+    ?assert(rpc:call(NodeA, blobs, has, [BlobId]) =:= true),
+
+    %% B connects to A (full SHS + EBT)
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                              ["localhost", ?PORT_A, ACurvePk]),
+
+    %% B requests the blob from A — returns {ok, Data} directly
+    {ok, BlobData} = rpc:call(NodeB, ssb_peer, fetch_blob, [PeerPid, BlobId]),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% End-to-end automatic blob replication: node_a publishes a post that
+%% mentions a blob it holds; node_b replicates the feed via EBT, and its
+%% blob_fetcher notices the missing blob, wants it from node_a, and fetches
+%% it without any explicit request.
+two_node_auto_blob_fetch_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    %% A holds a blob and posts a message that mentions it.
+    BlobData = ~"erlbutt automatic blob replication payload",
+    BlobId   = rpc:call(NodeA, blobs, store, [BlobData]),
+    AId      = rpc:call(NodeA, keys, pub_key_disp, []),
+    AFeedPid = rpc:call(NodeA, utils, find_or_create_feed_pid, [AId]),
+    ok = rpc:call(NodeA, ssb_feed, post_content,
+                  [AFeedPid, {[{~"type", ~"post"},
+                                {~"text", ~"have a blob"},
+                                {~"mentions", [{[{~"link", BlobId}]}]}]}]),
+
+    %% B connects and replicates the feed via EBT.
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                              ["localhost", ?PORT_A, ACurvePk]),
+    timer:sleep(300),
+    ok = follow_feed(NodeB, AId),
+    rpc:call(NodeB, ssb_peer, request_ebt, [PeerPid]),
+
+    %% Storing the post on B triggers want → have → fetch on its own.
+    ?assert(wait_until(fun() ->
+        rpc:call(NodeB, blobs, has, [BlobId]) =:= true
+    end, 40)),
+    ?assertEqual({ok, BlobData}, rpc:call(NodeB, blobs, fetch, [BlobId])),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% node_b authenticates with its own key, so on node_a it is an ordinary
+%% peer: owner-only methods (publish) must be refused, the open surface
+%% (whoami) must still answer, and the manifest node_a serves it must
+%% not advertise owner-only methods.
+two_node_rpc_permissions_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                             ["localhost", ?PORT_A, ACurvePk]),
+
+    %% owner-only builtin refused for a peer
+    {ok, Denied} = rpc:call(NodeB, ssb_peer, rpc_call,
+                            [PeerPid, [~"publish"], ~"async",
+                             [{[{~"type", ~"post"}, {~"text", ~"intrusion"}]}]]),
+    {DeniedProps} = rpc:call(NodeB, utils, nat_decode, [Denied]),
+    ?assertEqual(~"Error", proplists:get_value(~"name", DeniedProps)),
+    ?assertEqual(~"method not allowed",
+                 proplists:get_value(~"message", DeniedProps)),
+
+    %% nothing was published on node_a's own feed
+    AId      = rpc:call(NodeA, keys, pub_key_disp, []),
+    AFeedPid = rpc:call(NodeA, utils, find_or_create_feed_pid, [AId]),
+    LastMsg  = rpc:call(NodeA, ssb_feed, fetch_last_msg, [AFeedPid]),
+    case LastMsg of
+        #message{content = Content} ->
+            ?assertNotEqual(~"intrusion", msg_text(Content));
+        _ -> ok
+    end,
+
+    %% the open surface still answers
+    {ok, WhoBody} = rpc:call(NodeB, ssb_peer, rpc_call,
+                             [PeerPid, [?whoami], ~"async"]),
+    {WhoProps} = rpc:call(NodeB, utils, nat_decode, [WhoBody]),
+    ?assertEqual(AId, proplists:get_value(~"id", WhoProps)),
+
+    %% the manifest served to a peer hides owner-only methods
+    {ok, ManBody} = rpc:call(NodeB, ssb_peer, rpc_call,
+                             [PeerPid, [~"manifest"], ~"sync"]),
+    {ManProps} = rpc:call(NodeB, utils, nat_decode, [ManBody]),
+    ?assertEqual(undefined, proplists:get_value(~"publish", ManProps)),
+    ?assertEqual(undefined, proplists:get_value(~"createLogStream", ManProps)),
+    ?assertEqual(~"source", proplists:get_value(?createhistorystream, ManProps)),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Node A archives its feed; node B asks for boundaries and gets back the
+%% author's own signed archive genesis — the message it would seed a
+%% validation floor from.  This is the discovery half of onboarding: B
+%% learns where A's feed can be started without fetching anything below it.
+two_node_archive_boundaries_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    AId      = rpc:call(NodeA, keys, pub_key_disp, []),
+    AFeedPid = rpc:call(NodeA, utils, find_or_create_feed_pid, [AId]),
+    ok = rpc:call(NodeA, config, set_archive_length, [undefined]),
+    ok = rpc:call(NodeA, ssb_feed, post_content, [AFeedPid, ~"before one"]),
+    ok = rpc:call(NodeA, ssb_feed, post_content, [AFeedPid, ~"before two"]),
+    {ok, _Blob} = rpc:call(NodeA, ssb_feed, archive, [AFeedPid]),
+    #message{id = GenId, sequence = GenSeq, previous = GenPrev} =
+        rpc:call(NodeA, ssb_feed, fetch_last_msg, [AFeedPid]),
+
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                             ["localhost", ?PORT_A, ACurvePk]),
+
+    {ok, Bodies} = rpc:call(NodeB, ssb_peer, rpc_stream_call,
+                            [PeerPid, [?archives, ?boundaries], []]),
+    ?assert(length(Bodies) >= 1),
+
+    %% B verifies the AUTHOR's signature; it never takes A's word for it.
+    Decoded = [rpc:call(NodeB, message, decode_value, [Body, true])
+               || Body <- Bodies],
+    Ours = [M || #message{author = Auth} = M <- Decoded, Auth =:= AId],
+    ?assertMatch([_ | _], Ours),
+    [#message{id = Id, sequence = Seq, previous = Prev,
+              validated = Valid, content = {Props}} | _] = Ours,
+    ?assertEqual(true,   Valid),
+    ?assertEqual(GenId,  Id),
+    ?assertEqual(GenSeq, Seq),
+    ?assertEqual(GenPrev, Prev),
+    ?assertEqual(~"archive", proplists:get_value(~"type", Props)),
+    ?assert(is_integer(proplists:get_value(~"size", Props))),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+msg_text({Props}) -> proplists:get_value(~"text", Props);
+msg_text(_)       -> undefined.
+
+%% Posting a follow updates the EBT replication set via the friends
+%% view's change events (debounced ~1s) — no explicit
+%% ebt:refresh_repl_set/0 and no waiting for the periodic timer.
+two_node_repl_set_event_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    Target = rpc:call(NodeA, keys, pub_key_disp, []),
+    NewFeed = fresh_feed_id(),
+    ?assertNot(rpc:call(NodeA, ebt, replicate_feed, [NewFeed])),
+    SelfPid = rpc:call(NodeA, utils, find_or_create_feed_pid, [Target]),
+    Content = {[{~"type", ~"contact"}, {~"contact", NewFeed},
+                {~"following", true}]},
+    ok = rpc:call(NodeA, ssb_feed, post_content, [SelfPid, Content]),
+    ?assert(wait_until(
+              fun() -> rpc:call(NodeA, ebt, replicate_feed, [NewFeed]) end,
+              20)).
+
+%% The whole onboarding path: B learns where a feed can be started and
+%% starts it there, instead of fetching everything below the boundary.
+%%
+%% The feed is a throwaway one that neither node has ever replicated, so
+%% the case does not depend on what earlier cases in this suite left
+%% behind — the nodes are shared across the suite, and B already holds
+%% A's own feed by the time this runs.
+%%
+%% It is placed at HOP TWO for B (B follows a middle feed, which follows
+%% it).  A direct follow is never floored — you are the witness of last
+%% resort for people you chose — so following it directly would exercise
+%% the exemption rather than the adoption.
+two_node_adopts_floor_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    %% A holds an archive boundary for some third feed, and can offer it.
+    {FeedId, GenSeq, PrevId} = plant_boundary(NodeA),
+    ?assert(wait_until(
+              fun() -> rpc:call(NodeA, ssb_archives, newest, [FeedId]) =/= none end,
+              20)),
+
+    %% Put that feed two hops from B.
+    Middle = via_feed(NodeB, FeedId),
+    ok = follow_feed(NodeB, Middle),
+    ok = rpc:call(NodeB, ebt, refresh_repl_set, []),
+    ?assert(wait_until(
+              fun() -> rpc:call(NodeB, ebt, replicate_feed, [FeedId]) end, 20)),
+
+    %% B holds nothing of it.
+    BFeedPid = rpc:call(NodeB, utils, find_or_create_feed_pid, [FeedId]),
+    ?assertEqual(0, rpc:call(NodeB, ssb_feed, current_seq, [BFeedPid])),
+
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                             ["localhost", ?PORT_A, ACurvePk]),
+    timer:sleep(300),
+
+    ok = rpc:call(NodeB, boundary_discovery, run_now, []),
+
+    %% B now claims everything below the boundary, so EBT will ask for the
+    %% genesis onward rather than for the whole feed — and the chain check
+    %% will accept it, because last_msg is the boundary's own predecessor.
+    ?assertEqual(GenSeq - 1,
+                 rpc:call(NodeB, ssb_feed, current_seq, [BFeedPid])),
+    {ok, Floor} = rpc:call(NodeB, feed_floor, get, [FeedId]),
+    ?assertEqual(GenSeq,  maps:get(floor_seq, Floor)),
+    ?assertEqual(PrevId,  maps:get(prev_id, Floor)),
+    ?assertEqual(4242,    maps:get(size, Floor)),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Store a signed archive genesis for a throwaway feed on Node, so Node can
+%% offer it as a boundary.  Only a feed's owner can archive, so the message
+%% is authored directly rather than produced by ssb_feed:archive/1.
+plant_boundary(Node) ->
+    #{public := Pub, secret := Priv} = enacl:sign_keypair(),
+    FeedId = <<"@", (base64:encode(Pub))/binary, ".ed25519">>,
+    PrevId = ~"%bm90aGluZyByZWFsIGhlcmUsIGp1c3QgYSBwcmV2aW91cw==.sha256",
+    Content = {[{~"type",           ~"archive"},
+                {~"archive",        ~"&cGxhbnRlZCBhcmNoaXZlIGJsb2IgaWQ=.sha256"},
+                {~"from_sequence",  1},
+                {~"to_sequence",    10},
+                {~"size",           4242},
+                {~"from_timestamp", 1000},
+                {~"to_timestamp",   2000}]},
+    Msg = rpc:call(Node, message, new_msg,
+                   [PrevId, 11, Content, {FeedId, base64:encode(Priv)}]),
+    Pid = rpc:call(Node, utils, find_or_create_feed_pid, [FeedId]),
+    stored = rpc:call(Node, ssb_feed, store_msg, [Pid, Msg]),
+    {FeedId, 11, PrevId}.
+
+%% A feed on Node that follows TargetId, so TargetId sits one hop further
+%% out than whoever follows this feed.  Signed with a throwaway key and
+%% stored directly — the point is the follow edge, not how it arrived.
+via_feed(Node, TargetId) ->
+    #{public := Pub, secret := Priv} = enacl:sign_keypair(),
+    MidId = <<"@", (base64:encode(Pub))/binary, ".ed25519">>,
+    Content = {[{~"type", ~"contact"}, {~"contact", TargetId},
+                {~"following", true}]},
+    %% new_msg base64-decodes the secret, so hand it the encoded form —
+    %% enacl returns raw bytes.
+    Msg = rpc:call(Node, message, new_msg,
+                   [null, 1, Content, {MidId, base64:encode(Priv)}]),
+    MidPid = rpc:call(Node, utils, find_or_create_feed_pid, [MidId]),
+    stored = rpc:call(Node, ssb_feed, store_msg, [MidPid, Msg]),
+    MidId.
+
+fresh_feed_id() ->
+    #{public := Pub} = enacl:sign_keypair(),
+    <<"@", (base64:encode(Pub))/binary, ".ed25519">>.
+
+%% A glimpse crosses the wire as the author signed it, and B checks that
+%% signature itself.
+%%
+%% This is the carriage half of the design: A is relaying a sealed
+%% envelope for a feed it happens to hold, and B is entitled to read it
+%% because a feed id IS an ed25519 public key — no chain, no predecessor,
+%% no prior knowledge of the feed required to verify.
+two_node_glimpse_offers_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    #{feed := FeedId, blob := Blob} = plant_glimpse(NodeA, ~"a feed about boats"),
+    ?assert(wait_until(
+              fun() -> rpc:call(NodeA, ssb_glimpses, for_feed, [FeedId]) =/= none end,
+              20)),
+
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                             ["localhost", ?PORT_A, ACurvePk]),
+
+    {ok, Bodies} = rpc:call(NodeB, ssb_peer, rpc_stream_call,
+                            [PeerPid, [?glimpses, ?offers], []]),
+    Decoded = [rpc:call(NodeB, message, decode_value, [Body, true])
+               || Body <- Bodies],
+    Ours = [M || #message{author = Auth} = M <- Decoded, Auth =:= FeedId],
+    ?assertMatch([_ | _], Ours),
+    [#message{validated = Valid, content = {Props}} | _] = Ours,
+    ?assertEqual(true,      Valid),
+    ?assertEqual(~"glimpse", proplists:get_value(~"type", Props)),
+    ?assertEqual(Blob,      proplists:get_value(~"blob", Props)),
+    ?assert(is_integer(proplists:get_value(~"size", Props))),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% The whole discovery path: B learns who somebody at the edge of its
+%% graph is, without replicating them, and then decides to.
+%%
+%% The feed is placed at HOPS+1 for B — three hops with the default
+%% hops=2 — which takes two throwaway identities in the middle.  That is
+%% the arrangement the feature exists for and the one that is easy to get
+%% wrong: a feed the peer itself follows would sit at hops 2 and already
+%% be replicated, and the round would correctly skip it.
+%%
+%% Also asserted here, and NOT coverable by the unit tests: a glimpse
+%% offered in the same round for a feed nobody B replicates has ever
+%% followed is refused.  decide/4 is tested against a hand-built set;
+%% this tests that boundary_set/0 computes the set that argument assumes,
+%% from a real follow graph.
+two_node_stages_and_promotes_a_glimpse_test(Config) ->
+    NodeA = ?config(node_a, Config),
+    NodeB = ?config(node_b, Config),
+
+    #{feed := FeedId, blob := Blob, payload := Payload} =
+        plant_glimpse(NodeA, ~"slow software, boats"),
+    #{feed := Stranger} = plant_glimpse(NodeA, ~"nobody sent me"),
+    ?assert(wait_until(
+              fun() -> rpc:call(NodeA, ssb_glimpses, for_feed, [Stranger]) =/= none end,
+              20)),
+
+    %% Put the feed three hops from B: B -> Mid1 -> Mid2 -> FeedId.
+    Mid2 = via_feed(NodeB, FeedId),
+    Mid1 = via_feed(NodeB, Mid2),
+    ok = follow_feed(NodeB, Mid1),
+    ?assert(wait_until(
+              fun() -> rpc:call(NodeB, ebt, replicate_feed, [Mid2]) end, 20)),
+
+    %% It is at the boundary: reachable, and deliberately not replicated.
+    ?assertNot(rpc:call(NodeB, ebt, replicate_feed, [FeedId])),
+    Boundary = rpc:call(NodeB, glimpse_discovery, boundary_set, []),
+    ?assert(sets:is_element(FeedId, Boundary)),
+    ?assertNot(sets:is_element(Stranger, Boundary)),
+
+    APubKey  = rpc:call(NodeA, keys, pub_key, []),
+    ACurvePk = rpc:call(NodeA, base64, decode, [APubKey]),
+    {ok, PeerPid} = rpc:call(NodeB, ssb_peer, start,
+                             ["localhost", ?PORT_A, ACurvePk]),
+    timer:sleep(300),
+
+    ok = rpc:call(NodeB, glimpse_discovery, run_now, []),
+
+    %% Staged, and marked as what it is: a peer's copy for a feed we do
+    %% not carry.
+    ?assertMatch({ok, #{source := edge, seq := 1, blob := Blob}},
+                 rpc:call(NodeB, ssb_glimpses, for_feed, [FeedId])),
+
+    %% We don't want nobody that nobody sent.
+    ?assertEqual(none, rpc:call(NodeB, ssb_glimpses, for_feed, [Stranger])),
+
+    %% Staged is not served: a glimpse we hold for a feed we do not
+    %% replicate is ours to look at, not ours to relay.
+    ?assertNot(lists:member(
+                 FeedId,
+                 [F || #{feed := F} <- rpc:call(NodeB, ssb_glimpses, offers, [])])),
+
+    %% The pointer and the payload travel separately; wanting the blob is
+    %% what makes the second one arrive.
+    ?assert(wait_until(
+              fun() -> rpc:call(NodeB, blobs, has, [Blob]) =:= true end, 40)),
+    ?assertEqual({ok, Payload}, rpc:call(NodeB, blobs, fetch, [Blob])),
+
+    %% Promotion: a local pin, and the graph-derived set is unchanged.
+    ok = rpc:call(NodeB, feed_pins, pin, [FeedId, ~"glimpse"]),
+    ?assert(wait_until(
+              fun() -> rpc:call(NodeB, ebt, replicate_feed, [FeedId]) end, 20)),
+    ok = rpc:call(NodeB, ssb_glimpses, forget, [FeedId]),
+    ?assertEqual(none, rpc:call(NodeB, ssb_glimpses, for_feed, [FeedId])),
+
+    %% And undone as cheaply as it was done.
+    ok = rpc:call(NodeB, feed_pins, unpin, [FeedId]),
+    ?assert(wait_until(
+              fun() -> not rpc:call(NodeB, ebt, replicate_feed, [FeedId]) end, 20)),
+
+    rpc:call(NodeB, gen_server, stop, [PeerPid]).
+
+%% Store a signed glimpse for a throwaway feed on Node, together with the
+%% payload blob it names, so Node can offer both.
+%%
+%% Authored directly rather than published: only a feed's owner can write
+%% its glimpse, and this feed exists nowhere but in the test.  Sequence 1
+%% with previous = null is a valid one-message feed and needs no chain
+%% behind it.
+plant_glimpse(Node, Statement) ->
+    #{public := Pub, secret := Priv} = enacl:sign_keypair(),
+    FeedId = <<"@", (base64:encode(Pub))/binary, ".ed25519">>,
+    Payload = iolist_to_binary(
+                ["{\"version\":1,\"feed\":\"", FeedId,
+                 "\",\"statement\":\"", Statement, "\"}"]),
+    Blob = rpc:call(Node, blobs, store, [Payload]),
+    Content = {[{~"type",    ~"glimpse"},
+                {~"blob",    Blob},
+                {~"size",    byte_size(Payload)},
+                {~"updated", 1789000000000}]},
+    %% new_msg base64-decodes the secret, so hand it the encoded form.
+    Msg = rpc:call(Node, message, new_msg,
+                   [null, 1, Content, {FeedId, base64:encode(Priv)}]),
+    Pid = rpc:call(Node, utils, find_or_create_feed_pid, [FeedId]),
+    stored = rpc:call(Node, ssb_feed, store_msg, [Pid, Msg]),
+    #{feed => FeedId, blob => Blob, payload => Payload}.
+
+%%% Helpers -------------------------------------------------------------
+
+%% Make Node follow TargetId (post a contact on Node's own feed) and refresh
+%% the EBT replication set, so TargetId falls within Node's replication horizon.
+follow_feed(Node, TargetId) ->
+    SelfId  = rpc:call(Node, keys, pub_key_disp, []),
+    SelfPid = rpc:call(Node, utils, find_or_create_feed_pid, [SelfId]),
+    Content = {[{~"type", ~"contact"}, {~"contact", TargetId}, {~"following", true}]},
+    ok = rpc:call(Node, ssb_feed, post_content, [SelfPid, Content]),
+    ok = rpc:call(Node, ebt, refresh_repl_set, []).
+
+wait_until(_F, 0) -> false;
+wait_until(F, N) ->
+    case F() of
+        true  -> true;
+        false -> timer:sleep(250), wait_until(F, N - 1)
+    end.

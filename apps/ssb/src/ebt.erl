@@ -1,0 +1,601 @@
+%% SPDX-License-Identifier: GPL-2.0-only
+%%
+%% Copyright (C) 2025 Charles Moid
+-module(ebt).
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
+
+-include_lib("ssb/include/ssb.hrl").
+
+-behaviour(gen_server).
+-behavior(rpc_behavior).
+
+%% API
+-export([start_link/0,
+         initial_vector/0,
+         full_clock/0,
+         replicate_feed/1,
+         refresh_repl_set/0,
+         handle_data/3]).
+
+%% gen_server callbacks
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2,
+         terminate/2, code_change/3]).
+
+-compile({no_auto_import,[size/1]}).
+-import(utils, [size/1]).
+
+-define(SERVER, ?MODULE).
+
+%% Cached replication set: the feeds we will store and serve.  Recomputed
+%% from the follow graph + room members − blocks, on a timer and on demand.
+-define(REPL_SET, ebt_repl_set).
+-define(REPL_REFRESH_MS, 20000).
+
+%% ebt is both a gen_server (supervised singleton in ssb_sup) and an
+%% rpc_behavior (callbacks invoked per-connection by each rpc_processor).
+%% The gen_server carries no state; all connection context arrives via args.
+%% debounce is the timer ref for a pending event-triggered repl-set
+%% refresh (undefined when none is queued).
+%% quiet: Pid => {FirstSeenQuiet, AlreadyWarned}.  A connection is allowed
+%% to be briefly quiet — the EBT stream is asked for just after the
+%% handshake — so the warning waits out ?QUIET_GRACE_MS and then fires
+%% once per connection.
+-record(state, {debounce, quiet = #{}}).
+
+%% How long a connection may sit with no EBT stream before it is worth
+%% mentioning.  Generous on purpose: the point is to catch connections
+%% that will NEVER replicate, not to nag about the moment after a
+%% handshake.
+-define(QUIET_GRACE_MS, 60000).
+
+start_link() ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+
+initial_vector() ->
+    full_clock().
+
+%% Build a full vector clock from the feeds we hold that are within our
+%% replication set.  Each entry is {FeedId, encoded_int} with receive=true so
+%% the peer pushes us updates.
+full_clock() ->
+    %% Build the clock from our replication set (the feeds we WANT), not just the
+    %% in-memory feed registry.  Feeds load lazily, so right after a restart the
+    %% registry is empty — advertising only registry feeds made us send an empty
+    %% clock `{}` and request nothing, so the peer pushed nothing and replication
+    %% (and therefore blob discovery) stalled until the registry happened to warm
+    %% up.  Loading each replication-set feed here also drives the bootstrap: we
+    %% advertise wanting it (at seq 0 when we hold nothing), the peer pushes it,
+    %% and the set grows as we learn follows-of-follows.
+    {lists:filtermap(
+       fun(FeedId) ->
+               case utils:find_or_create_feed_pid(FeedId) of
+                   bad -> false;
+                   Pid ->
+                       case clock_entry_for(FeedId, Pid) of
+                           skip  -> false;
+                           Entry -> {true, Entry}
+                       end
+               end
+       end, repl_set_feeds())}.
+
+%% Notice connections that are up but replicating nothing.
+%%
+%% Opening a connection and asking it to replicate are two steps, and only
+%% peer_dialer does both.  A hand-dialled peer therefore handshakes,
+%% answers RPC and serves archive boundaries while replicating NOTHING —
+%% with no error anywhere, and nothing to distinguish it from a working
+%% connection.  That has cost three debugging sessions; the state was
+%% readable throughout and simply nobody read it.
+%%
+%% Warns once per connection, then stays quiet: a signpost, not an alarm.
+%% A node deliberately holding a client connection should not have its log
+%% filled by it.
+check_replicating(Quiet) ->
+    Now  = erlang:monotonic_time(millisecond),
+    Live = [{Pid, ssb_peer:replicating(Pid)}
+            || {_PubKey, Pid} <- peer_registry:all(), is_process_alive(Pid)],
+    %% Rebuilt from the live set each tick, so a peer that starts
+    %% replicating, disconnects or dies falls out on its own.
+    lists:foldl(fun({Pid, St}, Acc) -> note(Pid, St, Now, Quiet, Acc) end,
+                #{}, Live).
+
+%% true -> replicating, forget it.  unknown -> too busy to answer within
+%% the timeout, which for a peer means it is mid-fold writing messages to
+%% a socket: the opposite of the symptom, so never counted as one.
+note(_Pid, true, _Now, _Was, Acc)    -> Acc;
+note(_Pid, unknown, _Now, _Was, Acc) -> Acc;
+note(Pid, false, Now, Was, Acc) ->
+    case maps:get(Pid, Was, undefined) of
+        undefined       -> Acc#{Pid => {Now, false}};
+        {Since, Warned} -> Acc#{Pid => {Since, warn_once(Pid, Now - Since, Warned)}}
+    end.
+
+warn_once(_Pid, _Elapsed, true) ->
+    true;
+warn_once(Pid, Elapsed, false) when Elapsed >= ?QUIET_GRACE_MS ->
+    ?SSB_INFO("ebt: peer ~p connected ~p s with no EBT stream; it will "
+              "replicate nothing until request_ebt/1 is called on it. "
+              "peer_dialer does that automatically, a hand-dialled "
+              "connection does not.~n", [Pid, Elapsed div 1000]),
+    true;
+warn_once(_Pid, _Elapsed, false) ->
+    false.
+
+%% Feed ids in our current replication set (see recompute_repl_set/0).
+repl_set_feeds() ->
+    try [FeedId || {FeedId} <- ets:tab2list(?REPL_SET)]
+    catch error:badarg -> []
+    end.
+
+%% Whether we replicate (store/serve) FeedId: our own feed, anyone within our
+%% follow horizon, or an explicit room member — minus anyone we block.  Reads
+%% the cached set; if the table is absent (ebt not started, e.g. isolated
+%% eunit) it fails open so unrelated paths keep working.
+replicate_feed(FeedId) ->
+    try ets:member(?REPL_SET, FeedId)
+    catch error:badarg -> true
+    end.
+
+%% Recompute the cached replication set now (e.g. after a new follow/block or
+%% room member). Synchronous so callers/tests see the effect immediately.
+refresh_repl_set() ->
+    gen_server:call(?SERVER, refresh_repl_set).
+
+%% Called by rpc_processor for each subsequent message on an open EBT
+%% duplex stream (after the initial ebt.replicate handshake).
+%%
+%% The peer sends either:
+%%   - a vector clock (JSON object keyed by @feed.ed25519 IDs)
+%%   - a feed message (JSON with "key"/"value"/"timestamp")
+handle_data(ReqNo, Body, #ssb_conn{socket = Socket,
+                                    nonce = Nonce,
+                                    secret_box = Key}) ->
+    Decoded = utils:nat_decode(Body),
+    case is_vector_clock(Decoded) of
+        true ->
+            ?SSB_DEBUG("EBT: received vector clock ~n", []),
+            handle_clock(ReqNo, Decoded, Socket, Nonce, Key);
+        false ->
+            case is_peer_error(Decoded) of
+                true ->
+                    Nonce;
+                false ->
+                    ?SSB_DEBUG("EBT: received message from peer ~n", []),
+                    case store_message(Body) of
+                        {ok, FeedId, Seq} ->
+                            send_clock_ack(FeedId, Seq, -ReqNo, Socket, Nonce, Key);
+                        _ ->
+                            %% skipped (duplicate) or error: no ack.
+                            Nonce
+                    end
+            end
+    end.
+
+init([]) ->
+    process_flag(trap_exit, true),
+    ets:new(?REPL_SET, [set, named_table, public]),
+    recompute_repl_set(),
+    schedule_repl_refresh(),
+    %% Follow/block changes land in the social graph view; refresh the
+    %% replication set when they do instead of waiting for the periodic
+    %% timer (kept as anti-entropy).  No manager in some eunit setups.
+    catch view_manager:subscribe(ssb_social_graph),
+    {ok, #state{}}.
+
+handle_call(refresh_repl_set, _From, State) ->
+    recompute_repl_set(),
+    {reply, ok, State};
+
+handle_call(_Request, _From, State) ->
+    {reply, ok, State}.
+
+handle_cast(_Request, State) ->
+    {noreply, State}.
+
+handle_info(refresh_repl_set, #state{quiet = Quiet} = State) ->
+    recompute_repl_set(),
+    schedule_repl_refresh(),
+    {noreply, State#state{quiet = check_replicating(Quiet)}};
+
+%% A follow or block changed in the social graph view.  Debounce: one
+%% recompute per second no matter how many contact messages land in a
+%% replication burst.
+handle_info({view_event, ssb_social_graph, _Event}, #state{debounce = undefined} = State) ->
+    Ref = erlang:send_after(1000, self(), debounced_refresh),
+    {noreply, State#state{debounce = Ref}};
+handle_info({view_event, ssb_social_graph, _Event}, State) ->
+    {noreply, State};
+
+handle_info(debounced_refresh, State) ->
+    recompute_repl_set(),
+    {noreply, State#state{debounce = undefined}};
+
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+%%%===================================================================
+%%% Internal functions
+%%%===================================================================
+
+schedule_repl_refresh() ->
+    erlang:send_after(?REPL_REFRESH_MS, self(), refresh_repl_set).
+
+%% Replication set = {self} ∪ follows(self, hops) ∪ room members ∪ local
+%% pins − blocks(self).  A block wins even over membership or a pin.
+%%
+%% Pins are the only member of that union not derived from something
+%% published: they are how this node's operator says "carry this one
+%% anyway", which is what promoting a glimpse does (see feed_pins).
+recompute_repl_set() ->
+    try
+        Self    = keys:pub_key_disp(),
+        Follows = ssb_social_graph:follows(Self, config:replication_hops()),
+        Members = room_store:members(),
+        Pinned  = feed_pins:all(),
+        Blocked = ssb_social_graph:blocks(Self),
+        Combined = lists:usort([Self | Follows] ++ Members ++ Pinned),
+        Set = [F || F <- Combined, not lists:member(F, Blocked)],
+        ets:delete_all_objects(?REPL_SET),
+        [ets:insert(?REPL_SET, {F}) || F <- Set],
+        ok
+    catch Class:Reason ->
+        ?SSB_INFO("EBT: repl set recompute failed: ~p~n", [{Class, Reason}]),
+        ok
+    end.
+
+%% A vector clock's top-level keys all start with "@" (feed IDs).
+%% A message's keys are "key", "value", "timestamp".
+is_vector_clock({[]}) -> true;
+is_vector_clock({[{<<$@, _/binary>>, _} | _]}) -> true;
+is_vector_clock(_) -> false.
+
+%% Peer error responses (e.g. PW's "reconnected to peer" JSON) have a "name"
+%% key but no "author" key.  Discard them silently — they are the remote
+%% peer's internal diagnostics, not SSB data.
+is_peer_error({Props}) when is_list(Props) ->
+    lists:keymember(~"name", 1, Props) andalso
+        not lists:keymember(~"author", 1, Props);
+is_peer_error(_) -> false.
+
+%% For each feed in the peer's clock, send them any messages they are
+%% missing (i.e. messages with sequence > their last known sequence).
+%%
+%% The entry for our OWN feed is also the fork guard's evidence: the peer's
+%% sequence for it, ahead of ours, means the feed went on without this
+%% store (see own_feed).
+handle_clock(ReqNo, {PeerClock}, Socket, Nonce, Key) ->
+    Self = keys:pub_key_disp(),
+    {NewNonce, Cnt} =
+    lists:foldl(fun({FeedId, EncodedInt}, {NonceAcc, Fc}) ->
+                        check_feed_cnt(Fc),
+                        {Rep, Rec, PeerSeq} = ebt_vc:decode_clock_int(EncodedInt),
+                        FeedId =:= Self andalso own_feed:peer_note({Rep, PeerSeq}),
+                        %%?SSB_DEBUG("EBT: decode vector to ~p for feed ~p ~n", [{Rep, Rec, PeerSeq},
+                        %%    {FeedId, EncodedInt}]),
+                        {send_feed_msgs_after(FeedId, {Rep, Rec,PeerSeq}, -ReqNo, Socket, NonceAcc, Key), Fc + 1}
+                end, {Nonce, 0}, PeerClock),
+    ?SSB_INFO("EBT: handle_clock: processed ~p clocks ~n", [Cnt]),
+    NewNonce.
+
+send_feed_msgs_after(_, {false, _, _}, _, _, Nonce, _) -> Nonce;
+
+send_feed_msgs_after(_, {true, false, _}, _, _, Nonce, _) -> Nonce;
+
+%% Iterate through a feed and send all messages with sequence > AfterSeq.
+%% Each message is re-encoded: only the "value" field is sent, not the full
+%% {key, value, timestamp} envelope stored on disk.
+send_feed_msgs_after(FeedId, {true, true, AfterSeq}, OutReqNo, Socket, Nonce, Key) ->
+    case replicate_feed(FeedId) of
+        false -> Nonce;
+        true  -> send_feed_msgs_after_ok(FeedId, AfterSeq, OutReqNo, Socket, Nonce, Key)
+    end.
+
+send_feed_msgs_after_ok(FeedId, AfterSeq, OutReqNo, Socket, Nonce, Key) ->
+    Pid = utils:find_or_create_feed_pid(FeedId),
+    case Pid of
+        bad ->
+            Nonce;
+        _ ->
+            case ssb_feed:servable_from(Pid, AfterSeq) of
+                true            -> send_from(FeedId, Pid, AfterSeq, OutReqNo,
+                                             Socket, Nonce, Key);
+                {false, Lowest} -> refuse(FeedId, AfterSeq, Lowest, Nonce)
+            end
+    end.
+
+%% The peer is below what our live log can chain to.
+%%
+%% EBT has no per-feed error channel — a note is a vector clock and nothing
+%% else — so the honest answer is to send nothing and let the peer get that
+%% history from a node that holds it.  Sending anyway would deliver
+%% messages it cannot link; see ssb_feed:servable_from/2 for why that is
+%% worse than silence.
+refuse(FeedId, AfterSeq, Lowest, Nonce) ->
+    ?SSB_DEBUG("EBT: not serving ~p from ~p, live log starts at ~p~n",
+               [FeedId, AfterSeq, Lowest]),
+    Nonce.
+
+send_from(FeedId, Pid, AfterSeq, OutReqNo, Socket, Nonce, Key) ->
+            ssb_feed:fold_servable(FeedId, Pid, AfterSeq,
+                           fun(MsgData, NonceAcc) ->
+                                   try
+                                       #message{sequence = Seq} =
+                                           message:decode(MsgData, false),
+                                       case Seq > AfterSeq of
+                                           true ->
+                                               send_msg_data(MsgData, OutReqNo,
+                                                             Socket, NonceAcc, Key);
+                                           false ->
+                                               NonceAcc
+                                       end
+                                   catch
+                                       _:Err ->
+                                           ?SSB_INFO("EBT: skipping bad stored msg: ~p~n", [Err]),
+                                           NonceAcc
+                                   end
+                           end, Nonce).
+
+%% Send a single raw message binary over the duplex stream.
+%% Only the "value" object is sent (not the full {key,value,timestamp} envelope),
+%% consistent with how createHistoryStream works with keys:false.
+send_msg_data(MsgData, OutReqNo, Socket, Nonce, Key) ->
+    {PropList} = utils:nat_decode(MsgData),
+    SendData = iolist_to_binary(
+                   message:ssb_encoder(proplists:get_value(~"value", PropList),
+                                       fun message:ssb_encoder/3, [pretty, use_nil])),
+    %%?SSB_DEBUG("EBT: sending msg ~p to output req ~p~n", [SendData, OutReqNo]),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(SendData), OutReqNo),
+    utils:send_data(utils:combine(Header, SendData), Socket, Nonce, Key).
+
+%% Send a single-feed clock acknowledgment back to the peer after storing a message.
+%% This tells the peer we have the feed up to Seq and still want to receive more.
+send_clock_ack(FeedId, Seq, OutReqNo, Socket, Nonce, Key) ->
+    Ack = utils:encode_rec({[{FeedId, ebt_vc:encode_clock_int(true, true, Seq)}]}),
+    Flags = rpc_processor:create_flags(1, 0, 2),
+    Header = rpc_processor:create_header(Flags, size(Ack), OutReqNo),
+    utils:send_data(utils:combine(Header, Ack), Socket, Nonce, Key).
+
+%% Build the {FeedId, encoded_int} clock entry for one feed, or `skip` if the
+%% feed process can't answer promptly.  During heavy replication a feed gen_server
+%% can be blocked for seconds inside a foldl (it does the socket sends for EBT),
+%% and a default 5s gen_server:call timeout here used to crash the whole
+%% connection (full DB → many busy feeds).  Skipping a momentarily busy feed just
+%% omits it from this clock; it is re-advertised on the next clock/anti-entropy.
+%%
+%% Reads the feed's sequence from its STATE, not from the last stored
+%% message.  Two reasons: it is a gen_server reply rather than a disk read
+%% per feed per clock build, and — the correctness one — a feed carrying a
+%% validation floor has a sequence but no stored messages yet.  Asking the
+%% log would report 0 for such a feed and ask the peer to send the entire
+%% history we deliberately declined to fetch.
+clock_entry_for(FeedId, Pid) ->
+    try ssb_feed:current_seq(Pid) of
+        S when is_integer(S) -> {FeedId, ebt_vc:encode_clock_int(true, true, S)};
+        _                    -> {FeedId, ebt_vc:encode_clock_int(true, true, 0)}
+    catch
+        _:_ ->
+            ?SSB_DEBUG("EBT: skipping busy/unavailable feed in clock: ~p~n", [FeedId]),
+            skip
+    end.
+
+%% Decode an incoming message and store it in the appropriate feed.
+%% Body is the value-only JSON (no key/timestamp wrapper), as sent by EBT
+%% and createHistoryStream with keys:false.
+%% Returns {ok, FeedId, Seq} on success so the caller can send a clock ack.
+store_message(Body) ->
+    try
+        Msg = message:decode_value(Body, true),
+        case replicate_feed(Msg#message.author) of
+            false ->
+                ?SSB_DEBUG("EBT: dropping msg for non-replicated feed ~p~n",
+                           [Msg#message.author]),
+                error;
+            true ->
+                case utils:find_or_create_feed_pid(Msg#message.author) of
+                    bad ->
+                        ?SSB_INFO("EBT: bad author in received message: ~p~n",
+                            [{Msg#message.author, Msg#message.id}]),
+                        error;
+                    Pid ->
+                        case ssb_feed:store_msg_checked(Pid, Msg) of
+                            stored ->
+                                {ok, Msg#message.author, Msg#message.sequence};
+                            _ ->
+                                %% Duplicate, or a chain-broken message we
+                                %% reject: don't ack, so we don't re-invite the
+                                %% peer to resend.
+                                skipped
+                        end
+                end
+        end
+    catch
+        Class:Reason ->
+            %% Name the feed and sequence.  Without them this line says a
+            %% message was dropped but not which one, and a single
+            %% undecodable message silently stalls its whole feed: every
+            %% later message fails the chain check against a tail that
+            %% never advanced past the hole.  Reconstructing that from the
+            %% resulting rejection spam took an hour once; it should take
+            %% one line.
+            ?SSB_INFO("EBT: dropped message ~s: ~p:~p — this feed will "
+                      "stall here until the peer resends from our tail~n",
+                      [describe(Body), Class, Reason]),
+            error
+    end.
+
+%% Best-effort "which message was that" for one we could not handle.
+%% Deliberately its own decode with validation off: whatever broke the
+%% real one may well break this too, so it must never raise.
+describe(Body) ->
+    try
+        {Props} = utils:nat_decode(Body),
+        io_lib:format("~s seq ~p",
+                      [?pgv(~"author", Props), ?pgv(~"sequence", Props)])
+    catch _:_ ->
+        io_lib:format("(undecodable, ~p bytes)", [byte_size(Body)])
+    end.
+
+check_feed_cnt(Cnt) when Cnt rem 1000 =:= 0 ->
+    ?SSB_DEBUG("EBT: feeds processed: ~p~n", [Cnt]);
+check_feed_cnt(_) ->
+    ok.
+
+-ifdef(TEST).
+
+full_clock_test() ->
+    config:start_link("test/ssb.cfg"),
+    keys:start_link(),
+    ssb_feed_sup:start_link(),
+
+    %% Register three feeds in the local registry.
+    {PubA, _} = utils:create_key_pair(),
+    {PubB, _} = utils:create_key_pair(),
+    FeedA = utils:display_pub(PubA),
+    FeedB = utils:display_pub(PubB),
+    OwnFeed = keys:pub_key_disp(),
+    _ = utils:find_or_create_feed_pid(FeedA),
+    _ = utils:find_or_create_feed_pid(FeedB),
+    _ = utils:find_or_create_feed_pid(OwnFeed),
+
+    %% full_clock/0 builds from the replication set, so seed it directly here
+    %% (this unit test has no social graph to drive recompute_repl_set/0).
+    case ets:info(?REPL_SET) of
+        undefined -> ets:new(?REPL_SET, [set, named_table, public]);
+        _         -> ets:delete_all_objects(?REPL_SET)
+    end,
+    [ets:insert(?REPL_SET, {F}) || F <- [FeedA, FeedB, OwnFeed]],
+
+    {Clock} = full_clock(),
+    ?assert(is_list(Clock)),
+
+    %% All three feeds must appear in the clock.
+    ?assert(lists:keymember(FeedA, 1, Clock)),
+    ?assert(lists:keymember(FeedB, 1, Clock)),
+    ?assert(lists:keymember(OwnFeed, 1, Clock)),
+
+    %% Every entry must decode to {replicate=true, receive=true, seq>=0}.
+    lists:foreach(fun({_Id, Enc}) ->
+        {true, true, Seq} = ebt_vc:decode_clock_int(Enc),
+        ?assert(Seq >= 0)
+    end, Clock),
+
+    %% We created ?REPL_SET ourselves (ebt is not started in this test); drop it
+    %% so later tests' ebt:init/1 can create it fresh.
+    catch ets:delete(?REPL_SET),
+
+    process_flag(trap_exit, true),
+    exit(whereis(ssb_feed_sup), shutdown),
+    receive {'EXIT', _, _} -> ok after 1000 -> ok end,
+    gen_server:stop(keys),
+    gen_server:stop(config).
+
+%% Gate logic: the replication set admits our own feed, direct follows and
+%% room members, rejects strangers, and lets a block win even over membership.
+repl_set_test_() ->
+    {setup, fun rs_setup/0, fun rs_cleanup/1, fun(_) -> ?_test(repl_set_logic()) end}.
+
+rs_setup() ->
+    catch gen_server:stop(ebt),
+    catch gen_server:stop(room_store),
+    catch gen_server:stop(ssb_social_graph),
+    catch gen_server:stop(ssb_store),
+    catch gen_server:stop(keys),
+    catch gen_server:stop(config),
+    Home = filename:join("/tmp", "ebt_rs_"
+                         ++ integer_to_list(erlang:system_time(microsecond))),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    application:set_env(ssb, ssb_home, Home),
+    {ok, _} = config:start_link("test/ssb.cfg"),
+    {ok, _} = keys:start_link(),
+    {ok, _} = ssb_store:start_link(),
+    {ok, _} = ssb_social_graph:start_link(),
+    {ok, _} = room_store:start_link(),
+    {ok, _} = ebt:start_link(),
+    Home.
+
+rs_cleanup(Home) ->
+    catch gen_server:stop(ebt),
+    catch gen_server:stop(room_store),
+    catch gen_server:stop(ssb_social_graph),
+    catch gen_server:stop(ssb_store),
+    catch gen_server:stop(keys),
+    catch gen_server:stop(config),
+    os:cmd("rm -rf " ++ Home),
+    application:unset_env(ssb, ssb_home),
+    ok.
+
+rs_fresh_feed() ->
+    #{public := Pub} = enacl:sign_keypair(),
+    <<"@", (base64:encode(Pub))/binary, ".ed25519">>.
+
+%% Assert one contact edge by folding a contact message into the view,
+%% the same path a stored message takes.
+rs_edge(Source, Dest, Field, Value) ->
+    Msg = #message{author = Source, sequence = 1,
+                   content = {[{~"type", ~"contact"},
+                               {~"contact", Dest},
+                               {Field, Value}]}},
+    _ = ssb_social_graph:view_entry(Msg),
+    ok.
+
+repl_set_logic() ->
+    Self     = keys:pub_key_disp(),
+    Follow   = rs_fresh_feed(),
+    Member   = rs_fresh_feed(),
+    Blocked  = rs_fresh_feed(),
+    Stranger = rs_fresh_feed(),
+    %% Seed the graphs through the view, not by poking its storage — it
+    %% is store-backed now, and a test that knew the table name was
+    %% coupled to an implementation detail it had no business knowing.
+    ok = rs_edge(Self, Follow,  ~"following", true),
+    ok = rs_edge(Self, Blocked, ~"blocking",  true),
+    ok = room_store:add_member(Member),
+    ok = refresh_repl_set(),
+    ?assert(replicate_feed(Self)),         %% our own feed
+    ?assert(replicate_feed(Follow)),       %% a direct follow
+    ?assert(replicate_feed(Member)),       %% a room member
+    ?assertNot(replicate_feed(Blocked)),   %% blocked
+    ?assertNot(replicate_feed(Stranger)),  %% neither followed nor a member
+    %% A block wins even over membership.
+    ok = rs_edge(Self, Member, ~"blocking", true),
+    ok = refresh_repl_set(),
+    ?assertNot(replicate_feed(Member)).
+
+%% Only just gone quiet: start a clock, say nothing.  The first tick after
+%% a handshake always catches some peers before their stream is up.
+quiet_starts_a_clock_rather_than_warning_test() ->
+    Pid = self(),
+    ?assertEqual({1000, false}, maps:get(Pid, note(Pid, false, 1000, #{}, #{}))).
+
+%% Still quiet past the grace period: warn, and remember having warned.
+quiet_past_the_grace_period_warns_once_test() ->
+    Pid = self(),
+    Acc = note(Pid, false, ?QUIET_GRACE_MS + 1, #{Pid => {0, false}}, #{}),
+    ?assertEqual({0, true}, maps:get(Pid, Acc)),
+    Acc2 = note(Pid, false, ?QUIET_GRACE_MS * 10, Acc, #{}),
+    ?assertEqual({0, true}, maps:get(Pid, Acc2)).
+
+%% A peer that starts replicating drops out, so a later reconnect gets a
+%% fresh clock rather than an instant warning.
+replicating_peer_is_forgotten_test() ->
+    Pid = self(),
+    ?assertEqual(#{}, note(Pid, true, 999999, #{Pid => {0, true}}, #{})).
+
+%% Too busy to answer means mid-fold, writing messages to a socket. That
+%% is the opposite of the symptom and must never be reported as one.
+busy_peer_is_not_a_symptom_test() ->
+    Pid = self(),
+    ?assertEqual(#{}, note(Pid, unknown, ?QUIET_GRACE_MS * 10,
+                           #{Pid => {0, false}}, #{})).
+
+-endif.

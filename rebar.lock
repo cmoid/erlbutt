@@ -1,0 +1,12 @@
+[{<<"enacl">>,
+  {git,"https://github.com/cmoid/enacl",
+       {ref,"3be2ed2e4ee1fdfbd73c04207c0b572fcde49720"}},
+  0},
+ {<<"esqlite">>,
+  {git,"https://github.com/cmoid/esqlite",
+       {ref,"b3adc97accc1efb8d6dba2166f1011b3abe52fb6"}},
+  0},
+ {<<"ranch">>,
+  {git,"https://github.com/ninenines/ranch",
+       {ref,"ebf216e91ef2ae54d378234062db949d95f01c0d"}},
+  0}].

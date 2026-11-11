@@ -1,0 +1,1380 @@
+%% SPDX-License-Identifier: GPL-2.0-only
+%%
+%% Copyright (C) 2023 Charles Moid
+-module(rpc_processor).
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
+
+-behaviour(gen_server).
+
+-include_lib("ssb/include/ssb.hrl").
+
+%% gen_server exports
+-export([init/1, handle_call/3, handle_cast/2,
+         handle_info/2, terminate/2,
+         code_change/3]).
+
+%% API
+-export([start_link/0,
+         process/3,
+         register_stream/3,
+         set_remote_pk/2,
+         set_owner/2,
+         create_flags/3,
+         create_header/3,
+         parse_flags/1]).
+
+-import(message, [ssb_encoder/3]).
+-compile({no_auto_import,[size/1]}).
+-import(utils, [size/1]).
+
+%% Start a per-connection rpc_processor; returns {ok, Pid}.
+start_link() ->
+    gen_server:start_link(?MODULE, [], []).
+
+%% Pid is the per-connection rpc_processor started by ssb_peer.
+process(Pid, {Header, Body}, Connection) ->
+    gen_server:call(Pid, {rpc_process, {Header, Body}, Connection}, 45000).
+
+%% Register a duplex stream so that subsequent messages on ReqNo are
+%% routed to Module:handle_data/3.  Used by the client-side peer to
+%% register the negative ReqNo it expects for its outbound requests.
+register_stream(Pid, ReqNo, Module) ->
+    gen_server:call(Pid, {register_stream, ReqNo, Module}).
+
+%% Store the remote peer's public key so invite.use can validate it.
+set_remote_pk(Pid, RemotePk) ->
+    gen_server:call(Pid, {set_remote_pk, RemotePk}).
+
+%% Store the owning ssb_peer pid so tunnel handlers can send frames back
+%% on this connection (writes must go through ssb_peer to keep nonce order).
+set_owner(Pid, OwnerPid) ->
+    gen_server:call(Pid, {set_owner, OwnerPid}).
+
+parse_flags(Header) ->
+    <<Flags:1/binary, _Rest/binary>> = Header,
+    <<_Unused:4, Stream:1, EndOrError:1, Type:2>> = Flags,
+    {Stream, EndOrError, Type}.
+
+create_flags(Stream, EndOrError, Type) ->
+    <<0:4, Stream:1, EndOrError:1, Type:2>>.
+
+create_header(Flags, BodySize, ReqNo) ->
+    <<Flags:1/binary,
+      BodySize:4/big-unsigned-integer-unit:8,
+      ReqNo:4/big-signed-integer-unit:8>>.
+
+%% Stream a list of stored, already-signed messages down a source request
+%% and close it.
+%%
+%% Each row is sent as the author signed it: these answers are offers
+%% ABOUT feeds, so the receiver checks the author's signature and never
+%% has to believe anything we say.  Shared by archives.boundaries and
+%% glimpses.offers, which differ only in which table they read.
+stream_raw(Calls, ReqNo, Rows, Socket, Nonce, SecretBoxKey) ->
+    ets:insert(Calls, {ReqNo, noop}),
+    NewNonce = lists:foldl(
+        fun(#{raw := Raw}, N) ->
+            Flags  = create_flags(1, 0, 2),
+            Header = create_header(Flags, size(Raw), -ReqNo),
+            utils:send_data(utils:combine(Header, Raw), Socket, N, SecretBoxKey)
+        end, Nonce, Rows),
+    TrueEnd = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+    EndFlags  = create_flags(1, 1, 2),
+    EndHeader = create_header(EndFlags, size(TrueEnd), -ReqNo),
+    utils:send_data(utils:combine(EndHeader, TrueEnd), Socket, NewNonce, SecretBoxKey).
+
+init([]) ->
+    process_flag(trap_exit, true),
+    ?LOG_INFO("Started rpc processor ~n", []),
+    {ok, #rpc_state{calls = ets:new(rpc_calls, [set, public])}}.
+
+handle_info(Info, State) ->
+    ?LOG_INFO("Stopped presumably for normal reason: ~p ~n", [Info]),
+    {stop, normal, State}.
+
+handle_call({register_stream, ReqNo, Module}, _From,
+            #rpc_state{calls = Calls} = State) ->
+    ets:insert(Calls, {ReqNo, Module}),
+    {reply, ok, State};
+
+handle_call({set_remote_pk, RemotePk}, _From,
+            #rpc_state{calls = Calls} = State) ->
+    ets:insert(Calls, {remote_pk, RemotePk}),
+    {reply, ok, State};
+
+handle_call({set_owner, OwnerPid}, _From,
+            #rpc_state{calls = Calls} = State) ->
+    ets:insert(Calls, {owner, OwnerPid}),
+    {reply, ok, State};
+
+handle_call({rpc_process, {Header, Body}, #ssb_conn{
+                                            socket = Socket,
+                                            nonce = Nonce,
+                                            secret_box = SecretBoxKey} = Conn},
+                            _From, #rpc_state{calls = Calls} = State) ->
+    %% Positive ReqNo = new or continuing request from peer.
+    %% Negative ReqNo = response to a request we initiated.
+    %% Both positive and negative registered streams are routed to the
+    %% owning module's handle_data/3.
+    ReqNo = req_no(Header),
+    HasSeen = ets:lookup(Calls, ReqNo),
+    %% A blobs.add frame updates the sink accumulator, so it is the one
+    %% continuation that also rewrites State.  Handled before the generic
+    %% 2-tuple clause below, which would otherwise match {blob_add, Id}.
+    case HasSeen of
+        [{ReqNo, {blob_add, ExpectedId}}] ->
+            {Non, NewState} = blob_add_frame(ReqNo, ExpectedId, Header, Body,
+                                             Socket, Nonce, SecretBoxKey, State),
+            {reply, {Non, none}, NewState};
+        _ ->
+            {reply, rpc_frame(HasSeen, ReqNo, Header, Body, Conn, Calls), State}
+    end.
+
+rpc_frame(HasSeen, ReqNo, Header, Body,
+          #ssb_conn{socket = Socket,
+                    nonce = Nonce,
+                    secret_box = SecretBoxKey} = Conn, Calls) ->
+    case HasSeen of
+        [{ReqNo, noop}] ->
+            %% Stream already ended or handled; silently ignore continuations.
+            {Nonce, none};
+        [{ReqNo, {reply_to, Pid, Ref}}] ->
+            %% Sync RPC reply: deliver body directly to the waiting caller.
+            Pid ! {rpc_reply, Ref, Body},
+            {Nonce, none};
+        [{ReqNo, {stream_to, Pid, Ref}}] ->
+            %% Source stream reply: deliver data or signal end-of-stream.
+            {_, IsEnd, _} = parse_flags(Header),
+            case IsEnd of
+                1 -> Pid ! {stream_done, Ref};
+                0 -> Pid ! {stream_data, Ref, Body}
+            end,
+            {Nonce, none};
+        [{ReqNo, {live_source, StreamPid}}] ->
+            %% only the client's end/cancel matters on a live source
+            {_, IsEnd, _} = parse_flags(Header),
+            case IsEnd of
+                1 ->
+                    view_stream:stop(StreamPid),
+                    ets:insert(Calls, {ReqNo, noop});
+                0 -> ok
+            end,
+            {Nonce, none};
+        [{ReqNo, {source_pump, Pump}}] ->
+            %% the client ended or aborted a finite source: stop sending
+            {_, IsEnd, _} = parse_flags(Header),
+            case IsEnd of
+                1 ->
+                    exit(Pump, kill),
+                    ets:insert(Calls, {ReqNo, noop});
+                0 -> ok
+            end,
+            {Nonce, none};
+        [{ReqNo, {Mod, SinkPid}}] ->
+            ?SSB_DEBUG("Stream continuation for req with pid: ~p ~n", [ReqNo]),
+            NewNonce = Mod:handle_data(ReqNo, Body, Conn, SinkPid),
+            {NewNonce, none};
+        [{ReqNo, Mod}] ->
+            ?SSB_DEBUG("Stream continuation for req: ~p with body: ~p ~n", [ReqNo, Body]),
+            NewNonce = Mod:handle_data(ReqNo, Body, Conn),
+            {NewNonce, none};
+        [] ->
+            dispatch(Calls, ReqNo, Body, Socket, Nonce, SecretBoxKey)
+    end.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+   {ok, State}.
+
+
+%%%===================================================================
+%%% Internal functions
+%%%===================================================================
+
+req_no(Header) ->
+    <<_Flags:1/binary,
+      _BodySize:4/binary,
+      Req:4/big-signed-integer-unit:8>> = Header,
+    Req.
+
+create_req(Body) ->
+    DecBody = utils:nat_decode(Body),
+    ?SSB_DEBUG("Body decoded is ~p ~n", [DecBody]),
+    decode_body(DecBody).
+
+decode_body({Props}) ->
+    #ssb_rpc{
+        name = normalize_name(proplists:get_value(~"name", Props)),
+        args = proplists:get_value(~"args", Props),
+        type = proplists:get_value(~"type", Props)};
+
+decode_body(Other) ->
+    Other.
+
+%% muxrpc sends a method name as an array of path segments
+%% (["blobs","get"]), but the manifest reflection call — which every
+%% ssb-client makes on connect to build its api — arrives as a bare
+%% string ("manifest").  Normalize a bare binary to a single-segment
+%% list so dispatch and the plugin registry see one consistent shape.
+normalize_name(Name) when is_binary(Name) -> [Name];
+normalize_name(Name)                       -> Name.
+
+dispatch(_Calls, ReqNo, Body, _Socket, Nonce, _SecretBoxKey) when ReqNo < 0 ->
+    {Nonce, proc_response(ReqNo, Body)};
+dispatch(Calls, ReqNo, Body, Socket, Nonce, SecretBoxKey) ->
+    Req = create_req(Body),
+    case permitted(Calls, Req) of
+        true ->
+            NewNonce = proc_request(Calls, ReqNo, Req, Socket, Nonce, SecretBoxKey),
+            Tag = case Req of
+                #ssb_rpc{name = [?blobs, ?createwants]} -> {wants_stream, ReqNo};
+                #ssb_rpc{name = [?ebt,   ~"replicate"]} -> {ebt_stream,   ReqNo};
+                #ssb_rpc{name = [?room,  ?attendants]}  -> {attendants_stream, ReqNo};
+                #ssb_rpc{name = [?tunnel, ?endpoints]}  -> {endpoints_stream, ReqNo};
+                _                                        -> none
+            end,
+            {NewNonce, Tag};
+        {denied, Name, Class, Perm, Kind} ->
+            ?SSB_INFO("rpc ~p denied for ~p (class ~p, needs ~p)",
+                      [Name, caller_feed_id(Calls), Class, Perm]),
+            ets:insert(Calls, {ReqNo, noop}),
+            {rpc_error(ReqNo, ~"method not allowed", Kind,
+                       Socket, Nonce, SecretBoxKey),
+             none}
+    end.
+
+%% Single permission choke point for every incoming request, builtin or
+%% plugin.  Methods the registry does not know are let through here, and
+%% answered with an error by unhandled_request/7.
+permitted(Calls, #ssb_rpc{name = Name}) when is_list(Name) ->
+    {Kind, Perm} = case plugin_registry:lookup(Name) of
+        {ok, {_Mod, K, P}}  -> {K, P};
+        {builtin, K, P}     -> {K, P};
+        unknown             -> {async, anyone}
+    end,
+    case Perm of
+        anyone -> true;
+        _ ->
+            Class = maps:get(class, caller_info(Calls)),
+            case plugin_registry:allowed(Class, Perm) of
+                true  -> true;
+                false -> {denied, Name, Class, Perm, Kind}
+            end
+    end;
+permitted(_Calls, _Req) ->
+    true.
+
+
+proc_response(ReqNo, RespBody) ->
+    ?SSB_DEBUG("The response from ~p was ~p ~n", [ReqNo, RespBody]),
+    RespBody.
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [Method],
+                             args = [{ArgProps}]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey)
+  when Method =:= ?createhistorystream orelse Method =:= ~"createUserStream" ->
+    Id    = proplists:get_value(~"id",    ArgProps),
+    Seq   = proplists:get_value(~"seq",   ArgProps, 0),
+    Limit = proplists:get_value(~"limit", ArgProps, -1),
+    Keys  = proplists:get_value(~"keys",  ArgProps, true),
+    Reverse = proplists:get_value(~"reverse", ArgProps, false) =:= true,
+    ets:insert(Calls, {ReqNo, noop}),
+    FeedPid = utils:find_or_create_feed_pid(Id),
+    case ssb_feed:servable_from(FeedPid, Seq) of
+        {false, Lowest} ->
+            % Our live log starts above what this caller holds, so every
+            % message we could send is one it cannot chain.  Ending the
+            % stream normally would claim "that is the whole feed", which
+            % is a lie; an error says "not from here" and the caller can
+            % look elsewhere.  As with blobs.get, the error must carry the
+            % stream flag or a standard client never routes it and hangs.
+            Text = iolist_to_binary(
+                     ["history before sequence ", integer_to_list(Lowest),
+                      " is not available from this node"]),
+            ErrMsg  = utils:error_msg(~"Error", Text),
+            EFlags  = create_flags(1, 1, 2),
+            EHeader = create_header(EFlags, size(ErrMsg), -ReqNo),
+            utils:send_data(utils:combine(EHeader, ErrMsg), Socket, Nonce,
+                            SecretBoxKey);
+        true when Reverse ->
+            %% Newest first, as ssb-db does.  The log only reads forward,
+            %% so keep the last Limit bodies in a bounded queue as it
+            %% passes and send those backwards — memory is bounded by the
+            %% limit rather than the feed (an unlimited reverse read does
+            %% hold the whole feed, which is what it asked for).
+            {_Len, Kept} = ssb_feed:fold_servable(Id, FeedPid, Seq,
+                fun(MsgData, Acc) ->
+                    case history_body(MsgData, Seq, Keys) of
+                        skip -> Acc;
+                        Body -> keep_last(Limit, Body, Acc)
+                    end
+                end, {0, queue:new()}),
+            NewNonce = lists:foldl(
+                fun(Body, N) -> send_history_item(Body, ReqNo, Socket, N, SecretBoxKey) end,
+                Nonce, lists:reverse(queue:to_list(Kept))),
+            TrueEnd = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+            Flags  = create_flags(1, 1, 2),
+            Header = create_header(Flags, size(TrueEnd), -ReqNo),
+            utils:send_data(utils:combine(Header, TrueEnd), Socket, NewNonce, SecretBoxKey);
+        true ->
+            {NewNonce, _} = ssb_feed:fold_servable(Id, FeedPid, Seq,
+                fun(MsgData, {N, Count}) ->
+                    case Limit >= 0 andalso Count >= Limit of
+                        true -> {N, Count};
+                        false ->
+                            case history_body(MsgData, Seq, Keys) of
+                                skip -> {N, Count};
+                                Body -> {send_history_item(Body, ReqNo, Socket, N, SecretBoxKey),
+                                         Count + 1}
+                            end
+                    end
+                end, {Nonce, 0}),
+            TrueEnd = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+            Flags  = create_flags(1, 1, 2),
+            Header = create_header(Flags, size(TrueEnd), -ReqNo),
+            utils:send_data(utils:combine(Header, TrueEnd), Socket, NewNonce, SecretBoxKey)
+    end;
+
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"publish"],
+                             args = [Content]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    OurId   = keys:pub_key_disp(),
+    FeedPid = utils:find_or_create_feed_pid(OurId),
+    case ssb_feed:post_content(FeedPid, Content) of
+        ok ->
+            Msg  = ssb_feed:fetch_last_msg(FeedPid),
+            Body = message:encode(Msg),
+            %% async reply: stream=0.  A stream/end-flagged frame is rejected by
+            %% a standard muxrpc async caller ("no stream for incoming msg").
+            Flags  = create_flags(0, 0, 2),
+            Header = create_header(Flags, size(Body), -ReqNo),
+            utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+        {error, {own_feed_behind, Ours, Target}} ->
+            %% Signing now would fork the feed: see own_feed.
+            Text = iolist_to_binary(
+                     io_lib:format("this node holds your feed to sequence ~p but "
+                                   "it reaches ~p elsewhere; publishing is paused "
+                                   "until it has caught up", [Ours, Target])),
+            ErrMsg = utils:error_msg(~"Error", Text),
+            Flags  = create_flags(0, 1, 2),
+            Header = create_header(Flags, size(ErrMsg), -ReqNo),
+            utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey);
+        {error, {too_large, Len}} ->
+            %% ssb-validate's wording, which git-ssb's publish retry
+            %% matches on ("must not be large") to shrink and try again.
+            Text = iolist_to_binary(
+                     io_lib:format("encoded message must not be larger than ~p "
+                                   "bytes (this one is ~p)", [?MAX_MSG_LENGTH, Len])),
+            ErrMsg = utils:error_msg(~"Error", Text),
+            Flags  = create_flags(0, 1, 2),
+            Header = create_header(Flags, size(ErrMsg), -ReqNo),
+            utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey)
+    end;
+
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"get"],
+                             args = [Arg]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    %% ssb-db get accepts either a bare message id or an options object
+    %% {id, private, ...}; the silkpurse renderer sends the object form.
+    MsgId = case Arg of
+        {Props} when is_list(Props) -> proplists:get_value(~"id", Props);
+        Id when is_binary(Id)       -> Id;
+        _                           -> undefined
+    end,
+    Private = case Arg of
+                  {Ps} when is_list(Ps) -> proplists:get_value(~"private", Ps) =:= true;
+                  _                     -> false
+              end,
+    Found = case MsgId =/= undefined andalso mess_auth:get(MsgId) of
+                Author when is_binary(Author) ->
+                    FeedPid = utils:find_or_create_feed_pid(Author),
+                    %% may be not_found: the id->author index can outlive
+                    %% the message (a truncated or wiped feed)
+                    ssb_feed:fetch_msg(FeedPid, MsgId);
+                _ ->
+                    not_found
+            end,
+    case Found of
+        #message{} = Msg ->
+            %% ssb-db get returns the bare message value, not the
+            %% {key, value, timestamp} envelope (the renderer reads
+            %% value.content directly).  With {private: true} a boxed
+            %% message we can read is unboxed in place.
+            Body = get_value(Msg, Private),
+            Flags  = create_flags(0, 0, 2),   %% async reply: stream=0
+            Header = create_header(Flags, size(Body), -ReqNo),
+            utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+        not_found ->
+            ErrMsg = utils:error_msg(~"Error", ~"message not found"),
+            Flags  = create_flags(0, 1, 2),
+            Header = create_header(Flags, size(ErrMsg), -ReqNo),
+            utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey)
+    end;
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = Name}
+             = _ReqBody, Socket, Nonce, SecretBoxKey)
+  when Name =:= [~"createLogStream"] orelse Name =:= [~"createFeedStream"] ->
+    ets:insert(Calls, {ReqNo, noop}),
+    %% arrival order via the ingest journal; bodies from the per-feed store
+    NewNonce = ingest_journal:stream_messages(
+        fun(Body, N) ->
+            Flags  = create_flags(1, 0, 2),
+            Header = create_header(Flags, size(Body), -ReqNo),
+            utils:send_data(utils:combine(Header, Body), Socket, N, SecretBoxKey)
+        end, Nonce),
+    TrueEnd = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+    Flags  = create_flags(1, 1, 2),
+    Header = create_header(Flags, size(TrueEnd), -ReqNo),
+    utils:send_data(utils:combine(Header, TrueEnd), Socket, NewNonce, SecretBoxKey);
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?archives, ?boundaries]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    %% Every archive boundary we know, so a peer starting one of these
+    %% feeds can begin at the boundary instead of fetching and validating
+    %% everything below it.
+    %%
+    %% The peer VOLUNTEERS its list rather than being asked feed by feed.
+    %% Almost no feeds are archived, so per-feed asking spends a round
+    %% trip to hear "no" nearly every time — and new feeds arrive in
+    %% batches when the replication set is recomputed, so feeds x peers is
+    %% the shape of a want storm.  This is one short stream per
+    %% connection, and usually an empty one.
+    %%
+    %% Every boundary is offered, not just the newest: a receiver
+    %% deliberately prefers a LOWER boundary, keeping more history and
+    %% staying a witness for longer, so the choice belongs to it.  What
+    %% goes on the wire is the author's own signed message — the receiver
+    %% verifies that signature and never has to trust us for any of it.
+    stream_raw(Calls, ReqNo, ssb_archives:boundaries(), Socket, Nonce,
+               SecretBoxKey);
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?glimpses, ?offers]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    %% Every feed we replicate that has said something about itself, so a
+    %% peer can read a self-description for a feed at the edge of its own
+    %% graph without replicating it first.  See
+    %% doc/research/feed-glimpses.md.
+    %%
+    %% Volunteered whole, for the same reason boundaries are: the asker
+    %% would otherwise have to name the feeds it is curious about, and at
+    %% hops+1 that list runs to tens of thousands of ids — per peer, per
+    %% round, to hear "no" about nearly all of them.  What we hold is
+    %% short by comparison, and the receiver drops everything outside its
+    %% own boundary set on arrival.
+    %%
+    %% Only glimpses of feeds we actually replicate go out.  Relaying
+    %% glimpses we merely staged for ourselves would propagate
+    %% self-descriptions for feeds nobody involved carries; see the note
+    %% in ssb_glimpses.
+    stream_raw(Calls, ReqNo, ssb_glimpses:offers(), Socket, Nonce,
+               SecretBoxKey);
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?gossip, ?ping],
+                             args = [{_Args}]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    %% gossip.ping is pull-ping: a 5-minute keepalive volley, NOT a 30s liveness
+    %% check.  Answer the opening frame once and mark the stream noop.  Do NOT
+    %% volley every frame: combined with this unprompted reply it desyncs
+    %% pull-ping's serve/volley alternation into a tight RTT-speed loop.
+    ets:insert(Calls, {ReqNo, noop}),
+    Flags = create_flags(1,0,2),
+    TimeStamp = iolist_to_binary(message:ssb_encoder(integer_to_binary(current_time()),
+                                    fun message:ssb_encoder/3, [pretty])),
+    Header = create_header(Flags, size(TimeStamp), -ReqNo),
+    ?SSB_DEBUG("Answering ping with ~p ~n", [{Header, TimeStamp}]),
+    utils:send_data(utils:combine(Header, TimeStamp), Socket, Nonce, SecretBoxKey);
+
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [?whoami],
+                             args = []}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    %% sync reply: stream=0.  (A stream/end-flagged frame is rejected by
+    %% a standard muxrpc sync/async caller as "no stream for incoming
+    %% msg".)  This is a single reply on this req, so it does not touch
+    %% other open streams (e.g. EBT).
+    Flags = create_flags(0, 0, 2),
+    Body = whoami(),
+    ?SSB_DEBUG("rpc_processor: whoami:  ~p~n", [Body]),
+    Header = create_header(Flags, size(Body), -ReqNo),
+    utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?blobs, ?createwants],
+                             args = []}
+             = _ReqBody, _Socket, Nonce, _SecretBoxKey) ->
+    %% Register so subsequent messages on this stream route to blob_wants.
+    %% Haves are sent on our own createWants stream, not this response channel.
+    ?SSB_DEBUG("rpc_processor: createwants reqno ~p~n", [ReqNo]),
+    ets:insert(Calls, {ReqNo, blob_wants}),
+    Nonce;
+
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobswant],
+                             args = [BlobId]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) when is_binary(BlobId) ->
+    %% Fire-and-forget: register the want (broadcast to peers by
+    %% blob_fetcher) and acknowledge.  Arrival is observable on the
+    %% blobs.ls live stream; we do not hold the reply until the blob
+    %% lands the way ssb-blobs does.
+    case blobs:has(BlobId) of
+        true  -> ok;
+        false -> blob_fetcher:want(BlobId)
+    end,
+    TrueBody = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+    Flags  = create_flags(0, 0, 2),
+    Header = create_header(Flags, size(TrueBody), -ReqNo),
+    utils:send_data(utils:combine(Header, TrueBody), Socket, Nonce, SecretBoxKey);
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobsadd],
+                             args = Args}
+             = _ReqBody, _Socket, Nonce, _SecretBoxKey) ->
+    %% Opening frame of a sink: the client now streams the blob's bytes as
+    %% binary frames on this same (positive) ReqNo, then an end frame.  We
+    %% only register here; the bytes are collected in handle_call (which
+    %% owns the accumulator) and stored when the end frame lands.
+    %%
+    %% args are [null] (hash it yourself) or [BlobId] (verify against it):
+    %% ssb-client's fix-add-blob hashes the stream CLIENT-side and hands its
+    %% own callback that id, so we never send the id back — see blob_add_end.
+    ExpectedId = case Args of
+        [Id] when is_binary(Id) -> Id;
+        _                       -> undefined
+    end,
+    ?SSB_DEBUG("rpc_processor: blobs.add reqno ~p expecting ~p~n",
+               [ReqNo, ExpectedId]),
+    ets:insert(Calls, {ReqNo, {blob_add, ExpectedId}}),
+    Nonce;
+
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobspush],
+                             args = [BlobId]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) when is_binary(BlobId) ->
+    %% "Make sure peers can get this blob."  We hold it already (the client
+    %% just added it), and blob_wants answers any peer's want with a have,
+    %% so there is nothing to schedule: ack so the client's publish proceeds.
+    %% If we somehow do NOT have it, fall back to wanting it like blobs.want.
+    case blobs:has(BlobId) of
+        true  -> ok;
+        false -> blob_fetcher:want(BlobId)
+    end,
+    TrueBody = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+    Flags  = create_flags(0, 0, 2),
+    Header = create_header(Flags, size(TrueBody), -ReqNo),
+    utils:send_data(utils:combine(Header, TrueBody), Socket, Nonce, SecretBoxKey);
+
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobshas],
+                             args = [BlobId]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    Has  = blobs:has(BlobId),
+    Body = iolist_to_binary(message:ssb_encoder(Has, fun message:ssb_encoder/3, [pretty])),
+    Flags  = create_flags(0, 0, 2),
+    Header = create_header(Flags, size(Body), -ReqNo),
+    %% Async reply is complete on its own — a trailing ?RPC_END here is the
+    %% muxrpc goodbye and terminates the peer's whole session.
+    utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?blobs, ?blobsget],
+                             args = Args}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    %% Register the stream so the client's end-ack after our final frame
+    %% is swallowed instead of falling through to unhandled_request
+    %% (which would answer it with a spurious end frame).
+    ets:insert(Calls, {ReqNo, noop}),
+    %% blobs.get args are either the id string directly, or an object whose
+    %% blob id lives under "key" (ssb-blobs / PonchoWonky) or "hash".
+    %% this is missing in the protocol guide.
+    BlobId = case Args of
+        [Id] when is_binary(Id) -> Id;
+        [{Props}] ->
+            case proplists:get_value(~"key", Props) of
+                undefined -> proplists:get_value(~"hash", Props);
+                Key       -> Key
+            end;
+        _ -> undefined
+    end,
+    case BlobId =/= undefined andalso blobs:fetch(BlobId) of
+        {ok, BlobData} ->
+            send_blob_chunks(BlobData, -ReqNo, Socket, Nonce, SecretBoxKey);
+        _ ->
+            ErrMsg = utils:error_msg(~"Error", ~"blob not found"),
+            %% blobs.get is a source: the error must carry the stream
+            %% flag or a standard client never routes it and hangs
+            Flags  = create_flags(1, 1, 2),
+            Header = create_header(Flags, size(ErrMsg), -ReqNo),
+            utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey)
+    end;
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?tunnel, ?isRoom],
+                             args = []}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    %% PROBE: a rooms-2.0 client (manyverse) only calls this when room.metadata
+    %% came back as "method missing"; poncho (1.0) always calls it. So seeing
+    %% this from manyverse means it rejected our metadata reply above.
+    ?SSB_INFO("ROOMDBG tunnel.isRoom (1.0 path) from=~p answering ~p~n",
+              [caller_feed_id(Calls), config:is_room()]),
+    %% async reply: stream=0,end=0. A stream/end-flagged reply is routed by the
+    %% caller's packet-stream to _onstream (no matching outstream) and dropped,
+    %% so the client's isRoom() promise never resolves.
+    Flags = create_flags(0, 0, 2),
+    Body = iolist_to_binary(message:ssb_encoder(config:is_room(),
+                                                fun message:ssb_encoder/3, [pretty])),
+    Header = create_header(Flags, size(Body), -ReqNo),
+    utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?room, ?metadata]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    %% When not configured as a room, answer plain `false` so clients don't
+    %% treat us as one (matches tildefriends/go-ssb-room).  Otherwise: open
+    %% rooms admit anyone; community/restricted rooms report whether the caller
+    %% has joined (redeemed an invite — see room_store / invite.use).
+    IsMember = room_caller_allowed(Calls),
+    Body = case config:is_room() of
+        false ->
+            iolist_to_binary(message:ssb_encoder(false, fun message:ssb_encoder/3, [pretty]));
+        true ->
+            utils:encode_rec({[{~"name", config:room_name()},
+                               {~"membership", IsMember},
+                               {~"features", [?tunnel, ~"room1", ~"room2"]}]})
+    end,
+    %% async reply: stream=0,end=0 (see tunnel.isRoom note). With stream/end set,
+    %% the client's room.metadata() promise never resolves and it never goes on
+    %% to subscribe room.attendants.
+    Flags = create_flags(0, 0, 2),
+    %% PROBE: caller, what we report, and the exact reply bytes. If manyverse
+    %% stays on the 2.0 path you should see this (and NOT tunnel.isRoom) per
+    %% connection; the body here is what feeds room-observer's features.
+    ?SSB_INFO("ROOMDBG room.metadata from=~p membership=~p privacy=~p "
+              "flags=~p reply=~s~n",
+              [caller_feed_id(Calls), IsMember, config:room_privacy(),
+               Flags, Body]),
+    Header = create_header(Flags, size(Body), -ReqNo),
+    utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?tunnel, ?connect], args = Args}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    %% PROBE: this is the payoff — a peer asking us to relay to `target`. If you
+    %% never see this when tapping an attendant in manyverse, the client never
+    %% got a usable attendant from the steps above.
+    ?SSB_INFO("ROOMDBG tunnel.connect from=~p (is_room=~p) args=~p~n",
+              [caller_feed_id(Calls), config:is_room(), Args]),
+    case config:is_room() of
+        true  -> tunnel_relay_connect(Calls, ReqNo, Args, Socket, Nonce, SecretBoxKey);
+        false -> tunnel_accept_connect(Calls, ReqNo, Args, Socket, Nonce, SecretBoxKey)
+    end;
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?room, ?attendants]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    %% Send the current presence snapshot; subsequent joined/left updates are
+    %% pushed by ssb_peer (see the {attendants_stream, ReqNo} dispatch tag).
+    ets:insert(Calls, {ReqNo, noop}),
+    Ids = other_attendants(Calls),
+    %% PROBE: who subscribed and the snapshot they get. An empty/short list when
+    %% you expect peers is a presence problem, not a detection one. Watch for
+    %% follow-up "room_event joined" pushes too.
+    ?SSB_INFO("ROOMDBG room.attendants subscribe from=~p snapshot_ids=~p~n",
+              [caller_feed_id(Calls), Ids]),
+    Body = utils:encode_rec({[{~"type", ~"state"}, {~"ids", Ids}]}),
+    Flags = create_flags(1, 0, 2),
+    Header = create_header(Flags, size(Body), -ReqNo),
+    utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?tunnel, ?endpoints]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    %% Rooms 1.0 presence: a source stream whose values are the full array of
+    %% attendant ids (vs room.attendants' {type,id} deltas).  ssb_peer re-emits
+    %% the updated array on every join/leave (see {endpoints_stream, ReqNo}).
+    ets:insert(Calls, {ReqNo, noop}),
+    Ids = other_attendants(Calls),
+    ?SSB_INFO("ROOMDBG tunnel.endpoints subscribe from=~p snapshot_ids=~p~n",
+              [caller_feed_id(Calls), Ids]),
+    Body = utils:encode_rec(Ids),
+    Flags = create_flags(1, 0, 2),
+    Header = create_header(Flags, size(Body), -ReqNo),
+    utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [?ebt, ~"replicate"],
+                             args = Args}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    {Version, Format} = case Args of
+        [{ArgProps}] ->
+            {proplists:get_value(~"version", ArgProps, 3),
+             proplists:get_value(~"format", ArgProps, ~"classic")};
+        _ ->
+            {undefined, undefined}
+    end,
+    %% ponchoWonky/tildefriends don't use these args, though they send the version
+    %% and and tildefriends sends the format. We'll use the defaults for
+    %% both since they seem to be dead args for now.
+    case {Version, Format} of
+        {3, ~"classic"} ->
+            ets:insert(Calls, {ReqNo, ebt}),
+            Flags = create_flags(1, 0, 2),
+            InitVectorEnc = utils:encode_rec(ebt:initial_vector()),
+            Header = create_header(Flags, size(InitVectorEnc), -ReqNo),
+            ?SSB_DEBUG("Answering ebt_rep req ~p with ~p ~n", [ReqNo, {Header, InitVectorEnc}]),
+            %% Keep the duplex stream open — do NOT send RPC_END
+            utils:send_data(utils:combine(Header, InitVectorEnc),
+                            Socket, Nonce, SecretBoxKey);
+        _ ->
+            ErrMsg = utils:error_msg(~"Error", ~"unsupported EBT version or format"),
+            Flags = create_flags(0, 1, 2),
+            Header = create_header(Flags, size(ErrMsg), -ReqNo),
+            utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey)
+    end;
+
+proc_request(_Calls, ReqNo, #ssb_rpc{name = [~"invite", ~"create"],
+                             args = [Host, Port]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    {ok, Code} = invite:create(binary_to_list(Host), Port),
+    %% The address only.  Code carries the seed that redeems it, so it is
+    %% the one part of an invite that must never reach the log.
+    ?SSB_INFO("invite.create: issued an invite for ~s:~p~n", [Host, Port]),
+    Body = iolist_to_binary(message:ssb_encoder({[{~"invite", Code}]},
+                              fun message:ssb_encoder/3, [])),
+    Flags  = create_flags(0, 0, 2),   %% async reply: stream=0
+    Header = create_header(Flags, size(Body), -ReqNo),
+    utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey);
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = [~"invite", ~"use"],
+                             args = [{ArgProps}]}
+             = _ReqBody, Socket, Nonce, SecretBoxKey) ->
+    FeedId = proplists:get_value(~"feed", ArgProps),
+    ClientPk = case ets:lookup(Calls, remote_pk) of
+        [{remote_pk, Pk}] -> Pk;
+        []                -> undefined
+    end,
+    case invite:validate_and_consume(ClientPk) of
+        ok ->
+            %% A room grants membership (same invite bootstrap, different
+            %% post-handshake effect); a pub posts a follow of the new user.
+            case config:is_room() of
+                true ->
+                    ?SSB_INFO("ROOMDBG invite.use granted room membership to ~p~n", [FeedId]),
+                    ok = room_store:add_member(FeedId);
+                false ->
+                    ?SSB_INFO("invite.use: ~p redeemed an invite; following"
+                              " them back as a pub~n", [FeedId]),
+                    OurId   = keys:pub_key_disp(),
+                    FeedPid = utils:find_or_create_feed_pid(OurId),
+                    FollowContent = {[{~"type",      ~"contact"},
+                                      {~"contact",   FeedId},
+                                      {~"following", true},
+                                      {~"pub",       true}]},
+                    %% refused only while the fork guard holds publishing;
+                    %% the invite itself stands
+                    case ssb_feed:post_content(FeedPid, FollowContent) of
+                        ok    -> ok;
+                        Other -> ?SSB_INFO("invite.use: follow-back of ~p not "
+                                           "published: ~p~n", [FeedId, Other])
+                    end
+            end,
+            %% The new member/follow just changed our replication set; refresh
+            %% it now so we replicate their feed immediately rather than after
+            %% the next periodic (20s) recompute.
+            ok = ebt:refresh_repl_set(),
+            TrueBody = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+            Flags  = create_flags(0, 0, 2),
+            Header = create_header(Flags, size(TrueBody), -ReqNo),
+            utils:send_data(utils:combine(Header, TrueBody), Socket, Nonce, SecretBoxKey);
+        {error, Reason} ->
+            %% invite_store has already logged which invite was refused;
+            %% this says who was turned away, which it cannot see.
+            ?SSB_INFO("invite.use: refused ~p (~p)~n", [FeedId, Reason]),
+            ErrMsg = utils:error_msg(~"Error", ~"invalid or expired invite"),
+            Flags  = create_flags(0, 1, 2),
+            Header = create_header(Flags, size(ErrMsg), -ReqNo),
+            utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey)
+    end;
+
+proc_request(Calls, ReqNo, #ssb_rpc{name = Name, args = Args} = ReqBody,
+             Socket, Nonce, SecretBoxKey) when is_list(Name) ->
+    %% Not handled above: consult the plugin registry before giving up.
+    %% Permission was already checked at the dispatch/6 choke point.
+    case plugin_registry:lookup(Name) of
+        {ok, {Mod, Kind, _Perm}} ->
+            plugin_dispatch(Mod, Kind, Name, Args, caller_info(Calls), Calls,
+                            ReqNo, Socket, Nonce, SecretBoxKey);
+        unknown ->
+            unhandled_request(Calls, ReqNo, ReqBody, ~"method not found: ",
+                              Socket, Nonce, SecretBoxKey);
+        _ ->  %% a builtin whose args didn't match its clause
+            unhandled_request(Calls, ReqNo, ReqBody, ~"invalid arguments for ",
+                              Socket, Nonce, SecretBoxKey)
+    end;
+
+proc_request(Calls, ReqNo, ReqBody, Socket, Nonce, SecretBoxKey) ->
+    unhandled_request(Calls, ReqNo, ReqBody, ~"method not found: ",
+                      Socket, Nonce, SecretBoxKey).
+
+%% A request nothing here can answer gets an error, as ssb-server does —
+%% answering it with a normal end made "no such method" indistinguishable
+%% from "an empty result", which is how a misnamed call reads as a broken
+%% view.  The error carries the stream flag for stream requests, or a
+%% standard client never routes it and hangs.
+%%
+%% Only real requests: those carry a muxrpc type.  A peer's error/end on
+%% one of its own streams we already let go of also lands here (named
+%% "Error", no type), and is not a call — it keeps the old end frame.
+unhandled_request(Calls, ReqNo, #ssb_rpc{name = Name, type = Type} = ReqBody,
+                  Prefix, Socket, Nonce, SecretBoxKey)
+  when is_list(Name), is_binary(Type) ->
+    ?SSB_INFO("unhandled RPC: ~p~n", [ReqBody]),
+    ets:insert(Calls, {ReqNo, noop}),
+    Kind = case Type of
+               ~"source" -> source;
+               ~"duplex" -> source;
+               ~"sink"   -> sink;
+               _         -> async
+           end,
+    Reason = iolist_to_binary([Prefix, lists:join(".", [N || N <- Name, is_binary(N)])]),
+    rpc_error(ReqNo, Reason, Kind, Socket, Nonce, SecretBoxKey);
+unhandled_request(Calls, ReqNo, ReqBody, _Prefix, Socket, Nonce, SecretBoxKey) ->
+    ?SSB_INFO("ROOMDBG unhandled RPC (fall thru): ~p~n", [ReqBody]),
+    ets:insert(Calls, {ReqNo, noop}),
+    Flags = create_flags(1, 1, 2),
+    TrueEnd = message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty]),
+    Header = create_header(Flags, size(TrueEnd), -ReqNo),
+    utils:send_data(utils:combine(Header, TrueEnd), Socket, Nonce, SecretBoxKey).
+
+%% Dispatch to a registered plugin and frame its result.  sync/async
+%% methods answer one JSON value (stream=0); source methods emit one
+%% frame per item then close with JSON true, like createHistoryStream.
+%% A crashing plugin answers an error frame instead of killing the
+%% connection's rpc_processor.
+plugin_dispatch(Mod, Kind, Name, Args, Caller, Calls,
+                ReqNo, Socket, Nonce, SecretBoxKey) ->
+    Result = try Mod:handle_rpc(Name, Args, Caller)
+             catch C:R:Stack ->
+                     ?SSB_ERROR("plugin ~p crashed on ~p: ~p:~p ~p",
+                                [Mod, Name, C, R, Stack]),
+                     {error, ~"internal error"}
+             end,
+    case {Kind, Result} of
+        {source, {source, Items}} ->
+            case owner(Calls) of
+                undefined ->
+                    %% no owning ssb_peer (e.g. unit tests): send inline
+                    ets:insert(Calls, {ReqNo, noop}),
+                    N1 = send_source_items(Items, ReqNo, Socket, Nonce, SecretBoxKey),
+                    TrueEnd = encode_json(true),
+                    Header = create_header(create_flags(1, 1, 2), size(TrueEnd), -ReqNo),
+                    utils:send_data(utils:combine(Header, TrueEnd), Socket, N1, SecretBoxKey);
+                OwnerPid ->
+                    Pump = pump(OwnerPid, ReqNo, Items, end_stream),
+                    ets:insert(Calls, {ReqNo, {source_pump, Pump}}),
+                    Nonce
+            end;
+        {source, {live_source, Pairs, ViewMod, EventFun}} ->
+            %% snapshot now, then keep the stream open: a view_stream
+            %% pushes later matches via the connection's ordered writes
+            case owner(Calls) of
+                undefined ->
+                    %% no owning ssb_peer (e.g. unit tests): finite fallback
+                    ets:insert(Calls, {ReqNo, noop}),
+                    N0 = send_source_items([snapshot_item(B) || {_, B} <- Pairs],
+                                           ReqNo, Socket, Nonce, SecretBoxKey),
+                    TrueEnd = encode_json(true),
+                    Header = create_header(create_flags(1, 1, 2),
+                                           size(TrueEnd), -ReqNo),
+                    utils:send_data(utils:combine(Header, TrueEnd),
+                                    Socket, N0, SecretBoxKey);
+                OwnerPid ->
+                    {ok, Stream} = view_stream:start(OwnerPid, -ReqNo,
+                                                     ViewMod, EventFun),
+                    ets:insert(Calls, {ReqNo, {live_source, Stream}}),
+                    %% the snapshot can be a whole index (messagesByType
+                    %% live), so it goes out through the pump too; the
+                    %% stream goes live once the pump has sent it
+                    _ = pump(OwnerPid, ReqNo,
+                             [snapshot_item(B) || {_, B} <- Pairs],
+                             {release, Stream, [Id || {Id, _} <- Pairs]}),
+                    Nonce
+            end;
+        {_, {reply, Term}} when Kind =:= sync; Kind =:= async ->
+            case safe_encode(Term) of
+                {ok, Body} ->
+                    Header = create_header(create_flags(0, 0, 2), size(Body),
+                                           -ReqNo),
+                    utils:send_data(utils:combine(Header, Body), Socket, Nonce,
+                                    SecretBoxKey);
+                {error, Why} ->
+                    ?SSB_ERROR("plugin ~p: reply to ~p is not encodable (~p) "
+                               "— answering with an error frame",
+                               [Mod, Name, Why]),
+                    rpc_error(ReqNo, ~"reply not encodable", Kind, Socket,
+                              Nonce, SecretBoxKey)
+            end;
+        {_, {error, Reason}} when is_binary(Reason) ->
+            rpc_error(ReqNo, Reason, Kind, Socket, Nonce, SecretBoxKey);
+        {_, Other} ->
+            ?SSB_ERROR("plugin ~p returned ~p for ~p method ~p",
+                       [Mod, Other, Kind, Name]),
+            rpc_error(ReqNo, ~"internal error", Kind, Socket, Nonce, SecretBoxKey)
+    end.
+
+%% An item may be a fun/0 producing the encoded body (or undefined to
+%% skip): large snapshots hydrate one item at a time DURING the send
+%% fold, so frames flow immediately and nothing is built up front — an
+%% eager [{json, Bin}] list for a big index wedged the connection's
+%% rpc_processor for minutes while it hydrated (messagesByType on a
+%% full store).
+send_source_items(Items, ReqNo, Socket, Nonce, SecretBoxKey) ->
+    lists:foldl(
+      fun(Item, N) ->
+              case item_body(Item) of
+                  skip ->
+                      N;
+                  Body ->
+                      Header = create_header(create_flags(1, 0, 2),
+                                             size(Body), -ReqNo),
+                      utils:send_data(utils:combine(Header, Body),
+                                      Socket, N, SecretBoxKey)
+              end
+      end, Nonce, Items).
+
+%% The encoded frame body for one source item, or skip.
+item_body(Item0) ->
+    case materialize(Item0) of
+        skip ->
+            skip;
+        Item ->
+            case safe_encode(Item) of
+                {ok, Body} ->
+                    Body;
+                {error, Why} ->
+                    %% Mid-stream there is no way to report one bad item,
+                    %% so drop it and keep the stream alive — losing an
+                    %% item beats losing the connection and every other
+                    %% item with it.
+                    ?SSB_ERROR("rpc_processor: skipping unencodable "
+                               "stream item (~p)", [Why]),
+                    skip
+            end
+    end.
+
+%%%===================================================================
+%%% Pump: plugin sources sent outside the request path
+%%%
+%%% Every frame is encrypted with the connection's box-stream nonce, so
+%%% ssb_peer waits on process/3 for the nonce a request leaves behind.
+%%% Sending a source inline therefore holds that call open for the whole
+%%% stream, and process/3 has a 45s timeout: messagesByType("contact")
+%%% over a 624k-row store ran past it and the timeout killed the
+%%% connection.  A bigger timeout only moves the cliff, and blocks every
+%%% other request on the connection meanwhile.
+%%%
+%%% So the request returns at once and a pump process sends the items
+%%% through ssb_peer:send_frames/4 — the same ordered write path a live
+%%% stream's later frames already take, so the nonce never forks.  Batches
+%%% are synchronous calls, which paces the pump to the socket instead of
+%%% filling ssb_peer's mailbox.  The pump runs unlinked: it ends with the
+%%% stream, is killed if the client cancels (the {source_pump, Pid} call
+%%% entry), and exits on its next batch if the connection is gone.
+%%%===================================================================
+
+-define(PUMP_BATCH, 64).
+
+%% Finish is end_stream (send the end frame) or {release, Stream, SentIds}
+%% (hand the stream to its view_stream, which goes live).
+pump(OwnerPid, ReqNo, Items, Finish) ->
+    spawn(fun() ->
+                  try
+                      pump_items(OwnerPid, -ReqNo, Items, 0, [], Finish)
+                  catch
+                      exit:_ -> ok   %% connection gone mid-stream
+                  end
+          end).
+
+pump_items(Owner, ReqNo, [], _Count, Batch, end_stream) ->
+    ok = ssb_peer:send_frames(Owner, ReqNo, lists:reverse(Batch), true);
+pump_items(Owner, ReqNo, [], _Count, Batch, {release, Stream, SentIds}) ->
+    ok = ssb_peer:send_frames(Owner, ReqNo, lists:reverse(Batch), false),
+    view_stream:release(Stream, SentIds);
+pump_items(Owner, ReqNo, Items, ?PUMP_BATCH, Batch, Finish) ->
+    ok = ssb_peer:send_frames(Owner, ReqNo, lists:reverse(Batch), false),
+    %% a cancelled live stream stops its view_stream, not this pump
+    case Finish of
+        {release, Stream, _} -> is_process_alive(Stream) orelse exit(cancelled);
+        end_stream           -> ok
+    end,
+    pump_items(Owner, ReqNo, Items, 0, [], Finish);
+pump_items(Owner, ReqNo, [Item | Rest], Count, Batch, Finish) ->
+    case item_body(Item) of
+        skip -> pump_items(Owner, ReqNo, Rest, Count, Batch, Finish);
+        Body -> pump_items(Owner, ReqNo, Rest, Count + 1, [Body | Batch], Finish)
+    end.
+
+materialize(F) when is_function(F, 0) ->
+    case F() of
+        undefined -> skip;
+        Bin       -> {json, Bin}
+    end;
+materialize(Item) ->
+    Item.
+
+%% live_source snapshot pairs are {Id, Bin} or {Id, fun/0} (lazy).
+snapshot_item(F) when is_function(F, 0) -> F;
+snapshot_item(B)                        -> {json, B}.
+
+%% The error frame's stream flag must match the call's kind: a standard
+%% muxrpc client routes a stream-flagged frame to its open source and a
+%% plain one to its async callback — the wrong flag means the caller
+%% never sees the error and waits forever.  A sink is a stream too.
+%% One createHistoryStream item: the wire body for a stored message past
+%% Seq, or skip.  keys:true (the default) is the {key, value, timestamp}
+%% envelope; keys:false the bare stored value.
+history_body(MsgData, Seq, Keys) ->
+    try message:decode(MsgData, false) of
+        #message{sequence = S} = Msg when S > Seq ->
+            case Keys of
+                true  -> message:encode(Msg);
+                false -> MsgData
+            end;
+        _ ->
+            skip
+    catch _:_ -> skip
+    end.
+
+%% Append Body, dropping the oldest once more than Limit are held
+%% (Limit < 0 = no limit).  The count rides along because queue:len/1
+%% walks the queue.
+keep_last(Limit, Body, {Len, Q}) ->
+    Q1 = queue:in(Body, Q),
+    case Limit >= 0 andalso Len + 1 > Limit of
+        true when Limit =:= 0 -> {0, queue:new()};
+        true                  -> {Len, queue:drop(Q1)};
+        false                 -> {Len + 1, Q1}
+    end.
+
+send_history_item(Body, ReqNo, Socket, Nonce, SecretBoxKey) ->
+    Header = create_header(create_flags(1, 0, 2), size(Body), -ReqNo),
+    utils:send_data(utils:combine(Header, Body), Socket, Nonce, SecretBoxKey).
+
+rpc_error(ReqNo, Reason, Kind, Socket, Nonce, SecretBoxKey) ->
+    ErrMsg = utils:error_msg(~"Error", Reason),
+    Stream = case Kind of
+                 source -> 1;
+                 sink   -> 1;
+                 _      -> 0
+             end,
+    Flags  = create_flags(Stream, 1, 2),
+    Header = create_header(Flags, size(ErrMsg), -ReqNo),
+    utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey).
+
+%%%===================================================================
+%%% blobs.add — the one sink method
+%%%===================================================================
+
+%% Frames on an open blobs.add sink.  Data frames carry raw bytes (the
+%% client sends the file in 64 KB binary frames); the end frame closes it.
+blob_add_frame(ReqNo, ExpectedId, Header, Body, Socket, Nonce, SecretBoxKey,
+               #rpc_state{calls = Calls, sinks = Sinks} = State) ->
+    {_, IsEnd, _} = parse_flags(Header),
+    case IsEnd of
+        1 ->
+            {Chunks, _Size} = maps:get(ReqNo, Sinks, {[], 0}),
+            N = blob_add_end(ReqNo, ExpectedId, Chunks, Body,
+                             Socket, Nonce, SecretBoxKey),
+            ets:insert(Calls, {ReqNo, noop}),
+            {N, State#rpc_state{sinks = maps:remove(ReqNo, Sinks)}};
+        0 ->
+            {Chunks, Size} = maps:get(ReqNo, Sinks, {[], 0}),
+            NewSize = Size + byte_size(Body),
+            case NewSize > ?BLOB_MAX_SIZE of
+                true ->
+                    %% Refuse rather than buffer an unbounded blob.  The sink
+                    %% stays registered as noop, so the client's remaining
+                    %% frames and its end are swallowed.
+                    ?SSB_INFO("blobs.add req ~p exceeds max blob size (~p bytes)",
+                              [ReqNo, NewSize]),
+                    N = rpc_error(ReqNo, ~"blob exceeds max size", sink,
+                                  Socket, Nonce, SecretBoxKey),
+                    ets:insert(Calls, {ReqNo, noop}),
+                    {N, State#rpc_state{sinks = maps:remove(ReqNo, Sinks)}};
+                false ->
+                    %% prepend: reversed and flattened once, at the end
+                    {Nonce,
+                     State#rpc_state{sinks = Sinks#{ReqNo =>
+                                                    {[Body | Chunks], NewSize}}}}
+            end
+    end.
+
+%% The client ended the sink.  A clean end carries JSON `true`; anything
+%% else is the client aborting (pull-stream propagates the error), in which
+%% case we drop the partial blob and answer nothing.
+blob_add_end(ReqNo, ExpectedId, Chunks, Body, Socket, Nonce, SecretBoxKey) ->
+    case is_clean_end(Body) of
+        false ->
+            ?SSB_INFO("blobs.add req ~p aborted by client: ~p", [ReqNo, Body]),
+            Nonce;
+        true ->
+            Blob = iolist_to_binary(lists:reverse(Chunks)),
+            case store_blob(ExpectedId, Blob) of
+                {ok, BlobId} ->
+                    ?SSB_INFO("blobs.add stored ~p (~p bytes)",
+                              [BlobId, byte_size(Blob)]),
+                    %% Terminate the sink with JSON `true` — NOT the blob id.
+                    %% A muxrpc sink's callback takes only an error, and the
+                    %% client reads any non-`true` end value AS that error
+                    %% (ssb-client computes the id itself: fix-add-blob.js).
+                    TrueEnd = encode_json(true),
+                    Hdr = create_header(create_flags(1, 1, 2),
+                                        size(TrueEnd), -ReqNo),
+                    utils:send_data(utils:combine(Hdr, TrueEnd),
+                                    Socket, Nonce, SecretBoxKey);
+                {error, Reason} ->
+                    ?SSB_INFO("blobs.add req ~p rejected: ~p", [ReqNo, Reason]),
+                    rpc_error(ReqNo, Reason, sink, Socket, Nonce, SecretBoxKey)
+            end
+    end.
+
+%% With an id in the opening args the bytes must hash to it; without one
+%% (the usual case) we hash whatever arrived.
+store_blob(undefined, Blob) ->
+    {ok, blobs:store(Blob)};
+store_blob(ExpectedId, Blob) ->
+    case blobs:store_verified(ExpectedId, Blob) of
+        ok                     -> {ok, ExpectedId};
+        {error, hash_mismatch} -> {error, ~"blob hash mismatch"}
+    end.
+
+is_clean_end(Body) ->
+    try utils:nat_decode(Body) of
+        true -> true;
+        _    -> false
+    catch _:_ ->
+        false
+    end.
+
+%% {json, Bin} is pre-encoded JSON passed through untouched — used by
+%% plugins that serve stored message bytes (see ssb_plugin).
+encode_json({json, Bin}) when is_binary(Bin) ->
+    Bin;
+encode_json(Term) ->
+    iolist_to_binary(message:ssb_encoder(Term, fun message:ssb_encoder/3, [pretty])).
+
+%% Encode a reply body, or say why it cannot be encoded.
+%%
+%% Stored SSB content is NOT guaranteed to be valid UTF-8 — messages from
+%% the wild carry latin1 bytes — and Erlang's json module rejects those
+%% with {invalid_byte, N}.  Raised bare, that killed the connection's
+%% rpc_processor part-way through writing a frame; the client saw a
+%% truncated body ("stream ended with:9 but wanted:3190"), reconnected,
+%% re-issued the same request and crashed it again.  A single
+%% unencodable message anywhere in the store became an endless reconnect
+%% loop that looked like a network fault.
+%%
+%% One bad message must cost at most one reply.
+safe_encode(Term) ->
+    try {ok, encode_json(Term)}
+    catch Class:Reason ->
+            {error, {Class, Reason}}
+    end.
+
+%% The value JSON for a get: with {private: true} and a box we can read,
+%% unbox the content in place; otherwise the bare stored value.
+get_value(#message{content = Content} = Msg, true) ->
+    case private_box:is_private(Content) andalso private_box:decrypt(Content) of
+        {ok, Plain} ->
+            try message:encode_value_decrypted(Msg, utils:nat_decode(Plain))
+            catch _:_ -> message:encode_value(Msg)
+            end;
+        _ ->
+            message:encode_value(Msg)
+    end;
+get_value(Msg, false) ->
+    message:encode_value(Msg).
+
+%% The caller's identity and permission class, from the remote key the
+%% handshake authenticated: the node's own key = a local client (owner);
+%% a registered room member = member; anyone else = peer.  Computed per
+%% dispatch because membership can change mid-connection (invite.use).
+caller_info(Calls) ->
+    FeedId = caller_feed_id(Calls),
+    Class = case ets:lookup(Calls, remote_pk) of
+        [{remote_pk, Pk}] ->
+            %% keys:pub_key() is base64 text; remote_pk is the raw key
+            %% the handshake authenticated.
+            case base64:decode(keys:pub_key()) of
+                Pk -> owner;
+                _  ->
+                    case room_store:is_member(FeedId) of
+                        true  -> member;
+                        false -> peer
+                    end
+            end;
+        [] -> peer
+    end,
+    #{feed_id => FeedId, class => Class}.
+
+%% Stream BlobData in 65 536-byte muxrpc frames, then close with JSON true.
+%% Each frame is further split into <=4096-byte box-stream packets by
+%% boxstream:box (the box-stream length field is only 2 bytes wide).
+send_blob_chunks(<<>>, ReqNo, Socket, Nonce, Key) ->
+    TrueBody = iolist_to_binary(message:ssb_encoder(true, fun message:ssb_encoder/3, [pretty])),
+    Flags    = create_flags(1, 1, 2),
+    Header   = create_header(Flags, size(TrueBody), ReqNo),
+    utils:send_data(utils:combine(Header, TrueBody), Socket, Nonce, Key);
+send_blob_chunks(Data, ReqNo, Socket, Nonce, Key) ->
+    ChunkSize = 65536,
+    {Chunk, Rest} = case Data of
+        <<C:ChunkSize/binary, R/binary>> -> {C, R};
+        Last                             -> {Last, <<>>}
+    end,
+    Flags    = create_flags(1, 0, 0),
+    Header   = create_header(Flags, size(Chunk), ReqNo),
+    NewNonce = utils:send_data(utils:combine(Header, Chunk), Socket, Nonce, Key),
+    send_blob_chunks(Rest, ReqNo, Socket, NewNonce, Key).
+
+current_time() ->
+    erlang:system_time(millisecond).
+
+whoami() ->
+    iolist_to_binary(message:ssb_encoder({[{~"id", keys:pub_key_disp()}]},
+                       fun message:ssb_encoder/3, [])).
+
+%% Room side of tunnel.connect: look up the target attendant and bridge the
+%% two connections.  ReqNo is the positive request number on this (the
+%% caller's) connection; bridge sends the caller's responses on -ReqNo.
+%% Membership gating happens at the dispatch choke point (the method's
+%% registry perm is `room`), not here.
+tunnel_relay_connect(Calls, ReqNo, Args, Socket, Nonce, SecretBoxKey) ->
+    Target = tunnel_target(Args),
+    case Target =/= undefined andalso room_attendants:lookup(Target) of
+        {ok, TargetPid} ->
+            OwnerPid = owner(Calls),
+            {ok, Bridge} = tunnel_bridge:start(OwnerPid, ReqNo, TargetPid, Args),
+            ets:insert(Calls, {ReqNo, {tunnel_relay, Bridge}}),
+            %% PROBE: relay accepted — target was found and a bridge spawned.
+            ?SSB_INFO("ROOMDBG relay target=~p FOUND pid=~p bridge=~p reqno=~p~n",
+                      [Target, TargetPid, Bridge, ReqNo]),
+            Nonce;
+        _ ->
+            %% PROBE: relay rejected — target not in room_attendants. If you see
+            %% this, the attendant disconnected (or never registered) between the
+            %% snapshot and the connect; manyverse will unstage it.
+            ?SSB_INFO("ROOMDBG relay target=~p NOT connected; sending error~n",
+                      [Target]),
+            tunnel_error(ReqNo, ~"target not connected", Socket, Nonce, SecretBoxKey)
+    end.
+
+%% Endpoint side of tunnel.connect: a non-room node was asked (by a room) to
+%% accept an incoming tunnelled connection.  Hand it to the registered tunnel
+%% listener, which drives the inner protocol (Phase 2c: SHS over the tunnel).
+tunnel_accept_connect(Calls, ReqNo, _Args, Socket, Nonce, SecretBoxKey) ->
+    OwnerPid = owner(Calls),
+    case tunnel_endpoint:accept(ReqNo, OwnerPid) of
+        {ok, SinkPid} ->
+            ets:insert(Calls, {ReqNo, {tunnel_relay, SinkPid}}),
+            Nonce;
+        _ ->
+            tunnel_error(ReqNo, ~"tunnel not accepted", Socket, Nonce, SecretBoxKey)
+    end.
+
+tunnel_target(Args) ->
+    case Args of
+        [{Props}] -> proplists:get_value(~"target", Props);
+        _         -> undefined
+    end.
+
+owner(Calls) ->
+    case ets:lookup(Calls, owner) of
+        [{owner, Pid}] -> Pid;
+        []             -> undefined
+    end.
+
+%% Whether the connection's peer may use this room: open rooms admit anyone;
+%% community/restricted rooms require the caller to be a registered member.
+room_caller_allowed(Calls) ->
+    case config:room_privacy() of
+        open -> true;
+        _    -> room_store:is_member(caller_feed_id(Calls))
+    end.
+
+caller_feed_id(Calls) ->
+    case ets:lookup(Calls, remote_pk) of
+        [{remote_pk, Pk}] -> <<"@", (base64:encode(Pk))/binary, ".ed25519">>;
+        []                -> undefined
+    end.
+
+%% Current attendants minus the caller: a client should not see itself in its
+%% own presence snapshot (room.attendants / tunnel.endpoints).
+other_attendants(Calls) ->
+    Self = caller_feed_id(Calls),
+    [Id || Id <- room_attendants:list(), Id =/= Self].
+
+tunnel_error(ReqNo, Reason, Socket, Nonce, SecretBoxKey) ->
+    ErrMsg = utils:error_msg(~"Error", Reason),
+    Flags  = create_flags(0, 1, 2),
+    Header = create_header(Flags, size(ErrMsg), -ReqNo),
+    utils:send_data(utils:combine(Header, ErrMsg), Socket, Nonce, SecretBoxKey).
+
+-ifdef(TEST).
+
+body1_test() ->
+    Rpc = create_req(iolist_to_binary(ssb_encoder({[{~"name",[~"gossip",~"ping"]},
+                                    {~"args",[{[{~"timeout",300000}]}]},
+                                    {~"type",~"duplex"}]}, fun message:ssb_encoder/3, []))),
+    ?assert(Rpc#ssb_rpc.name == [~"gossip",~"ping"]),
+    ?assert(Rpc#ssb_rpc.type == ~"duplex").
+
+body2_test() ->
+    Rpc = create_req(iolist_to_binary(ssb_encoder(22222, fun message:ssb_encoder/3, []))),
+    ?assert(Rpc == 22222).
+
+%% Stored SSB content is not always valid UTF-8.  Encoding must report
+%% that rather than raise, because raising here happens inside the
+%% connection's process and takes the whole connection with it — and the
+%% client then retries the same request forever.
+safe_encode_survives_latin1_test() ->
+    Valid = {[{~"text", ~"plain ascii"}]},
+    ?assertMatch({ok, _}, safe_encode(Valid)),
+    %% 0xFC is 'ü' in latin1 and not a valid UTF-8 sequence
+    Latin1 = {[{~"text", <<"caf", 252, " closed">>}]},
+    ?assertMatch({error, _}, safe_encode(Latin1)),
+    %% the bad one must not have poisoned anything: encoding still works
+    ?assertMatch({ok, _}, safe_encode(Valid)).
+
+%% A nested bad binary is caught too — the byte is usually buried in
+%% content, not at the top level.
+safe_encode_catches_nested_test() ->
+    Nested = {[{~"value",
+                {[{~"content",
+                   {[{~"text", <<"deep ", 252, " byte">>}]}}]}}]},
+    ?assertMatch({error, _}, safe_encode(Nested)).
+
+flags_test() ->
+    ?assert(<<10>> == create_flags(1,0,2)),
+    ?assert({1,0,2} == parse_flags(<<10>>)),
+    ?assert({1,1,2} == parse_flags(<<14>>)),
+    ?assert(<<14>> == create_flags(1,1,2)).
+
+flags_eq_test() ->
+    ?assert(create_flags(1,0,10) == create_flags(1,0,2)).
+
+req_no_test() ->
+    Flags = create_flags(1,1,2),
+    Header = create_header(Flags,size(~"true"), 5),
+    ?assert(req_no(Header) == 5).
+
+neg_req_no_test() ->
+    Flags = create_flags(1,1,2),
+    Header = create_header(Flags,size(~"true"), -5),
+    ?assert(req_no(Header) == -5).
+
+keep_last_test() ->
+    Keep = fun(Limit, Items) ->
+                   {Len, Q} = lists:foldl(fun(I, Acc) -> keep_last(Limit, I, Acc) end,
+                                          {0, queue:new()}, Items),
+                   {Len, queue:to_list(Q)}
+           end,
+    ?assertEqual({2, [c, d]},       Keep(2, [a, b, c, d])),
+    ?assertEqual({2, [a, b]},       Keep(5, [a, b])),
+    ?assertEqual({0, []},           Keep(0, [a, b])),
+    ?assertEqual({3, [a, b, c]},    Keep(-1, [a, b, c])).
+
+-endif.

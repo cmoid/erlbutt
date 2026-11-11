@@ -1,0 +1,19 @@
+%% SPDX-License-Identifier: GPL-2.0-only
+%%
+%% Copyright (C) 2023 Charles Moid
+{application, ssb,
+ [{description, "ssb"},
+  {vsn, {cmd, "git describe --always --tags | sed 's/^v//'"}},
+  {registered, []},
+  %% Genuine runtime dependencies only.  GUI/tooling apps (observer, wx,
+  %% debugger, tools, syntax_tools) are not needed to run a node; the devpkg
+  %% release profile adds them back for development.
+  {applications, [kernel,
+                  sasl,
+                  stdlib,
+                  crypto,
+                  ranch,
+                  enacl,
+                  esqlite]},
+  {env, []},
+  {mod, {ssb_app, [{ssb_log_level, notice}]}}]}.

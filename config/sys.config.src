@@ -1,0 +1,45 @@
+%% Each file handler wraps at 50 MB and keeps 5 older generations, gzipped
+%% — so the log directory is bounded (150 MB of live files plus fifteen
+%% compressed archives) instead of growing until the disk fills.
+%%
+%% Note that the handlers are nested rather than exclusive: the debug file
+%% receives everything the info file does, and info everything error does,
+%% so one runaway message is written twice or three times.  Splitting them
+%% would need per-handler level filters; the wrap limit is what keeps that
+%% from mattering.
+[{kernel,
+  [{logger,
+    [{handler, default, logger_std_h,
+      #{level => error,
+        config => #{type => {file, "log/error.log"},
+                    max_no_bytes => 52428800,
+                    max_no_files => 5,
+                    compress_on_rotate => true}}},
+     {handler, term, logger_std_h,
+      #{formatter => {logger_formatter, #{single_line => true}}}},
+     {handler, info, logger_std_h,
+      #{level => info,
+        config => #{type => {file, "log/info.log"},
+                    max_no_bytes => 52428800,
+                    max_no_files => 5,
+                    compress_on_rotate => true}}},
+     {handler, debug, logger_std_h,
+      #{level => debug,
+        config => #{type => {file, "log/debug.log"},
+                    max_no_bytes => 52428800,
+                    max_no_files => 5,
+                    compress_on_rotate => true}}}
+    ]}]},
+ {ssb, [{ssb_log_level, ${SSB_LOG_LEVEL:-error}},
+        %% No ssb_home here any more.  The data directory is resolved by
+        %% ssb_paths from SSB_DATA, legacy SSB_HOME, or the data_dir
+        %% default in the release's ssb.cfg — read straight from the OS
+        %% environment, so that app env stays free for tests to set
+        %% without a shell variable overriding them.
+        %% The SSB listen port.  Overridable so that two nodes can run on
+        %% one machine, which is the only way to exercise anything that
+        %% needs a peer — replication, archive boundaries, adopting a
+        %% floor.  Without it, ssb_app fell back to a hardcoded 8008 and a
+        %% second node could not listen at all.
+        {port, ${SSB_PORT:-8008}}]}].
+

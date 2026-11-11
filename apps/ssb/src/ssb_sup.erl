@@ -1,0 +1,66 @@
+%% SPDX-License-Identifier: GPL-2.0-only
+%%
+%% Copyright (C) 2023 Charles Moid
+-module(ssb_sup).
+
+-behaviour(supervisor).
+
+-include_lib("ssb/include/ssb.hrl").
+
+%% API
+-export([start_link/0]).
+
+%% Supervisor callbacks
+-export([init/1]).
+
+%% ===================================================================
+%% API functions
+%% ===================================================================
+start_link() ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
+
+%% ===================================================================
+%% Supervisor callbacks
+%% ===================================================================
+init([]) ->
+    {ok, { {one_for_one, 5, 10},
+           [?CHILD(config, worker),
+            %% Before anything that declares a schema against it —
+            %% mess_auth and the core views all do.
+            ?CHILD(ssb_store, worker),
+            ?CHILD(plugin_registry, worker),
+            ?CHILD(network_id_cache, worker),
+            ?CHILD(heartbeat, worker),
+            ?CHILD(keys, worker),
+            ?CHILD(blobs, worker),
+            ?CHILD(mess_auth, worker),
+            ?CHILD(invite_store, worker),
+            ?CHILD(room_store, worker),
+            ?CHILD(conn_db, worker),
+            ?CHILD(ingest_journal, worker),
+            %% Before ssb_feed_sup: a feed consults its floor during init,
+            %% and must find the table declared.
+            ?CHILD(feed_floor, worker),
+            ?CHILD(ssb_feed_sup, supervisor),
+            %% After the feeds: its boot check reads our own feed's seq.
+            ?CHILD(own_feed, worker),
+            ?CHILD(view_manager, worker),
+            %% core views (doc/research/persistence.md §5): the ssb app owns these
+            %% and starts them itself, before any application's views
+            ?CHILD(ssb_social_graph, worker),
+            ?CHILD(ssb_feed_meta, worker),
+            ?CHILD(ssb_links, worker),
+            ?CHILD(ssb_archives, worker),
+            ?CHILD(ssb_glimpses, worker),
+            %% Before ebt: its replication set unions the pins in.
+            ?CHILD(feed_pins, worker),
+            ?CHILD(ebt, worker),
+            ?CHILD(peer_registry, worker),
+            ?CHILD(boundary_discovery, worker),
+            ?CHILD(glimpse_discovery, worker),
+            ?CHILD(room_attendants, worker),
+            ?CHILD(tunnel_endpoint, worker),
+            ?CHILD(blob_fetcher, worker),
+            ?CHILD(peer_dialer, worker),
+            %% Last: plugins depend on every service above.
+            ?CHILD(plugin_loader, worker)]}}.
