@@ -533,7 +533,7 @@ than as prebuilt beams.
 ## Compatibility
 
 ssb_git reads every git-ssb repo on the network and writes what git-ssb
-clients read, with four differences:
+clients read, with five differences:
 
 - **chunked packs**, which old readers cannot reassemble;
 - **`repoBranch`** computed from published ref values rather than a walk
@@ -541,7 +541,14 @@ clients read, with four differences:
   uses, is the same);
 - **shrinking** keeps the newest commits and drops `object_ids`, where
   git-ssb kept `object_ids` and could end up with neither;
-- **whose close counts**, which is a reader's choice in either.
+- **whose close counts**, which is a reader's choice in either;
+- **`HEAD`** is `master`, else `main`, else the fold's choice if that is
+  a branch, else the first branch. git-ssb's merge falls back from
+  `master` to the last ref in fold order, so a repo using `main` gets
+  whatever the newest push named last, often a tag. The fold itself keeps
+  git-ssb's answer, and the fold-diff still checks it; the correction is
+  applied when the node reports refs, so clones, the Emacs buffers and
+  push-time issue closing all see the branch.
 
 A stock `git-remote-ssb` pointed at erlbutt would also need `links` and
 `blobs.size`, which the core does not serve; both would be shims
