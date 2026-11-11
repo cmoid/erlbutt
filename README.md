@@ -77,6 +77,30 @@ the release directory, so it can never post as you on the real network.
 `make prodpkg` builds a production package. See
 [Building and testing][10] and [Releasing][11].
 
+Source, history and contributing
+--------------------------------
+
+erlbutt's home is on Scuttlebutt, hosted with [ssb_git][8]:
+
+```sh
+git clone ssb://%TvkoTlcpiyV8DGLLAo5XzB8K+u1qnk56mxMwWmCst0g=.sha256 erlbutt
+```
+
+That needs a running erlbutt node with the ssb_git plugin. If you don't
+have one, [github.com/cmoid/erlbutt][19] is a read-only mirror of the
+same history, and new releases are published there too.
+
+Send issues and pull requests through ssb_git, not GitHub. Anything
+merged is pushed to SSB first and then to the mirror, so pull requests
+opened on GitHub can't be merged there.
+
+The history begins at v0.3.0 with a single commit. The prototype's full
+history (530 commits), along with the v0.1.0 and v0.2.0 releases, is
+archived read-only at [github.com/cmoid/erlbutt-prototype][20]. The first
+commit here names the prototype commit it was taken from. Any clone of
+`cmoid/erlbutt` made before November 2026 has the prototype history and
+shares no commits with this repository, so make a fresh clone.
+
 Documentation
 -------------
 
@@ -116,3 +140,5 @@ licensed (`test/testdata.zip.license`). Contributors are listed in
 [16]: https://github.com/cmoid/maxbutt
 [17]: https://cmoid.github.io/scuttlebutt-protocol-guide/#extensions
 [18]: https://cmoid.github.io/scuttlebutt-protocol-guide/
+[19]: https://github.com/cmoid/erlbutt
+[20]: https://github.com/cmoid/erlbutt-prototype
