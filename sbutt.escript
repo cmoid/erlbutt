@@ -308,7 +308,10 @@ cmd_health(Peer) ->
                        onoff(gv(<<"dialerEnabled">>, Props, false))]),
             io:format("  views           ~p registered~n",
                       [gv(<<"views">>, Props, 0)]),
-            io:format("  invalid sigs    ~s~n", [sig_line(Props)]);
+            io:format("  invalid sigs    ~s~n", [sig_line(Props)]),
+            io:format("  bad format      ~s~n",
+                      [rejects_line(Props, <<"invalidFormat">>,
+                                    <<"requireValidFormat">>)]);
         Other ->
             io:format("  UNAVAILABLE: ~p~n", [Other])
     end,
@@ -690,8 +693,14 @@ onoff(_)    -> "off".
 %% the whole point of the exercise, so it is stated plainly rather than
 %% only when something is wrong.
 sig_line(Props) ->
-    N    = gv(<<"invalidSignatures">>, Props, 0),
-    Mode = case gv(<<"requireValidSigs">>, Props, false) of
+    rejects_line(Props, <<"invalidSignatures">>, <<"requireValidSigs">>).
+
+%% Shown, but not (yet) a reason for health to exit non-zero: format
+%% enforcement is in its measure phase, and peers re-serving old malformed
+%% messages are expected to show up here.
+rejects_line(Props, CountKey, ModeKey) ->
+    N    = gv(CountKey, Props, 0),
+    Mode = case gv(ModeKey, Props, false) of
                true -> "rejecting";
                _    -> "warn only, still stored"
            end,
