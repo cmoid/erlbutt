@@ -24,6 +24,7 @@
 
 -export([start_link/0,
          invalid_signature_count/0,
+         invalid_format_count/0,
          find_or_start/1]).
 
 -export([init/1]).
@@ -38,6 +39,15 @@
 %% ssb_feed:signature_ok/3.
 invalid_signature_count() ->
     try ets:lookup(ssb_feed_registry, '$invalid_sigs') of
+        [{_, N}] -> N;
+        []       -> 0
+    catch error:badarg -> 0
+    end.
+
+%% Same, for messages that failed msg_format:check/1; see
+%% ssb_feed:format_ok/3.
+invalid_format_count() ->
+    try ets:lookup(ssb_feed_registry, '$invalid_format') of
         [{_, N}] -> N;
         []       -> 0
     catch error:badarg -> 0

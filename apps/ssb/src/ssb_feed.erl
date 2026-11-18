@@ -85,7 +85,9 @@
                 %% message.
                 chain_break,
                 %% same shape, for messages that failed the signature check
-                bad_sig}).
+                bad_sig,
+                %% and for messages that failed msg_format:check/1
+                bad_format}).
 %%%===================================================================
 %%% API
 %%%===================================================================
@@ -296,20 +298,27 @@ handle_call({store, Msg}, _From, #state{last_seq = Before} = State) ->
     end,
     {reply, Status, NewState};
 
-%% Ingest from an untrusted peer: verify the signature, then the chain.
+%% Ingest from an untrusted peer: verify the signature, the format, then
+%% the chain.
 %%
-%% Two independent guards, and neither subsumes the other.  The chain
-%% check stops a hole being spliced into a feed and served onward; the
-%% signature check stops content being attributed to an author who never
-%% wrote it.  A forged message can chain perfectly, and a genuine message
-%% can arrive out of order, so both are needed.
+%% Independent guards, and none subsumes another.  The chain check stops
+%% a hole being spliced into a feed and served onward; the signature
+%% check stops content being attributed to an author who never wrote it;
+%% the format check stops us keeping a message every other peer refuses.
+%% A forged message can chain perfectly, a genuine message can arrive out
+%% of order, and a well-signed one can still be malformed.
 handle_call({store_checked, Msg}, _From,
             #state{last_seq = Before, last_msg = LastMsg, id = FeedId} = State) ->
     case signature_ok(Msg, FeedId, State) of
         {false, State1} ->
             {reply, skipped, State1};
         {true, State1} ->
-            store_if_chained(Msg, LastMsg, Before, FeedId, State1)
+            case format_ok(Msg, FeedId, State1) of
+                {false, State2} ->
+                    {reply, skipped, State2};
+                {true, State2} ->
+                    store_if_chained(Msg, LastMsg, Before, FeedId, State2)
+            end
     end;
 
 
@@ -694,6 +703,44 @@ count_bad_signature() ->
     try ets:update_counter(ssb_feed_registry, '$invalid_sigs', {2, 1},
                            {'$invalid_sigs', 0})
     catch error:badarg -> 0          %% no registry (bare eunit): don't count
+    end.
+
+%% Does this message keep the rules every JS peer enforces on its shape?
+%%
+%% Same two modes as signature_ok/3, under {require_valid_format, Bool},
+%% and the same one-line-per-feed logging.  Unlike signatures, releases
+%% still ship warn-only: the rules are new to erlbutt, and a genuine
+%% message they wrongly refused would wedge its feed exactly as a
+%% genuine message with a misjudged signature did.
+format_ok(#message{sequence = Seq} = Msg, FeedId, State) ->
+    case msg_format:check(Msg) of
+        ok ->
+            {true, State};
+        {error, Reason} ->
+            count_bad_format(),
+            State1 = note_bad_format(Seq, Reason, FeedId, State),
+            {not config:require_valid_format(), State1}
+    end.
+
+note_bad_format(Seq, Reason, FeedId, #state{bad_format = undefined} = State) ->
+    ?SSB_ERROR("feed ~s: seq ~p BREAKS A MESSAGE FORMAT RULE — ~s.  Mode is "
+               "~s.  Further occurrences for this feed are counted, not "
+               "logged; the running total is in admin.status as "
+               "invalidFormat.~n",
+               [FeedId, Seq, Reason,
+                case config:require_valid_format() of
+                    true  -> ~"reject";
+                    false -> ~"warn only, message stored"
+                end]),
+    State#state{bad_format = {Seq, 1}};
+note_bad_format(_Seq, _Reason, _FeedId,
+                #state{bad_format = {First, N}} = State) ->
+    State#state{bad_format = {First, N + 1}}.
+
+count_bad_format() ->
+    try ets:update_counter(ssb_feed_registry, '$invalid_format', {2, 1},
+                           {'$invalid_format', 0})
+    catch error:badarg -> 0
     end.
 
 %% A peer offered a message that does not link our tail.

@@ -55,6 +55,9 @@ handle_rpc([~"admin", ~"status"], _Args, _Caller) ->
               %% require_valid_sigs is turned on
               {~"invalidSignatures", ssb_feed_sup:invalid_signature_count()},
               {~"requireValidSigs", config:require_valid_sigs()},
+              %% peer messages that broke a structural rule (msg_format)
+              {~"invalidFormat",    ssb_feed_sup:invalid_format_count()},
+              {~"requireValidFormat", config:require_valid_format()},
               {~"views",           length(view_manager:views())}]}};
 
 %%%===================================================================

@@ -27,6 +27,8 @@
          set_dialer/1,
          require_valid_sigs/0,
          set_require_valid_sigs/1,
+         require_valid_format/0,
+         set_require_valid_format/1,
          blob_scan_enabled/0,
          plugins/0,
          is_room/0,
@@ -62,6 +64,11 @@
                  %% so the real rate can be measured before anything starts
                  %% being refused (see ssb_feed:store_msg_checked/2).
                  require_valid_sigs = false,
+                 %% Reject peer messages that break ssb-validate's structural
+                 %% rules (msg_format:check/1).  Off in every build for now:
+                 %% warn-and-count until a real corpus shows they reject
+                 %% nothing genuine, the same path require_valid_sigs took.
+                 require_valid_format = false,
                  room = false,
                  room_name = <<"erlbutt room">>,
                  room_privacy = open,
@@ -196,6 +203,12 @@ dialer_enabled() ->
 require_valid_sigs() ->
     (get_config())#config.require_valid_sigs.
 
+%% Whether a peer message that breaks a structural rule (content shape,
+%% content type length, hash, timestamp, size; see msg_format) is REJECTED
+%% (true) or stored with a warning and a count (false, the default).
+require_valid_format() ->
+    (get_config())#config.require_valid_format.
+
 %% Whether to scan existing on-disk messages for blob references at startup
 %% and fetch any we don't already hold.  Off by default (it folds the whole
 %% log); enable with {blob_scan, true}. in ssb.cfg.
@@ -220,6 +233,10 @@ add_network_id(NetId) when is_binary(NetId) ->
 %% and for tests, without editing ssb.cfg and restarting.
 set_require_valid_sigs(Bool) when is_boolean(Bool) ->
     gen_server:call(?MODULE, {set_require_valid_sigs, Bool}, infinity).
+
+%% Flip format enforcement at runtime, as set_require_valid_sigs/1 does.
+set_require_valid_format(Bool) when is_boolean(Bool) ->
+    gen_server:call(?MODULE, {set_require_valid_format, Bool}, infinity).
 
 %% Turn automatic dialing on or off, now and after a restart.
 %%
@@ -384,6 +401,10 @@ handle_call({set_require_valid_sigs, Bool}, _From, Cfg) ->
     _ = persist(require_valid_sigs, Bool, Cfg),
     {reply, ok, publish(Cfg#config{require_valid_sigs = Bool})};
 
+handle_call({set_require_valid_format, Bool}, _From, Cfg) ->
+    _ = persist(require_valid_format, Bool, Cfg),
+    {reply, ok, publish(Cfg#config{require_valid_format = Bool})};
+
 handle_call({set_pin_archives, Bool}, _From, Cfg) ->
     _ = persist(pin_archives, Bool, Cfg),
     {reply, ok, publish(Cfg#config{pin_archives = Bool})};
@@ -466,6 +487,9 @@ parse({archive_length, Len}, Cfg) when is_integer(Len), Len > 0 ->
 
 parse({require_valid_sigs, Bool}, Cfg) when is_boolean(Bool) ->
     Cfg#config{require_valid_sigs = Bool};
+
+parse({require_valid_format, Bool}, Cfg) when is_boolean(Bool) ->
+    Cfg#config{require_valid_format = Bool};
 
 parse({replication_hops, Hops}, Cfg) when is_integer(Hops), Hops >= 0 ->
     Cfg#config{replication_hops = Hops};

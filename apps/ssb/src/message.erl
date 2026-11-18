@@ -236,30 +236,50 @@ validate(false, _MsgProps) ->
     not_checked;
 validate(true, MsgProps) ->
     try
-        Author = ?pgv(~"author", MsgProps),
+        key_order(MsgProps) orelse throw(bad_key_order),
+
+        %% Strict decoding of both: see msg_format:decode_sigil/4 for why
+        %% a lenient one (it used to be strip_suffix + base64:decode) let
+        %% a signature with junk appended verify under a second id.
+        {ok, AuthorPk} = sigil(?pgv(~"author", MsgProps), ~"@", ~".ed25519",
+                               32, bad_author),
+        {ok, SigDec} = sigil(?pgv(~"signature", MsgProps), ~"", ~".sig.ed25519",
+                             64, bad_signature_encoding),
 
         %% remove signature from message and encode as json
         DelSigProps = proplists:delete(~"signature", MsgProps),
         EncMsg = ssb_encoder({DelSigProps}, fun ssb_encoder/3, [pretty, use_nil]),
 
-        %% extract and decode the keys for the signature and the author
-        Sig = ?pgv(~"signature", MsgProps),
-        <<"@",KeySuf/binary>> = Author,
-        %% Assertive match, like the author line above it: a signature that
-        %% is not a binary is not a signature, and drops into the catch
-        %% below as an unvalidatable message.
-        <<SigBody/binary>> = Sig,
-        AuthorPk = base64:decode(utils:strip_suffix(KeySuf, ~".ed25519")),
-        SigDec = base64:decode(utils:strip_suffix(SigBody, ~".sig.ed25519")),
-
-        %% verify
         enacl:sign_verify_detached(SigDec, EncMsg, AuthorPk)
     catch
-        error:Reason ->
+        Class:Reason when Class =:= error; Class =:= throw ->
             ?LOG_INFO("Unable to validate due to: ~p ~n",
                   [Reason]),
             false
     end.
+
+sigil(Ref, Prefix, Suffix, Size, Why) ->
+    case msg_format:decode_sigil(Ref, Prefix, Suffix, Size) of
+        {ok, _} = Ok -> Ok;
+        error        -> throw(Why)
+    end.
+
+%% A classic message has exactly these seven keys, in one of exactly two
+%% orders (the second is legacy, and is what #message.swapped records).
+%%
+%% Checked with the signature rather than with the other format rules
+%% because store/2 re-encodes a message in canonical order from the
+%% #message{} fields: a value signed over any other order, or carrying an
+%% extra key, would be stored as bytes its author never signed, under an
+%% id no other peer computes.  It cannot be kept faithfully, so it is not
+%% a signature erlbutt can vouch for.
+key_order(Props) ->
+    Keys = [K || {K, _} <- Props],
+    Keys =:= [~"previous", ~"author", ~"sequence", ~"timestamp", ~"hash",
+              ~"content", ~"signature"]
+        orelse
+    Keys =:= [~"previous", ~"sequence", ~"author", ~"timestamp", ~"hash",
+              ~"content", ~"signature"].
 
 add_sig(NewMsg, EncSig) ->
     CanonProps = canonical_sign_props(NewMsg) ++ [{~"signature", EncSig}],
