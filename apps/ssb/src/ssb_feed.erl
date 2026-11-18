@@ -1216,6 +1216,8 @@ feed_test_() ->
       fun chain_break_is_counted_then_cleared_test/1,
       fun bad_signature_warns_but_stores_test/1,
       fun bad_signature_rejected_when_enforcing_test/1,
+      fun bad_format_warns_but_stores_test/1,
+      fun bad_format_rejected_when_enforcing_test/1,
       fun no_profile_or_contacts_files_test/1,
       fun fetch_missing_msg_test/1,
       fun archive_manual_test/1,
@@ -2126,6 +2128,51 @@ bad_signature_rejected_when_enforcing_test({Pid, FeedId, _}) ->
             ?assertMatch(#message{sequence = 1}, ssb_feed:fetch_last_msg(Pid))
         after
             ok = config:set_require_valid_sigs(false)
+        end
+    end.
+
+feed_bad_format(Pid) ->
+    element(#state.bad_format, sys:get_state(Pid)).
+
+%% A genuine, verified message whose content type is one character too
+%% short for ssb-validate.
+short_type_msg(Prev, Seq, FeedId) ->
+    (message:new_msg(Prev, Seq, {[{~"type", ~"ab"}]},
+                     {FeedId, keys:priv_key()}))#message{validated = true}.
+
+%% Format rules start in measure mode, as signatures did: a malformed but
+%% correctly signed message is counted, logged once, and still stored.
+bad_format_warns_but_stores_test({Pid, FeedId, _}) ->
+    fun() ->
+        ?assertEqual(false, config:require_valid_format()),
+        One = short_type_msg(null, 1, FeedId),
+        ?assertEqual(stored, ssb_feed:store_msg_checked(Pid, One)),
+        ?assertMatch({1, 1}, feed_bad_format(Pid)),
+        ?assertEqual(undefined, feed_bad_sig(Pid)),
+        Two = short_type_msg(One#message.id, 2, FeedId),
+        ?assertEqual(stored, ssb_feed:store_msg_checked(Pid, Two)),
+        ?assertMatch({1, 2}, feed_bad_format(Pid)),
+        %% a well-formed one is not counted
+        Three = (message:new_msg(Two#message.id, 3, {[{~"type", ~"post"}]},
+                                 {FeedId, keys:priv_key()}))#message{validated = true},
+        ?assertEqual(stored, ssb_feed:store_msg_checked(Pid, Three)),
+        ?assertMatch({1, 2}, feed_bad_format(Pid))
+    end.
+
+%% With {require_valid_format, true} it is refused and the feed untouched.
+bad_format_rejected_when_enforcing_test({Pid, FeedId, _}) ->
+    fun() ->
+        ok = config:set_require_valid_format(true),
+        try
+            Bad = short_type_msg(null, 1, FeedId),
+            ?assertEqual(skipped, ssb_feed:store_msg_checked(Pid, Bad)),
+            ?assertEqual(no_file, ssb_feed:fetch_last_msg(Pid)),
+            Good = (message:new_msg(null, 1, {[{~"type", ~"post"}]},
+                                    {FeedId, keys:priv_key()}))#message{validated = true},
+            ?assertEqual(stored, ssb_feed:store_msg_checked(Pid, Good)),
+            ?assertMatch(#message{sequence = 1}, ssb_feed:fetch_last_msg(Pid))
+        after
+            ok = config:set_require_valid_format(false)
         end
     end.
 

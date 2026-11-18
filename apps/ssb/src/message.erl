@@ -621,4 +621,111 @@ received_is_not_signed_test() ->
                  [K || {K, _} <- Signed]),
     ?assertNot(lists:keymember(~"received", 1, Signed)).
 
+%% Every real message in testdata/ — go-ssb's corpus, legacy orderings and
+%% all — verifies and is well-formed.  The guard against the strict rules
+%% above rejecting something genuine: a false rejection wedges a feed.
+testdata_is_valid_and_well_formed_test() ->
+    {ok, Cwd} = file:get_cwd(),
+    [begin
+         F = Cwd ++ "/testdata/" ++ io_lib:format("~5..0w", [N]) ++ ".full",
+         {ok, Bin} = file:read_file(F),
+         {Props} = utils:nat_decode(Bin),
+         {Value} = ?pgv(~"value", Props),
+         Msg = from_value(Value, true),
+         ?assertEqual({N, true}, {N, Msg#message.validated}),
+         ?assertEqual({N, ?pgv(~"key", Props)}, {N, Msg#message.id}),
+         ?assertEqual({N, ok}, {N, msg_format:check(Msg)})
+     end || N <- lists:seq(1, 235)].
+
+%% Value proplist signed as given, with a throwaway key.
+signed_value(Mutate) ->
+    #{public := Pub, secret := Priv} = enacl:sign_keypair(),
+    Author = iolist_to_binary(["@", base64:encode(Pub), ".ed25519"]),
+    Props = Mutate([{~"previous",  null},
+                    {~"author",    Author},
+                    {~"sequence",  1},
+                    {~"timestamp", 1700000000000},
+                    {~"hash",      ~"sha256"},
+                    {~"content",   {[{~"type", ~"post"}, {~"text", ~"hi"}]}}]),
+    Enc = iolist_to_binary(ssb_encoder({Props}, fun ssb_encoder/3, [pretty, use_nil])),
+    {Props, enacl:sign_detached(Enc, Priv)}.
+
+with_sig(Props, SigText) ->
+    Props ++ [{~"signature", SigText}].
+
+sig_text(Sig) ->
+    iolist_to_binary([base64:encode(Sig), ".sig.ed25519"]).
+
+valid(Value) ->
+    (from_value(Value, true))#message.validated.
+
+same(Props) -> Props.
+
+signature_encoding_test_() ->
+    {Props, Sig} = signed_value(fun same/1),
+    Text = sig_text(Sig),
+    %% flip the lowest bit of the last base64 digit before the "==": those
+    %% four bits are padding, so the decoded bytes are unchanged
+    [Body, _] = binary:split(Text, ~"=="),
+    Last = binary:last(Body),
+    Alphabet = ~"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
+    {Idx, 1} = binary:match(Alphabet, <<Last>>),
+    NonCanon = <<(binary:part(Body, 0, byte_size(Body) - 1))/binary,
+                 (binary:at(Alphabet, Idx bor 1)), "==.sig.ed25519">>,
+    [?_assertEqual(true, valid(with_sig(Props, Text))),
+     %% libsodium verifies the first 64 bytes and ignores the rest, so
+     %% this used to pass — under a different message id
+     ?_assert(enacl:sign_verify_detached(
+                <<Sig/binary, (crypto:strong_rand_bytes(24))/binary>>,
+                ssb_encoder({Props}, fun ssb_encoder/3, [pretty, use_nil]),
+                element(2, msg_format:decode_sigil(?pgv(~"author", Props),
+                                                   ~"@", ~".ed25519", 32)))),
+     ?_assertEqual(false, valid(with_sig(Props, sig_text(
+                                  <<Sig/binary, (crypto:strong_rand_bytes(24))/binary>>)))),
+     ?_assertEqual(false, valid(with_sig(Props, sig_text(binary:part(Sig, 0, 63))))),
+     ?_assertNotEqual(Text, NonCanon),
+     ?_assertEqual(false, valid(with_sig(Props, NonCanon))),
+     ?_assertEqual(false, valid(with_sig(Props, base64:encode(Sig)))),
+     ?_assertEqual(false, valid(with_sig(Props, <<(base64:encode(Sig))/binary, ".sig.ed25519x">>))),
+     ?_assertEqual(false, valid(with_sig(Props, null))),
+     ?_assertEqual(false, valid(Props))].
+
+author_encoding_test_() ->
+    Swap = fun(F) -> fun(Ps) -> lists:keyreplace(~"author", 1, Ps,
+                                                 {~"author", F(?pgv(~"author", Ps))})
+                     end end,
+    Case = fun(Mutate) -> {P, S} = signed_value(Mutate), valid(with_sig(P, sig_text(S))) end,
+    [?_assertEqual(true,  Case(Swap(fun(A) -> A end))),
+     %% signed over the mutated author, so only the decoding can object
+     ?_assertEqual(false, Case(Swap(fun(A) -> utils:strip_suffix(A, ~".ed25519") end))),
+     ?_assertEqual(false, Case(Swap(fun(A) -> <<A/binary, "x">> end))),
+     ?_assertEqual(false, Case(Swap(fun(<<"@", A/binary>>) -> A end))),
+     ?_assertEqual(false, Case(Swap(fun(_) -> 42 end))),
+     ?_assertEqual(false, Case(Swap(fun(_) ->
+                                       iolist_to_binary(["@", base64:encode(
+                                                                crypto:strong_rand_bytes(31)),
+                                                         ".ed25519"])
+                                    end)))].
+
+key_order_test_() ->
+    Case = fun(Mutate) -> {P, S} = signed_value(Mutate), valid(with_sig(P, sig_text(S))) end,
+    Move = fun(K, Pos) -> fun(Ps) ->
+                                  {value, KV, Rest} = lists:keytake(K, 1, Ps),
+                                  {A, B} = lists:split(Pos, Rest),
+                                  A ++ [KV] ++ B
+                          end end,
+    [%% the legacy order, sequence before author, is allowed
+     ?_assertEqual(true,  Case(Move(~"sequence", 1))),
+     ?_assertEqual(false, Case(Move(~"timestamp", 0))),
+     ?_assertEqual(false, Case(Move(~"content", 4))),
+     ?_assertEqual(false, Case(fun(Ps) -> lists:keydelete(~"hash", 1, Ps) end)),
+     ?_assertEqual(false, Case(fun(Ps) -> Ps ++ [{~"extra", 1}] end)),
+     %% a tampered value no longer matches its signature
+     ?_assertEqual(false, begin
+                              {P, S} = signed_value(fun same/1),
+                              valid(with_sig(lists:keyreplace(~"timestamp", 1, P,
+                                                              {~"timestamp", 1}),
+                                             sig_text(S)))
+                          end)].
+
 -endif.
