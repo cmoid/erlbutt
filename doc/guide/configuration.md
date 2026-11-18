@@ -43,6 +43,7 @@ Settings
 | `replication_hops` | `2` | How far out the follow graph to replicate: 1 is the feeds you follow, 2 adds the feeds they follow. Each hop can multiply the data stored many times over. |
 | `peer_dialer` | `true` (releases); `false` (development builds) | Whether the node dials out to known peers by itself. A node that never dials only gets what others bring it. Changed at runtime with `admin.dialer.enable` / `disable`, which persists. |
 | `require_valid_sigs` | `true` | Reject messages whose signature does not verify. Leave it on. |
+| `require_valid_format` | `false` | Reject peer messages that break ssb-validate's structural rules: content that is null, an array or an unboxed string; a content type shorter than 3 or longer than 52 characters; a `hash` other than `sha256`; a non-number timestamp; over 8192 bytes. Off while erlbutt measures how often real peers send such messages: they are logged once per feed, stored anyway, and counted as `invalidFormat` in `admin.status` and `sbutt health`. |
 | `blob_scan` | `false` | At startup, scan every stored message for blobs and fetch any that are missing. A full pass over the store. |
 | `archive_length` | unset | Archive your own feed automatically every N messages. Leave it unset on a pub. See [archives](../architecture/feeds-archives-glimpses.md#archive-boundaries). |
 | `archive_floors` | `true` | Accept a peer's offer to start a feed partway down, at an archive boundary, instead of from the beginning. |
