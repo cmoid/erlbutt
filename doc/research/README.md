@@ -11,7 +11,7 @@ links back to the note behind it.
 | Note | Written | Status | What it decided |
 |---|---|---|---|
 | [plugin-architecture.md](plugin-architecture.md) | July 2026 | built | Two behaviours, `ssb_plugin` for methods and `ssb_view` for derived state; per-feed logs rather than a global log; the plugin API version (October). |
-| [persistence.md](persistence.md) | July 2026 | built | Truth in flat files, derivation in SQLite; the three layers (foundation, conventions, applications) and the core views. |
+| [persistence.md](persistence.md) | July 2026 | built | Truth in flat files, derivation in SQLite; the three layers (foundation, conventions, applications) and the core views; §9 compares the result with flumedb and ssb-db2. |
 | [archive-boundaries.md](archive-boundaries.md) | August 2026 | built | How a feed retires its early history and a reader starts partway down, with no change to validation. Written to be argued with by other implementers. |
 | [feed-glimpses.md](feed-glimpses.md) | September 2026 | built | How a feed describes itself to peers at the edge of its graph, and promotion as a private pin. |
 | [git-over-ssb.md](git-over-ssb.md) | October 2026 | built as the [ssb_git](https://github.com/cmoid/ssb_git) plugin | Git repositories, pushes, issues and pull requests as SSB messages, compatible with the old git-ssb formats. |

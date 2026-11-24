@@ -750,3 +750,62 @@ registration queued behind it. Catch-up should be chunked or run outside
 the registration call before `ssb_links` becomes always-on. This is worth
 doing on its own account: `silkpurse_backlinks` hits the identical wall on
 the identical corpus.
+
+## 9. Compared with flumedb and ssb-db2
+
+*Added November 2026, describing the design as built rather than as
+proposed above.*
+
+erlbutt's storage was modelled on flumedb, the database underneath the
+JavaScript stack (ssb-server, patchwork), and it is worth setting out what
+it kept, what it changed, and why, for anyone coming from that side.
+
+### What was kept
+
+- **The log is the truth; every index is a fold over it.** A view is a
+  reducer plus a checkpoint, and can be thrown away and rebuilt at any
+  time. This is flume's central idea and erlbutt's too.
+- **A version bump means a rebuild.** `view_version/0` plays the part of
+  a flumeview's `version`: change it and the view is dropped and refolded.
+- **Live tailing.** Open streams receive new messages as they are stored,
+  as with flume's `since` observable. In erlbutt this is `view_stream`,
+  which subscribes before it takes its snapshot, so nothing is delivered
+  twice and nothing falls in the gap.
+- **The `log.offset` framing,** byte for byte. That is what lets the
+  converter read a flume store directly (see
+  [moving from SSB](../guide/moving-from-ssb.md)).
+
+### What changed
+
+| | flumedb | erlbutt | Why |
+|---|---|---|---|
+| **Log** | One global log, every author interleaved in arrival order; the byte offset identifies every message | One log per feed (`feeds/<2>/<rest>/log.offset`), same framing; the feed is the partition | A single feed can be archived, dropped or rebuilt, and feeds can be replayed in parallel. Flume cannot remove anything without rewriting the whole log. |
+| **Arrival order** | Is the log | A separate `ingest.journal` of `{FeedId, Seq}` references, without bodies | Arrival order is the one thing the global log really provided, and it is local information nothing else records. `createLogStream` serves from it. It replaced an earlier global `log.offset` that stored every message a second time. |
+| **View checkpoint** | One integer: `since`, a global offset | A vector clock per view (`feed → seq`), the same shape as an EBT clock | SSB views need only each author's own order. Per-feed checkpoints allow `view_manager:refold_feed/1` (re-fold one feed in moments, where a full rebuild takes half an hour) and partial rebuilds. A timestamp watermark was considered and rejected: timestamps are asserted by authors and arrive out of order, so a watermark skips messages; per-feed sequence cursors cannot. |
+| **View storage** | Each view chooses its own: flumeview-level, flumeview-reduce's JSON snapshot, flumeview-query; one set of files per view | One SQLite database, `store.db`: schemas versioned per view, ids interned to integers, a single writer that batches, reads in the calling process | The first erlbutt views used ETS tables saved with `tab2file`, effectively flumeview-reduce's model. That rewrote each table in full every 60 seconds (cost proportional to size, not to change) and needed every view to fit in RAM. The views turned out to be "select where, order by, limit" work, which is what SQL is for: follows out to N hops is one recursive CTE. See [storage](../architecture/storage.md). |
+| **Delivery to views** | Each view pulls from the log on its own, asynchronously | `view_manager` delivers each message to every view synchronously as it is stored, plus a chunked catch-up; core views always run before app views | Flume has no ordering between views. erlbutt app views fold against core state (the social graph, which also drives EBT), so the order is guaranteed. A view that is still catching up receives nothing directly, since the catch-up will reach the message, so no hole can open in it. |
+| **Point read, `get(msgid)`** | A keys index (level) gives the global offset | `mess_auth` (msgid → author, in SQLite), then the feed's in-memory id → offset index; archived segments are found through `.hint` sidecar files, an idea borrowed from bitcask | With partitioned logs, "which feed" comes before "where in it". Every read checks that the record it lands on is the one it expected, so a stale index is detected rather than believed. |
+| **Old data** | Grows forever | Archives: frozen `.gz` segments, stored as blobs and announced in an `archive` message on the owner's feed | No flume equivalent. Archives also underpin glimpses and serving a feed from its segments. See [feeds, archives and glimpses](../architecture/feeds-archives-glimpses.md). |
+| **What counts as truth** | Implicit: the log is truth, everything else an index | Explicit, with a third category of local truth: `own_heads` (half of the fork guard), validation floors, the ingest journal | These records cannot be derived from the logs, so a rebuild must never touch them. Flume has nowhere to put such state. |
+| **Decoding** | Each view parses what it needs | Each message is decoded once on arrival; views receive the decoded record alongside the raw bytes | Verifying the signature forces a parse anyway. |
+| **Format safety** | None | `data_version` refuses to start a node against data written by a newer build | It protects the parts that cannot be rebuilt: logs, segments, floors. |
+
+### ssb-db2
+
+ssb-db2, flume's successor in the JavaScript stack, went a different way.
+It kept a single global log but changed its encoding (bipf, on
+async-append-only-log), replaced most views with lazily built bitvector
+indexes (jitdb), and added deletion and compaction. erlbutt kept the JSON
+framing for compatibility with existing flume stores and partitioned the
+log instead; deleting or archiving a feed is then a matter of files, not a
+compaction pass over everything.
+
+### Still open
+
+- **EBT cannot express a suffix.** A node that holds a feed only from an
+  archive boundary onward has no way to say so in an EBT clock (see
+  [archive boundaries](archive-boundaries.md)).
+- **No fsync on the hot path,** deliberately (§3): syncing cost about
+  60 ms per write and throttled replication. A power cut can tear the tail
+  of a log; recovery handles a torn tail, but the last messages are lost.
+- **No blob garbage collection.** Blobs are never removed.

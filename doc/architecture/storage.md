@@ -146,7 +146,8 @@ Further reading
 ---------------
 
 - [research/persistence.md](../research/persistence.md) — the survey and
-  measurements behind this design, and how it compares to flumedb and
-  ssb-db2.
+  measurements behind this design; its
+  [§9](../research/persistence.md#9-compared-with-flumedb-and-ssb-db2)
+  compares it with flumedb and ssb-db2.
 - [Rebuilding a node](../guide/rebuilding-a-node.md) — what to do, and not
   do, when the data has to be recreated.
