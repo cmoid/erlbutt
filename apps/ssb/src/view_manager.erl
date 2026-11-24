@@ -307,7 +307,7 @@ handle_call({refold_feed, FeedId}, _From,
     N = fold_feed_into(Mods, FeedId),
     ?SSB_INFO("view_manager: refolded ~s into ~p views (~p deliveries)",
               [FeedId, length(Mods), N]),
-    {reply, {ok, N}, State};
+    {reply, {ok, N}, State, hibernate};
 
 handle_call({ingest, _Msg}, _From, #vm_state{paused = true} = State) ->
     %% Bulk load in progress: resume_ingest/0 will fold this from the
@@ -503,6 +503,21 @@ budget() ->
 turn_ms() ->
     application:get_env(ssb, view_catch_up_ms, ?CATCH_UP_MS).
 
+%% Hibernate once no fold is running, to give back the heap a fold grew.
+%%
+%% Folds run in this process, so a big catch-up or refold grows its heap
+%% to whatever a chunk needed.  Once the fold is done the server is nearly
+%% idle, allocates almost nothing, and so never collects again: on a 600k
+%% message node that was 1.1 GB of heap held for good around 624 bytes of
+%% live state.  Hibernating does a full sweep and shrinks the heap to
+%% fit.  The save tick does the same for ingest garbage, at most once a
+%% minute, and never while a catch-up is running, because its next chunk
+%% is already queued and would only wake the process again.
+idle_gc(#vm_state{catching = Catching} = State) when map_size(Catching) =:= 0 ->
+    {noreply, State, hibernate};
+idle_gc(State) ->
+    {noreply, State}.
+
 %% Append Mod to its class group: core views ahead of every app view,
 %% within a group in registration order.
 insert_view(Mod, core, Views) ->
@@ -515,7 +530,7 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info({catch_up, Mod, Gen, Work, Delivered, Pass, T0}, State) ->
-    {noreply, do_catch_up(Mod, Gen, Work, Delivered, Pass, T0, State)};
+    idle_gc(do_catch_up(Mod, Gen, Work, Delivered, Pass, T0, State));
 
 handle_info(save_tick, #vm_state{views = Views, catching = Catching,
                                  paused = Paused} = State) ->
@@ -528,7 +543,7 @@ handle_info(save_tick, #vm_state{views = Views, catching = Catching,
         false -> ok
     end,
     erlang:send_after(?SAVE_EVERY_MS, self(), save_tick),
-    {noreply, State};
+    idle_gc(State);
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -840,7 +855,8 @@ vm_test_() ->
               ?_test(imports_the_legacy_snapshot()),
               ?_test(pause_drops_ingest_and_resume_folds_it_in()),
               ?_test(a_pause_survives_a_manager_restart()),
-              ?_test(a_stale_view_is_refused())]
+              ?_test(a_stale_view_is_refused()),
+              ?_test(an_idle_manager_hibernates())]
      end}.
 
 %% Built against a plugin API this node does not implement: refused
@@ -850,6 +866,35 @@ a_stale_view_is_refused() ->
                                                  built  := 0}}},
                  register_view(test_stale_plugin)),
     ?assertNot(lists:member(test_stale_plugin, views())).
+
+%% A finished fold leaves the manager hibernating, which is the full
+%% sweep that hands back the heap the fold grew; so does a refold.
+%% Polled with process_info, because any call would wake it.
+an_idle_manager_hibernates() ->
+    ok = test_counter_view:ensure_table(),
+    ok = vm_ensure_manager(),
+    {Pid, Id, Priv} = vm_make_peer(),
+    vm_store_post(Pid, Id, Priv, null, 1),
+    %% a fresh manager, so registering starts a catch-up (an earlier test
+    %% registered the view already) and nothing else is talking to it
+    ok = vm_restart_manager(),
+    ok = register_view(test_counter_view),
+    ok = wait_hibernating(100),
+    ?assert(caught_up(test_counter_view)),
+    {ok, _} = refold_feed(Id),
+    ok = wait_hibernating(100).
+
+%% gen_server hibernates two ways on OTP 28: erlang:hibernate/3 after a
+%% noreply, and in place (erlang:hibernate/0, inside loop_hibernate/4)
+%% after a reply.  Both are the full sweep.
+wait_hibernating(0) ->
+    error(never_hibernated);
+wait_hibernating(N) ->
+    case process_info(whereis(view_manager), current_function) of
+        {current_function, {erlang, hibernate, 3}} -> ok;
+        {current_function, {gen_server, loop_hibernate, 4}} -> ok;
+        _ -> timer:sleep(20), wait_hibernating(N - 1)
+    end.
 
 %% Fully isolated home: these tests archive the own feed and rebuild
 %% from disk, and a home shared across eunit runs accumulates
