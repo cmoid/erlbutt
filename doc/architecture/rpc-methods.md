@@ -65,6 +65,7 @@ The node's control plane. All owner only.
 | `admin.export` / `admin.import` | [feed bundles](../guide/backup-export-import.md) |
 | `admin.gc.plan` | stored feeds outside the replication set and what removing them would touch; removes nothing ([sbutt gc plan](../guide/sbutt.md#data)) |
 | `admin.gc.blobs.plan` | stored blobs nothing references any more; removes nothing ([sbutt gc blobs plan](../guide/sbutt.md#blobs-nothing-references)) |
+| `admin.gc.blobs.run` / `admin.gc.blobs.restore` | move unreferenced blobs into a quarantine on the live node, and put one back |
 
 Client surface (`apps/silkpurse`)
 ---------------------------------

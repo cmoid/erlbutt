@@ -23,6 +23,7 @@
 %%   gc restore      Put a quarantine back (node stopped)
 %%   gc list|purge   Show / delete quarantines
 %%   gc blobs plan   Which stored blobs nothing references any more
+%%   gc blobs run    Move them into a quarantine (node running)
 %%
 %% The escript connects to the local erlbutt node on port 8008 (or SSB_PORT) using the
 %% node's own secret key, found the same way the node finds it (ssb_paths) (same approach as sbot in Node.js: two processes,
@@ -51,6 +52,9 @@ main(["import", Dir]) ->
     run(fun(P) -> cmd_import(P, Dir) end);
 main(["gc", "plan" | Args]) ->
     run(fun(P) -> cmd_gc_plan(P, Args) end);
+main(["gc", "blobs", "run" | Args]) ->
+    {Opts, Yes} = gc_blobs_run_args(Args, [], false),
+    run(fun(P) -> cmd_gc_blobs_run(P, Opts, Yes) end);
 main(["gc", "blobs", "plan" | Args]) ->
     Opts = gc_blobs_args(Args, []),
     run(fun(P) -> cmd_gc_blobs_plan(P, Opts) end);
@@ -58,7 +62,18 @@ main(["gc", "run" | Args]) ->
     {Opts, Yes} = gc_run_args(Args, #{}, false),
     run_offline(fun() -> cmd_gc_run(Opts, Yes) end);
 main(["gc", "restore", Stamp]) ->
-    run_offline(fun() -> cmd_gc_restore(Stamp) end);
+    %% a feed quarantine goes back with the node stopped, a blob one
+    %% through the running node; the manifest says which this is
+    init_paths(),
+    case catch feed_gc:read_manifest(feed_gc:quarantine_dir(Stamp)) of
+        #{kind := blobs} ->
+            run(fun(P) -> cmd_gc_blobs_restore(P, Stamp) end);
+        #{} ->
+            run_offline(fun() -> cmd_gc_restore(Stamp) end);
+        {refuse, Why} ->
+            io:format(standard_error, "gc restore: ~p~n", [Why]),
+            erlang:halt(1)
+    end;
 main(["gc", "list"]) ->
     run_local(fun cmd_gc_list/0);
 main(["gc", "purge", Stamp]) ->
@@ -219,6 +234,12 @@ start_keys() ->
 %% does — so the CLI uses the node's keys without being told where they
 %% are.
 init_paths() ->
+    case whereis(config) of
+        undefined -> init_paths1();
+        _         -> ok          %% already done (gc restore looks first)
+    end.
+
+init_paths1() ->
     logger:set_primary_config(level, error),
     Root = release_root(),
     add_code_paths(Root),
@@ -438,6 +459,7 @@ cmd_gc_plan(Peer, Args) ->
             end,
     case Reply of
         {Props} when is_list(Props) ->
+            ok = gc_reply_ok(Props, <<"candidates">>),
             report_gc_plan(Props);
         Other ->
             io:format("gc plan failed: ~p~n", [Other]),
@@ -624,9 +646,9 @@ cmd_gc_list() ->
         [] ->
             io:format("No quarantines.~n");
         Qs ->
-            [io:format("~s  ~8s feeds  ~-15s ~s~n",
-                       [S, group(N), atom_to_list(St), D])
-             || #{stamp := S, feeds := N, step := St, dir := D} <- Qs]
+            [io:format("~s  ~8s ~-5s  ~-15s ~s~n",
+                       [S, group(N), atom_to_list(K), atom_to_list(St), D])
+             || #{stamp := S, kind := K, count := N, step := St, dir := D} <- Qs]
     end.
 
 cmd_gc_purge(Stamp) ->
@@ -661,9 +683,93 @@ cmd_gc_blobs_plan(Peer, Opts) ->
             catch Class:Reason -> {error, {Class, Reason}}
             end,
     case Reply of
-        {P} when is_list(P) -> report_gc_blobs_plan(P);
+        {P} when is_list(P) ->
+            ok = gc_reply_ok(P, <<"candidates">>),
+            report_gc_blobs_plan(P);
         Other ->
             io:format("gc blobs plan failed: ~p~n", [Other]),
+            erlang:halt(1)
+    end.
+
+%% An error frame decodes to an object too ({name, message, ...}); without
+%% this it was printed as a report full of zeros.  Key is a field every
+%% real answer has.
+gc_reply_ok(Props, Key) ->
+    case lists:keymember(Key, 1, Props) of
+        true ->
+            ok;
+        false ->
+            io:format(standard_error, "the node said: ~ts~n",
+                      [gv(<<"message">>, Props, io_lib:format("~p", [Props]))]),
+            erlang:halt(1)
+    end.
+
+gc_blobs_run_args([], Acc, Y) -> {Acc, Y};
+gc_blobs_run_args(["--yes" | R], Acc, _) -> gc_blobs_run_args(R, Acc, true);
+gc_blobs_run_args(["--grace", D | R], Acc, Y) ->
+    gc_blobs_run_args(R, [{<<"graceDays">>, list_to_integer(D)} | Acc], Y);
+gc_blobs_run_args([Other | _], _, _) ->
+    io:format(standard_error, "gc blobs run: unknown option ~s~n"
+              "usage: sbutt gc blobs run [--grace DAYS] [--yes]~n", [Other]),
+    erlang:halt(1).
+
+%% sbutt gc blobs run — on the running node.  Without --yes it only says
+%% what it would move.
+cmd_gc_blobs_run(Peer, Opts, Yes) ->
+    Name = [<<"admin">>, <<"gc">>, <<"blobs">>, <<"run">>],
+    Args = [{[{<<"dryRun">>, not Yes} | Opts]}],
+    Reply = try ssb_peer:rpc_call(Peer, Name, <<"async">>, Args, 1800000) of
+                {ok, Body} -> utils:nat_decode(Body);
+                Err        -> {error, Err}
+            catch Class:Reason -> {error, {Class, Reason}}
+            end,
+    case Reply of
+        {P} when is_list(P) ->
+            ok = gc_reply_ok(P, <<"candidates">>),
+            N = gv(<<"candidates">>, P, 0),
+            io:format("candidates      ~s blobs (~s), referenced by nothing, "
+                      "unchanged for ~bd+~n",
+                      [group(N), human_bytes(gv(<<"bytes">>, P, 0)),
+                       gv(<<"graceDays">>, P, 0)]),
+            case {gv(<<"done">>, P, false), N} of
+                {_, 0} ->
+                    io:format("~nNothing to remove.~n");
+                {false, _} ->
+                    io:format("~nThis moves them into a quarantine (undo with "
+                              "`sbutt gc restore`).~nRe-run with --yes to do it.~n");
+                {true, _} ->
+                    Stamp = gv(<<"stamp">>, P, <<"?">>),
+                    io:format("~nMoved ~s blobs (~s) into ~s~n",
+                              [group(gv(<<"moved">>, P, 0)),
+                               human_bytes(gv(<<"movedBytes">>, P, 0)),
+                               gv(<<"quarantine">>, P, <<"?">>)]),
+                    case gv(<<"putBack">>, P, 0) of
+                        0 -> ok;
+                        B -> io:format("  ~s put back: referenced while the "
+                                       "run worked~n", [group(B)])
+                    end,
+                    [io:format("  NOT moved: ~s (~s)~n",
+                               [gv(<<"id">>, F, <<"?">>), gv(<<"error">>, F, <<"?">>)])
+                     || {F} <- gv(<<"failed">>, P, [])],
+                    io:format("Undo:        sbutt gc restore ~s~n"
+                              "Free space:  sbutt gc purge ~s~n", [Stamp, Stamp])
+            end;
+        Other ->
+            io:format("gc blobs run failed: ~p~n", [Other]),
+            erlang:halt(1)
+    end.
+
+cmd_gc_blobs_restore(Peer, Stamp) ->
+    Name = [<<"admin">>, <<"gc">>, <<"blobs">>, <<"restore">>],
+    case catch ssb_peer:rpc_call(Peer, Name, <<"async">>,
+                                 [list_to_binary(Stamp)], 600000) of
+        {ok, Body} ->
+            {P} = utils:nat_decode(Body),
+            io:format("Restored ~s blobs from ~s (~s were back already)~n",
+                      [group(gv(<<"restored">>, P, 0)), Stamp,
+                       group(gv(<<"alreadyPresent">>, P, 0))]);
+        Other ->
+            io:format(standard_error, "gc blobs restore failed: ~p~n", [Other]),
             erlang:halt(1)
     end.
 
@@ -1514,9 +1620,13 @@ usage() ->
     io:format("  gc run [--grace DAYS] [--keep-views] [--yes]~n"),
     io:format("                                Move the eligible feeds into a~n"),
     io:format("                                quarantine (node stopped)~n"),
-    io:format("  gc restore STAMP              Put a quarantine back (node stopped)~n"),
+    io:format("  gc restore STAMP              Put a quarantine back (feeds: node~n"),
+    io:format("                                stopped; blobs: node running)~n"),
     io:format("  gc list                       List quarantines~n"),
     io:format("  gc purge STAMP                Delete a quarantine for good~n"),
+    io:format("  gc blobs run [--grace DAYS] [--yes]~n"),
+    io:format("                                Move them into a quarantine~n"),
+    io:format("                                (node running)~n"),
     io:format("  gc blobs plan [--grace DAYS] [--top N|all]~n"),
     io:format("                                Blobs nothing references any more~n"),
     io:format("                                (removes nothing)~n").

@@ -75,10 +75,11 @@ Data
 | `sbutt census encoding [--limit N]` | Count stored messages that cannot be encoded for a client. *No node needed.* |
 | `sbutt gc plan [--grace DAYS] [--top N\|all] [--no-record]` | List the stored feeds that have fallen out of the replication set and what removing them would touch. *Removes nothing.* |
 | `sbutt gc run [--grace DAYS] [--keep-views] [--yes]` | Move the eligible feeds into a quarantine. Without `--yes` it only says what it would do. *Node stopped.* |
-| `sbutt gc restore STAMP` | Put a quarantine back. *Node stopped.* |
+| `sbutt gc restore STAMP` | Put a quarantine back. *Feeds: node stopped. Blobs: node running.* |
 | `sbutt gc list` | List quarantines. |
 | `sbutt gc purge STAMP` | Delete a quarantine for good. |
 | `sbutt gc blobs plan [--grace DAYS] [--top N\|all]` | List the stored blobs nothing references any more, and how much space they take. *Removes nothing.* |
+| `sbutt gc blobs run [--grace DAYS] [--yes]` | Move those blobs into a quarantine. Without `--yes` it only says what it would do. *Node running.* |
 
 Export and import are described in
 [Backup, export and import](backup-export-import.md).
@@ -194,6 +195,32 @@ A blob is kept if any of these hold:
 Everything else is a candidate. The plan refuses to answer while the
 links view is still catching up. It reads every stored message, so on a
 large store expect it to take about a minute.
+
+`sbutt gc blobs run --yes` works out the candidates the same way, then
+moves them into `<data>/gc/<STAMP>/blobs/`. Unlike `gc run` it works with
+the node running:
+
+- blob files never change once written, and nothing in the node holds an
+  index into them;
+- if a peer is reading a blob while it moves, the read finishes;
+- if a message that names a moved blob arrives later, the node fetches
+  the blob again.
+
+Messages keep arriving while the run reads the store. So once the moves
+are done, it checks the links index again, and any blob that has become
+referenced in the meantime goes straight back. A reference that arrives
+during the run *inside post text* isn't caught that way. That blob stays
+in the quarantine, where `sbutt gc restore STAMP` finds it.
+
+`sbutt gc list` shows feed and blob quarantines together. `gc restore`
+reads a quarantine's manifest to decide how to put it back: a blob
+quarantine through the running node, a feed quarantine with the node
+stopped. `gc purge` deletes either kind.
+
+Blobs held by a feed quarantine are kept until you purge that feed
+quarantine. So the order to free space is: `gc run`, check that things
+look right, `gc purge` the feed quarantine, `gc blobs run`, and later
+`gc purge` the blob quarantine.
 
 Going further
 -------------
