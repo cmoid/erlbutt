@@ -64,6 +64,13 @@
          report_json/1,
          ledger_file/0]).
 
+%% Quarantine bookkeeping, shared with blob_gc.
+-export([stamp/1,
+         quarantine_dir/1,
+         write_manifest/2,
+         read_manifest/1,
+         tree_bytes/1]).
+
 -define(DEFAULT_GRACE_DAYS, 7).
 -define(DEFAULT_TOP, 20).
 -define(DAY, 86400).
@@ -367,7 +374,8 @@ run(Opts) ->
         ok = offline_check(),
         ssb_store:available() orelse throw({refuse, store_unavailable}),
         _ = checked_q("SELECT count(*) FROM social_edges"),
-        case [S || #{stamp := S, step := St} <- quarantines(), St =/= done] of
+        case [S || #{stamp := S, kind := feeds, step := St} <- quarantines(),
+                   St =/= done] of
             []         -> ok;
             Unfinished -> throw({refuse, {unfinished, Unfinished}})
         end,
@@ -566,6 +574,8 @@ restore(Stamp) ->
         ssb_store:available() orelse throw({refuse, store_unavailable}),
         Q = quarantine_dir(Stamp),
         M = read_manifest(Q),
+        maps:get(kind, M, feeds) =:= feeds
+            orelse throw({refuse, {not_a_feed_quarantine, Stamp}}),
         FeedLoc = ?b2l(config:feed_loc()),
         {Back, Clash} =
             lists:foldl(
@@ -667,19 +677,23 @@ purge(Stamp) ->
             {error, Other}
     end.
 
-%% Every quarantine under <data>/gc, oldest first.
+%% Every quarantine under <data>/gc, feeds' (feed_gc) and blobs'
+%% (blob_gc), oldest first.  A manifest without a kind predates blob_gc
+%% and is a feed quarantine.
 quarantines() ->
     Root = filename:dirname(ledger_file()),
     lists:sort(
-      [#{stamp   => ?l2b(S),
-         created => maps:get(created, M),
-         feeds   => length(maps:get(feeds, M)),
+      [#{created => maps:get(created, M),
+         stamp   => ?l2b(S),
+         kind    => Kind,
+         count   => length(maps:get(Kind, M, [])),
          step    => maps:get(step, M),
          dir     => ?l2b(filename:join(Root, S))}
        || S <- case file:list_dir(Root) of {ok, L} -> L; _ -> [] end,
           is_stamp(S),
           M <- [catch read_manifest(filename:join(Root, S))],
-          is_map(M)]).
+          is_map(M),
+          Kind <- [maps:get(kind, M, feeds)]]).
 
 tree_bytes(Dir) ->
     filelib:fold_files(Dir, "", true,
@@ -953,7 +967,8 @@ run_restore_purge() ->
     ?assertEqual(0, gc_count(Authors, Gone)),
     ?assert(gc_count(Ckpts, Kept) > 0),
     ?assertEqual(#{}, read_ledger(ledger_file())),
-    ?assertMatch([#{stamp := Stamp, step := done, feeds := 1}], quarantines()),
+    ?assertMatch([#{stamp := Stamp, kind := feeds, step := done, count := 1}],
+                 quarantines()),
 
     %% no cascade
     ?assertMatch({ok, #{eligible := 0, waiting := 0}}, run(#{grace_days => 0})),

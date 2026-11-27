@@ -33,7 +33,9 @@ manifest() ->
      {[~"admin", ~"export"],              async, owner},
      {[~"admin", ~"import"],              async, owner},
      {[~"admin", ~"gc", ~"plan"],         async, owner},
-     {[~"admin", ~"gc", ~"blobs", ~"plan"], async, owner}].
+     {[~"admin", ~"gc", ~"blobs", ~"plan"], async, owner},
+     {[~"admin", ~"gc", ~"blobs", ~"run"], async, owner},
+     {[~"admin", ~"gc", ~"blobs", ~"restore"], async, owner}].
 
 %%%===================================================================
 %%% status
@@ -230,6 +232,49 @@ handle_rpc([~"admin", ~"gc", ~"blobs", ~"plan"], Args, _Caller) ->
                       "{graceDays: N, top: N | \"all\"}">>}
     end;
 
+%% Move the blobs nothing references into a quarantine (blob_gc:run/1),
+%% on the live node.  {"dryRun": true} only says what it would move.
+%% Marks first, exactly as the plan does, so it takes as long.
+handle_rpc([~"admin", ~"gc", ~"blobs", ~"run"], Args, _Caller) ->
+    case gc_opts(Args) of
+        {ok, Opts} when not is_map_key(record, Opts), not is_map_key(top, Opts) ->
+            case blob_gc:run(Opts) of
+                {ok, R} ->
+                    {reply, {[{~"done",       maps:get(done, R)},
+                              {~"graceDays",  maps:get(grace_days, R)},
+                              {~"candidates", maps:get(candidates, R)},
+                              {~"bytes",      maps:get(bytes, R)},
+                              {~"stamp",      maps:get(stamp, R, null)},
+                              {~"quarantine", maps:get(quarantine, R, null)},
+                              {~"moved",      maps:get(moved, R, 0)},
+                              {~"movedBytes", maps:get(moved_bytes, R, 0)},
+                              {~"putBack",    maps:get(put_back, R, 0)},
+                              {~"failed",     [{[{~"id", Id},
+                                                 {~"error", iolist_to_binary(
+                                                              io_lib:format("~p", [W]))}]}
+                                               || {Id, W} <- maps:get(failed, R, [])]}]}};
+                {error, Why} ->
+                    {error, iolist_to_binary(io_lib:format("gc blobs run refused: ~p",
+                                                           [Why]))}
+            end;
+        _ ->
+            {error, <<"gc.blobs.run takes an optional object: "
+                      "{graceDays: N, dryRun: bool}">>}
+    end;
+
+%% Put a blob quarantine back (blob_gc:restore/1), on the live node.
+handle_rpc([~"admin", ~"gc", ~"blobs", ~"restore"], [Stamp], _Caller)
+  when is_binary(Stamp) ->
+    case blob_gc:restore(Stamp) of
+        {ok, #{restored := N, already_present := D}} ->
+            {reply, {[{~"stamp", Stamp}, {~"restored", N}, {~"alreadyPresent", D}]}};
+        {error, Why} ->
+            {error, iolist_to_binary(io_lib:format("gc blobs restore refused: ~p",
+                                                   [Why]))}
+    end;
+handle_rpc([~"admin", ~"gc", ~"blobs", ~"restore"], _Args, _Caller) ->
+    {error, ~"gc.blobs.restore takes a quarantine stamp"};
+
 %%%===================================================================
 %%% store
 %%%===================================================================
@@ -280,6 +325,8 @@ gc_opts([{Props}]) when is_list(Props) ->
               {ok, O#{top => N}};
          ({~"record", B}, {ok, O}) when is_boolean(B) ->
               {ok, O#{record => B}};
+         ({~"dryRun", B}, {ok, O}) when is_boolean(B) ->
+              {ok, O#{dry_run => B}};
          (_, _) -> error
       end, {ok, #{}}, Props);
 gc_opts(_) -> error.
@@ -430,15 +477,24 @@ non_owner_is_refused() ->
 
 %% Bad arguments answer an error frame rather than crashing into the
 %% plugin's catch-all "internal error".
+blobs_restore_rejects_bad_args_test() ->
+    [?assertMatch({error, _},
+                  handle_rpc([~"admin", ~"gc", ~"blobs", ~"restore"], A, #{}))
+     || A <- [[], [42], [~"a", ~"b"]]],
+    ?assertMatch({error, _},
+                 handle_rpc([~"admin", ~"gc", ~"blobs", ~"restore"],
+                            [~"not-a-stamp"], #{})).
+
 import_rejects_bad_args_test() ->
     [?assertMatch({error, _}, handle_rpc([~"admin", ~"import"], Args, #{}))
      || Args <- [[], [~""], [42], [~"relative/dir"], [~"/abs", extra]]].
 
 gc_opts_test() ->
     ?assertEqual({ok, #{}}, gc_opts([])),
-    ?assertEqual({ok, #{grace_days => 0, top => all, record => false}},
+    ?assertEqual({ok, #{grace_days => 0, top => all, record => false,
+                        dry_run => true}},
                  gc_opts([{[{~"graceDays", 0}, {~"top", ~"all"},
-                            {~"record", false}]}])),
+                            {~"record", false}, {~"dryRun", true}]}])),
     [?assertEqual(error, gc_opts(A))
      || A <- [[{[{~"graceDays", -1}]}], [{[{~"top", ~"some"}]}],
               [{[{~"record", 1}]}], [{[{~"bogus", 1}]}], [1], [{[]}, extra]]].
