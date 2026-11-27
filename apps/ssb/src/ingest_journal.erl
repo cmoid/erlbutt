@@ -35,7 +35,10 @@
 -export([start_link/0,
          append/2,
          fold_refs/2,
-         stream_messages/2]).
+         stream_messages/2,
+         journal_file/0,
+         compact/3,
+         merge/4]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -113,6 +116,76 @@ warn_gap(FeedId, Seq, Warned) ->
                        "feed store — rebuild ingest.journal). Further gaps for "
                        "this feed are suppressed.", [FeedId, Seq]),
             Warned#{FeedId => true}
+    end.
+
+%%%===================================================================
+%%% Offline rewrites (feed_gc)
+%%%===================================================================
+%%
+%% Both write a NEW file and leave their inputs alone; the caller renames
+%% it into place.  Neither may run while this server has the journal
+%% open — they are for a node that is stopped (feed_gc checks).  Every
+%% kept record is re-framed, so NextOffset is right for its new position.
+
+%% Copy Src to Dst without the refs whose feed Drop(FeedId) says to drop.
+%% Survivors keep their order.  -> {ok, Kept, Dropped}
+compact(Src, Dst, Drop) when is_function(Drop, 1) ->
+    {ok, {Kept, Dropped}} =
+        rewrite(Dst, fun(Emit) ->
+                         fold_file(fun({F, _} = Ref, {K, D}) ->
+                                           case Drop(F) of
+                                               true  -> {K, D + 1};
+                                               false -> Emit(Ref), {K + 1, D}
+                                           end
+                                   end, {0, 0}, Src)
+                     end),
+    {ok, Kept, Dropped}.
+
+%% Every ref of Old, then the refs of Current after its first Skip — the
+%% journal as it would be had a compaction never happened, given the
+%% journal from before it (Old), the compacted journal the node has since
+%% appended to (Current), and how many refs the compaction kept (Skip).
+%% -> {ok, Total}
+merge(Old, Current, Skip, Dst) ->
+    {ok, {N1, N2}} =
+        rewrite(Dst, fun(Emit) ->
+                             A = fold_file(fun(Ref, N) -> Emit(Ref), N + 1 end,
+                                           0, Old),
+                             {_, B} = fold_file(
+                                        fun(Ref, {Seen, N}) when Seen < Skip ->
+                                                _ = Ref, {Seen + 1, N};
+                                           (Ref, {Seen, N}) ->
+                                                Emit(Ref), {Seen + 1, N + 1}
+                                        end, {0, 0}, Current),
+                             {A, B}
+                     end),
+    {ok, N1 + N2}.
+
+fold_file(Fun, Acc0, File) ->
+    utils:fold_log_file(
+      fun(Data, Acc) ->
+              case catch binary_to_term(Data) of
+                  {F, S} = Ref when is_binary(F), is_integer(S) -> Fun(Ref, Acc);
+                  _ -> Acc
+              end
+      end, Acc0, File).
+
+%% Run Body(Emit) with Emit writing refs to a fresh Dst, then fsync.
+%% -> {ok, Body's result}
+rewrite(Dst, Body) ->
+    _ = file:delete(Dst),
+    {ok, IoDev} = file:open(Dst, [write, binary, raw,
+                                  {delayed_write, 1 bsl 20, 2000}]),
+    Offset = make_ref(),
+    put(Offset, 0),
+    Emit = fun({F, S}) -> put(Offset, write_ref(IoDev, get(Offset), F, S)) end,
+    try
+        Result = Body(Emit),
+        ok = file:sync(IoDev),
+        {ok, Result}
+    after
+        _ = file:close(IoDev),
+        erase(Offset)
     end.
 
 %%%===================================================================
@@ -291,6 +364,35 @@ ij_stream_refs(FeedIds) ->
         end, [])).
 
 %% Interleaved stores across two feeds come back in arrival order.
+%% compact drops whole feeds and keeps the survivors' order; merge puts
+%% back what compact took out, followed by whatever was appended since.
+compact_and_merge_test() ->
+    Dir = filename:join("/tmp", "ij_gc_" ++
+                            integer_to_list(erlang:unique_integer([positive]))),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    [Src, Dst, Out] = [filename:join(Dir, N) || N <- ["src", "dst", "out"]],
+    Refs = [{~"a", 1}, {~"b", 1}, {~"a", 2}, {~"c", 1}, {~"b", 2}],
+    {ok, _} = rewrite(Src, fun(E) -> [E(R) || R <- Refs] end),
+    ?assertEqual({ok, 3, 2}, compact(Src, Dst, fun(F) -> F =:= ~"b" end)),
+    ?assertEqual([{~"a", 1}, {~"a", 2}, {~"c", 1}], read_refs(Dst)),
+    %% the node appends to the compacted journal afterwards
+    {ok, Fd} = file:open(Dst, [append, binary]),
+    _ = write_ref(Fd, filelib:file_size(Dst), ~"d", 1),
+    ok = file:close(Fd),
+    ?assertEqual({ok, 6}, merge(Src, Dst, 3, Out)),
+    ?assertEqual(Refs ++ [{~"d", 1}], read_refs(Out)),
+    %% re-framed: each record's NextOffset is where the next one starts
+    {ok, Bin} = file:read_file(Dst),
+    ?assert(offsets_chain(Bin, 0)),
+    ok = file:del_dir_r(Dir).
+
+read_refs(File) ->
+    lists:reverse(fold_file(fun(R, Acc) -> [R | Acc] end, [], File)).
+
+offsets_chain(<<>>, _) -> true;
+offsets_chain(<<Len:32, _:Len/binary, Len:32, Next:32, Rest/binary>>, Pos) ->
+    Next =:= Pos + Len + 12 andalso offsets_chain(Rest, Next).
+
 arrival_order() ->
     ok = ij_ensure(),
     {PidA, IdA, PrivA} = ij_make_peer(),
