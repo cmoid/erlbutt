@@ -78,6 +78,7 @@ Data
 | `sbutt gc restore STAMP` | Put a quarantine back. *Node stopped.* |
 | `sbutt gc list` | List quarantines. |
 | `sbutt gc purge STAMP` | Delete a quarantine for good. |
+| `sbutt gc blobs plan [--grace DAYS] [--top N\|all]` | List the stored blobs nothing references any more, and how much space they take. *Removes nothing.* |
 
 Export and import are described in
 [Backup, export and import](backup-export-import.md).
@@ -168,7 +169,31 @@ some peers remember what they think you hold and won't resend it. That
 is why removal goes through a quarantine.
 
 Blobs are not touched. Archive segments and images belonging to removed
-feeds stay in `blobs/`.
+feeds stay in `blobs/` (see the next section).
+
+### Blobs nothing references
+
+A blob is fetched because a stored message named it, and nothing ever
+removes it. `sbutt gc blobs plan` runs on the live node and reports which
+blobs nothing references any more. It writes nothing.
+
+A blob is kept if any of these hold:
+
+- a message in any stored feed names it. The plan checks the links index,
+  which can read private messages addressed to you, and also scans every
+  message's raw bytes, so a `![img](&….sha256)` written inside post text
+  counts.
+- a message in a feed held in an unpurged `gc run` quarantine names it,
+  so that `gc restore` brings feeds back with their images. Those blobs
+  become candidates once you purge the quarantine.
+- a table names it: archive segments, validation floors, glimpses, or
+  outstanding wants.
+- it changed within the grace period (`--grace`, 7 days by default),
+  which covers an upload you haven't posted yet.
+
+Everything else is a candidate. The plan refuses to answer while the
+links view is still catching up. It reads every stored message, so on a
+large store expect it to take about a minute.
 
 Going further
 -------------

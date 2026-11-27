@@ -22,6 +22,7 @@
 %%   gc run          Remove them into a quarantine (node stopped)
 %%   gc restore      Put a quarantine back (node stopped)
 %%   gc list|purge   Show / delete quarantines
+%%   gc blobs plan   Which stored blobs nothing references any more
 %%
 %% The escript connects to the local erlbutt node on port 8008 (or SSB_PORT) using the
 %% node's own secret key, found the same way the node finds it (ssb_paths) (same approach as sbot in Node.js: two processes,
@@ -50,6 +51,9 @@ main(["import", Dir]) ->
     run(fun(P) -> cmd_import(P, Dir) end);
 main(["gc", "plan" | Args]) ->
     run(fun(P) -> cmd_gc_plan(P, Args) end);
+main(["gc", "blobs", "plan" | Args]) ->
+    Opts = gc_blobs_args(Args, []),
+    run(fun(P) -> cmd_gc_blobs_plan(P, Opts) end);
 main(["gc", "run" | Args]) ->
     {Opts, Yes} = gc_run_args(Args, #{}, false),
     run_offline(fun() -> cmd_gc_run(Opts, Yes) end);
@@ -633,6 +637,81 @@ cmd_gc_purge(Stamp) ->
             io:format(standard_error, "gc purge refused: ~p~n", [Why]),
             erlang:halt(1)
     end.
+
+%% sbutt gc blobs plan — which blobs nothing references (blob_gc, via
+%% admin.gc.blobs.plan).  Removes nothing, writes nothing.
+gc_blobs_args([], Acc) -> Acc;
+gc_blobs_args(["--grace", D | R], Acc) ->
+    gc_blobs_args(R, [{<<"graceDays">>, list_to_integer(D)} | Acc]);
+gc_blobs_args(["--top", "all" | R], Acc) ->
+    gc_blobs_args(R, [{<<"top">>, <<"all">>} | Acc]);
+gc_blobs_args(["--top", N | R], Acc) ->
+    gc_blobs_args(R, [{<<"top">>, list_to_integer(N)} | Acc]);
+gc_blobs_args([Other | _], _) ->
+    io:format(standard_error, "gc blobs plan: unknown option ~s~n"
+              "usage: sbutt gc blobs plan [--grace DAYS] [--top N|all]~n",
+              [Other]),
+    erlang:halt(1).
+
+cmd_gc_blobs_plan(Peer, Opts) ->
+    Name = [<<"admin">>, <<"gc">>, <<"blobs">>, <<"plan">>],
+    Reply = try ssb_peer:rpc_call(Peer, Name, <<"async">>, [{Opts}], 1800000) of
+                {ok, Body} -> utils:nat_decode(Body);
+                Err        -> {error, Err}
+            catch Class:Reason -> {error, {Class, Reason}}
+            end,
+    case Reply of
+        {P} when is_list(P) -> report_gc_blobs_plan(P);
+        Other ->
+            io:format("gc blobs plan failed: ~p~n", [Other]),
+            erlang:halt(1)
+    end.
+
+report_gc_blobs_plan(P) ->
+    Tot = fun({T}) -> io_lib:format("~10s blobs  ~10s",
+                                    [group(gv(<<"blobs">>, T, 0)),
+                                     human_bytes(gv(<<"bytes">>, T, 0))])
+          end,
+    {K} = gv(<<"kept">>, P, {[]}),
+    io:format("~n== blobs on disk ==~n"),
+    io:format("  ~s blobs, ~s~n", [group(gv(<<"blobsOnDisk">>, P, 0)),
+                                   human_bytes(gv(<<"bytesOnDisk">>, P, 0))]),
+    case gv(<<"unrecognised">>, P, 0) of
+        0 -> ok;
+        U -> io:format("  ~s other files under blobs/ (left alone)~n", [group(U)])
+    end,
+    io:format("~n== kept ==~n"),
+    io:format("  referenced by stored feeds        ~s~n", [Tot(gv(<<"feeds">>, K, {[]}))]),
+    io:format("  referenced by quarantined feeds   ~s~n", [Tot(gv(<<"quarantine">>, K, {[]}))]),
+    io:format("  named by other tables             ~s~n", [Tot(gv(<<"tables">>, K, {[]}))]),
+    io:format("  changed in the last ~3bd          ~s~n",
+              [gv(<<"graceDays">>, P, 0), Tot(gv(<<"recent">>, K, {[]}))]),
+    io:format("~n== referenced by nothing ==~n"),
+    io:format("  candidates                        ~s~n", [Tot(gv(<<"candidates">>, P, {[]}))]),
+    [io:format("    ~-8s                        ~10s blobs  ~10s~n",
+               [gv(<<"size">>, B, <<"?">>), group(gv(<<"blobs">>, B, 0)),
+                human_bytes(gv(<<"bytes">>, B, 0))])
+     || {B} <- gv(<<"bySize">>, P, [])],
+    case gv(<<"quarantines">>, P, 0) of
+        0 -> ok;
+        Q -> io:format("  (~p feed quarantine(s) still hold their feeds' blobs; "
+                       "`sbutt gc purge` frees them for the next plan)~n", [Q])
+    end,
+    case gv(<<"referencedMissing">>, P, 0) of
+        0 -> ok;
+        M -> io:format("  (~s referenced blobs are not on disk)~n", [group(M)])
+    end,
+    case gv(<<"top">>, P, []) of
+        [] -> ok;
+        Top ->
+            io:format("~n== largest candidates ==~n"),
+            [io:format("  ~10s  ~s  ~s~n",
+                       [human_bytes(gv(<<"bytes">>, B, 0)),
+                        ms_date(gv(<<"mtime">>, B, 0) * 1000),
+                        gv(<<"id">>, B, <<"?">>)])
+             || {B} <- Top]
+    end,
+    io:format("~nNothing was removed.~n").
 
 ceil_days(S) when is_integer(S) -> (S + 86399) div 86400;
 ceil_days(_)                    -> 0.
@@ -1437,4 +1516,7 @@ usage() ->
     io:format("                                quarantine (node stopped)~n"),
     io:format("  gc restore STAMP              Put a quarantine back (node stopped)~n"),
     io:format("  gc list                       List quarantines~n"),
-    io:format("  gc purge STAMP                Delete a quarantine for good~n").
+    io:format("  gc purge STAMP                Delete a quarantine for good~n"),
+    io:format("  gc blobs plan [--grace DAYS] [--top N|all]~n"),
+    io:format("                                Blobs nothing references any more~n"),
+    io:format("                                (removes nothing)~n").
