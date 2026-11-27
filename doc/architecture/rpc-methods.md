@@ -63,6 +63,7 @@ The node's control plane. All owner only.
 | `admin.peers.known` / `.connected` | the address book; live connections |
 | `admin.store.tables` | tables in `store.db` and their row counts |
 | `admin.export` / `admin.import` | [feed bundles](../guide/backup-export-import.md) |
+| `admin.gc.plan` | stored feeds outside the replication set and what removing them would touch; removes nothing ([sbutt gc plan](../guide/sbutt.md#data)) |
 
 Client surface (`apps/silkpurse`)
 ---------------------------------

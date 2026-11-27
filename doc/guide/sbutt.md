@@ -73,9 +73,46 @@ Data
 | `sbutt export DIR [FEEDID ...]` | Write feeds (your own by default) and their blobs to a new directory. *Reads the store directly; safe beside a running node.* |
 | `sbutt import DIR` | Verify a bundle and load whatever is new into the running node. |
 | `sbutt census encoding [--limit N]` | Count stored messages that cannot be encoded for a client. *No node needed.* |
+| `sbutt gc plan [--grace DAYS] [--top N\|all] [--no-record]` | List the stored feeds that have fallen out of the replication set and what removing them would touch. *Removes nothing.* |
 
 Export and import are described in
 [Backup, export and import](backup-export-import.md).
+
+### Feeds the graph no longer reaches
+
+A node keeps every feed that was ever in its replication set (yourself,
+follows out to `replication_hops`, room members and pins, minus blocks).
+The set moves when you or the people you follow unfollow someone, or when
+you lower the hop count. Nothing removes the feeds that fall out of it.
+`sbutt gc plan` lists them.
+
+It reports, for the feeds outside the set and for the subset that is
+*eligible*:
+
+- their size on disk and how many messages they hold;
+- their refs in the ingest journal;
+- their view checkpoints, validation floors and `feed_meta` rows.
+
+It also lists the largest of them, with names where known. Other view
+rows are rebuilt by a run rather than counted.
+
+A feed becomes eligible only after it has been outside the set for the
+grace period (`--grace`, 7 days by default). The node records when each
+one was first seen outside the set in `<data>/gc/candidates`, and that
+ledger is the only thing a plan writes. A feed that comes back into the
+set leaves the ledger, and its grace period starts over if it falls out
+again. Use `--no-record` to look without updating the ledger.
+
+The plan refuses to answer rather than guess when:
+
+- the store can't be read;
+- the follow graph is still catching up;
+- the keep set holds nobody but you while `replication_hops` is above 0.
+
+It reads every feed directory and the whole journal, so expect it to take
+seconds to a minute.
+
+There is no `gc run` yet.
 
 Going further
 -------------

@@ -18,6 +18,7 @@
 %%   census encoding Count stored messages that cannot be encoded for a client
 %%   export          Write feeds + their blobs out as a portable bundle
 %%   import          Verify and load a bundle into the running node
+%%   gc plan         Which stored feeds fell out of the replication set
 %%
 %% The escript connects to the local erlbutt node on port 8008 (or SSB_PORT) using the
 %% node's own secret key, found the same way the node finds it (ssb_paths) (same approach as sbot in Node.js: two processes,
@@ -44,6 +45,8 @@ main(["export", Dir | Feeds]) ->
     run_local(fun() -> cmd_export(Dir, Feeds) end);
 main(["import", Dir]) ->
     run(fun(P) -> cmd_import(P, Dir) end);
+main(["gc", "plan" | Args]) ->
+    run(fun(P) -> cmd_gc_plan(P, Args) end);
 main(["whoami"])          -> run(fun cmd_whoami/1);
 main(["id"])              -> run(fun cmd_whoami/1);
 main(["ping"])            -> run(fun cmd_ping/1);
@@ -363,6 +366,144 @@ cmd_health(Peer) ->
                       [lists:join(", ", Mods)]),
             erlang:halt(2)
     end.
+
+%%% Feed GC plan ------------------------------------------------------------
+%%
+%% Which stored feeds have fallen out of the replication set, and what a
+%% gc run would remove (feed_gc, via admin.gc.plan).  Removes nothing.
+%% The node remembers when each feed was first seen outside the set, in
+%% <data>/gc/candidates, so that a feed becomes eligible only after the
+%% grace period; --no-record leaves that ledger alone.
+cmd_gc_plan(Peer, Args) ->
+    Opts = gc_plan_args(Args, []),
+    Name = [<<"admin">>, <<"gc">>, <<"plan">>],
+    %% walks every feed directory and the whole ingest journal
+    Reply = try ssb_peer:rpc_call(Peer, Name, <<"async">>, [{Opts}], 600000) of
+                {ok, Body} -> utils:nat_decode(Body);
+                Err        -> {error, Err}
+            catch Class:Reason -> {error, {Class, Reason}}
+            end,
+    case Reply of
+        {Props} when is_list(Props) ->
+            report_gc_plan(Props);
+        Other ->
+            io:format("gc plan failed: ~p~n", [Other]),
+            erlang:halt(1)
+    end.
+
+gc_plan_args([], Acc) -> Acc;
+gc_plan_args(["--grace", D | Rest], Acc) ->
+    gc_plan_args(Rest, [{<<"graceDays">>, list_to_integer(D)} | Acc]);
+gc_plan_args(["--top", "all" | Rest], Acc) ->
+    gc_plan_args(Rest, [{<<"top">>, <<"all">>} | Acc]);
+gc_plan_args(["--top", N | Rest], Acc) ->
+    gc_plan_args(Rest, [{<<"top">>, list_to_integer(N)} | Acc]);
+gc_plan_args(["--no-record" | Rest], Acc) ->
+    gc_plan_args(Rest, [{<<"record">>, false} | Acc]);
+gc_plan_args([Other | _], _) ->
+    io:format("gc plan: unknown option ~s~n"
+              "usage: sbutt gc plan [--grace DAYS] [--top N|all] [--no-record]~n",
+              [Other]),
+    erlang:halt(1).
+
+report_gc_plan(P) ->
+    {C} = gv(<<"candidates">>, P, {[]}),
+    {E} = gv(<<"eligible">>, P, {[]}),
+    Grace = gv(<<"graceDays">>, P, 0),
+    io:format("~n== keep ==~n"),
+    io:format("  replication     ~p hops; keep set ~s feeds~n",
+              [gv(<<"hops">>, P, 0), group(gv(<<"keepSet">>, P, 0))]),
+    io:format("  on disk         ~s feed dirs, ~s kept (~s)~n",
+              [group(gv(<<"feedsOnDisk">>, P, 0)),
+               group(gv(<<"keptOnDisk">>, P, 0)),
+               human_bytes(gv(<<"keptBytes">>, P, 0))]),
+    case gv(<<"unrecognisedDirs">>, P, 0) of
+        0 -> ok;
+        U -> io:format("  unrecognised    ~s dirs under feeds/ (left alone)~n",
+                       [group(U)])
+    end,
+    io:format("~n== outside the keep set ==~n"),
+    io:format("  ~-20s ~14s ~14s~n",
+              ["", "candidates", io_lib:format("eligible ~bd+", [Grace])]),
+    Row = fun(Label, Key, Fmt) ->
+                  io:format("  ~-20s ~14s ~14s~n",
+                            [Label, Fmt(gv(Key, C, 0)), Fmt(gv(Key, E, 0))])
+          end,
+    Row("feeds",            <<"feeds">>,       fun group/1),
+    Row("on disk",          <<"bytes">>,       fun human_bytes/1),
+    Row("messages",         <<"messages">>,    fun group/1),
+    Row("journal refs",     <<"journalRefs">>, fun group/1),
+    Row("view checkpoints", <<"checkpoints">>, fun group/1),
+    Row("validation floors", <<"floors">>,     fun group/1),
+    Row("feed_meta rows",   <<"feedMeta">>,    fun group/1),
+    Row("of them blocked",  <<"blocked">>,     fun group/1),
+    io:format("  (ingest journal holds ~s refs in all; other view rows are "
+              "rebuilt, not counted)~n", [group(gv(<<"journalRefs">>, P, 0))]),
+    case gv(<<"top">>, P, []) of
+        [] -> ok;
+        Top ->
+            io:format("~n== largest candidates ==~n"),
+            io:format("  ~9s ~8s  ~-10s  ~-12s  ~s~n",
+                      ["size", "msgs", "last msg", "eligible", "name / id"]),
+            [begin
+                 Elig = case gv(<<"eligible">>, F, false) of
+                            true  -> "yes";
+                            false -> io_lib:format("in ~bd",
+                                                   [ceil_days(gv(<<"graceLeft">>, F, 0))])
+                        end,
+                 Who = case gv(<<"name">>, F, null) of
+                           null -> gv(<<"id">>, F, <<"?">>);
+                           N    -> [N, "  ", gv(<<"id">>, F, <<"?">>)]
+                       end,
+                 io:format("  ~9s ~8s  ~-10s  ~-12s  ~ts~n",
+                           [human_bytes(gv(<<"bytes">>, F, 0)),
+                            case gv(<<"seq">>, F, null) of
+                                null -> "?";
+                                S    -> group(S)
+                            end,
+                            ms_date(gv(<<"last">>, F, null)),
+                            Elig, Who])
+             end || {F} <- Top]
+    end,
+    io:format("~nledger: ~s (~s)~n",
+              [gv(<<"ledger">>, P, <<"?">>),
+               case gv(<<"recorded">>, P, false) of
+                   true  -> "updated";
+                   false -> "not updated"
+               end]),
+    io:format("Nothing was removed.~n").
+
+ceil_days(S) when is_integer(S) -> (S + 86399) div 86400;
+ceil_days(_)                    -> 0.
+
+ms_date(null) -> "?";
+ms_date(Ms) when is_number(Ms) ->
+    try calendar:system_time_to_universal_time(round(Ms), millisecond) of
+        {{Y, M, D}, _} -> io_lib:format("~4..0b-~2..0b-~2..0b", [Y, M, D])
+    catch _:_ -> "?"
+    end;
+ms_date(_) -> "?".
+
+human_bytes(B) when is_integer(B), B >= 1 bsl 30 ->
+    io_lib:format("~.1f GB", [B / (1 bsl 30)]);
+human_bytes(B) when is_integer(B), B >= 1 bsl 20 ->
+    io_lib:format("~.1f MB", [B / (1 bsl 20)]);
+human_bytes(B) when is_integer(B), B >= 1 bsl 10 ->
+    io_lib:format("~.1f KB", [B / (1 bsl 10)]);
+human_bytes(B) when is_integer(B) -> io_lib:format("~b B", [B]);
+human_bytes(_) -> "?".
+
+%% 1234567 -> "1,234,567"
+group(N) when is_integer(N), N < 0 -> [$- | group(-N)];
+group(N) when is_integer(N) ->
+    S = integer_to_list(N),
+    Lead = length(S) rem 3,
+    {H, T} = lists:split(Lead, S),
+    string:join([H || H =/= ""] ++ chunks3(T), ",");
+group(_) -> "?".
+
+chunks3([]) -> [];
+chunks3([A, B, C | R]) -> [[A, B, C] | chunks3(R)].
 
 %%% Encoding census ---------------------------------------------------------
 %%
@@ -1125,4 +1266,8 @@ usage() ->
     io:format("                                their blobs to a new directory DIR~n"),
     io:format("                                (reads the store directly)~n"),
     io:format("  import DIR                    Verify a bundle and load what is new~n"),
-    io:format("                                into the running node~n").
+    io:format("                                into the running node~n"),
+    io:format("  gc plan [--grace DAYS] [--top N|all] [--no-record]~n"),
+    io:format("                                Feeds outside the replication set and~n"),
+    io:format("                                what removing them would touch~n"),
+    io:format("                                (removes nothing)~n").
