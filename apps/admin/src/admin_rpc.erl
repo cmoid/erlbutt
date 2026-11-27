@@ -32,7 +32,8 @@ manifest() ->
      {[~"admin", ~"store", ~"tables"],    async, owner},
      {[~"admin", ~"export"],              async, owner},
      {[~"admin", ~"import"],              async, owner},
-     {[~"admin", ~"gc", ~"plan"],         async, owner}].
+     {[~"admin", ~"gc", ~"plan"],         async, owner},
+     {[~"admin", ~"gc", ~"blobs", ~"plan"], async, owner}].
 
 %%%===================================================================
 %%% status
@@ -210,6 +211,23 @@ handle_rpc([~"admin", ~"gc", ~"plan"], Args, _Caller) ->
         error ->
             {error, <<"gc.plan takes an optional object: "
                       "{graceDays: N, top: N | \"all\", record: bool}">>}
+    end;
+
+%% Which stored blobs nothing references any more (blob_gc).  Removes
+%% nothing and writes nothing.  Scans every stored message, so it blocks
+%% the calling connection for a minute or more on a large store.
+handle_rpc([~"admin", ~"gc", ~"blobs", ~"plan"], Args, _Caller) ->
+    case gc_opts(Args) of
+        {ok, Opts} when not is_map_key(record, Opts) ->
+            case blob_gc:plan(Opts) of
+                {ok, Report} -> {reply, blob_gc:report_json(Report)};
+                {error, Why} -> {error, iolist_to_binary(
+                                          io_lib:format("gc blobs plan refused: ~p",
+                                                        [Why]))}
+            end;
+        _ ->
+            {error, <<"gc.blobs.plan takes an optional object: "
+                      "{graceDays: N, top: N | \"all\"}">>}
     end;
 
 %%%===================================================================
