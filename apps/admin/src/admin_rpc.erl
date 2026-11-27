@@ -31,7 +31,8 @@ manifest() ->
      {[~"admin", ~"peers", ~"connected"], async, owner},
      {[~"admin", ~"store", ~"tables"],    async, owner},
      {[~"admin", ~"export"],              async, owner},
-     {[~"admin", ~"import"],              async, owner}].
+     {[~"admin", ~"import"],              async, owner},
+     {[~"admin", ~"gc", ~"plan"],         async, owner}].
 
 %%%===================================================================
 %%% status
@@ -189,6 +190,29 @@ handle_rpc([~"admin", ~"import"], _Args, _Caller) ->
     {error, ~"import takes a bundle directory"};
 
 %%%===================================================================
+%%% gc
+%%%===================================================================
+
+%% Which stored feeds have fallen out of the replication set, and what
+%% removing them would touch (feed_gc).  Removes nothing; it updates only
+%% the candidates ledger, unless {"record": false}.  It walks every feed
+%% directory and the whole ingest journal, so it blocks the calling
+%% connection for seconds to a minute on a large store.
+handle_rpc([~"admin", ~"gc", ~"plan"], Args, _Caller) ->
+    case gc_opts(Args) of
+        {ok, Opts} ->
+            case feed_gc:plan(Opts) of
+                {ok, Report} -> {reply, feed_gc:report_json(Report)};
+                {error, Why} -> {error, iolist_to_binary(
+                                          io_lib:format("gc plan refused: ~p",
+                                                        [Why]))}
+            end;
+        error ->
+            {error, <<"gc.plan takes an optional object: "
+                      "{graceDays: N, top: N | \"all\", record: bool}">>}
+    end;
+
+%%%===================================================================
 %%% store
 %%%===================================================================
 
@@ -226,6 +250,21 @@ table_rows(Name) ->
 %%%===================================================================
 %%% Internal
 %%%===================================================================
+
+gc_opts([]) -> {ok, #{}};
+gc_opts([{Props}]) when is_list(Props) ->
+    lists:foldl(
+      fun(_, error) -> error;
+         ({~"graceDays", N}, {ok, O}) when is_integer(N), N >= 0 ->
+              {ok, O#{grace_days => N}};
+         ({~"top", ~"all"}, {ok, O}) -> {ok, O#{top => all}};
+         ({~"top", N}, {ok, O}) when is_integer(N), N >= 0 ->
+              {ok, O#{top => N}};
+         ({~"record", B}, {ok, O}) when is_boolean(B) ->
+              {ok, O#{record => B}};
+         (_, _) -> error
+      end, {ok, #{}}, Props);
+gc_opts(_) -> error.
 
 %% peer_registry keys connections by the RAW 32-byte public key — that is
 %% what the handshake yields and what ssb_peer registers — not the
@@ -376,6 +415,15 @@ non_owner_is_refused() ->
 import_rejects_bad_args_test() ->
     [?assertMatch({error, _}, handle_rpc([~"admin", ~"import"], Args, #{}))
      || Args <- [[], [~""], [42], [~"relative/dir"], [~"/abs", extra]]].
+
+gc_opts_test() ->
+    ?assertEqual({ok, #{}}, gc_opts([])),
+    ?assertEqual({ok, #{grace_days => 0, top => all, record => false}},
+                 gc_opts([{[{~"graceDays", 0}, {~"top", ~"all"},
+                            {~"record", false}]}])),
+    [?assertEqual(error, gc_opts(A))
+     || A <- [[{[{~"graceDays", -1}]}], [{[{~"top", ~"some"}]}],
+              [{[{~"record", 1}]}], [{[{~"bogus", 1}]}], [1], [{[]}, extra]]].
 
 export_rejects_bad_args_test() ->
     [?assertMatch({error, _}, handle_rpc([~"admin", ~"export"], Args, #{}))

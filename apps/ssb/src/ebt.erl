@@ -18,6 +18,7 @@
          full_clock/0,
          replicate_feed/1,
          refresh_repl_set/0,
+         compute_repl_set/0,
          handle_data/3]).
 
 %% gen_server callbacks
@@ -237,13 +238,7 @@ schedule_repl_refresh() ->
 %% anyway", which is what promoting a glimpse does (see feed_pins).
 recompute_repl_set() ->
     try
-        Self    = keys:pub_key_disp(),
-        Follows = ssb_social_graph:follows(Self, config:replication_hops()),
-        Members = room_store:members(),
-        Pinned  = feed_pins:all(),
-        Blocked = ssb_social_graph:blocks(Self),
-        Combined = lists:usort([Self | Follows] ++ Members ++ Pinned),
-        Set = [F || F <- Combined, not lists:member(F, Blocked)],
+        Set = compute_repl_set(),
         ets:delete_all_objects(?REPL_SET),
         [ets:insert(?REPL_SET, {F}) || F <- Set],
         ok
@@ -251,6 +246,21 @@ recompute_repl_set() ->
         ?SSB_INFO("EBT: repl set recompute failed: ~p~n", [{Class, Reason}]),
         ok
     end.
+
+%% The replication set, computed fresh rather than read from the cache.
+%% Shared with feed_gc so that "what we replicate" and "what we keep" can
+%% never disagree.  Note the readers under it answer [] when the store
+%% cannot be read rather than raising; that fails safe here (replicate
+%% less for twenty seconds) but not for a collector, so feed_gc checks
+%% the store itself before trusting this.
+compute_repl_set() ->
+    Self    = keys:pub_key_disp(),
+    Follows = ssb_social_graph:follows(Self, config:replication_hops()),
+    Members = room_store:members(),
+    Pinned  = feed_pins:all(),
+    Blocked = ssb_social_graph:blocks(Self),
+    Combined = lists:usort([Self | Follows] ++ Members ++ Pinned),
+    [F || F <- Combined, not lists:member(F, Blocked)].
 
 %% A vector clock's top-level keys all start with "@" (feed IDs).
 %% A message's keys are "key", "value", "timestamp".
