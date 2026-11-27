@@ -19,6 +19,9 @@
 %%   export          Write feeds + their blobs out as a portable bundle
 %%   import          Verify and load a bundle into the running node
 %%   gc plan         Which stored feeds fell out of the replication set
+%%   gc run          Remove them into a quarantine (node stopped)
+%%   gc restore      Put a quarantine back (node stopped)
+%%   gc list|purge   Show / delete quarantines
 %%
 %% The escript connects to the local erlbutt node on port 8008 (or SSB_PORT) using the
 %% node's own secret key, found the same way the node finds it (ssb_paths) (same approach as sbot in Node.js: two processes,
@@ -47,6 +50,15 @@ main(["import", Dir]) ->
     run(fun(P) -> cmd_import(P, Dir) end);
 main(["gc", "plan" | Args]) ->
     run(fun(P) -> cmd_gc_plan(P, Args) end);
+main(["gc", "run" | Args]) ->
+    {Opts, Yes} = gc_run_args(Args, #{}, false),
+    run_offline(fun() -> cmd_gc_run(Opts, Yes) end);
+main(["gc", "restore", Stamp]) ->
+    run_offline(fun() -> cmd_gc_restore(Stamp) end);
+main(["gc", "list"]) ->
+    run_local(fun cmd_gc_list/0);
+main(["gc", "purge", Stamp]) ->
+    run_local(fun() -> cmd_gc_purge(Stamp) end);
 main(["whoami"])          -> run(fun cmd_whoami/1);
 main(["id"])              -> run(fun cmd_whoami/1);
 main(["ping"])            -> run(fun cmd_ping/1);
@@ -113,6 +125,43 @@ run(CmdFun) ->
 run_local(CmdFun) ->
     init_paths(),
     CmdFun().
+
+%% For commands that change the store's files and so need the node
+%% STOPPED: take the node's own LOCK (which also stops the node starting
+%% underneath us), check the data version as the node would, and open the
+%% store — nothing else.  CmdFun returns the exit status; the lock is
+%% released before exiting either way.
+run_offline(CmdFun) ->
+    init_paths(),
+    start_keys(),
+    Dir = config:ssb_repo_loc(),
+    case store_lock:acquire(Dir) of
+        ok ->
+            ok;
+        {error, {locked, Holder}} ->
+            io:format(standard_error,
+                      "The node is running (~0p).~n"
+                      "Stop it first: this command changes the store's files.~n",
+                      [Holder]),
+            erlang:halt(1);
+        {error, Reason} ->
+            io:format(standard_error, "Cannot lock ~s: ~p~n", [Dir, Reason]),
+            erlang:halt(1)
+    end,
+    Code = try
+               ok = data_version:check(),
+               {ok, _} = ssb_store:start_link(),
+               {ok, _} = room_store:start_link(),
+               CmdFun()
+           catch Class:Why:St ->
+               io:format(standard_error, "failed: ~p:~p~n~p~n", [Class, Why, St]),
+               1
+           after
+               catch gen_server:stop(room_store),
+               catch gen_server:stop(ssb_store),
+               store_lock:release(Dir)
+           end,
+    erlang:halt(Code).
 
 setup() ->
     init_paths(),
@@ -472,6 +521,118 @@ report_gc_plan(P) ->
                    false -> "not updated"
                end]),
     io:format("Nothing was removed.~n").
+
+%% sbutt gc run — remove the eligible feeds into a quarantine.  Without
+%% --yes it only says what it would do.
+cmd_gc_run(Opts, Yes) ->
+    case feed_gc:run(Opts#{dry_run => not Yes}) of
+        {ok, #{done := false, eligible := 0} = R} ->
+            gc_run_summary(R),
+            io:format("~nNothing to remove.~n"),
+            0;
+        {ok, #{done := false} = R} ->
+            gc_run_summary(R),
+            io:format("~nThis removes them into a quarantine under ~s~n"
+                      "(undo with `sbutt gc restore`).~s~n"
+                      "Re-run with --yes to do it.~n",
+                      [filename:dirname(feed_gc:ledger_file()),
+                       case maps:get(rebuild_views, R) of
+                           true  -> " Every view rebuilds at the next start.";
+                           false -> ""
+                       end]),
+            0;
+        {ok, #{done := true} = R} ->
+            gc_run_summary(R),
+            #{stamp := Stamp, quarantine := Q, moved := Moved, failed := Failed,
+              journal := J, derived := D} = R,
+            io:format("~nRemoved ~s feeds into ~s~n", [group(Moved), Q]),
+            [io:format("  NOT moved: ~s (~p)~n", [Id, Why]) || {Id, _, Why} <- Failed],
+            case J of
+                #{present := true, kept := K, dropped := Dr} ->
+                    io:format("  ingest journal  ~s refs kept, ~s dropped~n",
+                              [group(K), group(Dr)]);
+                _ -> ok
+            end,
+            [io:format("  ~-15s ~s rows~n", [atom_to_list(T), group(N)])
+             || {T, N} <- lists:sort(maps:to_list(D)), T =/= views_reset],
+            case maps:get(views_reset, D, 0) of
+                0 -> ok;
+                V -> io:format("~n~s views will rebuild when the node starts; "
+                               "they fill in while it runs.~n", [group(V)])
+            end,
+            io:format("Undo:        sbutt gc restore ~s~n"
+                      "Free space:  sbutt gc purge ~s~n", [Stamp, Stamp]),
+            case Failed of [] -> 0; _ -> 2 end;
+        {error, {unfinished, Stamps}} ->
+            io:format(standard_error,
+                      "An earlier gc run did not finish: ~s~n"
+                      "Put it back first with `sbutt gc restore STAMP`.~n",
+                      [lists:join(", ", Stamps)]),
+            1;
+        {error, Why} ->
+            io:format(standard_error, "gc run refused: ~p~n", [Why]),
+            1
+    end.
+
+gc_run_args([], O, Y) -> {O, Y};
+gc_run_args(["--yes" | R], O, _) -> gc_run_args(R, O, true);
+gc_run_args(["--keep-views" | R], O, Y) ->
+    gc_run_args(R, O#{rebuild_views => false}, Y);
+gc_run_args(["--grace", D | R], O, Y) ->
+    gc_run_args(R, O#{grace_days => list_to_integer(D)}, Y);
+gc_run_args([Other | _], _, _) ->
+    io:format(standard_error, "gc run: unknown option ~s~n"
+              "usage: sbutt gc run [--grace DAYS] [--keep-views] [--yes]~n",
+              [Other]),
+    erlang:halt(1).
+
+gc_run_summary(R) ->
+    io:format("eligible        ~s feeds (~s), outside the keep set for ~bd+~n",
+              [group(maps:get(eligible, R)), human_bytes(maps:get(bytes, R)),
+               maps:get(grace_days, R)]),
+    io:format("still in grace  ~s feeds outside the set~n",
+              [group(maps:get(waiting, R))]),
+    case maps:get(back_in_set, R) of
+        0 -> ok;
+        B -> io:format("back in the set ~s feeds a plan had named (kept)~n",
+                       [group(B)])
+    end.
+
+cmd_gc_restore(Stamp) ->
+    case feed_gc:restore(Stamp) of
+        {ok, R} ->
+            #{restored := N, clashes := C, journal := J, floors := F,
+              msg_author := A} = R,
+            io:format("Restored ~s feeds from ~s~n", [group(N), Stamp]),
+            io:format("  ingest journal  ~p~n  floors          ~s~n"
+                      "  msg_author      ~s rows~n", [J, group(F), group(A)]),
+            [io:format("  KEPT IN QUARANTINE: ~s (fetched again since; the "
+                       "copy in the store wins)~n", [Id]) || Id <- C],
+            io:format("Views fold the restored feeds in when the node starts.~n"),
+            0;
+        {error, Why} ->
+            io:format(standard_error, "gc restore refused: ~p~n", [Why]),
+            1
+    end.
+
+cmd_gc_list() ->
+    case feed_gc:quarantines() of
+        [] ->
+            io:format("No quarantines.~n");
+        Qs ->
+            [io:format("~s  ~8s feeds  ~-15s ~s~n",
+                       [S, group(N), atom_to_list(St), D])
+             || #{stamp := S, feeds := N, step := St, dir := D} <- Qs]
+    end.
+
+cmd_gc_purge(Stamp) ->
+    case feed_gc:purge(Stamp) of
+        {ok, #{bytes := B}} ->
+            io:format("Purged ~s (~s freed).~n", [Stamp, human_bytes(B)]);
+        {error, Why} ->
+            io:format(standard_error, "gc purge refused: ~p~n", [Why]),
+            erlang:halt(1)
+    end.
 
 ceil_days(S) when is_integer(S) -> (S + 86399) div 86400;
 ceil_days(_)                    -> 0.
@@ -1270,4 +1431,10 @@ usage() ->
     io:format("  gc plan [--grace DAYS] [--top N|all] [--no-record]~n"),
     io:format("                                Feeds outside the replication set and~n"),
     io:format("                                what removing them would touch~n"),
-    io:format("                                (removes nothing)~n").
+    io:format("                                (removes nothing)~n"),
+    io:format("  gc run [--grace DAYS] [--keep-views] [--yes]~n"),
+    io:format("                                Move the eligible feeds into a~n"),
+    io:format("                                quarantine (node stopped)~n"),
+    io:format("  gc restore STAMP              Put a quarantine back (node stopped)~n"),
+    io:format("  gc list                       List quarantines~n"),
+    io:format("  gc purge STAMP                Delete a quarantine for good~n").

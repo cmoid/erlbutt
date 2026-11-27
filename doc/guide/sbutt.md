@@ -74,6 +74,10 @@ Data
 | `sbutt import DIR` | Verify a bundle and load whatever is new into the running node. |
 | `sbutt census encoding [--limit N]` | Count stored messages that cannot be encoded for a client. *No node needed.* |
 | `sbutt gc plan [--grace DAYS] [--top N\|all] [--no-record]` | List the stored feeds that have fallen out of the replication set and what removing them would touch. *Removes nothing.* |
+| `sbutt gc run [--grace DAYS] [--keep-views] [--yes]` | Move the eligible feeds into a quarantine. Without `--yes` it only says what it would do. *Node stopped.* |
+| `sbutt gc restore STAMP` | Put a quarantine back. *Node stopped.* |
+| `sbutt gc list` | List quarantines. |
+| `sbutt gc purge STAMP` | Delete a quarantine for good. |
 
 Export and import are described in
 [Backup, export and import](backup-export-import.md).
@@ -112,7 +116,59 @@ The plan refuses to answer rather than guess when:
 It reads every feed directory and the whole journal, so expect it to take
 seconds to a minute.
 
-There is no `gc run` yet.
+#### Removing them
+
+`sbutt gc run` works on a **stopped** node. It takes the node's LOCK, so
+the node can't start while it runs. It removes a feed only when both of
+these are true:
+
+- a plan recorded by the running node named the feed at least the grace
+  period ago;
+- the feed is still outside the replication set, worked out afresh from
+  the same store.
+
+If you re-follow someone after the plan, their feed is kept.
+
+What it does, in order:
+
+1. Moves each feed's directory into `<data>/gc/<STAMP>/feeds/`, beside a
+   `MANIFEST`.
+2. Rewrites the ingest journal without those feeds' refs. The surviving
+   refs keep their order, and the old journal stays in the quarantine.
+3. Deletes the feeds' validation floors, view checkpoints, `feed_meta`
+   rows and message-id index rows from `store.db`, in one transaction.
+4. Marks every view to rebuild when the node next starts, because other
+   view rows (links, threads, contacts) would otherwise still point at
+   messages that are gone. The node serves while the views refold, but
+   the views are incomplete until the refold finishes. `--keep-views`
+   skips the rebuild and leaves those rows stale.
+
+On a store of 2.5 million messages, removing 42,000 feeds (1.25 million
+messages) took about 25 seconds.
+
+`sbutt gc restore STAMP` puts a quarantine back:
+
+- the feed directories;
+- the journal, merged so that refs the node added since the run are kept
+  after the restored history;
+- the validation floors;
+- the message-id index.
+
+The views fold the restored feeds in at the next start. If a feed was
+fetched afresh after the run, the store's copy is kept and the
+quarantined one stays where it is. Once you are sure,
+`sbutt gc purge STAMP` frees the space.
+
+If a run is interrupted, the manifest records how far it got. A later
+`gc run` refuses until you `restore` that quarantine, and restoring is
+safe to repeat.
+
+Removed feeds can't always be fetched again: peers drop feeds too, and
+some peers remember what they think you hold and won't resend it. That
+is why removal goes through a quarantine.
+
+Blobs are not touched. Archive segments and images belonging to removed
+feeds stay in `blobs/`.
 
 Going further
 -------------

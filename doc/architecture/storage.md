@@ -26,6 +26,7 @@ recreated, the rest are **derived** and can be thrown away and rebuilt.
   ssb.cfg             the operator's settings (optional)         config
   overrides.cfg       settings changed at runtime                config
   plugins/            operator-installed plugins (optional)      code
+  gc/                 feed GC ledger and quarantines (optional)  local
   LOCK                held by the running node                   runtime
 ```
 
